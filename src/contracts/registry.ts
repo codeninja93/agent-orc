@@ -13,6 +13,7 @@ import { z } from 'zod';
 import { CommandIntentSchema } from './command.js';
 import { EventEnvelopeSchema } from './event.js';
 import { OrchErrorSchema } from './error.js';
+import { FetchRecordSchema } from './fetch.js';
 import { QuestionStateSchema } from './question.js';
 import { StepInputSchema, StepOutputSchema } from './step.js';
 
@@ -63,6 +64,14 @@ export const CONTRACTS = {
     description: 'The compare-and-set question state file under runs/<run-id>/questions/ (AD-25).',
     model_produced: false,
     schema: QuestionStateSchema,
+  },
+  'fetch.record': {
+    id: 'fetch.record',
+    kind: 'artifact',
+    description:
+      'The run shared fetch record at runs/<run-id>/fetch-record.json (AD-13, AD-14, AD-28).',
+    model_produced: false,
+    schema: FetchRecordSchema,
   },
   'error.shape': {
     id: 'error.shape',

@@ -15,6 +15,7 @@ assertNodeFloorOrExit();
 export * from './command.js';
 export * from './error.js';
 export * from './event.js';
+export * from './fetch.js';
 export * from './node-floor.js';
 export * from './question.js';
 export * from './registry.js';
