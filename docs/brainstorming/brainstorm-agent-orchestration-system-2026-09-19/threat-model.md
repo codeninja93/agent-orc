@@ -142,7 +142,8 @@ None of the other fourteen predators kill this project. Sandbox escape is surviv
 
 - **Build on Claude Code's existing primitives — subagents, hooks, MCP, worktrees — as *config plus small scripts*, never a bespoke platform.** Every component that already exists and is maintained by someone else is a component that cannot rot on you.
 - **Reuse over build for the supporting cast.** Git as the message bus (comms, audit, replay, flight recorder, stigmergy — one decision solves five problems). Git notes for agent metadata. SQLite for the event log. A TUI over the event stream before any web app; the web app is a second renderer of the same stream, if ever.
-- **Three agents, not eight.** A deterministic workflow engine with LLM intelligence only at the leaves — the pipeline is code, not a model deciding what comes next. Fewer moving parts, lower token cost, higher reliability, and far less to maintain.
+- **Intelligence at the leaves, not in the control flow.** A deterministic workflow engine with LLM intelligence only at the leaves — the pipeline is code, not a model deciding what comes next. Fewer moving parts, higher reliability, and far less to maintain.
+  - *Revised after the spec run.* This originally read **"three agents, not eight"**. Deep decided the full agent roster ships from the start, so the restraint is no longer a head count: it is that the roster is declarative configuration referencing a fixed set of registered contracts (AD-17), so adding an agent costs one TOML file and no engine change. What bounds maintenance is the number of distinct contract *shapes*, not the number of agents. The principle in this bullet is unaffected by that decision.
 
 **Stop-building tripwires.** These exist to tell you when to *stop*, which is the whole point:
 
