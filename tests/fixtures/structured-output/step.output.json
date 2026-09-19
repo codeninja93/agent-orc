@@ -1,0 +1,59 @@
+{
+  "contract_id": "step.output",
+  "step": "analysis",
+  "status": "completed",
+  "summary": "Read ARCHITECTURE-SPINE.md and story 1-1 and found the six shared contracts the contracts package must define in src/contracts/, which imports nothing else from src/: (1) the AD-5 event envelope with eight fields (ts, seq, feature, run, step, emitter, type, payload), an open list of event types, and passthrough of parent_tool_use_id and session_id; (2) the AD-3 Command enum covering the 14 steering controls; (3) the AD-25 question contract with asked/resolved/deflected states and resolver and principal fields; (4) the AD-35 error shape {code, message, retryable, cause} with its disposition table, where unknown codes fall back to abandon-and-hand-off; (5) the AD-28 schema_version field and a helper that refuses unrecognised versions; (6) the typed step input/output envelope. They share one contract registry keyed by id, and it exports draft-7 JSON Schema through a single toJsonSchema helper. Every step contract must stay inside the structured-outputs subset.",
+  "provenance": [
+    "analysis: docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md (AD-2, AD-3, AD-5, AD-17, AD-19, AD-25, AD-28, AD-31, AD-35; Structural Seed)",
+    "analysis: docs/specs/spec-agent-orchestrator/stories/1-1-contracts-package.md (Intent, Boundaries, Code Map, Tasks)",
+    "analysis: docs/specs/spec-agent-orchestrator/architecture.md (Agent contract, two planes)",
+    "analysis: docs/specs/spec-agent-orchestrator/interface-contract.md (steering controls the Command enum must cover)"
+  ],
+  "decisions": [
+    {
+      "question": "Should the six contracts be separate modules, or one combined schema file?",
+      "answer": "One module per contract under src/contracts/ (event.ts, command.ts, question.ts, error.ts, schema-version.ts, step.ts). registry.ts maps contract id to Zod schema and is the only place z.toJSONSchema is called, always with target draft-7.",
+      "rationale": "AD-17 agent TOML refers to contracts by id and never inlines a schema. Zod 4 defaults to draft-2020-12, which claude -p --json-schema rejects. If export goes through one helper, a call site cannot forget the draft-7 argument, and the subset guard and round-trip suites can iterate over a single registry."
+    }
+  ],
+  "artifacts": [
+    {
+      "kind": "transcript",
+      "path": "~/.orch/runs/01JBQZ8Q0000000000000000AA/transcripts/contracts-package/analysis.jsonl",
+      "description": "Full session transcript of the analysis step: the spine and story 1-1 reads and the reasoning that identified the six shared contracts (evidence plane, read on demand)."
+    }
+  ],
+  "questions": [
+    {
+      "prompt": "Should the command intent file schema (AD-19: the durable file under runs/<run-id>/commands/ that carries a Command, its arguments and its principal) be defined in this story, or deferred to the story that builds the reconciler or renderers?",
+      "brief": "Story 1-1 defines the AD-3 Command enum. It does not list a schema for the intent file that wraps the enum. AD-19 makes that file the only thing the reconciler consumes, and it must record a principal. Both renderers and the engine will depend on it, which suggests it belongs in contracts. Adding it here grows a story that is already flagged oversized.",
+      "options": [
+        {
+          "id": "include",
+          "label": "Define the command intent schema in this story",
+          "consequence": "Adds src/contracts/command-intent.ts and a registry entry. Both renderers and the reconciler build against one shape from the start. The story grows by one file and roughly two matrix rows."
+        },
+        {
+          "id": "defer",
+          "label": "Defer it to the reconciler/renderer stories",
+          "consequence": "Keeps 1-1 within its current scope. The first consumer defines the schema later and must place it in src/contracts/, with some risk that the two renderers drift in the meantime."
+        },
+        {
+          "id": "stub",
+          "label": "Add a minimal envelope now and fill in the per-command payloads later",
+          "consequence": "Fixes command, principal, ts and schema_version now and leaves payload open. This limits drift at little cost, but a later story has to tighten the payloads."
+        }
+      ],
+      "escape": {
+        "id": "halt",
+        "label": "Pause and ask the spec author",
+        "consequence": "Planning for contracts-package waits until the story's scope is clarified."
+      },
+      "recommended_option_id": "stub",
+      "default_action": "Proceed with the minimal command intent envelope (option 'stub') and record the choice in the story's Spec Change Log.",
+      "default_window_ms": 3600000
+    }
+  ],
+  "write_intents": [],
+  "error": null
+}

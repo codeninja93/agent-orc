@@ -1,0 +1,444 @@
+/**
+ * The I/O and edge-case matrix of story 1-1, asserted row by row: the event envelope's
+ * forward compatibility (AD-5), the error disposition table's unknown-code fallback (AD-35), the
+ * `schema_version` gate (AD-28), the `Command` enum's coverage of every steering control (AD-3),
+ * and the question lifecycle's single accepted transition (AD-25).
+ */
+import { describe, expect, it } from 'vitest';
+
+import {
+  BudgetSchema,
+  CURRENT_SCHEMA_VERSION,
+  Command,
+  CommandIntentSchema,
+  COMMANDS,
+  DISPOSITIONS,
+  ERROR_CODES,
+  ERROR_DISPOSITIONS,
+  EVENT_ENVELOPE_REQUIRED_FIELDS,
+  EVENT_TYPES,
+  EventEnvelopeSchema,
+  OrchErrorSchema,
+  QuestionDraftSchema,
+  QuestionStateSchema,
+  SchemaVersionRefusal,
+  TimestampSchema,
+  compareEventOrder,
+  contractIdsOfKind,
+  deflectQuestion,
+  dispositionFor,
+  dispositionForError,
+  eventTypeForResolution,
+  formatTimestamp,
+  getContract,
+  isDeclaredEventType,
+  isErrorCode,
+  isResumable,
+  isRetryable,
+  makeError,
+  parseVersionedArtifact,
+  renderCause,
+  resolveQuestion,
+  schemaVersionRefusalMessage,
+  writesToDecisionLedger,
+} from '../src/contracts/index.js';
+import type { CommandMap, QuestionState, StepDisposition } from '../src/contracts/index.js';
+
+const validEnvelope = {
+  ts: '2026-09-19T12:34:56.789Z',
+  seq: 42,
+  feature: 'contracts-package',
+  run: '01JBQZ8Q0000000000000000AA',
+  step: 'implementation',
+  emitter: 'engine',
+  type: 'step.started',
+  payload: { step: 'implementation' },
+};
+
+describe('AD-5 — the event envelope', () => {
+  it('parses an envelope carrying all eight fields', () => {
+    const parsed = EventEnvelopeSchema.parse(validEnvelope);
+    for (const field of EVENT_ENVELOPE_REQUIRED_FIELDS) {
+      expect(parsed).toHaveProperty(field);
+    }
+  });
+
+  it('accepts only RFC3339 with milliseconds in UTC', () => {
+    expect(TimestampSchema.safeParse('2026-09-19T12:34:56.789Z').success).toBe(true);
+    for (const bad of [
+      '2026-09-19T12:34:56Z',
+      '2026-09-19T12:34:56.789+02:00',
+      '2026-09-19 12:34:56.789Z',
+      '2026-09-19T12:34:56.789123Z',
+      '2026-13-19T12:34:56.789Z',
+    ]) {
+      expect(TimestampSchema.safeParse(bad).success, bad).toBe(false);
+    }
+  });
+
+  it('accepts an event type outside the declared vocabulary — adding a type is never breaking', () => {
+    const unknown = { ...validEnvelope, type: 'consolidation.compacted' };
+    expect(isDeclaredEventType(unknown.type)).toBe(false);
+    expect(EventEnvelopeSchema.parse(unknown).type).toBe('consolidation.compacted');
+  });
+
+  it('declares a dot-namespaced, past-tense vocabulary', () => {
+    for (const type of EVENT_TYPES) {
+      expect(type).toMatch(/^[a-z_]+\.[a-z_]+$/);
+      expect(isDeclaredEventType(type)).toBe(true);
+    }
+  });
+
+  it('fails when a required field is missing, naming the field', () => {
+    const { emitter: _omitted, ...withoutEmitter } = validEnvelope;
+    const result = EventEnvelopeSchema.safeParse(withoutEmitter);
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain('emitter');
+  });
+
+  it('preserves the stream-origin fields verbatim', () => {
+    const streamOrigin = {
+      ...validEnvelope,
+      emitter: 'step.implementation',
+      parent_tool_use_id: 'toolu_01ABCdefGHIjklMNOpqrST',
+      session_id: 'cd74ff61-b185-4d5c-b8aa-b4622f7ad3f7',
+    };
+    const parsed = EventEnvelopeSchema.parse(streamOrigin);
+    expect(parsed.parent_tool_use_id).toBe(streamOrigin.parent_tool_use_id);
+    expect(parsed.session_id).toBe(streamOrigin.session_id);
+  });
+
+  it('keeps unknown keys rather than dropping them', () => {
+    const parsed = EventEnvelopeSchema.parse({ ...validEnvelope, usage_tokens: 1234 });
+    expect(parsed['usage_tokens']).toBe(1234);
+  });
+
+  it('formats a timestamp the schema accepts, to exactly millisecond precision', () => {
+    expect(TimestampSchema.safeParse(formatTimestamp()).success).toBe(true);
+    expect(formatTimestamp(new Date(Date.UTC(2026, 8, 19, 12, 34, 56, 789)))).toBe(
+      '2026-09-19T12:34:56.789Z',
+    );
+  });
+
+  it('orders by seq, not by timestamp (AD-29)', () => {
+    const later = { ...validEnvelope, seq: 7, ts: '2026-09-19T12:00:00.000Z' };
+    const earlier = { ...validEnvelope, seq: 3, ts: '2026-09-19T13:00:00.000Z' };
+    expect(compareEventOrder(EventEnvelopeSchema.parse(earlier), EventEnvelopeSchema.parse(later))).toBeLessThan(0);
+    expect(compareEventOrder(EventEnvelopeSchema.parse(later), EventEnvelopeSchema.parse(later))).toBe(0);
+  });
+});
+
+describe('AD-35 — every failure code carries a declared disposition', () => {
+  it('maps every registered code to exactly one of the four dispositions', () => {
+    expect(ERROR_CODES.length).toBeGreaterThan(0);
+    for (const code of ERROR_CODES) {
+      expect(DISPOSITIONS).toContain(ERROR_DISPOSITIONS[code]);
+    }
+  });
+
+  it('resolves a registered code to its declared disposition', () => {
+    expect(dispositionFor('model.rate_limited')).toBe('retry-with-backoff');
+    expect(dispositionFor('step.verification_failed')).toBe('escalate-model-tier');
+    expect(dispositionFor('permission.denied')).toBe('escalate-to-human');
+    expect(dispositionFor('redaction.failed')).toBe('abandon-and-hand-off');
+  });
+
+  it('resolves an unknown code to abandon-and-hand-off, and never retries it', () => {
+    const unknown = makeError('gremlin.unheard_of', 'something nobody declared');
+    expect(dispositionForError(unknown)).toBe('abandon-and-hand-off');
+    expect(unknown.retryable).toBe(false);
+    expect(isRetryable('gremlin.unheard_of')).toBe(false);
+  });
+
+  it('parses an error whose code is unknown rather than throwing a second failure', () => {
+    const parsed = OrchErrorSchema.parse({
+      code: 'gremlin.unheard_of',
+      message: 'x',
+      retryable: false,
+      cause: null,
+    });
+    expect(parsed.code).toBe('gremlin.unheard_of');
+  });
+
+  it.each(['constructor', 'toString', '__proto__', 'valueOf', 'hasOwnProperty'])(
+    'treats the prototype key %s as an unknown code, not a registered one',
+    (key) => {
+      expect(isErrorCode(key)).toBe(false);
+      expect(dispositionFor(key)).toBe('abandon-and-hand-off');
+      expect(DISPOSITIONS).toContain(dispositionFor(key));
+      expect(isRetryable(key)).toBe(false);
+    },
+  );
+
+  it('renders any thrown value as a cause string, never "[object Object]"', () => {
+    expect(renderCause(new TypeError('bad input'))).toBe('TypeError: bad input');
+    expect(renderCause('plain')).toBe('plain');
+    expect(renderCause(null)).toBeNull();
+    expect(renderCause(undefined)).toBeNull();
+    expect(renderCause({ exit: 1 })).toBe('{"exit":1}');
+    expect(renderCause({ exit: 1 })).not.toContain('[object Object]');
+  });
+
+  it('derives retryable from the table, so the flag cannot disagree with it', () => {
+    for (const code of ERROR_CODES) {
+      expect(makeError(code, 'm').retryable).toBe(
+        ERROR_DISPOSITIONS[code] === 'retry-with-backoff',
+      );
+    }
+  });
+});
+
+describe('AD-28 — schema_version', () => {
+  const artifact = {
+    schema_version: CURRENT_SCHEMA_VERSION,
+    intent_id: 'intent-1',
+    command: Command.Kill,
+    run: '01JBQZ8Q0000000000000000AA',
+    feature: 'contracts-package',
+    step: 'implementation',
+    principal: { kind: 'user', id: 'deep' },
+    source: 'tui',
+    issued_at: '2026-09-19T12:34:56.789Z',
+    argument: null,
+  };
+
+  it('accepts an artifact at the current version', () => {
+    expect(parseVersionedArtifact(CommandIntentSchema, artifact, 'a command intent').command).toBe(
+      Command.Kill,
+    );
+  });
+
+  it('fails to parse an artifact with no schema_version, naming the field', () => {
+    const { schema_version: _omitted, ...withoutVersion } = artifact;
+    const result = CommandIntentSchema.safeParse(withoutVersion);
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain('schema_version');
+  });
+
+  it('refuses a future version, stating the installer versions involved', () => {
+    const future = { ...artifact, schema_version: CURRENT_SCHEMA_VERSION + 1 };
+    try {
+      parseVersionedArtifact(CommandIntentSchema, future, 'a command intent');
+      expect.unreachable('a future schema_version must be refused');
+    } catch (error) {
+      expect(error).toBeInstanceOf(SchemaVersionRefusal);
+      const refusal = error as SchemaVersionRefusal;
+      expect(refusal.message).toContain('not recognised');
+      expect(refusal.message).toMatch(/installer/);
+      expect(refusal.message).toContain('Re-run the installer');
+      expect(refusal.writtenBy).toBeNull();
+    }
+  });
+
+  it('rejects a non-integer schema_version', () => {
+    expect(CommandIntentSchema.safeParse({ ...artifact, schema_version: 1.5 }).success).toBe(false);
+  });
+
+  /**
+   * Asserted across the registry rather than against one schema, so a new on-disk artifact that
+   * forgets `versioned()` is caught by the check growing to cover it.
+   */
+  it.each(contractIdsOfKind('artifact'))(
+    '%s fails to parse when schema_version is absent',
+    (id) => {
+      const result = getContract(id).schema.safeParse({});
+      expect(result.success).toBe(false);
+      expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain('schema_version');
+    },
+  );
+
+  it('states the direction of an unrecognised version, older as well as newer', () => {
+    expect(schemaVersionRefusalMessage('a state file', CURRENT_SCHEMA_VERSION + 1)).toContain(
+      'newer than',
+    );
+    expect(schemaVersionRefusalMessage('a state file', 0)).toContain('older than');
+    expect(schemaVersionRefusalMessage('a state file', 0)).not.toContain('newer than');
+  });
+});
+
+describe('AD-3 — one Command enum covering every steering control', () => {
+  it('covers every control named by the interface contract and CAP-5, CAP-15 and CAP-23', () => {
+    expect([...COMMANDS].sort()).toStrictEqual(
+      [
+        'answer',
+        'approve',
+        'confirm_spec',
+        'continue',
+        'disengage',
+        'edit_criterion',
+        'fork',
+        'inject_note',
+        'just_do_it',
+        'kill',
+        'narrow',
+        'pause',
+        'reject',
+        'take_over',
+      ].sort(),
+    );
+  });
+
+  it('makes a renderer missing a control a compile error, via a total map', () => {
+    const labels: CommandMap<string> = {
+      [Command.Answer]: 'Answer',
+      [Command.ConfirmSpec]: 'Confirm spec',
+      [Command.EditCriterion]: 'Edit criterion',
+      [Command.Approve]: 'Approve',
+      [Command.Reject]: 'Reject',
+      [Command.Continue]: 'Continue',
+      [Command.Narrow]: 'Narrow',
+      [Command.Pause]: 'Pause',
+      [Command.InjectNote]: 'Inject note',
+      [Command.Kill]: 'Kill',
+      [Command.Fork]: 'Fork',
+      [Command.TakeOver]: 'Take over',
+      [Command.Disengage]: 'Disengage',
+      [Command.JustDoIt]: 'Just do it',
+    };
+    expect(Object.keys(labels)).toHaveLength(COMMANDS.length);
+  });
+});
+
+describe('AD-25 — the question lifecycle is one compare-and-set transition', () => {
+  const asked: QuestionState = QuestionStateSchema.parse({
+    schema_version: CURRENT_SCHEMA_VERSION,
+    question: {
+      id: 'q-1',
+      feature: 'contracts-package',
+      run: '01JBQZ8Q0000000000000000AA',
+      step: null,
+      prompt: 'Which package manager should the profile name?',
+      brief: 'The repository has both a package-lock.json and a pnpm-lock.yaml.',
+      options: [
+        { id: 'npm', label: 'npm', consequence: 'package-lock.json stays authoritative.' },
+        { id: 'pnpm', label: 'pnpm', consequence: 'package-lock.json is deleted.' },
+      ],
+      escape: { id: 'ask-later', label: 'Decide later', consequence: 'The run pauses.' },
+      recommended_option_id: 'npm',
+      default_action: 'Take npm and record the decision.',
+      default_window_ms: 600000,
+      asked_at: '2026-09-19T12:34:56.789Z',
+    },
+    status: 'asked',
+    resolution: null,
+    deflection: null,
+  });
+
+  const tuiAnswer = {
+    resolver: 'tui' as const,
+    principal: { kind: 'user' as const, id: 'deep' },
+    answer: 'npm, the lockfile is committed',
+    option_id: 'npm',
+    resolved_at: '2026-09-19T12:35:10.001Z',
+  };
+
+  it('accepts the first transition and records its resolver and principal', () => {
+    const first = resolveQuestion(asked, tuiAnswer);
+    expect(first.accepted).toBe(true);
+    expect(first.state.status).toBe('resolved');
+    expect(first.state.resolution?.resolver).toBe('tui');
+    expect(first.state.resolution?.principal.id).toBe('deep');
+    expect(writesToDecisionLedger(first.state)).toBe(true);
+  });
+
+  it('refuses every later resolver with an already-resolved result, writing nothing', () => {
+    const resolved = resolveQuestion(asked, tuiAnswer).state;
+    for (const resolver of ['web', 'timeout_default'] as const) {
+      const late = resolveQuestion(resolved, { ...tuiAnswer, resolver });
+      expect(late.accepted).toBe(false);
+      expect(late.refusal).toContain('already resolved');
+      expect(late.state).toStrictEqual(resolved);
+    }
+  });
+
+  it('reports a timeout default as question.default_taken and any other resolver as question.resolved', () => {
+    expect(eventTypeForResolution({ ...tuiAnswer, resolver: 'timeout_default' })).toBe(
+      'question.default_taken',
+    );
+    expect(eventTypeForResolution(tuiAnswer)).toBe('question.resolved');
+    expect(EVENT_TYPES).toContain('question.default_taken');
+  });
+
+  it('deflects from the repository, history or ledger, and does not write the ledger', () => {
+    const deflected = deflectQuestion(asked, {
+      source: 'decision_ledger',
+      answer: 'npm',
+      anchor: 'decision:package-manager',
+      deflected_at: '2026-09-19T12:34:57.000Z',
+    });
+    expect(deflected.accepted).toBe(true);
+    expect(deflected.state.status).toBe('deflected');
+    expect(writesToDecisionLedger(deflected.state)).toBe(false);
+    expect(resolveQuestion(deflected.state, tuiAnswer).accepted).toBe(false);
+  });
+
+  it('refuses a resolution naming an option that was never offered', () => {
+    const bogus = resolveQuestion(asked, { ...tuiAnswer, option_id: 'yarn' });
+    expect(bogus.accepted).toBe(false);
+    expect(bogus.refusal).toContain('never offered');
+    expect(bogus.state).toStrictEqual(asked);
+    expect(resolveQuestion(asked, { ...tuiAnswer, option_id: 'ask-later' }).accepted).toBe(true);
+  });
+
+  it('requires a resolved status and a resolution to accompany each other', () => {
+    expect(QuestionStateSchema.safeParse({ ...asked, status: 'resolved' }).success).toBe(false);
+    expect(
+      QuestionStateSchema.safeParse({ ...asked, resolution: tuiAnswer }).success,
+    ).toBe(false);
+    expect(QuestionStateSchema.safeParse({ ...asked, status: 'deflected' }).success).toBe(false);
+  });
+
+  it('requires a recommended option that exists, and unique option ids', () => {
+    const card = asked.question;
+    expect(QuestionDraftSchema.safeParse({ ...card, recommended_option_id: 'yarn' }).success).toBe(
+      false,
+    );
+    expect(QuestionDraftSchema.safeParse({ ...card, options: [] }).success).toBe(false);
+    expect(
+      QuestionDraftSchema.safeParse({
+        ...card,
+        options: [card.options[0], card.options[0]],
+      }).success,
+    ).toBe(false);
+    // The escape is a legitimate recommendation.
+    expect(
+      QuestionDraftSchema.safeParse({ ...card, recommended_option_id: card.escape.id }).success,
+    ).toBe(true);
+  });
+
+  it('holds a question to at most three options plus an escape', () => {
+    const tooMany = {
+      ...asked,
+      question: {
+        ...asked.question,
+        options: ['a', 'b', 'c', 'd'].map((id) => ({ id, label: id, consequence: id })),
+      },
+    };
+    expect(QuestionStateSchema.safeParse(tooMany).success).toBe(false);
+  });
+});
+
+describe('AD-8 and AD-24 — step dispositions and run ceilings', () => {
+  it('treats only the interrupted disposition as resumable', () => {
+    expect(isResumable('interrupted')).toBe(true);
+    for (const disposition of ['completed', 'blocked', 'failed', 'killed'] as StepDisposition[]) {
+      expect(isResumable(disposition), disposition).toBe(false);
+    }
+  });
+
+  it('rejects a budget that is negative, fractional in steps, or a share above one', () => {
+    const budget = {
+      steps_remaining: 9,
+      wall_clock_ms_remaining: 5400000,
+      rate_limit_budget_consumed: 0.18,
+    };
+    expect(BudgetSchema.safeParse(budget).success).toBe(true);
+    expect(BudgetSchema.safeParse({ ...budget, steps_remaining: -3.5 }).success).toBe(false);
+    expect(BudgetSchema.safeParse({ ...budget, steps_remaining: 2.5 }).success).toBe(false);
+    expect(BudgetSchema.safeParse({ ...budget, wall_clock_ms_remaining: -1 }).success).toBe(false);
+    expect(BudgetSchema.safeParse({ ...budget, rate_limit_budget_consumed: 47 }).success).toBe(false);
+    expect(BudgetSchema.safeParse({ ...budget, rate_limit_budget_consumed: -0.1 }).success).toBe(
+      false,
+    );
+  });
+});

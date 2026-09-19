@@ -1,2 +1,4 @@
 .DS_Store
 _bmad/
+node_modules/
+dist/

@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "contract_id": "step.output",
+  "run": "01JBQZ8Q0000000000000000AB",
+  "feature": "contracts-package",
+  "step": "implementation",
+  "mode": "live",
+  "baseline_ref": "ddd9bed4d286ac1f8a0f4f7bfef9530046605787",
+  "request": "Build the shared contracts package: one TypeScript package whose src/contracts/ layer defines every shared type once as a Zod v4 schema with a draft-7 JSON Schema export — the step input/output envelope, the Command enum, the event envelope, the question contract, and the error shape with its disposition table — so that no other unit invents its own.",
+  "acceptance_criteria": [
+    "Given a clean checkout on Node >=22.22, when `npm install && npm run typecheck && npm run lint && npm test` is run, then all four succeed with no error and the test run reports the round-trip and subset-guard suites passing.",
+    "Given any contract id in the registry, when its draft-7 export is requested, then the returned JSON Schema declares the draft-07 dialect and no export path uses `z.toJSONSchema` with default arguments.",
+    "Given an error object whose `code` is absent from the disposition table, when its disposition is resolved, then the result is abandon-and-hand-off and no retry is attempted."
+  ],
+  "decisions": [
+    {
+      "question": "AD-31 requires the round-trip suite to check a recorded real `structured_output`, but the `claude -p` spawner does not exist until story 1-4. Defer the fixture leg or satisfy it now?",
+      "answer": "Satisfy it now: capture each fixture once with a real `claude -p` call against the contract's exported draft-7 schema, commit it under tests/fixtures/structured-output/<contract-id>.json, and make the suite fail when a registered step contract has no fixture.",
+      "rationale": "Deferring the leg would leave the AD-31 guarantee unenforced exactly when stories 2-4 through 2-7 add step contracts. A fixture that must exist keeps the check honest without depending on story 1-4."
+    }
+  ],
+  "evidence": [
+    {
+      "kind": "diff",
+      "path": ".orchestrator/runs/01JBQZ8Q0000000000000000AB/evidence/implementation/worktree.diff",
+      "description": "Working-tree diff against baseline ddd9bed4 for the package scaffold (package.json, .nvmrc, tsconfig, vitest and eslint configs) and the src/contracts/ and tests/ trees made so far."
+    },
+    {
+      "kind": "transcript",
+      "path": ".orchestrator/runs/01JBQZ8Q0000000000000000AB/evidence/planning/transcript.jsonl",
+      "description": "Stream-json transcript from the planning step that produced story 1-1 and passed the Ready-for-Development gate, including the decision on the fixture leg."
+    }
+  ],
+  "budget": {
+    "steps_remaining": 9,
+    "wall_clock_ms_remaining": 5400000,
+    "rate_limit_budget_consumed": 0.18
+  },
+  "created_at": "2026-09-19T14:05:31.482Z"
+}
