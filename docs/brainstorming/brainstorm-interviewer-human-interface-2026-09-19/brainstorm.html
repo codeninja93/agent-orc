@@ -1,0 +1,1337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Morning Brief</title>
+<style>
+/* ══════════════════════════════════════════════════════════════════
+   THE MORNING BRIEF — keepsake for a brainstorming session
+   on the human interface to an agent-orchestration system.
+   Everything inline. No fonts, no images, no network.
+   ══════════════════════════════════════════════════════════════════ */
+
+:root{
+  --ink:        #13100d;
+  --ink-2:      #191511;
+  --panel:      #1e1a15;
+  --panel-2:    #241f19;
+  --line:       #352d24;
+  --line-soft:  #2a231c;
+  --text:       #ece3d4;
+  --dim:        #a89a8a;
+  --dimmer:     #776b5f;
+  --faint:      #4e453c;
+  --amber:      #e8a33d;
+  --amber-2:    #f3c882;
+  --cyan:       #7fbcb0;
+  --red:        #dd6458;
+  --green:      #97c06f;
+  --violet:     #a992cd;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "DejaVu Sans Mono", "Liberation Mono", Consolas, monospace;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", "Hoefler Text", Georgia, serif;
+  --gut: 16px;
+  --maxw: 1080px;
+}
+
+*,*::before,*::after{ box-sizing:border-box; }
+
+html{ -webkit-text-size-adjust:100%; }
+
+body{
+  margin:0;
+  background:var(--ink);
+  color:var(--text);
+  font-family:var(--mono);
+  font-size:15px;
+  line-height:1.62;
+  letter-spacing:.005em;
+  overflow-x:hidden;
+  font-variant-ligatures:none;
+  background-image:
+    radial-gradient(900px 500px at 12% -4%, rgba(232,163,61,.055), transparent 62%),
+    radial-gradient(700px 420px at 92% 8%, rgba(127,188,176,.035), transparent 60%);
+  background-attachment:fixed;
+}
+
+.wrap{ max-width:var(--maxw); margin:0 auto; padding:0 var(--gut); }
+
+a{ color:var(--amber); }
+
+/* ── status line (sticky, tmux-ish) ─────────────────────────────── */
+.statusline{
+  position:sticky; top:0; z-index:60;
+  background:linear-gradient(180deg,#1b1712 0%, #17130f 100%);
+  border-bottom:1px solid var(--line);
+  font-size:11.5px; letter-spacing:.06em;
+  color:var(--dim);
+  box-shadow:0 1px 0 rgba(0,0,0,.6), 0 10px 26px -18px rgba(0,0,0,.9);
+}
+.statusline .wrap{
+  display:flex; align-items:center; gap:0;
+  height:34px; white-space:nowrap; overflow:hidden;
+}
+.seg{ padding:0 11px; height:34px; display:flex; align-items:center; gap:7px; border-right:1px solid var(--line-soft); }
+.seg:last-child{ border-right:0; }
+.seg.mode{ background:var(--amber); color:#1a1309; font-weight:700; letter-spacing:.12em; border-right:0; }
+.seg.path{ color:var(--cyan); }
+.seg.push{ margin-left:auto; border-right:0; border-left:1px solid var(--line-soft); }
+.seg.ask{ color:var(--amber-2); }
+.dotsm{ width:6px;height:6px;border-radius:50%;background:var(--green);display:inline-block; }
+.dotsm.warn{ background:var(--amber); }
+@media (max-width:660px){
+  .seg.hide-s{ display:none; }
+  .statusline .wrap{ padding:0 8px; }
+}
+
+/* ── masthead ───────────────────────────────────────────────────── */
+.masthead{ padding:clamp(34px,7vw,74px) 0 clamp(26px,5vw,48px); }
+.prompt-line{ color:var(--dimmer); font-size:12.5px; letter-spacing:.04em; }
+.prompt-line .u{ color:var(--green); }
+.prompt-line .c{ color:var(--text); }
+
+h1.title{
+  font-family:var(--serif);
+  font-weight:400;
+  font-size:clamp(38px,9.5vw,82px);
+  line-height:1.02;
+  letter-spacing:-.02em;
+  margin:.28em 0 .1em;
+  color:var(--text);
+}
+h1.title em{ font-style:italic; color:var(--amber-2); }
+
+.sub{
+  font-size:clamp(13px,2.6vw,15px);
+  color:var(--dim);
+  max-width:54ch;
+  margin:14px 0 0;
+  line-height:1.72;
+}
+.sub b{ color:var(--text); font-weight:600; }
+
+.cursor{
+  display:inline-block; width:.58em; height:1.02em;
+  background:var(--amber); vertical-align:-.16em; margin-left:.18em;
+  animation:blink 1.15s steps(1,end) infinite;
+}
+@keyframes blink{ 0%,49%{opacity:1} 50%,100%{opacity:0} }
+
+/* frontmatter block */
+.frontmatter{
+  margin-top:clamp(26px,5vw,40px);
+  border:1px solid var(--line);
+  border-radius:3px;
+  background:linear-gradient(180deg,var(--panel),var(--ink-2));
+  overflow:hidden;
+}
+.fm-bar{
+  display:flex; align-items:center; gap:8px;
+  padding:8px 13px; border-bottom:1px solid var(--line-soft);
+  background:#1a1612; font-size:11px; letter-spacing:.1em; color:var(--dimmer);
+}
+.lamp{ width:9px;height:9px;border-radius:50%;background:#3a322a; box-shadow:0 0 0 1px rgba(0,0,0,.4) inset; }
+.lamp.on{ background:var(--amber); box-shadow:0 0 9px rgba(232,163,61,.5); }
+.fm-body{ padding:16px clamp(13px,3vw,22px); font-size:13px; }
+.fm-row{ display:grid; grid-template-columns:78px 1fr; gap:10px; padding:6px 0; border-bottom:1px dashed var(--line-soft); }
+.fm-row:last-child{ border-bottom:0; }
+.fm-k{ color:var(--amber); letter-spacing:.06em; }
+.fm-v{ color:var(--dim); }
+.fm-v.strong{ color:var(--text); }
+.badge-ok{ color:var(--green); }
+@media (max-width:520px){ .fm-row{ grid-template-columns:1fr; gap:2px; } }
+
+/* stats */
+.stats{
+  display:flex; flex-wrap:wrap; gap:0;
+  margin-top:clamp(22px,4vw,34px);
+  border-top:1px solid var(--line);
+  border-bottom:1px solid var(--line);
+}
+.stat{ flex:1 1 130px; padding:16px 4px 14px; border-right:1px dashed var(--line-soft); }
+.stat:last-child{ border-right:0; }
+.stat .n{ font-family:var(--serif); font-size:clamp(30px,6.6vw,44px); line-height:1; color:var(--amber-2); letter-spacing:-.02em; }
+.stat .l{ font-size:10.5px; letter-spacing:.17em; color:var(--dimmer); margin-top:8px; }
+
+/* ── section scaffolding ────────────────────────────────────────── */
+section{ padding:clamp(48px,8vw,96px) 0; border-top:1px solid var(--line-soft); }
+.sec-head{ display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; margin-bottom:8px; }
+.sec-num{
+  font-size:11px; letter-spacing:.2em; color:var(--ink);
+  background:var(--amber); padding:3px 8px 2px; border-radius:2px; font-weight:700;
+}
+h2{
+  font-family:var(--serif); font-weight:400;
+  font-size:clamp(26px,5.6vw,44px); line-height:1.08; letter-spacing:-.015em;
+  margin:0; color:var(--text);
+}
+.sec-meta{ font-size:11px; letter-spacing:.14em; color:var(--dimmer); }
+.sec-lede{
+  font-family:var(--serif); font-size:clamp(15px,2.8vw,18.5px); line-height:1.66;
+  color:var(--dim); max-width:66ch; margin:16px 0 clamp(26px,4.5vw,42px);
+}
+.sec-lede b{ color:var(--amber-2); font-weight:400; font-style:italic; }
+.rule-tiny{ height:1px; background:linear-gradient(90deg,var(--amber),transparent 62%); margin:12px 0 0; }
+
+/* ══ 01 EMPATHY MAP ═════════════════════════════════════════════ */
+#empathy{ background:linear-gradient(180deg,transparent, rgba(127,188,176,.02) 40%, transparent); }
+.emap{
+  display:grid; gap:1px;
+  grid-template-columns:1fr minmax(210px,.85fr) 1fr;
+  grid-template-areas:"says core thinks" "does core feels";
+  background:var(--line-soft);
+  border:1px solid var(--line);
+  border-radius:3px;
+  overflow:hidden;
+}
+.q{ background:var(--ink-2); padding:clamp(15px,2.6vw,24px); }
+.q.says{ grid-area:says; } .q.thinks{ grid-area:thinks; }
+.q.does{ grid-area:does; } .q.feels{ grid-area:feels; }
+.q-head{ display:flex; align-items:center; gap:9px; margin-bottom:14px; }
+.q-glyph{
+  width:26px;height:26px;border:1px solid var(--line);border-radius:3px;
+  display:grid;place-items:center;font-size:13px;flex:0 0 auto;background:#221d18;
+}
+.q-name{ font-size:11px; letter-spacing:.2em; }
+.says .q-name,.says .q-glyph{ color:var(--amber); }
+.thinks .q-name,.thinks .q-glyph{ color:var(--violet); }
+.does .q-name,.does .q-glyph{ color:var(--cyan); }
+.feels .q-name,.feels .q-glyph{ color:var(--red); }
+.q-overheard{ font-family:var(--serif); font-style:italic; color:var(--dimmer); font-size:13.5px; margin:-6px 0 14px; line-height:1.5; }
+.q ul{ list-style:none; margin:0; padding:0; display:grid; gap:12px; }
+.q li{ font-size:13.2px; line-height:1.58; color:var(--dim); padding-left:17px; position:relative; }
+.q li::before{ content:"›"; position:absolute; left:0; top:-1px; color:var(--faint); }
+.q li b{ color:var(--text); font-weight:600; }
+
+.core{
+  grid-area:core; background:var(--panel-2);
+  padding:clamp(15px,2.4vw,20px);
+  display:flex; flex-direction:column; justify-content:center; gap:14px;
+  border-left:1px solid var(--line); border-right:1px solid var(--line);
+}
+.clock{ font-family:var(--serif); font-size:clamp(30px,5vw,42px); line-height:1; color:var(--amber-2); letter-spacing:-.02em; }
+.core .who{ font-size:11px; letter-spacing:.18em; color:var(--dimmer); }
+.mini-term{
+  border:1px solid var(--line); border-radius:3px; background:#17130f;
+  font-size:11.5px; line-height:1.72; padding:11px 12px; color:var(--dim);
+}
+.mini-term .f{ color:var(--text); }
+.mini-term .w{ color:var(--amber); }
+.mini-term .g{ color:var(--green); }
+.core-note{ font-size:12px; line-height:1.6; color:var(--dimmer); border-top:1px dashed var(--line); padding-top:12px; }
+.core-note b{ color:var(--red); font-weight:600; }
+@media (max-width:820px){
+  .emap{ grid-template-columns:1fr 1fr; grid-template-areas:"core core" "says thinks" "does feels"; }
+  .core{ border-left:0; border-right:0; flex-direction:row; flex-wrap:wrap; align-items:center; }
+  .core .mini-term{ flex:1 1 240px; }
+  .core-note{ flex:1 1 200px; border-top:0; padding-top:0; }
+}
+@media (max-width:560px){
+  .emap{ grid-template-columns:1fr; grid-template-areas:"core" "says" "thinks" "does" "feels"; }
+  .core{ flex-direction:column; }
+}
+
+/* ══ 02 WORST POSSIBLE IDEA ═════════════════════════════════════ */
+#worst{ background:
+  repeating-linear-gradient(135deg, rgba(221,100,88,.022) 0 9px, transparent 9px 20px); }
+.flip-list{ display:grid; gap:0; border-top:1px solid var(--line); counter-reset:flip; }
+.flip{
+  display:grid; grid-template-columns:34px 1fr 1fr;
+  border-bottom:1px solid var(--line-soft);
+}
+.flip:hover{ background:rgba(255,255,255,.012); }
+.flip .idx{
+  counter-increment:flip;
+  font-size:10.5px; color:var(--faint); padding:16px 0 0 2px; letter-spacing:.06em;
+}
+.flip .idx::before{ content:counter(flip,decimal-leading-zero); }
+.bad{
+  padding:14px 18px 14px 0; position:relative;
+  color:var(--red); font-size:13.4px; line-height:1.55;
+}
+.bad .tag, .good .tag{
+  display:block; font-size:9.5px; letter-spacing:.22em; margin-bottom:6px; opacity:.8;
+}
+.bad .tag{ color:var(--red); }
+.bad s{ text-decoration:line-through; text-decoration-color:rgba(221,100,88,.55); text-decoration-thickness:1px; color:#c79089; }
+.good{
+  padding:14px 0 14px 20px; border-left:1px solid var(--line);
+  font-size:13.4px; line-height:1.55; color:var(--text); position:relative;
+}
+.good .tag{ color:var(--amber); }
+.good::before{
+  content:"↳"; position:absolute; left:-9px; top:15px;
+  background:var(--ink); color:var(--amber); font-size:12px; line-height:1; padding:2px 1px;
+}
+.good b{ color:var(--amber-2); font-weight:600; }
+@media (max-width:720px){
+  .flip{ grid-template-columns:30px 1fr; }
+  .bad{ padding:14px 0 8px 0; }
+  .good{ grid-column:2; border-left:0; padding:0 0 16px 0; }
+  .good::before{ position:static; display:inline-block; margin-right:6px; background:none; padding:0; }
+}
+.free-spec{
+  margin-top:26px; border:1px solid var(--line); border-left:2px solid var(--amber);
+  padding:15px 18px; font-size:13px; color:var(--dim); background:var(--ink-2);
+}
+.free-spec b{ color:var(--amber-2); }
+
+/* ══ 03 SCI-FI ARTIFACTS ════════════════════════════════════════ */
+.cards{ columns:2; column-gap:18px; }
+@media (max-width:860px){ .cards{ columns:1; } }
+.card{
+  break-inside:avoid; margin:0 0 18px;
+  border:1px solid var(--line); border-radius:4px;
+  background:linear-gradient(180deg,var(--panel),#1a1612);
+  overflow:hidden;
+  box-shadow:0 18px 34px -30px rgba(0,0,0,.95);
+}
+.card-bar{
+  display:flex; align-items:center; gap:8px;
+  padding:7px 12px; background:#211c17; border-bottom:1px solid var(--line-soft);
+  font-size:10px; letter-spacing:.17em; color:var(--dimmer);
+}
+.card-bar .sig{ font-size:12px; letter-spacing:0; }
+.card-bar .nm{ color:var(--dim); }
+.card-bar .rt{ margin-left:auto; color:var(--faint); letter-spacing:.08em; }
+.term{
+  padding:14px clamp(12px,2.4vw,17px);
+  font-size:12.4px; line-height:1.78; white-space:pre-wrap; word-break:break-word;
+  color:var(--dim);
+}
+.term .hl{ color:var(--text); }
+.term .am{ color:var(--amber); }
+.term .gr{ color:var(--green); }
+.term .rd{ color:var(--red); }
+.term .cy{ color:var(--cyan); }
+.term .fa{ color:var(--faint); }
+.term .key{ color:var(--ink); background:var(--amber); padding:0 5px; border-radius:2px; }
+.card-foot{
+  border-top:1px dashed var(--line); padding:11px clamp(12px,2.4vw,17px);
+  font-size:11.6px; line-height:1.62; color:var(--dimmer); background:rgba(0,0,0,.18);
+}
+.card-foot b{ color:var(--dim); font-weight:600; }
+.bar{ color:var(--amber); letter-spacing:-1px; }
+.bar .e{ color:var(--faint); }
+
+/* ══ 04 METAPHORS ═══════════════════════════════════════════════ */
+.met{
+  display:grid; grid-template-columns:150px 1fr; gap:clamp(16px,3vw,32px);
+  padding:clamp(20px,3.4vw,30px) 0; border-bottom:1px solid var(--line-soft);
+}
+.met:last-child{ border-bottom:0; }
+.met-id{ display:flex; gap:12px; align-items:flex-start; }
+.met-ico{ flex:0 0 auto; width:34px; height:34px; color:var(--amber); }
+.met-ico svg{ width:34px; height:34px; display:block; }
+.met-name{ font-size:12px; letter-spacing:.11em; line-height:1.42; color:var(--text); }
+.met-name span{ display:block; font-size:10px; letter-spacing:.18em; color:var(--dimmer); margin-top:5px; }
+.donations{ display:grid; gap:11px; }
+.don{
+  display:grid; grid-template-columns:96px 1fr; gap:14px;
+  font-size:13.2px; line-height:1.58; color:var(--dim);
+  border-left:1px solid var(--line); padding-left:14px;
+}
+.don .dk{ font-size:9.5px; letter-spacing:.16em; color:var(--faint); padding-top:4px; }
+.don b{ color:var(--text); font-weight:600; }
+.don.hot{ border-left-color:var(--amber); }
+.don.hot b{ color:var(--amber-2); }
+@media (max-width:720px){
+  .met{ grid-template-columns:1fr; gap:14px; }
+  .don{ grid-template-columns:1fr; gap:3px; padding-left:12px; }
+  .don .dk{ padding-top:0; }
+}
+
+/* ══ 05 SHADOW WORK ═════════════════════════════════════════════ */
+#shadow{
+  background:linear-gradient(180deg,#0d0b09 0%, #100d0a 60%, var(--ink) 100%);
+  border-top:1px solid #241d16;
+}
+#shadow h2{ color:#cfc3b2; }
+#shadow .sec-num{ background:#3b2f22; color:var(--amber-2); }
+#shadow .sec-lede{ color:#8b8073; }
+.confess{ max-width:74ch; }
+.conf{
+  position:relative; padding:0 0 0 clamp(18px,3.4vw,30px); margin:0 0 clamp(20px,3.2vw,28px);
+  border-left:1px solid #2b241c;
+}
+.conf::before{
+  content:""; position:absolute; left:-3px; top:10px; width:5px; height:5px; border-radius:50%;
+  background:#463a2d;
+}
+.conf .ct{
+  font-size:9.5px; letter-spacing:.22em; color:#6d6053; display:block; margin-bottom:7px;
+}
+.conf .cb{
+  font-family:var(--serif); font-size:clamp(14.5px,2.7vw,17px); line-height:1.66; color:#bfb2a0;
+}
+.conf .cb b{ color:var(--amber-2); font-weight:400; font-style:italic; }
+.conf.wish::before{ background:var(--amber); box-shadow:0 0 9px rgba(232,163,61,.45); }
+.conf.wish{ border-left-color:#4a3a22; }
+.conf.wish .ct{ color:var(--amber); }
+.conf.wish .cb{ color:#dbcdb6; }
+
+/* ══ SYNTHESIS ══════════════════════════════════════════════════ */
+#synth{
+  border-top:1px solid var(--line);
+  background:
+    radial-gradient(760px 420px at 50% 0%, rgba(232,163,61,.085), transparent 66%),
+    var(--ink);
+}
+.synth-kicker{ font-size:10.5px; letter-spacing:.32em; color:var(--amber); text-align:center; }
+.synth-title{
+  font-family:var(--serif); font-weight:400; text-align:center;
+  font-size:clamp(28px,6.4vw,54px); line-height:1.06; letter-spacing:-.02em;
+  margin:14px 0 8px;
+}
+.synth-sub{ text-align:center; color:var(--dimmer); font-size:12px; letter-spacing:.12em; margin-bottom:clamp(30px,5vw,52px); }
+
+.hero-point{
+  border:1px solid #4a3a1e; border-radius:4px;
+  background:linear-gradient(165deg, #241c11 0%, #1a1510 62%);
+  padding:clamp(20px,4vw,40px);
+  margin-bottom:18px;
+}
+.hp-top{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:6px; }
+.hp-n{ font-size:10.5px; letter-spacing:.2em; color:var(--ink); background:var(--amber); padding:3px 8px 2px; border-radius:2px; font-weight:700; }
+.hp-tag{ font-size:10.5px; letter-spacing:.22em; color:var(--amber); }
+.hp-h{
+  font-family:var(--serif); font-size:clamp(25px,5.4vw,44px); line-height:1.08;
+  letter-spacing:-.02em; color:var(--amber-2); margin:8px 0 16px;
+}
+.hp-b{ font-size:14px; line-height:1.72; color:var(--dim); max-width:64ch; }
+.hp-b b{ color:var(--text); font-weight:600; }
+
+/* exchange-rate scale */
+.scale{ margin:24px 0 4px; display:grid; gap:9px; }
+.scale-row{ display:grid; grid-template-columns:104px 1fr auto; gap:12px; align-items:center; font-size:11.5px; letter-spacing:.08em; }
+.scale-row .sl{ color:var(--dimmer); }
+.scale-bar{ height:12px; border:1px solid var(--line); background:#15110d; position:relative; overflow:hidden; border-radius:2px; }
+.scale-bar i{ position:absolute; inset:0 auto 0 0; display:block; border-radius:1px; }
+.scale-bar i.tok{ width:3%; background:var(--cyan); }
+.scale-bar i.att{ width:100%; background:linear-gradient(90deg,var(--amber),#b8762a); }
+.scale-row .sv{ color:var(--text); font-size:12px; }
+.scale-note{ font-size:11.5px; color:var(--faint); letter-spacing:.04em; margin-top:8px; }
+
+.grid2{ display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+@media (max-width:760px){ .grid2{ grid-template-columns:1fr; } }
+.point{
+  border:1px solid var(--line); border-radius:4px;
+  background:linear-gradient(180deg,var(--panel),#1a1612);
+  padding:clamp(17px,3vw,26px);
+}
+.point .hp-n{ background:#332a1d; color:var(--amber-2); }
+.point .hp-h{ font-size:clamp(19px,3.6vw,27px); margin:8px 0 12px; }
+.point .hp-b{ font-size:13.4px; }
+
+.converge{
+  display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:20px 0 6px;
+  font-size:11px; letter-spacing:.07em;
+}
+.cv{ border:1px solid var(--line); border-radius:3px; padding:11px 12px; background:#16120e; color:var(--dimmer); }
+.cv b{ display:block; color:var(--amber-2); font-size:10px; letter-spacing:.18em; margin-bottom:6px; font-weight:600; }
+.cv.join{ border-color:#4a3a1e; background:#211a10; color:var(--text); }
+@media (max-width:620px){ .converge{ grid-template-columns:1fr; } }
+
+.modes{ display:flex; gap:8px; flex-wrap:wrap; margin:18px 0 4px; }
+.modechip{ font-size:10.5px; letter-spacing:.16em; padding:5px 11px; border-radius:2px; border:1px solid var(--line); color:var(--dimmer); }
+.modechip.on{ background:var(--amber); color:#1a1309; border-color:var(--amber); font-weight:700; }
+
+.v0{
+  display:flex; align-items:baseline; gap:14px; flex-wrap:wrap;
+  margin-top:20px; padding-top:18px; border-top:1px dashed #4a3a1e;
+}
+.v0 .big{ font-family:var(--serif); font-size:clamp(30px,7vw,58px); line-height:.95; color:var(--amber); letter-spacing:-.03em; }
+.v0 .sm{ font-size:12px; letter-spacing:.14em; color:var(--dim); max-width:36ch; line-height:1.6; }
+
+.small3{ display:grid; grid-template-columns:repeat(3,1fr); gap:18px; margin-top:18px; }
+@media (max-width:820px){ .small3{ grid-template-columns:1fr; } }
+.point.sm .hp-h{ font-size:clamp(17px,3vw,21px); color:var(--text); }
+.point.sm .hp-b{ font-size:12.8px; }
+
+/* ── footer ─────────────────────────────────────────────────────── */
+footer{ padding:clamp(40px,7vw,78px) 0 clamp(50px,8vw,90px); border-top:1px solid var(--line-soft); }
+.sign{ font-family:var(--serif); font-size:clamp(19px,3.8vw,27px); line-height:1.4; color:var(--dim); max-width:38ch; }
+.sign b{ color:var(--amber-2); font-weight:400; font-style:italic; }
+.foot-meta{
+  margin-top:26px; display:flex; flex-wrap:wrap; gap:8px 22px;
+  font-size:10.5px; letter-spacing:.16em; color:var(--faint);
+}
+.foot-prompt{ margin-top:30px; font-size:12.5px; color:var(--dimmer); }
+.foot-prompt .u{ color:var(--green); }
+
+/* reveal */
+.rv{ opacity:0; transform:translateY(12px); transition:opacity .62s ease, transform .62s cubic-bezier(.2,.7,.3,1); }
+.rv.in{ opacity:1; transform:none; }
+
+@media (prefers-reduced-motion: reduce){
+  .cursor{ animation:none; }
+  .rv{ opacity:1 !important; transform:none !important; transition:none !important; }
+  *{ scroll-behavior:auto !important; }
+}
+
+::selection{ background:rgba(232,163,61,.28); color:#fff; }
+</style>
+</head>
+<body>
+
+<!-- ══ STATUS LINE ══════════════════════════════════════════════ -->
+<div class="statusline" role="status" aria-label="ambient status line">
+  <div class="wrap">
+    <span class="seg mode">AUTO</span>
+    <span class="seg path hide-s">~/agent-orcastrator</span>
+    <span class="seg"><span class="dotsm"></span> 3 in flight</span>
+    <span class="seg ask hide-s"><span class="dotsm warn"></span> 1 ask &middot; 30s</span>
+    <span class="seg hide-s">$4.20</span>
+    <span class="seg push" id="clk">09:02</span>
+  </div>
+</div>
+
+<!-- ══ MASTHEAD ═════════════════════════════════════════════════ -->
+<header class="masthead">
+  <div class="wrap">
+    <div class="prompt-line"><span class="u">deep@studio</span>:<span class="c">~</span>$ interviewer brief</div>
+    <h1 class="title">The&nbsp;Morning<br><em>Brief</em><span class="cursor" aria-hidden="true"></span></h1>
+    <p class="sub">
+      A brainstorming session about the one component that must stay a live conversation:
+      <b>what it actually feels like to talk to the Interviewer at 9am with three features in flight.</b>
+      Question compression, spec echo, interruption design, ambient awareness, terminal-first ergonomics,
+      trust and handoff. If this feels bad, the machinery behind it does not matter.
+    </p>
+
+    <div class="frontmatter">
+      <div class="fm-bar">
+        <span class="lamp on"></span><span class="lamp"></span><span class="lamp"></span>
+        <span style="margin-left:6px">SESSION &middot; 2026-09-19</span>
+      </div>
+      <div class="fm-body">
+        <div class="fm-row"><div class="fm-k">topic</div><div class="fm-v strong">The human interface to the agent-orchestration system</div></div>
+        <div class="fm-row"><div class="fm-k">goal</div><div class="fm-v">Design the one component that must stay a live LLM conversation &mdash; if this feels bad Deep abandons the system regardless of how good the machinery is</div></div>
+        <div class="fm-row"><div class="fm-k">mode</div><div class="fm-v">autonomous</div></div>
+        <div class="fm-row"><div class="fm-k">status</div><div class="fm-v badge-ok">&#10003; complete &middot; 17:24</div></div>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="n">86</div><div class="l">IDEAS</div></div>
+      <div class="stat"><div class="n">5</div><div class="l">LENSES</div></div>
+      <div class="stat"><div class="n">97</div><div class="l">LOGGED ENTRIES</div></div>
+      <div class="stat"><div class="n">1</div><div class="l">MASTER VARIABLE</div></div>
+    </div>
+  </div>
+</header>
+
+<!-- ══ 01 · EMPATHY MAP ═════════════════════════════════════════ -->
+<section id="empathy">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <span class="sec-num">LENS 01</span>
+      <h2>Empathy Map</h2>
+      <span class="sec-meta">16 IDEAS</span>
+    </div>
+    <div class="rule-tiny rv"></div>
+    <p class="sec-lede rv">
+      Deep at 9am with three features in flight. He <b>says</b> what is the status and did it ask me something.
+      He <b>thinks</b> is it stuck or thinking, and I could have done this myself by now. He <b>does</b> constant
+      alt-tabbing and diff-skimming between meetings. He <b>feels</b> low-grade spend anxiety plus guilt about
+      not reviewing properly.
+    </p>
+
+    <div class="emap rv">
+      <div class="q says">
+        <div class="q-head"><div class="q-glyph">&#8220;</div><div class="q-name">SAYS</div></div>
+        <div class="q-overheard">&ldquo;What&rsquo;s the status &mdash; and did it ask me something?&rdquo;</div>
+        <ul>
+          <li><b>Status must be answerable in under two seconds WITHOUT reading</b> &mdash; one glanceable line per feature. If a paragraph is needed to know the state, the interface has already failed.</li>
+          <li><b>Answer in the terminal he is already in.</b> The web app is for LOOKING, the terminal is for ANSWERING &mdash; never force a context switch to reply.</li>
+          <li>Make <b>just-do-it a real first-class command</b>: stop asking, use judgment, I will review at the end.</li>
+          <li><b>Make rejection cheap</b> &mdash; one keystroke plus a reason, and that reason becomes a decision-ledger entry automatically.</li>
+        </ul>
+      </div>
+
+      <div class="core">
+        <div>
+          <div class="who">DEEP &middot; MONDAY</div>
+          <div class="clock">09:00</div>
+        </div>
+        <div class="mini-term">
+<span class="f">checkout-retry</span>   <span class="w">? asking</span>
+<span class="f">auth-sso</span>         <span class="g">merged 03:14</span>
+<span class="f">payments-hook</span>    <span class="w">blocked</span>
+        </div>
+        <div class="core-note">
+          Between two meetings. Six browser tabs. Half a coffee.
+          <b>The mental model of all three features decays before he gets back.</b>
+        </div>
+      </div>
+
+      <div class="q thinks">
+        <div class="q-head"><div class="q-glyph">&#9678;</div><div class="q-name">THINKS</div></div>
+        <div class="q-overheard">&ldquo;Is it stuck, or thinking? I could have done this myself by now.&rdquo;</div>
+        <ul>
+          <li><b>Visually distinguish stuck from thinking</b> &mdash; that ambiguity is the single largest source of anxiety. A heartbeat pulse naming the current step, never an undifferentiated spinner.</li>
+          <li>His three-feature mental model decays fast between meetings, so <b>every notification must reload the context itself</b> rather than assuming he still holds it.</li>
+          <li><b>Every question carries its own mini-brief</b>, so it is answerable without loading the full feature context back into his head.</li>
+          <li><b>Show what he actually asked for alongside what is being built</b> &mdash; at 9am he does not remember his own 4pm phrasing.</li>
+        </ul>
+      </div>
+
+      <div class="q does">
+        <div class="q-head"><div class="q-glyph">&#8644;</div><div class="q-name">DOES</div></div>
+        <div class="q-overheard">Alt-tab. Skim. Alt-tab. Meeting. Repeat.</div>
+        <ul>
+          <li><b>Never interrupt with anything that cannot be resolved in ten seconds</b> &mdash; anything longer gets queued for a boundary.</li>
+          <li><b>Batch interruptions to natural boundaries</b> with a do-not-disturb-until mode that queues questions rather than firing them into a meeting.</li>
+          <li>He skims diffs rather than reading them, so the system must <b>say WHERE to look</b> &mdash; the risky twelve lines of a four-hundred-line diff. Review guidance, not review dumps.</li>
+          <li>I-could-have-done-this-myself is the churn signal: <b>surface elapsed-versus-estimate continuously</b> to enable killing early instead of sunk-costing.</li>
+        </ul>
+      </div>
+
+      <div class="q feels">
+        <div class="q-head"><div class="q-glyph">&#9829;</div><div class="q-name">FEELS</div></div>
+        <div class="q-overheard">Low-grade spend anxiety. Guilt about not reviewing properly.</div>
+        <ul>
+          <li>Cost needs a <b>permanently visible running number</b> &mdash; spend anxiety is continuous, and a report he has to request does not relieve it.</li>
+          <li>The system must <b>state its own confidence AND what it did not verify</b>, so trust is calibrated rather than blind and the guilt about skipping review is resolved honestly.</li>
+          <li>Target the emotional register of <b>a competent colleague reporting in</b>, not a dashboard demanding attention.</li>
+          <li><b>Silence must be a trustworthy contract</b> &mdash; no news is good news &mdash; or he will poll anxiously and the whole ambient design collapses.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══ 02 · WORST POSSIBLE IDEA ═════════════════════════════════ -->
+<section id="worst">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <span class="sec-num">LENS 02</span>
+      <h2>Worst Possible Idea</h2>
+      <span class="sec-meta">21 IRRITATIONS &rarr; 21 RULES</span>
+    </div>
+    <div class="rule-tiny rv"></div>
+    <p class="sec-lede rv">
+      Designing the most infuriating possible interface surfaces the real requirements faster than
+      designing the good one, because <b>every irritation inverts cleanly into a rule.</b>
+    </p>
+
+    <div class="flip-list rv">
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Asks a question every ninety seconds.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Question compression</b> plus an interrupt budget plus batching to boundaries.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Asks vague open questions like &ldquo;how should I handle errors?&rdquo;</s></div>
+        <div class="good"><span class="tag">FLIP</span>Every question ships with a <b>recommended default and two or three concrete options</b>, never open-ended.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Asks things it could have answered itself.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Answer-from-repo first</b>, with a tracked deflection rate.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Dumps two thousand tokens of reasoning per update.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>One line by default</b>, expandable on demand.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Notifies on every agent state change.</s></div>
+        <div class="good"><span class="tag">FLIP</span>Notify <b>only on exceptions, decisions and completion</b>.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Requires the web UI to do anything.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Terminal-complete</b>, with the web app strictly optional.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Asks the same question again next week.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>The decision ledger</b>, checked before any question is asked.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Says done when it is not.</s></div>
+        <div class="good"><span class="tag">FLIP</span>Every completion states <b>what was verified and what was not</b>.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Blocks silently, waiting for input.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Escalating notification</b> &mdash; terminal bell, then OS notification, then after N minutes proceed with the stated default.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Loses everything when the terminal closes.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Durable state</b> with resume-by-feature-name.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Reports progress as a meaningless percentage.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Name the current step and the next gate.</b></div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Demands answers in a rigid format.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Free text in</b> &mdash; the Interviewer does the parsing. Never make the human do machine work.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Wakes him at 3am.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Quiet hours</b> and async-by-default delivery.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Buries the question in scrollback.</s></div>
+        <div class="good"><span class="tag">FLIP</span>A <b>persistent question slot</b> that never scrolls away.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Offers eight options.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>At most three</b>, plus an explicit something-else escape.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Explains its reasoning when he asked for a decision.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Answer first</b>, reasoning strictly on request.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Phrases and formats every message differently.</s></div>
+        <div class="good"><span class="tag">FLIP</span>A <b>stable learnable grammar</b> of message types he can pattern-match at a glance.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Makes him remember agent names and run IDs.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Address everything by feature name</b>, never by agent identifier.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Cannot be stopped mid-run.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Interruptible at every step</b>, with clean partial state preserved.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Asks approval for reversible things.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Gate only the irreversible</b> &mdash; the reversibility axis surfacing again, this time from the interface side.</div></div>
+
+      <div class="flip"><div class="idx"></div>
+        <div class="bad"><span class="tag">WORST</span><s>Cheerful anthropomorphic filler around every message.</s></div>
+        <div class="good"><span class="tag">FLIP</span><b>Zero pleasantries</b>, information density, warmth expressed through competence not chattiness.</div></div>
+
+    </div>
+
+    <div class="free-spec rv">
+      <b>Net result:</b> twenty-one irritations inverting into twenty-one concrete interface rules &mdash;
+      effectively a free interface spec, and the most directly implementable output of any lens across three sessions.
+    </div>
+  </div>
+</section>
+
+<!-- ══ 03 · SCI-FI ARTIFACT FROM THE FUTURE ═════════════════════ -->
+<section id="scifi">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <span class="sec-num">LENS 03</span>
+      <h2>Artifacts From the Future</h2>
+      <span class="sec-meta">15 OBJECTS</span>
+    </div>
+    <div class="rule-tiny rv"></div>
+    <p class="sec-lede rv">
+      Describing concrete artifacts from the world where this already works &mdash; <b>actual terminal messages,
+      cards and commands</b> &mdash; forces specificity that abstract interface principles never reach.
+      What follows is a day in that world.
+    </p>
+
+    <div class="cards">
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--amber)">&#9635;</span><span class="nm">MORNING BRIEF</span><span class="rt">09:02</span></div>
+        <div class="term"><span class="hl">3 features in flight</span>
+<span class="am">?</span> <span class="hl">checkout-retry</span>    needs you &middot; <span class="am">30s</span>
+<span class="gr">&#10003;</span> <span class="hl">auth-sso</span>          merged 03:14 &middot; <span class="gr">$2.10</span>
+<span class="rd">!</span> <span class="hl">payments-webhook</span>  blocked &mdash; flaky
+   <span class="fa">stripe mock clock; 4th time seen</span>
+<span class="fa">─────────────────────────────</span>
+total attention required today: <span class="am">30s</span></div>
+        <div class="card-foot"><b>Six lines at 9am.</b> Which reverse-engineers into overnight autonomy, cost tracking, pattern memory, and triage ranked by attention cost.</div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--amber)">?</span><span class="nm">ONE-QUESTION INTERRUPT CARD</span><span class="rt">09:04</span></div>
+        <div class="term"><span class="hl">checkout-retry</span> &mdash; retry backoff
+<span class="fa">billing-worker already does (a). you said
+&ldquo;don&rsquo;t hammer stripe&rdquo; on 12 Sep.</span>
+
+<span class="am">&rarr; a)</span> exponential, cap 30s   <span class="fa">recommended</span>
+  <span class="cy">b)</span> fixed 5s              <span class="fa">simpler, noisier</span>
+  <span class="cy">c)</span> no retry              <span class="fa">errors reach user</span>
+
+<span class="fa">if you say nothing by 09:40 &rarr;</span> <span class="am">(a)</span>
+<span class="key">enter</span> <span class="fa">= a &middot; or just type an answer</span></div>
+        <div class="card-foot">Shows the question, the recommended answer, the consequence of each option, AND what it will do if he says nothing in ten minutes. <b>Default-on-timeout is the mechanic that makes async tolerable.</b></div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--cyan)">&#8801;</span><span class="nm">SPEC ECHO CARD</span><span class="rt">BEFORE ANY WORK</span></div>
+        <div class="term"><span class="hl">here is what I heard. nothing starts
+until you answer.</span>
+
+<span class="cy">1.</span> failed charge retries up to 4 times
+<span class="cy">2.</span> backoff exponential, capped at 30s
+<span class="cy">3.</span> idempotency key reused across retries
+<span class="cy">4.</span> 4th failure &rarr; dead-letter + #billing
+<span class="cy">5.</span> never retry on card_declined
+
+<span class="fa">reply</span> <span class="key">go</span> <span class="fa">&middot; or</span> <span class="key">edit 3</span> <span class="fa">&middot; or</span> <span class="key">drop 5</span></div>
+        <div class="card-foot">Five acceptance criteria before any work starts, with reply <b>go</b> or edit any line. <b>Editing the criteria in place beats re-prompting from scratch.</b></div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--red)">&#9888;</span><span class="nm">KILL CARD</span><span class="rt">11:20</span></div>
+        <div class="term"><span class="hl">payments-webhook</span> &mdash; <span class="rd">over budget</span>
+
+spent   <span class="rd">$8.00</span>  /  <span class="rd">40 min</span>
+estimate  <span class="fa">$3.00</span>  /  <span class="fa">15 min</span>
+progress  <span class="fa">3 of 5 criteria, test red</span>
+
+<span class="key">c</span> continue   <span class="key">n</span> narrow scope
+<span class="key">k</span> kill       <span class="key">t</span> take over</div>
+        <div class="card-foot">Feature X has spent eight dollars and forty minutes against a three dollar, fifteen minute estimate. <b>Making early exit a designed moment rather than a failure.</b></div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--violet)">&#10022;</span><span class="nm">THE HANDOFF DOCUMENT</span><span class="rt">I GAVE UP</span></div>
+        <div class="term"><span class="hl">payments-webhook &mdash; handing this back.</span>
+
+The flaky test is the stripe mock&rsquo;s clock:
+it advances in real time, so retry #4 lands
+outside the window on slow runs.
+
+What I&rsquo;d try next: pin the clock in the
+fixture rather than widen the window.
+
+Branch <span class="cy">wip/payments-webhook</span>, 3 commits,
+nothing merged, nothing destructive.
+Sorry &mdash; this one is yours.</div>
+        <div class="card-foot">The handoff document written when the system gives up reads like <b>a colleague note, not a stack trace</b> &mdash; and is the artifact that determines whether giving up feels like competence or failure.</div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--amber)">&#8981;</span><span class="nm">REVIEW REQUEST</span><span class="rt">auth-sso</span></div>
+        <div class="term"><span class="hl">12 of 401 lines need your eyes.</span>
+
+<span class="cy">session.ts:88-94</span>
+  <span class="fa">new cookie flags &mdash; touches prod auth</span>
+<span class="cy">oauth.ts:210-214</span>
+  <span class="fa">state compared with ==, not timing-safe</span>
+<span class="cy">0003_drop_legacy.sql:3</span>
+  <span class="rd">drops a column. irreversible.</span>
+
+<span class="fa">the other 389 lines are tests and
+generated types. skim them or don&rsquo;t.</span></div>
+        <div class="card-foot"><b>Twelve of four hundred lines need your eyes &mdash; and here is why each one does.</b></div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--cyan)">&#9636;</span><span class="nm">WEEKLY SELF-REPORT</span><span class="rt">WEEK 38</span></div>
+        <div class="term"><span class="hl">14 features shipped. you corrected me
+3 times. here is what I learned:</span>
+
+<span class="fa">&middot;</span> you want zod at the boundary, not inside
+<span class="fa">&middot;</span> never touch a migration without asking
+<span class="fa">&middot;</span> &ldquo;quick&rdquo; means skip the integration test
+
+<span class="hl">2 rules I&rsquo;d like to add to the ledger:</span>
+<span class="key">approve</span> <span class="key">edit</span> <span class="key">reject</span></div>
+        <div class="card-foot">Fourteen shipped, three corrections, two proposed rules &mdash; <b>the system proposing its own memory writes for approval.</b></div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--green)">&#9646;</span><span class="nm">TRUST METER</span><span class="rt">BY AREA</span></div>
+        <div class="term"><span class="hl">merged unchanged, last 90 days</span>
+
+auth       <span class="bar">█████████<span class="e">░</span></span>  <span class="gr">9/10</span>
+ui         <span class="bar">███████<span class="e">░░░</span></span>  <span class="gr">7/9</span>
+payments   <span class="bar">████<span class="e">░░░░░░</span></span>  <span class="rd">3/7</span>
+migrations <span class="bar"><span class="e">░░░░░░░░░░</span></span>  <span class="fa">0/0</span>
+
+<span class="fa">autonomy follows this table,
+not my mood.</span></div>
+        <div class="card-foot">Per-area accuracy history &mdash; auth nine of ten merged unchanged, payments three of seven. <b>Autonomy derived from evidence rather than granted by vibes.</b></div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--red)">&#8630;</span><span class="nm">THE UNDO COMMAND</span><span class="rt">ONE WORD</span></div>
+        <div class="term"><span class="gr">$</span> interviewer undo auth-sso
+
+reverting merge <span class="cy">a91f3c2</span>
+  4 files restored
+  1 migration rolled down
+  branch kept at <span class="cy">undone/auth-sso</span>
+
+<span class="gr">done.</span> main is exactly as it was at 03:13.</div>
+        <div class="card-foot">One word that cleanly reverts a merged feature &mdash; and <b>its mere existence is what makes delegation feel safe.</b></div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--amber)">&#9601;</span><span class="nm">AMBIENT STATUS LINE</span><span class="rt">ALWAYS THERE</span></div>
+        <div class="term"><span class="fa">~/checkout</span> <span class="gr">main &#10003;</span> <span class="am">&#10216; int: 3 &middot; 1 ask &middot; $4.20 &middot; AUTO &#10217;</span> <span class="fa">09:12</span>
+
+<span class="fa">that&rsquo;s the whole thing. one tmux segment.
+it never pings. you look at it, or you don&rsquo;t.</span></div>
+        <div class="card-foot">A single tmux or shell prompt segment &mdash; <b>always visible, never demanding, the opposite of a notification.</b></div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--violet)">&#9654;</span><span class="nm">WHAT DID YOU DO LAST NIGHT</span><span class="rt">REPLAY</span></div>
+        <div class="term"><span class="gr">$</span> interviewer replay --last-night
+
+Around 1am I picked up auth-sso. The SSO
+library&rsquo;s types were wrong, so rather than
+fight them I wrote a thin wrapper &mdash; you&rsquo;ve
+done the same in two other places.
+
+Tests went green at 3:02. I left
+payments-webhook alone: the same test had
+already failed twice and I didn&rsquo;t want to
+burn your money guessing.</div>
+        <div class="card-foot">Narrated in plain language rather than raw events &mdash; <b>because he wants the story, not the log.</b></div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--cyan)">&#9670;</span><span class="nm">NEW-REPO ONBOARDING</span><span class="rt">ONCE</span></div>
+        <div class="term"><span class="hl">bootstrap &mdash; invoices-api</span>
+<span class="fa">five minutes, one time, then never again.</span>
+
+<span class="cy">1/5</span>  how do tests run here?
+     <span class="fa">I see vitest in package.json but CI
+     calls a make target. which is truth?</span>
+<span class="gr">&gt;</span> <span class="cursor" style="width:.5em;height:.9em"></span></div>
+        <div class="card-foot">The bootstrap agent <b>interviews HIM for five minutes once</b>, then never asks those questions again.</div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--green)">&#10003;</span><span class="nm">A NOTIFICATION HE ENJOYS</span><span class="rt">03:14</span></div>
+        <div class="term"><span class="gr">auth-sso merged.</span>
+4 files &middot; tests green &middot; <span class="gr">$1.20</span>
+<span class="hl">nothing needed from you.</span></div>
+        <div class="card-foot">A notification he actually enjoys receiving &mdash; <b>because the shape of good news matters as much as the shape of bad news.</b></div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--violet)">~</span><span class="nm">THE I-AM-CONFUSED SIGNAL</span><span class="rt">DISTINCT STATE</span></div>
+        <div class="term"><span class="hl">invoices-api &mdash; I am confused.</span>
+
+<span class="fa">Two sources disagree and neither wins:
+README says pnpm. CI runs npm ci.
+Lockfiles for both are committed.</span>
+
+<span class="hl">I am not stuck. I am not thinking.
+I am confused, and I won&rsquo;t guess.</span>
+
+<span class="key">1</span> pnpm  <span class="key">2</span> npm  <span class="key">3</span> something else</div>
+        <div class="card-foot">A distinct, honest state &mdash; so <b>uncertainty surfaces as uncertainty rather than as a confident wrong answer.</b></div>
+      </div>
+
+      <div class="card rv">
+        <div class="card-bar"><span class="sig" style="color:var(--amber)">&#9642;</span><span class="nm">THE RECEIPT</span><span class="rt">18:30 &middot; DAILY</span></div>
+        <div class="term"><span class="hl">Thu 19 Sep</span>
+
+spend     <span class="am">$6.42</span> <span class="fa">of $25.00 ceiling</span>
+shipped   <span class="gr">2</span>   killed <span class="rd">1</span>   queued <span class="fa">1</span>
+your time <span class="hl">4 min 20 s</span>
+
+<span class="fa">nothing is running overnight.
+good night.</span></div>
+        <div class="card-foot">A single end-of-day summary of spend and outcomes &mdash; <b>resolving the anxiety daily instead of letting it accumulate.</b></div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ══ 04 · METAPHOR MAPPING ════════════════════════════════════ -->
+<section id="metaphor">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <span class="sec-num">LENS 04</span>
+      <h2>Seven Metaphors</h2>
+      <span class="sec-meta">20 DONATIONS</span>
+    </div>
+    <div class="rule-tiny rv"></div>
+    <p class="sec-lede rv">
+      Seven metaphors for the Interviewer, each donating a different mechanism &mdash; and
+      <b>the autopilot one donates the most safety-critical concept in the entire session: mode confusion.</b>
+    </p>
+
+    <!-- chief of staff -->
+    <div class="met rv">
+      <div class="met-id">
+        <div class="met-ico" aria-hidden="true">
+          <svg viewBox="0 0 34 34" fill="none" stroke="currentColor" stroke-width="1.3">
+            <rect x="4.5" y="10.5" width="25" height="17" rx="2"/>
+            <path d="M13 10.5V8a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2.5"/>
+            <path d="M4.5 17h25"/><path d="M15 17v2.5h4V17"/>
+          </svg>
+        </div>
+        <div class="met-name">CHIEF OF STAFF<span>DELEGATION</span></div>
+      </div>
+      <div class="donations">
+        <div class="don hot"><div class="dk">KPI</div><div>The Interviewer&rsquo;s real KPI is <b>QUESTIONS NOT ASKED</b> &mdash; it should report &ldquo;I handled it&rdquo; far more often than it asks &ldquo;what should I do?&rdquo;</div></div>
+        <div class="don"><div class="dk">FORMAT</div><div>A <b>standing brief format that never varies</b>, so he learns to read it in one saccade rather than parsing fresh prose each time.</div></div>
+        <div class="don"><div class="dk">MANDATE</div><div>It <b>owns the calendar of his attention</b> and is accountable for spending it well.</div></div>
+      </div>
+    </div>
+
+    <!-- air traffic control -->
+    <div class="met rv">
+      <div class="met-id">
+        <div class="met-ico" aria-hidden="true">
+          <svg viewBox="0 0 34 34" fill="none" stroke="currentColor" stroke-width="1.3">
+            <circle cx="17" cy="17" r="11.5"/><circle cx="17" cy="17" r="5.5"/>
+            <circle cx="17" cy="17" r="1.4" fill="currentColor" stroke="none"/>
+            <path d="M17 5.5v3M17 25.5v3M5.5 17h3M25.5 17h3"/>
+            <path d="M17 17l8-5.5"/>
+          </svg>
+        </div>
+        <div class="met-name">AIR TRAFFIC CONTROL<span>COORDINATION</span></div>
+      </div>
+      <div class="donations">
+        <div class="don"><div class="dk">STRIP</div><div>A <b>compact strip per feature</b> holding everything needed to resume it cold.</div></div>
+        <div class="don"><div class="dk">PHRASEOLOGY</div><div><b>Constrained phraseology</b> &mdash; a small fixed vocabulary of message types rather than free prose.</div></div>
+        <div class="don hot"><div class="dk">READBACK</div><div><b>READBACK is spec echo.</b> The system restates his instruction before acting on it, and the readback is the contract.</div></div>
+        <div class="don"><div class="dk">SEPARATION</div><div><b>Separation minima map to conflict domains</b>, and handoff between controllers maps to the artifact passed between phases.</div></div>
+      </div>
+    </div>
+
+    <!-- surgical nurse -->
+    <div class="met rv">
+      <div class="met-id">
+        <div class="met-ico" aria-hidden="true">
+          <svg viewBox="0 0 34 34" fill="none" stroke="currentColor" stroke-width="1.3">
+            <path d="M8 26l12-12 4-8 2 2-8 4-12 12z"/>
+            <path d="M8 26l3-3"/>
+            <path d="M22 26h6M25 23v6"/>
+          </svg>
+        </div>
+        <div class="met-name">SURGICAL NURSE<span>ANTICIPATION</span></div>
+      </div>
+      <div class="donations">
+        <div class="don"><div class="dk">PRE-FETCH</div><div><b>Anticipate the next instrument</b> and have it ready before it is requested &mdash; pre-fetch what he will need at the next decision point.</div></div>
+        <div class="don"><div class="dk">COUNT</div><div><b>The sponge count</b> is a reconciliation checklist that must balance before closing &mdash; and nothing merges until it does.</div></div>
+        <div class="don hot"><div class="dk">VOICE</div><div><b>Speak up only when something is wrong</b>, which is the purest form of the silence-means-success contract.</div></div>
+      </div>
+    </div>
+
+    <!-- newsroom editor -->
+    <div class="met rv">
+      <div class="met-id">
+        <div class="met-ico" aria-hidden="true">
+          <svg viewBox="0 0 34 34" fill="none" stroke="currentColor" stroke-width="1.3">
+            <rect x="4.5" y="7.5" width="25" height="19" rx="2"/>
+            <path d="M8.5 12h10M8.5 15.5h10M8.5 19h6"/>
+            <path d="M21.5 12h4.5v7h-4.5z"/>
+            <path d="M8.5 22.5h17"/>
+          </svg>
+        </div>
+        <div class="met-name">NEWSROOM EDITOR<span>STRUCTURE</span></div>
+      </div>
+      <div class="donations">
+        <div class="don"><div class="dk">PYRAMID</div><div>Every report follows the <b>inverted pyramid</b> &mdash; most important thing first, detail decaying downward.</div></div>
+        <div class="don"><div class="dk">HEADLINE</div><div><b>Headline discipline</b>: every message carries a one-line headline that stands completely alone.</div></div>
+        <div class="don"><div class="dk">SOURCING</div><div><b>Sourcing rules map to provenance</b> &mdash; no claim without a traceable source.</div></div>
+      </div>
+    </div>
+
+    <!-- sous chef -->
+    <div class="met rv">
+      <div class="met-id">
+        <div class="met-ico" aria-hidden="true">
+          <svg viewBox="0 0 34 34" fill="none" stroke="currentColor" stroke-width="1.3">
+            <path d="M5 20h24"/><path d="M8 20v6M26 20v6"/>
+            <path d="M11 16.5c0-3 2.5-5 6-5s6 2 6 5"/>
+            <path d="M14 7.5v4M17 6v5.5M20 7.5v4"/>
+          </svg>
+        </div>
+        <div class="met-name">SOUS CHEF &amp; EXPEDITER<span>RHYTHM</span></div>
+      </div>
+      <div class="donations">
+        <div class="don"><div class="dk">CALL</div><div>A <b>short, rhythmic, predictable calling voice</b>, with features as tickets moving through a pass.</div></div>
+      </div>
+    </div>
+
+    <!-- junior dev -->
+    <div class="met rv">
+      <div class="met-id">
+        <div class="met-ico" aria-hidden="true">
+          <svg viewBox="0 0 34 34" fill="none" stroke="currentColor" stroke-width="1.3">
+            <path d="M12 12l-5 5 5 5M22 12l5 5-5 5"/>
+            <path d="M19 9l-4 16"/>
+          </svg>
+        </div>
+        <div class="met-name">JUNIOR DEV, MENTORED<span>GROWTH</span></div>
+      </div>
+      <div class="donations">
+        <div class="don"><div class="dk">CORRECTION</div><div>Correction must be <b>cheap to give AND must stick permanently</b> &mdash; which is the decision ledger, justified from the human side.</div></div>
+        <div class="don"><div class="dk">ROPE</div><div><b>Rope is earned per area</b>, rather than granted globally.</div></div>
+      </div>
+    </div>
+
+    <!-- autopilot -->
+    <div class="met rv">
+      <div class="met-id">
+        <div class="met-ico" aria-hidden="true">
+          <svg viewBox="0 0 34 34" fill="none" stroke="currentColor" stroke-width="1.3">
+            <path d="M17 4.5c1.6 0 2.6 2.2 2.6 5.2v3.6l8.4 5v2.8l-8.4-2.6v5.2l3 2.3v2.2L17 26.5l-5.6 1.7v-2.2l3-2.3v-5.2L6 21.1v-2.8l8.4-5V9.7c0-3 1-5.2 2.6-5.2z"/>
+          </svg>
+        </div>
+        <div class="met-name">AUTOPILOT<span>SAFETY-CRITICAL</span></div>
+      </div>
+      <div class="donations">
+        <div class="don hot"><div class="dk">MODE</div><div><b>MODE VISIBILITY is safety-critical</b> &mdash; he must always know at a glance whether the system is in autonomous, asking, or paused mode.</div></div>
+        <div class="don hot"><div class="dk">CONFUSION</div><div><b>Mode confusion is the classic accident class in aviation</b>, and it is the exact failure waiting in a system with autonomy tiers &mdash; name the current mode in the prompt line, permanently.</div></div>
+        <div class="don"><div class="dk">DISENGAGE</div><div><b>Disengagement must be instant, obvious and always available</b>, with a single physical gesture that always means stop.</div></div>
+        <div class="don"><div class="dk">CALLOUTS</div><div><b>Standard callouts at phase transitions</b>, so the human builds an accurate mental model of what the machine is doing without asking.</div></div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- ══ 05 · SHADOW WORK ═════════════════════════════════════════ -->
+<section id="shadow">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <span class="sec-num">LENS 05</span>
+      <h2>Shadow Work</h2>
+      <span class="sec-meta">14 ADMISSIONS</span>
+    </div>
+    <div class="rule-tiny rv"></div>
+    <p class="sec-lede rv">
+      What Deep is actually avoiding is more predictive of adoption than any feature. The fears:
+      <b>owning incomprehensible code, losing the feel of his own codebase, burning money while asleep,
+      and quietly preferring to build the tool rather than the products.</b>
+    </p>
+
+    <div class="confess">
+
+      <div class="conf rv"><span class="ct">FEAR &middot; COMPREHENSION</span>
+        <div class="cb">Fear of owning code he does not understand means <b>comprehensibility is a hard requirement, not a nicety</b> &mdash; the system must write in HIS idiom, and the review artifact must make the diff understandable, not merely correct.</div></div>
+
+      <div class="conf rv"><span class="ct">FEAR &middot; LOSS OF FEEL</span>
+        <div class="cb">Fear of losing the feel for his own codebase argues for <b>deliberately keeping him in the loop on architecture while delegating mechanics</b>. The parts he enjoys are a design input, not an inefficiency to optimize away.</div></div>
+
+      <div class="conf rv"><span class="ct">SHADOW &middot; PROCRASTINATION</span>
+        <div class="cb">The honest shadow: <b>building the orchestrator is more fun than building the products</b> &mdash; so the real success metric must be shipping velocity of actual products, not sophistication of the tool.</div></div>
+
+      <div class="conf rv"><span class="ct">FEAR &middot; MONEY</span>
+        <div class="cb">Fear of burning money overnight is resolved <b>not by a cap alone but by a morning receipt</b>, so the anxiety closes daily instead of compounding.</div></div>
+
+      <div class="conf rv"><span class="ct">FEAR &middot; REPUTATION</span>
+        <div class="cb">Fear of looking bad when it commits something dumb makes <b>attribution an EMOTIONAL design question</b> &mdash; PR by default rather than direct commit, and a clear convention for whose name is on the commit.</div></div>
+
+      <div class="conf rv"><span class="ct">IDENTITY</span>
+        <div class="cb">Deep does not want to be the orchestrator&rsquo;s user. He wants to be <b>a builder with leverage</b> &mdash; so the interface must feel like his own capability rather than a product he operates.</div></div>
+
+      <div class="conf rv"><span class="ct">ADMISSION &middot; REVIEW</span>
+        <div class="cb">He will not do thorough reviews, because reviewing is boring. So design honestly for that: <b>make verification strong enough that skimming is the RATIONAL choice</b>, rather than building a beautiful review UI he will not open.</div></div>
+
+      <div class="conf rv"><span class="ct">FEAR &middot; SILENT DECAY</span>
+        <div class="cb">Fear of silent degradation &mdash; it works for three months then quietly gets worse &mdash; is <b>exactly what the weekly self-report and the trust meter exist to make visible.</b></div></div>
+
+      <div class="conf wish rv"><span class="ct">THE SECRET WISH</span>
+        <div class="cb">To describe a feature and go make coffee. Which means the true north metric is <b>percentage of features completed with ZERO mid-flight interruptions.</b></div></div>
+
+      <div class="conf wish rv"><span class="ct">THE EXCHANGE RATE</span>
+        <div class="cb">An interruption costs roughly <b>fifteen minutes of his focus</b>, so the system should be willing to spend a great deal of compute to avoid one. Quantifying the exchange rate between tokens and attention is the single most clarifying idea for the whole interface.</div></div>
+
+      <div class="conf rv"><span class="ct">ADMISSION &middot; BLAME</span>
+        <div class="cb">He will blame the system for his own vague specs &mdash; and <b>spec echo protects both parties, because the echo becomes the contract.</b></div></div>
+
+      <div class="conf rv"><span class="ct">RISK &middot; UNCANNY REGISTER</span>
+        <div class="cb">Too human a question is unsettling; too robotic a question gets ignored. <b>Aim squarely at colleague &mdash; not butler, not robot.</b></div></div>
+
+      <div class="conf rv"><span class="ct">RISK &middot; RESENTMENT</span>
+        <div class="cb">If the system asks him to do something tedious that it could have done, <b>trust drops faster than it does from an outright bug.</b></div></div>
+
+      <div class="conf wish rv"><span class="ct">THE OTHER SECRET WISH</span>
+        <div class="cb">He secretly wants to be impressed. <b>A system that occasionally shows him something he did not know about his own codebase buys more trust than one that is merely correct.</b></div></div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ══ SYNTHESIS ════════════════════════════════════════════════ -->
+<section id="synth">
+  <div class="wrap">
+    <div class="synth-kicker rv">SYNTHESIS &middot; NINE POINTS</div>
+    <h1 class="synth-title rv" style="font-size:clamp(28px,6.4vw,54px)">What the session<br>actually decided</h1>
+    <div class="synth-sub rv">86 IDEAS &middot; 5 LENSES &middot; 97 ENTRIES &middot; ONE MASTER VARIABLE</div>
+
+    <!-- 1 -->
+    <div class="hero-point rv">
+      <div class="hp-top"><span class="hp-n">01</span><span class="hp-tag">MASTER VARIABLE</span></div>
+      <div class="hp-h">The exchange rate between tokens and attention</div>
+      <div class="hp-b">
+        An interruption costs about <b>fifteen minutes of focus</b>. So the system should be willing to spend
+        large amounts of compute to avoid a single question. This retroactively settles session one&rsquo;s
+        token-minimal premise: <b>attention is orders of magnitude more expensive than tokens</b>, and every
+        other rule in this document is downstream of that one price.
+      </div>
+      <div class="scale" aria-hidden="true">
+        <div class="scale-row"><span class="sl">TOKENS SPENT</span><span class="scale-bar"><i class="tok"></i></span><span class="sv">cheap</span></div>
+        <div class="scale-row"><span class="sl">ATTENTION SPENT</span><span class="scale-bar"><i class="att"></i></span><span class="sv">~15 min</span></div>
+      </div>
+      <div class="scale-note">SPEND THE FIRST TO PROTECT THE SECOND. ALWAYS.</div>
+    </div>
+
+    <div class="grid2">
+      <!-- 2 -->
+      <div class="point rv">
+        <div class="hp-top"><span class="hp-n">02</span><span class="hp-tag" style="color:var(--cyan)">DISGUISE</span></div>
+        <div class="hp-h">Silence-means-success is a verification requirement wearing an interface costume</div>
+        <div class="hp-b">
+          Three metaphors independently produced <b>speak only when something is wrong</b>. But that contract is
+          only trustworthy if detection is reliable. The moment the system stays quiet about a failure it
+          did not detect, every ambient design decision in this session collapses at once.
+        </div>
+        <div class="converge" style="margin-top:18px">
+          <div class="cv"><b>NURSE</b>speak up only when wrong</div>
+          <div class="cv"><b>EMPATHY</b>no news is good news</div>
+          <div class="cv join"><b>&rarr; THEREFORE</b>detection must be real</div>
+        </div>
+      </div>
+
+      <!-- 3 -->
+      <div class="point rv">
+        <div class="hp-top"><span class="hp-n">03</span><span class="hp-tag" style="color:var(--red)">ACCIDENT CLASS</span></div>
+        <div class="hp-h">Mode confusion is the aviation accident already waiting in the design</div>
+        <div class="hp-b">
+          A system with autonomy tiers has modes, and modes are what pilots crash on. The mitigations are
+          borrowed wholesale: <b>permanent mode display in the prompt line, instant disengage, standard
+          callouts at transitions.</b> Modes are how reversibility gets communicated to the human.
+        </div>
+        <div class="modes">
+          <span class="modechip on">AUTO</span>
+          <span class="modechip">ASKING</span>
+          <span class="modechip">PAUSED</span>
+          <span class="modechip" style="color:var(--red);border-color:#4a2a26">&#9209; DISENGAGE</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 4 -->
+    <div class="hero-point rv" style="margin-top:18px">
+      <div class="hp-top"><span class="hp-n">04</span><span class="hp-tag">THIRD CONVERGENCE &middot; THREE SESSIONS</span></div>
+      <div class="hp-h">Spec echo and ATC readback are the same mechanism, reached by unrelated routes</div>
+      <div class="hp-b">
+        Found once by threat-modeling specification drift. Found again by asking what an air traffic
+        controller does. Same answer: <b>restate the instruction before acting, and let the restatement be
+        the contract.</b> Two unrelated routes to one mechanism means it is load-bearing &mdash; and it should be
+        built first.
+      </div>
+      <div class="converge">
+        <div class="cv"><b>ROUTE A</b>threat modeling &rarr; specification drift &rarr; echo the spec</div>
+        <div class="cv"><b>ROUTE B</b>metaphor &rarr; air traffic control &rarr; readback is the contract</div>
+        <div class="cv join"><b>CONVERGENCE</b>the readback IS the acceptance criteria. build it first.</div>
+      </div>
+    </div>
+
+    <div class="grid2" style="margin-top:18px">
+      <!-- 5 -->
+      <div class="point rv">
+        <div class="hp-top"><span class="hp-n">05</span><span class="hp-tag">THE RECONCILER</span></div>
+        <div class="hp-h">Default-on-timeout makes async tolerable</div>
+        <div class="hp-b">
+          Every question states what happens if it is ignored. That single mechanic reconciles
+          <b>never block</b> with <b>do not act unapproved</b>, and it makes non-response a valid input
+          rather than a deadlock.
+        </div>
+        <div class="term" style="padding:14px 0 0;font-size:12px">
+<span class="fa">if you say nothing by 09:40 &rarr;</span> <span class="am">exponential, cap 30s</span>
+<span class="fa">silence is an answer. a known one.</span></div>
+      </div>
+
+      <!-- 8 -->
+      <div class="point rv" style="border-color:#4a3a1e;background:linear-gradient(165deg,#241c11,#1a1510)">
+        <div class="hp-top"><span class="hp-n" style="background:var(--amber);color:#1a1309">08</span><span class="hp-tag">BUILD ORDER CONSEQUENCE</span></div>
+        <div class="hp-h" style="color:var(--amber-2)">The interface is not phase two</div>
+        <div class="hp-b">
+          The v0 spine exists to run shadow mode. Shadow mode has no autonomy at all &mdash; it only reports.
+          Which means <b>shadow mode is entirely an interface product</b>, and the morning brief, the
+          one-question card with default-on-timeout, and mode display <b>ARE</b> v0.
+        </div>
+        <div class="v0">
+          <div class="big">v0</div>
+          <div class="sm">MORNING BRIEF &middot; ONE-QUESTION CARD WITH DEFAULT-ON-TIMEOUT &middot; MODE DISPLAY</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="small3">
+      <!-- 6 -->
+      <div class="point sm rv">
+        <div class="hp-top"><span class="hp-n">06</span><span class="hp-tag" style="color:var(--dimmer)">METRIC</span></div>
+        <div class="hp-h">True north, and its counter-metric</div>
+        <div class="hp-b">
+          Shadow work reframes success as <b>percentage of features completed with ZERO mid-flight
+          interruptions</b>, with shipping velocity of actual products as the counter-metric defending
+          against the tool-building-as-procrastination shadow.
+        </div>
+      </div>
+
+      <!-- 7 -->
+      <div class="point sm rv">
+        <div class="hp-top"><span class="hp-n">07</span><span class="hp-tag" style="color:var(--dimmer)">UNSPECCED</span></div>
+        <div class="hp-h">Two essentials nobody wrote down</div>
+        <div class="hp-b">
+          <b>Attribution is an emotional design question</b> &mdash; whose name is on the commit, PR versus direct
+          push. And <b>the register must be colleague</b> &mdash; not butler, not robot &mdash; warmth through
+          competence, with zero pleasantries.
+        </div>
+      </div>
+
+      <!-- 9 -->
+      <div class="point sm rv">
+        <div class="hp-top"><span class="hp-n">09</span><span class="hp-tag" style="color:var(--dimmer)">METHOD NOTE</span></div>
+        <div class="hp-h">The worst idea was the best lens</div>
+        <div class="hp-b">
+          Worst Possible Idea produced the most directly implementable output of any lens across three
+          sessions: <b>twenty-one irritations inverting into twenty-one concrete interface rules</b> &mdash;
+          effectively a free interface spec.
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- ══ FOOTER ═══════════════════════════════════════════════════ -->
+<footer>
+  <div class="wrap">
+    <p class="sign">
+      Describe a feature. Go make coffee.<br>
+      <b>The measure of this interface is how rarely you have to look at it.</b>
+    </p>
+    <div class="foot-meta">
+      <span>2026-09-19</span>
+      <span>86 IDEAS</span>
+      <span>5 LENSES</span>
+      <span>97 LOGGED ENTRIES</span>
+      <span>STATUS: COMPLETE</span>
+    </div>
+    <div class="foot-prompt"><span class="u">deep@studio</span>:~$ <span class="cursor" aria-hidden="true"></span></div>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var items = document.querySelectorAll('.rv');
+
+  if (reduce || !('IntersectionObserver' in window)) {
+    for (var i=0;i<items.length;i++) items[i].classList.add('in');
+  } else {
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if (e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); }
+      });
+    }, { rootMargin: '0px 0px -8% 0px', threshold: 0.04 });
+    for (var j=0;j<items.length;j++) io.observe(items[j]);
+  }
+
+  /* status line clock — drifts forward through the morning, purely decorative */
+  var clk = document.getElementById('clk');
+  if (clk && !reduce) {
+    var m = 2;
+    setInterval(function(){
+      m = (m + 1) % 60;
+      clk.textContent = '09:' + (m < 10 ? '0' + m : m);
+    }, 9000);
+  }
+})();
+</script>
+</body>
+</html>

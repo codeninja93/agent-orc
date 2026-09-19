@@ -1,0 +1,307 @@
+- id: "1-1"
+  title: "Contracts package — schemas, Command enum, event envelope, error dispositions"
+  description: >-
+    Stand up the single TypeScript package and its contracts layer: Zod v4
+    step contracts, the shared event envelope, the question type, the Command
+    enum, the error shape with its AD-35 disposition table, and schema_version
+    on every on-disk artifact. Includes the AD-31 contract round-trip suite
+    and the AD-28 Node floor assertion.
+  spec_checkpoint: true
+  invoke_dev_with: >-
+    Export every schema with z.toJSONSchema(schema, { target: "draft-7" }) —
+    never with default arguments, since Zod 4 defaults to draft-2020-12 and
+    the --json-schema validator rejects it. Step contracts must stay inside
+    the structured-outputs subset: no z.date(), no recursive or
+    self-referential schemas, no minLength, no minItems greater than one, no
+    minimum. Timestamps are z.string() carrying RFC3339 with milliseconds in
+    UTC.
+- id: "1-2"
+  title: "Runtime recorder — redaction, seq assignment, events.jsonl"
+  description: >-
+    The single writer of a run's events.jsonl: monotonic seq assignment, the
+    fail-closed redaction pass on the boundary between producer and log, and
+    the run shared fetch record. Every other producer, including MCP servers
+    and step subprocesses, emits through it rather than writing the file.
+  invoke_dev_with: >-
+    Redaction is a write-path invariant with no after-the-fact remedy: AD-4
+    immutability means an unredacted secret written once is permanent. The
+    pass fails closed — drop the artifact and emit redaction.failed rather
+    than writing unredacted content. Cover known token prefixes, high-entropy
+    strings, env-file contents, private-key headers and the literal values of
+    injected credentials.
+- id: "1-3"
+  title: "Engine reconciler — checkpoint, lock, dispositions, baseline commits"
+  description: >-
+    The controller loop that reads the checkpoint, takes at most one action,
+    and writes it back, holding no authoritative run state in memory. Covers
+    the log-wins rebuild of state.json, the exclusive ORCH_HOME lock, the
+    disposition table, resume by session id, and the per-step baseline_ref
+    reset.
+  invoke_dev_with: >-
+    Crash-injection tests must kill the reconciler at every state transition
+    and assert that restarting behaves identically to never having stopped
+    (AD-31, AD-7). Only the disposition `interrupted` is resumable; a step
+    terminated by a user steering command records `killed` and must never be
+    resumed or re-run by the loop. Idempotency is mechanised by the AD-26
+    baseline reset, not asserted.
+- id: "1-4"
+  title: "Step spawner — the claude -p subprocess contract"
+  description: >-
+    Spawn exactly one claude -p process per step with --json-schema,
+    --output-format stream-json, --strict-mcp-config and --restricted, capture
+    the session id, and re-parse structured_output against the originating Zod
+    schema before accepting it. Resolves an absolute Node path meeting the
+    floor and passes it to every child.
+  invoke_dev_with: >-
+    Bare mode is forbidden positively, not by absence of a flag: assert
+    subscription authentication at startup and refuse to run if the CLI
+    resolves to API-key mode. No unit may link the Claude Agent SDK as a
+    library — permission plumbing is parsed out of the JSON stream. Never rely
+    on PATH for the child Node; pass the resolved absolute path and record the
+    version to the event log.
+- id: "1-5"
+  title: "Container wrapper, executor image, and the three isolation tiers"
+  description: >-
+    One wrapper script owning every docker invocation, the locally-built
+    tier-2 image tagged by its Dockerfile content hash, and tier 0/1/2
+    selection by risk classification. Includes the AD-31 container assertion
+    suite that satisfies half the stage 1 gate.
+  spec_checkpoint: true
+  invoke_dev_with: >-
+    No unit composes its own docker flags — the wrapper is the only place they
+    exist: read-only root filesystem, tmpfs temp, only the run worktree and
+    session directory mounted (never HOME, ssh or cloud credential paths),
+    non-root user, all capabilities dropped, no-new-privileges, seccomp,
+    memory and pid limits. --rm is not used while a run is live because it
+    destroys the session transcript AD-8 resume depends on. The assertion test
+    must prove no push credential and no docker socket is reachable from
+    inside.
+- id: "1-6"
+  title: "Worktree lifecycle, leased resource pool, reconcile reclamation"
+  description: >-
+    Per-run worktrees plus postgres and redis instances leased from a warm
+    pool within a declared time bound and verified empty on return.
+    Reclamation is a reconcile pass comparing live resources against runs,
+    never a shutdown handler a crash can skip.
+- id: "1-7"
+  title: "Command transport — durable intent files, disengage, escape hatch"
+  description: >-
+    Every steering command is a durable intent file under
+    runs/<run-id>/commands/, the only thing the reconciler consumes, each
+    recording its principal so approvals are attributable. Delivers instant
+    one-gesture disengage and the escape hatch that leaves partial work on an
+    ordinary branch.
+- id: "1-8"
+  title: "Question lifecycle — compare-and-set with three resolvers"
+  description: >-
+    The question state machine admitting exactly one asked-to-resolved
+    transition, contested by a TUI answer, a web answer and the timeout
+    default, with losing resolvers receiving an already-resolved result. Emits
+    question.asked, question.resolved, question.default_taken and
+    question.deflected.
+- id: "1-9"
+  title: "TUI shell — event-log projection, permanent mode display, ambient status"
+  description: >-
+    The Ink renderer as a fold over events.jsonl, built against the shared
+    Command enum. Carries the permanently displayed autonomy mode, the
+    always-visible ambient status segment, and visible step count, consumed
+    rate-limit budget and elapsed-versus-estimate.
+- id: "1-10"
+  title: "TUI cards — question, spec echo, brief, kill, completion, handoff"
+  description: >-
+    The six required terminal surfaces: the one-question card with its stated
+    default and window, the line-editable spec echo card, the one-screen
+    morning brief, the kill card, the completion notice stating what was not
+    verified, and the handoff document. Last story before the stage 1 gate.
+  done_checkpoint: true
+- id: "2-1"
+  title: "Installer — npx init, the interview, .orch/ scaffolding"
+  description: >-
+    The interactive npx github:<owner>/<repo> init entry point, the
+    thirteen-question interview from build-sequencing.md, and the .orch/ files
+    it writes with a manifest and schema_version. Writes only into .orch/ and
+    .gitignore, bundling no credential.
+  spec_checkpoint: true
+  invoke_dev_with: >-
+    Re-running the installer must be idempotent and must preserve answers
+    already on disk, asking only what is missing; a half-install must be
+    detectable and recoverable from the manifest. Collect credential
+    ENVIRONMENT VARIABLE NAMES, never values. Nothing under .orch/ and no
+    runtime code path may require _bmad, a BMad skill or a BMad command
+    (AD-18).
+- id: "2-2"
+  title: "Project identity — first-commit SHA registration and prune"
+  description: >-
+    Register a project by the SHA of its first commit, treating the filesystem
+    path as a mutable pointer updated on mismatch. An unresolvable path marks
+    the registration unlocated and nothing more; central state is deleted only
+    by an explicit prune naming a project-id.
+- id: "2-3"
+  title: "Profile loader, precedence rules, and agent roster discovery"
+  description: >-
+    Load .orch/profile.toml as authoritative for mechanics while the
+    repository's own instructions win on code conventions, flagging a
+    contradicted profile entry stale rather than applying it. Discovers the
+    agent roster solely by reading .orch/agents/*.toml, holding no compiled-in
+    list.
+- id: "2-4"
+  title: "Step agents — analysis and planning"
+  description: >-
+    The first two roster agents as pure functions over typed files, each
+    re-grounding on the verbatim feature request rather than a summary and
+    carrying provenance on every claim. Produces the feature's declared file
+    territory that the reconciler uses to serialize overlapping work.
+- id: "2-5"
+  title: "Step agent — implementation"
+  description: >-
+    The implementing step agent, writing only inside its run worktree and
+    producing no side effect outside its typed output. Starts on the cheapest
+    viable model rung and is promoted only on a failed verification gate.
+- id: "2-6"
+  title: "Step agents — testing and verification with two-tier gate economics"
+  description: >-
+    Deterministic gates — typecheck, lint, tests — run before any model-based
+    review, so a run failing them spends nothing on review. Implementation is
+    judged against acceptance criteria fixed before it was written.
+- id: "2-7"
+  title: "Committer — branch naming, pull request, git note on the merge commit"
+  description: >-
+    The only unit that creates or names a branch and the only one permitted to
+    push, opening a pull request under the user's own git identity. Writes the
+    versioned git note carrying run id, ordered steps with dispositions,
+    acceptance criteria, usage totals and decisions taken.
+  invoke_dev_with: >-
+    Force-push is never permitted, and branch protection on the default branch
+    is asserted at run start. The branch pattern is declared once in the
+    project profile, defaulting to feature/<feature-slug> — no other unit may
+    infer a branch name from a feature slug. The committer is the sole writer
+    of the git note ref, and the note shape is a versioned contract.
+- id: "2-8"
+  title: "Interviewer — single entry point, spec echo, question compression"
+  description: >-
+    The one live conversation with the user: restates a request as
+    confirmable, line-editable acceptance criteria before any work begins, and
+    merges or deflects subagent questions against repository, history and
+    ledger so at most one reaches the user. Reports deflection rate per
+    feature.
+- id: "2-9"
+  title: "Run ceilings — degradation at eighty percent, hibernation at the limit"
+  description: >-
+    Three ceilings per run — step count, wall-clock and consumed rate-limit
+    budget, with no currency dimension. At eighty percent the run degrades by
+    downshifting model tier and narrowing scope; on reaching a ceiling it
+    hibernates with a handoff note rather than dying mid-write or continuing.
+- id: "2-10"
+  title: "Tool server pattern and the Jira MCP server"
+  description: >-
+    One MCP server per external domain holding that domain's credential and no
+    other, exposing no mutating tool at all. Every external read is recorded
+    through redaction to the run shared fetch record and served from it on
+    re-run rather than re-requested.
+- id: "2-11"
+  title: "Write surface — the engine's enumerated, idempotent intent executor"
+  description: >-
+    Agents never write; the engine executes an enumerated surface of push,
+    pull request creation, notes, tags and MCP mutations exactly once per
+    idempotency key. Last story before the stage 2 gate, where a real feature
+    completes end to end and the user merges the pull request.
+  done_checkpoint: true
+  invoke_dev_with: >-
+    Durability order is fixed: a write.attempted record carrying the
+    idempotency key must be durable BEFORE the call is made. Recovery finding
+    `attempted` with no recorded outcome reconciles against the target rather
+    than blindly re-executing. The key derives from run id plus intent id.
+- id: "3-1"
+  title: "Web control surface — loopback HTTP plus SSE, Command enum parity"
+  description: >-
+    A second renderer of the same event stream, binding loopback only and
+    serving a single local user. Writes the same durable command intent files
+    as the TUI, so with the server down every control remains available and no
+    reply ever requires a browser.
+- id: "3-2"
+  title: "Shadow mode — an ordinary run carrying mode: shadow"
+  description: >-
+    Run the full pipeline against an already-built feature and compare its
+    output to what was actually committed, writing nothing to the repository.
+    Only the intent executor and the committer honour the flag, recording
+    every write intent and executing none.
+  invoke_dev_with: >-
+    Shadow must be live execution with writes suppressed, not a replay runner
+    over past events: every component other than the intent executor and the
+    committer behaves identically to a live run, or the stage 3 autonomy gate
+    measures the wrong thing. The gate it feeds is a rolling window of at
+    least twenty shadow runs in one project, at least eighty percent accepted
+    without material change, and ZERO producing a write intent that would have
+    been destructive — the destructive count is a hard gate, not a percentage.
+- id: "3-3"
+  title: "Measurement — rework, deflection, interruptions, usage, trust record"
+  description: >-
+    The metrics the stage 3 gate is judged on, folded from the event log:
+    rework rate, deflection rate, interruption count and usage per feature.
+    Adds the per-area trust record of merged-unchanged versus corrected that
+    later justifies unlocking an autonomy tier.
+  done_checkpoint: true
+- id: "4-1"
+  title: "Reversibility classes enforced end to end"
+  description: >-
+    Every action type carries a declared class: reversible proceeds
+    unattended, recoverable notifies after the fact, irreversible blocks for
+    explicit approval. Gating is by blast radius, never by a global trust
+    level.
+  spec_checkpoint: true
+  invoke_dev_with: >-
+    Never ask approval for a reversible action, and never interrupt for
+    anything unresolvable in ten seconds. Engineering more actions into lower
+    classes is the intended way to increase autonomy safely — prefer that over
+    widening what proceeds unattended within a class. An approval is
+    attributable: the command records its principal.
+- id: "4-2"
+  title: "Adversarial tester"
+  description: >-
+    A verification agent whose job is actively trying to break the
+    implementation rather than confirming that it works. Runs only after the
+    free deterministic gates have passed, so no adversarial spend occurs on a
+    run that already fails.
+- id: "4-3"
+  title: "Steerable observability — pause, inject, kill, fork"
+  description: >-
+    Four controls over a live agent from the timeline, each a member of the
+    shared Command enum and each delivered as a durable intent file. Last
+    story before the stage 4 gate, where the threat-model minimum guardrail
+    set must be complete and tested.
+  done_checkpoint: true
+- id: "5-1"
+  title: "Episodic log and the between-run consolidation pass"
+  description: >-
+    A fast, lossy per-feature episodic log, compacted between features or
+    nightly into durable structured facts with failures weighted above
+    successes. Long-term memory is never written during a run, and only
+    verified merged outcomes ever reach it.
+- id: "5-2"
+  title: "Memory tiers, retrieval budget, anchors and invalidation"
+  description: >-
+    L1/L2/L3 tiering with a declared per-feature read budget, a decay policy
+    chosen at write time, anchors ranked by durability, and the sweep that
+    flags anchors no longer resolving. Wherever a remembered thing is
+    checkable it becomes a lint rule or regression test instead of a
+    retrieval.
+- id: "5-3"
+  title: "Decision ledger"
+  description: >-
+    An answer the user gives once becomes a durable rule that later agents
+    check before asking again, written only by a resolved question. The
+    cheapest and highest-hit-rate part of stage 5, and the one to pull forward
+    alone if interruption counts become painful before then.
+- id: "5-4"
+  title: "Cross-repo pattern memory"
+  description: >-
+    Abstract patterns recorded while building one product, retrievable when
+    building another, stored under ORCH_HOME/memory/ because they belong to no
+    single repository. Stores no code snippets and no per-repo specifics.
+- id: "5-5"
+  title: "Bootstrap agent — profiles authored for an unseen repository"
+  description: >-
+    Replaces the hand-written profile by generating one for a repository the
+    system has not seen, which the user reviews before first use. Final story
+    in the execution order.
+  done_checkpoint: true

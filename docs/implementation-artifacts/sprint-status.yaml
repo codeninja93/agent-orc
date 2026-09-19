@@ -1,0 +1,152 @@
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created, ready for development
+#   - in-progress: Developer actively working on implementation
+#   - review: Implementation complete, ready for review
+#   - done: Story completed
+
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when its first story starts (via build's sprint sync)
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates the next story after the previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; the status view surfaces open ones
+generated: 09-19-2026 18:45
+last_updated: 09-19-2026 18:45
+project: agent-orcastrator
+project_key: NOKEY
+tracking_system: file-system
+story_location: docs/implementation-artifacts
+development_status:
+  epic-1: backlog
+  1-1-initialize-the-repository-and-fix-its-identity: backlog
+  1-2-scaffold-the-package-and-assert-the-runtime-floor: backlog
+  1-3-define-the-shared-contracts-and-prove-they-round-trip: backlog
+  1-4-record-events-to-an-append-only-log: backlog
+  1-5-redact-secrets-before-they-reach-the-log: backlog
+  1-6-establish-the-state-layout-config-scopes-and-the-single-engi: backlog
+  1-7-make-every-steering-control-a-durable-intent-file: backlog
+  1-8-define-the-question-contract-and-resolve-it-exactly-once: backlog
+  1-9-take-the-declared-default-when-a-question-is-ignored: backlog
+  1-10-render-the-run-in-the-terminal-with-a-permanent-mode-display: backlog
+  1-11-present-the-active-question-in-a-slot-that-does-not-scroll-a: backlog
+  1-12-show-every-in-flight-feature-on-one-screen: backlog
+  1-13-stop-everything-with-one-gesture: backlog
+  1-14-hand-the-work-back-as-an-ordinary-branch: backlog
+  1-15-keep-mode-and-usage-visible-with-no-tui-running: backlog
+  1-16-notify-only-on-exception-decision-point-or-completion: backlog
+  epic-1-retrospective: optional
+
+  epic-2: backlog
+  2-1-select-the-weakest-isolation-tier-the-work-allows: backlog
+  2-2-put-every-docker-flag-behind-one-wrapper: backlog
+  2-3-build-the-executor-image-locally-and-tag-it-by-content: backlog
+  2-4-prove-the-executor-cannot-push-or-reach-the-daemon: backlog
+  2-5-separate-provisioning-from-execution-in-time: backlog
+  2-6-lease-an-ephemeral-database-and-get-it-back-empty: backlog
+  2-7-reclaim-resources-by-reconciling-never-by-exiting: backlog
+  2-8-assert-branch-protection-before-a-run-begins: backlog
+  epic-2-retrospective: optional
+
+  epic-3: backlog
+  3-1-reconcile-from-disk-holding-no-run-state-in-memory: backlog
+  3-2-spawn-a-step-as-a-subprocess-under-a-fixed-argument-baseline: backlog
+  3-3-record-a-step-baseline-and-reset-to-it-on-re-run: backlog
+  3-4-record-a-disposition-on-every-termination-and-resume-only-wh: backlog
+  3-5-replay-a-recorded-run-to-an-identical-step-sequence: backlog
+  3-6-keep-evidence-out-of-model-context: backlog
+  3-7-fail-hard-when-the-control-plane-ceiling-is-exceeded: backlog
+  3-8-re-ground-every-step-on-the-verbatim-request: backlog
+  3-9-check-each-artifact-against-the-request-before-it-flows-on: backlog
+  3-10-serialize-only-features-whose-territory-overlaps: backlog
+  3-11-enforce-three-ceilings-and-degrade-at-eighty-percent: backlog
+  3-12-hibernate-at-a-ceiling-rather-than-dying-or-continuing: backlog
+  3-13-cap-steps-per-agent-and-flag-anomalous-usage: backlog
+  3-14-estimate-a-run-before-spending-capacity-on-it: backlog
+  epic-3-retrospective: optional
+
+  epic-4: backlog
+  4-1-talk-to-one-agent-and-nothing-else: backlog
+  4-2-echo-the-request-back-as-acceptance-criteria: backlog
+  4-3-edit-any-criterion-and-confirm-in-one-keystroke: backlog
+  4-4-answer-a-question-from-the-repository-before-asking-me: backlog
+  4-5-merge-related-questions-and-hold-the-median-to-one: backlog
+  4-6-give-each-external-domain-one-server-and-one-credential: backlog
+  4-7-record-every-external-read-and-serve-it-from-the-record: backlog
+  4-8-interpret-the-request-against-the-repository: backlog
+  4-9-produce-a-plan-that-declares-its-territory: backlog
+  4-10-write-the-code-in-the-worktree: backlog
+  4-11-write-the-failing-tests-before-the-implementation-runs: backlog
+  4-12-run-the-deterministic-gate-before-spending-on-review: backlog
+  4-13-try-to-break-the-implementation: backlog
+  4-14-classify-every-action-by-reversibility-and-gate-on-it: backlog
+  4-15-execute-the-enumerated-write-surface-exactly-once: backlog
+  4-16-commit-to-a-branch-only-the-committer-names: backlog
+  4-17-write-the-run-s-record-as-a-git-note-on-the-merge-commit: backlog
+  4-18-reconstruct-a-feature-s-timeline-from-git-alone: backlog
+  4-19-open-a-pull-request-under-my-own-identity: backlog
+  epic-4-retrospective: optional
+
+  epic-5: backlog
+  5-1-onboard-a-repository-with-one-command: backlog
+  5-2-ask-the-interview-that-produces-a-working-profile: backlog
+  5-3-make-a-half-install-detectable-and-recoverable: backlog
+  5-4-re-run-the-installer-without-losing-my-answers: backlog
+  5-5-identify-a-project-by-its-first-commit: backlog
+  5-6-never-infer-abandonment-from-a-missing-path: backlog
+  5-7-load-the-profile-with-fixed-precedence-against-the-repositor: backlog
+  5-8-discover-the-agent-roster-from-configuration-alone: backlog
+  5-9-complete-a-feature-in-a-repository-the-system-has-never-seen: backlog
+  5-10-ship-nothing-that-depends-on-the-design-time-toolchain: backlog
+  epic-5-retrospective: optional
+
+  epic-6: backlog
+  6-1-serve-the-run-on-loopback-as-a-second-renderer: backlog
+  6-2-render-the-same-historical-run-identically-in-both-surfaces: backlog
+  6-3-run-a-feature-in-shadow-mode-writing-nothing: backlog
+  6-4-compare-a-shadow-run-against-what-was-actually-committed: backlog
+  6-5-keep-a-trust-record-per-area: backlog
+  6-6-measure-rework-deflection-interruptions-and-usage: backlog
+  6-7-resolve-a-feature-name-to-its-runs: backlog
+  epic-6-retrospective: optional
+
+  epic-7: backlog
+  7-1-enforce-reversibility-classes-end-to-end: backlog
+  7-2-steer-a-live-run-four-ways: backlog
+  7-3-refuse-to-run-unattended-until-every-guardrail-exists: backlog
+  7-4-kill-an-agent-mid-run-on-purpose-and-confirm-the-system-halt: backlog
+  7-5-unlock-autonomy-per-risk-tier-from-measured-accuracy: backlog
+  7-6-tell-the-system-to-stop-asking: backlog
+  epic-7-retrospective: optional
+
+  epic-8: backlog
+  8-1-append-to-an-episodic-log-during-a-run: backlog
+  8-2-consolidate-a-finished-feature-into-structured-facts: backlog
+  8-3-load-memory-in-tiers-under-a-read-budget: backlog
+  8-4-give-every-entry-a-decay-policy-and-a-durable-anchor: backlog
+  8-5-rewrite-anchors-on-rename-and-sweep-for-dead-ones: backlog
+  8-6-count-retrievals-then-promote-and-prune: backlog
+  8-7-convert-a-checkable-memory-into-a-lint-rule-or-a-test: backlog
+  8-8-answer-a-question-once-and-never-be-asked-again: backlog
+  8-9-carry-an-abstract-pattern-between-projects: backlog
+  8-10-rebuild-memory-from-git-and-the-event-log: backlog
+  8-11-report-retrieval-cost-against-rework-reduction: backlog
+  8-12-generate-a-per-repo-profile-automatically: backlog
+  epic-8-retrospective: optional

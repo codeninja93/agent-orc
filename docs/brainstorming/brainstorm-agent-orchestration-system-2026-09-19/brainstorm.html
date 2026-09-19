@@ -1,0 +1,1996 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orchestrator Flight Recorder</title>
+<style>
+/* ============================================================
+   ORCHESTRATOR FLIGHT RECORDER
+   session: brainstorm-agent-orchestration-system-2026-09-19
+   single file · no deps · no images · no external fonts
+   ============================================================ */
+
+:root{
+  --bg:      #06080b;
+  --bg-2:    #0a0e13;
+  --panel:   #0d1218;
+  --panel-2: #111821;
+  --rule:    #1b242f;
+  --rule-2:  #263341;
+  --ink:     #d7e2ec;
+  --ink-dim: #8a9aab;
+  --ink-mute:#5c6b7b;
+
+  --amber:  #ffb43d;   /* L1 assumption reversal */
+  --cyan:   #3ad6e8;   /* L2 morphological      */
+  --magenta:#ff5fa8;   /* L3 triz               */
+  --red:    #ff5a51;   /* L4 predator           */
+  --green:  #46dd93;   /* L4 defense            */
+  --lime:   #b9f24d;   /* L5 swarm              */
+  --ice:    #9fd8ff;   /* synthesis             */
+  --gold:   #ffd166;   /* breakthrough          */
+
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, "Cascadia Mono", "Roboto Mono", Consolas, "Liberation Mono", monospace;
+  --sans: "Helvetica Neue", Helvetica, Inter, "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+
+  --gutter: 16px;
+  --maxw: 1240px;
+}
+
+*,*::before,*::after{ box-sizing:border-box; }
+
+html{ -webkit-text-size-adjust:100%; }
+
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--ink);
+  font-family:var(--sans);
+  font-size:15px;
+  line-height:1.55;
+  overflow-x:hidden;
+  -webkit-font-smoothing:antialiased;
+  background-image:
+    linear-gradient(to right, rgba(255,255,255,.017) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255,255,255,.017) 1px, transparent 1px);
+  background-size:44px 44px;
+}
+
+/* faint CRT scanline wash over everything, behind content */
+body::before{
+  content:"";
+  position:fixed; inset:0;
+  pointer-events:none;
+  z-index:0;
+  background:repeating-linear-gradient(to bottom, rgba(255,255,255,.014) 0 1px, transparent 1px 3px);
+  mix-blend-mode:screen;
+}
+
+.wrap{
+  position:relative; z-index:1;
+  max-width:var(--maxw);
+  margin:0 auto;
+  padding:0 var(--gutter);
+}
+
+/* ---------- shared primitives ---------- */
+
+.mono{ font-family:var(--mono); }
+
+.tick{
+  font-family:var(--mono);
+  font-size:10px;
+  letter-spacing:.22em;
+  text-transform:uppercase;
+  color:var(--ink-mute);
+}
+
+.hr{
+  height:1px;
+  background:linear-gradient(to right, var(--rule) 0%, var(--rule) 60%, transparent 100%);
+  border:0; margin:0;
+}
+
+a{ color:inherit; }
+
+/* =========================================================
+   MASTHEAD
+   ========================================================= */
+
+.mast{
+  padding:clamp(28px,7vw,64px) 0 0;
+  border-bottom:1px solid var(--rule);
+  position:relative;
+}
+
+.mast-strip{
+  display:flex; flex-wrap:wrap; gap:8px 18px;
+  align-items:center;
+  font-family:var(--mono); font-size:10.5px;
+  letter-spacing:.16em; text-transform:uppercase;
+  color:var(--ink-mute);
+  padding-bottom:22px;
+}
+.rec{ display:inline-flex; align-items:center; gap:7px; color:var(--red); }
+.rec .dot{
+  width:8px;height:8px;border-radius:50%;
+  background:var(--red);
+  box-shadow:0 0 0 0 rgba(255,90,81,.7);
+  animation:blip 2.4s ease-out infinite;
+}
+@keyframes blip{
+  0%{ box-shadow:0 0 0 0 rgba(255,90,81,.55); }
+  70%{ box-shadow:0 0 0 9px rgba(255,90,81,0); }
+  100%{ box-shadow:0 0 0 0 rgba(255,90,81,0); }
+}
+
+h1.title{
+  font-family:var(--mono);
+  font-weight:600;
+  font-size:clamp(34px,9.2vw,92px);
+  line-height:.94;
+  letter-spacing:-.035em;
+  margin:0 0 6px;
+  color:#f2f7fb;
+}
+h1.title .fade{ color:var(--ink-mute); }
+
+.subtitle{
+  font-family:var(--mono);
+  font-size:clamp(11px,2.6vw,14px);
+  letter-spacing:.06em;
+  color:var(--cyan);
+  margin:0 0 30px;
+}
+
+.brief{
+  display:grid;
+  grid-template-columns:1fr;
+  gap:0;
+  border-top:1px solid var(--rule);
+  margin-bottom:26px;
+}
+.brief-row{
+  display:grid;
+  grid-template-columns:96px 1fr;
+  gap:14px;
+  padding:13px 0;
+  border-bottom:1px solid var(--rule);
+  align-items:start;
+}
+.brief-row dt{
+  font-family:var(--mono); font-size:10px; letter-spacing:.2em;
+  text-transform:uppercase; color:var(--ink-mute); padding-top:3px;
+}
+.brief-row dd{ margin:0; font-size:13.5px; color:var(--ink-dim); }
+.brief-row dd b{ color:var(--ink); font-weight:600; }
+.status-ok{ color:var(--green); font-family:var(--mono); font-size:12px; letter-spacing:.14em; }
+
+/* readout — session stats */
+.readout{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  border:1px solid var(--rule-2);
+  background:
+    linear-gradient(180deg, rgba(58,214,232,.05), transparent 70%),
+    var(--panel);
+  margin-bottom:clamp(26px,6vw,54px);
+}
+.gauge{
+  padding:18px 14px 16px;
+  border-right:1px solid var(--rule);
+  position:relative;
+  text-align:center;
+}
+.gauge:last-child{ border-right:0; }
+.gauge .num{
+  font-family:var(--mono);
+  font-size:clamp(28px,8vw,52px);
+  font-weight:600;
+  letter-spacing:-.04em;
+  line-height:1;
+  color:#fff;
+  display:block;
+}
+.gauge .lab{
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.22em;
+  text-transform:uppercase; color:var(--ink-mute); margin-top:9px; display:block;
+}
+.gauge .bar{
+  height:3px; margin-top:12px; background:var(--rule);
+  position:relative; overflow:hidden;
+}
+.gauge .bar span{ position:absolute; inset:0 auto 0 0; }
+.g1 .bar span{ width:92%;  background:var(--amber); }
+.g2 .bar span{ width:36%;  background:var(--magenta); }
+.g3 .bar span{ width:100%; background:var(--cyan); }
+
+/* =========================================================
+   SECTION SHELL
+   ========================================================= */
+
+.lens{ padding:clamp(48px,10vw,104px) 0 clamp(36px,8vw,72px); border-bottom:1px solid var(--rule); }
+
+.lens-head{ margin-bottom:clamp(26px,5vw,46px); }
+.lens-no{
+  font-family:var(--mono);
+  font-size:clamp(46px,14vw,132px);
+  line-height:.82;
+  font-weight:600;
+  letter-spacing:-.06em;
+  color:transparent;
+  -webkit-text-stroke:1px var(--rule-2);
+  display:block;
+  margin-bottom:-6px;
+}
+.lens-name{
+  font-family:var(--mono);
+  font-size:clamp(20px,5.4vw,40px);
+  letter-spacing:-.02em;
+  font-weight:600;
+  margin:0 0 10px;
+  line-height:1.05;
+}
+.lens-meta{
+  font-family:var(--mono); font-size:10px; letter-spacing:.2em;
+  text-transform:uppercase; color:var(--ink-mute);
+  display:flex; flex-wrap:wrap; gap:6px 16px; margin-bottom:16px;
+}
+.lens-insight{
+  font-size:clamp(14px,3.2vw,17.5px);
+  line-height:1.5;
+  max-width:70ch;
+  color:var(--ink);
+  border-left:2px solid currentColor;
+  padding-left:16px;
+  margin:0;
+}
+.lens-insight .ii{ color:var(--ink-dim); }
+
+/* per-lens accent hookup */
+#l1{ --acc:var(--amber); }
+#l2{ --acc:var(--cyan); }
+#l3{ --acc:var(--magenta); }
+#l4{ --acc:var(--red); }
+#l5{ --acc:var(--lime); }
+.lens .lens-name,.lens .lens-insight{ color:var(--acc); }
+.lens .lens-insight{ color:var(--ink); border-left-color:var(--acc); }
+.lens .lens-name{ color:var(--acc); }
+
+/* =========================================================
+   LENS 1 · ASSUMPTION REVERSAL  — flip plates
+   ========================================================= */
+
+.flipfield{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(270px,1fr));
+  gap:1px;
+  background:var(--rule);
+  border:1px solid var(--rule);
+}
+.flip{
+  background:var(--bg-2);
+  padding:16px 15px 17px;
+  position:relative;
+  transition:background .2s ease;
+}
+.flip:hover{ background:#0f1520; }
+.flip .fid{
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.2em;
+  color:var(--amber); opacity:.62; display:block; margin-bottom:9px;
+}
+.flip .was{
+  font-family:var(--mono);
+  font-size:11px;
+  line-height:1.4;
+  color:var(--ink-mute);
+  text-decoration:line-through;
+  text-decoration-color:rgba(255,90,81,.75);
+  text-decoration-thickness:1px;
+  display:block;
+  margin-bottom:8px;
+}
+.flip .pivot{
+  display:block;
+  font-family:var(--mono);
+  font-size:12px;
+  color:var(--amber);
+  margin-bottom:8px;
+  letter-spacing:.04em;
+}
+.flip .now{
+  font-size:13.2px;
+  line-height:1.5;
+  color:var(--ink);
+  margin:0;
+}
+.flip .now b{ color:#fff; font-weight:600; }
+
+/* =========================================================
+   LENS 2 · MORPHOLOGICAL — parameter box + option chips
+   ========================================================= */
+
+.morphbox{
+  border:1px solid var(--rule-2);
+  background:var(--panel);
+  margin-bottom:34px;
+  overflow:hidden;
+}
+.morphbox-cap{
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.2em;
+  text-transform:uppercase; color:var(--ink-mute);
+  padding:11px 14px; border-bottom:1px solid var(--rule);
+  display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap;
+}
+.morphbox-cap .k{ color:var(--cyan); }
+.matrix{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(122px,1fr));
+  gap:1px;
+  background:var(--rule);
+}
+.mcell{
+  background:var(--bg-2);
+  padding:10px 10px 11px;
+}
+.mcell .p{
+  font-family:var(--mono); font-size:9px; letter-spacing:.12em;
+  text-transform:uppercase; color:var(--ink-dim); display:block; line-height:1.3;
+  min-height:2.6em;
+}
+.pips{ display:flex; gap:3px; margin-top:8px; }
+.pips i{ width:7px; height:7px; background:var(--rule-2); display:block; }
+.pips i.on{ background:var(--cyan); box-shadow:0 0 7px rgba(58,214,232,.55); }
+.mcell.empty .p{ color:var(--ink-mute); }
+.mcell.empty .pips i{ background:#182029; }
+.mcell.empty::after{
+  content:"UNEXPLORED";
+  display:block; margin-top:7px;
+  font-family:var(--mono); font-size:8px; letter-spacing:.16em; color:var(--red); opacity:.8;
+}
+
+.optlist{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+  gap:1px;
+  background:var(--rule);
+  border:1px solid var(--rule);
+}
+.opt{
+  background:var(--bg-2);
+  padding:15px 15px 16px;
+  display:grid;
+  grid-template-columns:1fr;
+  gap:7px;
+}
+.opt:hover{ background:#0f1520; }
+.opt .otop{ display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; }
+.opt .oid{ font-family:var(--mono); font-size:9.5px; color:var(--cyan); opacity:.7; letter-spacing:.16em; }
+.opt .odim{
+  font-family:var(--mono); font-size:9px; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--ink-mute); border:1px solid var(--rule-2); padding:2px 6px;
+}
+.opt p{ margin:0; font-size:13.2px; line-height:1.5; }
+.opt p b{ color:#fff; font-weight:600; }
+
+/* =========================================================
+   LENS 3 · TRIZ — opposing forces meeting at a resolution
+   ========================================================= */
+
+.triz{ display:grid; gap:1px; background:var(--rule); border:1px solid var(--rule); }
+.tz{
+  background:var(--bg-2);
+  display:grid;
+  grid-template-columns:1fr;
+  padding:0;
+}
+.tz-forces{
+  display:grid;
+  grid-template-columns:1fr auto 1fr;
+  align-items:center;
+  gap:8px;
+  padding:12px 14px 10px;
+  border-bottom:1px dashed var(--rule-2);
+}
+.tz-forces .f{
+  font-family:var(--mono); font-size:10.5px; line-height:1.35;
+  letter-spacing:.02em; color:var(--ink-dim);
+}
+.tz-forces .fa{ text-align:right; }
+.tz-forces .fb{ text-align:left; }
+.tz-forces .clash{
+  font-family:var(--mono); font-size:15px; color:var(--magenta);
+  line-height:1; padding:0 2px;
+}
+.tz-body{ padding:13px 14px 15px; display:grid; gap:8px; }
+.tz-tags{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.tz-id{ font-family:var(--mono); font-size:9.5px; color:var(--magenta); opacity:.75; letter-spacing:.16em; }
+.sep{
+  font-family:var(--mono); font-size:8.5px; letter-spacing:.18em;
+  text-transform:uppercase; padding:2px 7px;
+  border:1px solid rgba(255,95,168,.4); color:var(--magenta);
+  background:rgba(255,95,168,.07);
+}
+.tz-body p{ margin:0; font-size:13.2px; line-height:1.5; }
+.tz-body p b{ color:#fff; font-weight:600; }
+@media (min-width:860px){
+  .triz{ grid-template-columns:1fr 1fr; }
+}
+
+/* =========================================================
+   LENS 4 · PREDATOR & PREY — threat ledger + evolved defenses
+   ========================================================= */
+
+.preyfield{ display:grid; gap:1px; background:var(--rule); border:1px solid var(--rule); }
+@media (min-width:760px){ .preyfield{ grid-template-columns:1fr 1fr; } }
+
+.prey{
+  background:var(--bg-2);
+  display:grid;
+  grid-template-columns:1fr;
+}
+.prey-threat{
+  display:flex; align-items:center; gap:9px;
+  padding:9px 13px;
+  background:rgba(255,90,81,.07);
+  border-bottom:1px solid rgba(255,90,81,.2);
+}
+.prey-threat .fang{ color:var(--red); font-size:12px; line-height:1; }
+.prey-threat .tname{
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.18em;
+  text-transform:uppercase; color:var(--red);
+}
+.prey-threat .pid{
+  margin-left:auto; font-family:var(--mono); font-size:9px;
+  letter-spacing:.16em; color:var(--ink-mute);
+}
+.prey-def{ padding:13px 13px 15px; display:grid; gap:7px; }
+.prey-def .dlab{
+  font-family:var(--mono); font-size:8.5px; letter-spacing:.2em;
+  text-transform:uppercase; color:var(--green);
+}
+.prey-def p{ margin:0; font-size:13.2px; line-height:1.5; }
+.prey-def p b{ color:#fff; font-weight:600; }
+
+.bestiary{
+  display:flex; flex-wrap:wrap; gap:6px;
+  margin-bottom:28px;
+}
+.bestiary span{
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.12em;
+  text-transform:uppercase;
+  border:1px solid rgba(255,90,81,.3);
+  color:#e8a49f;
+  padding:4px 8px;
+  background:rgba(255,90,81,.05);
+}
+
+/* =========================================================
+   LENS 5 · SWARM — scattered emergent nodes + pheromone wash
+   ========================================================= */
+
+.colony{
+  position:relative;
+  padding:10px 0 0;
+}
+.colony::before{
+  content:"";
+  position:absolute; inset:-10px -4px;
+  pointer-events:none;
+  background:
+    radial-gradient(60% 40% at 18% 22%, rgba(185,242,77,.055), transparent 70%),
+    radial-gradient(50% 45% at 78% 58%, rgba(185,242,77,.045), transparent 70%),
+    radial-gradient(40% 35% at 45% 88%, rgba(185,242,77,.04), transparent 70%);
+}
+.swarmgrid{
+  position:relative;
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(250px,1fr));
+  gap:14px;
+}
+.bug{
+  position:relative;
+  border:1px solid var(--rule-2);
+  background:rgba(10,14,19,.86);
+  padding:14px 14px 15px 16px;
+  display:grid; gap:7px;
+  transition:border-color .2s ease, transform .2s ease;
+}
+.bug:hover{ border-color:rgba(185,242,77,.5); transform:translateY(-2px); }
+.bug::before{
+  content:"";
+  position:absolute; left:-1px; top:14px; bottom:14px; width:2px;
+  background:var(--lime); opacity:.55;
+}
+.bug .bhead{ display:flex; align-items:baseline; gap:9px; flex-wrap:wrap; }
+.bug .bid{ font-family:var(--mono); font-size:9.5px; letter-spacing:.16em; color:var(--lime); opacity:.75; }
+.bug .brule{
+  font-family:var(--mono); font-size:8.5px; letter-spacing:.16em; text-transform:uppercase;
+  color:var(--ink-mute);
+}
+.bug p{ margin:0; font-size:13.2px; line-height:1.5; }
+.bug p b{ color:#fff; font-weight:600; }
+.bug .pher{
+  display:flex; gap:3px; margin-top:2px;
+}
+.bug .pher i{ width:4px;height:4px;border-radius:50%;background:var(--lime);opacity:.25; display:block; }
+.bug .pher i:nth-child(1){ opacity:.7; }
+.bug .pher i:nth-child(2){ opacity:.5; }
+.bug .pher i:nth-child(3){ opacity:.33; }
+
+/* emergent, non-gridded feel on wide screens */
+@media (min-width:900px){
+  .swarmgrid{ grid-template-columns:repeat(4,1fr); }
+  .bug:nth-child(4n+1){ transform:translateY(0); }
+  .bug:nth-child(4n+2){ transform:translateY(26px); }
+  .bug:nth-child(4n+3){ transform:translateY(12px); }
+  .bug:nth-child(4n+4){ transform:translateY(38px); }
+  .bug:nth-child(4n+2):hover{ transform:translateY(24px); }
+  .bug:nth-child(4n+3):hover{ transform:translateY(10px); }
+  .bug:nth-child(4n+4):hover{ transform:translateY(36px); }
+  .swarmgrid{ padding-bottom:44px; }
+}
+@media (prefers-reduced-motion:reduce){
+  *{ animation:none !important; transition:none !important; }
+}
+
+.bug.hybrid{ border-color:rgba(159,216,255,.4); background:rgba(14,20,28,.9); }
+.bug.hybrid::before{ background:var(--ice); opacity:.8; }
+.bug.hybrid .bid{ color:var(--ice); }
+
+/* =========================================================
+   SYNTHESIS — the climax
+   ========================================================= */
+
+.synth{
+  position:relative;
+  padding:clamp(56px,12vw,130px) 0 clamp(48px,10vw,110px);
+  background:
+    radial-gradient(90% 60% at 50% 0%, rgba(159,216,255,.075), transparent 66%),
+    linear-gradient(180deg, #080b10 0%, #05070a 100%);
+  border-bottom:1px solid var(--rule);
+  overflow:hidden;
+}
+.synth::before{
+  content:"";
+  position:absolute; inset:0; pointer-events:none;
+  background-image:
+    linear-gradient(to right, rgba(159,216,255,.045) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(159,216,255,.045) 1px, transparent 1px);
+  background-size:110px 110px;
+  mask-image:radial-gradient(70% 50% at 50% 24%, #000 10%, transparent 80%);
+  -webkit-mask-image:radial-gradient(70% 50% at 50% 24%, #000 10%, transparent 80%);
+}
+.synth .wrap{ position:relative; z-index:2; }
+
+.synth-kicker{
+  font-family:var(--mono); font-size:10px; letter-spacing:.34em;
+  text-transform:uppercase; color:var(--ice); margin-bottom:14px;
+}
+.synth-title{
+  font-family:var(--mono);
+  font-size:clamp(30px,9vw,86px);
+  line-height:.92; letter-spacing:-.045em; font-weight:600;
+  margin:0 0 16px; color:#fff;
+}
+.synth-title em{ font-style:normal; color:var(--ice); }
+.synth-lede{
+  max-width:64ch; font-size:clamp(14px,3.1vw,18px); line-height:1.55;
+  color:var(--ink-dim); margin:0 0 clamp(34px,7vw,64px);
+}
+
+/* convergence stack, points 1-7 */
+.conv{ display:grid; gap:1px; background:rgba(159,216,255,.13); border:1px solid rgba(159,216,255,.16); }
+.cv{
+  background:rgba(7,10,14,.9);
+  display:grid;
+  grid-template-columns:52px 1fr;
+  gap:0;
+  align-items:stretch;
+}
+.cv .cvn{
+  font-family:var(--mono); font-size:16px; font-weight:600;
+  color:var(--ice);
+  display:flex; align-items:flex-start; justify-content:center;
+  padding:16px 0 0;
+  border-right:1px solid rgba(159,216,255,.13);
+  background:rgba(159,216,255,.035);
+}
+.cv .cvb{ padding:15px 16px 17px; }
+.cv h4{
+  margin:0 0 6px;
+  font-family:var(--mono); font-size:12.5px; letter-spacing:.1em;
+  text-transform:uppercase; color:#fff; font-weight:600;
+}
+.cv p{ margin:0; font-size:13.6px; line-height:1.56; color:var(--ink-dim); }
+.cv p b{ color:var(--ink); font-weight:600; }
+@media (min-width:820px){
+  .cv{ grid-template-columns:78px 1fr; }
+  .cv .cvn{ font-size:20px; padding-top:17px; }
+  .cv .cvb{ padding:18px 22px 20px; }
+  .cv h4{ font-size:13.5px; }
+}
+
+/* ---- point 8 — BREAKTHROUGH ---- */
+.breakthrough{
+  margin:clamp(34px,7vw,70px) 0 clamp(30px,6vw,56px);
+  border:1px solid rgba(255,209,102,.34);
+  background:
+    linear-gradient(180deg, rgba(255,209,102,.07), rgba(255,209,102,.015) 46%, transparent);
+  position:relative;
+}
+.breakthrough::after{
+  content:"";
+  position:absolute; left:0; right:0; top:-1px; height:2px;
+  background:linear-gradient(to right, transparent, var(--gold), transparent);
+}
+.bt-cap{
+  display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;
+  padding:13px 16px; border-bottom:1px solid rgba(255,209,102,.22);
+}
+.bt-cap .n{ font-family:var(--mono); font-size:11px; color:var(--gold); letter-spacing:.2em; }
+.bt-cap .w{
+  font-family:var(--mono); font-size:clamp(11px,2.6vw,13px);
+  letter-spacing:.3em; text-transform:uppercase; color:var(--gold); font-weight:600;
+}
+.bt-body{ padding:clamp(18px,4.5vw,34px) clamp(14px,4vw,30px) clamp(22px,5vw,38px); }
+.bt-claim{
+  font-family:var(--mono);
+  font-size:clamp(15px,4vw,26px);
+  line-height:1.3; letter-spacing:-.02em;
+  color:#fff; margin:0 0 clamp(22px,5vw,38px); max-width:30ch;
+}
+.bt-claim span{ color:var(--gold); }
+
+/* the split diagram */
+.split{ display:grid; gap:0; }
+.split-src{
+  border:1px solid var(--rule-2);
+  background:var(--panel-2);
+  padding:14px 16px;
+  text-align:center;
+  position:relative;
+}
+.split-src .t{
+  font-family:var(--mono); font-size:clamp(12px,3.4vw,17px); letter-spacing:.14em;
+  text-transform:uppercase; color:var(--ink); display:block;
+}
+.split-src .s{
+  font-family:var(--mono); font-size:10px; letter-spacing:.1em; color:var(--ink-mute);
+  display:block; margin-top:5px;
+}
+.crack{
+  height:54px;
+  position:relative;
+  display:flex; align-items:center; justify-content:center;
+}
+.crack svg{ width:100%; height:100%; display:block; }
+.split-out{
+  display:grid; grid-template-columns:1fr; gap:14px;
+}
+@media (min-width:700px){ .split-out{ grid-template-columns:1fr 1fr; } }
+.half{
+  border:1px solid rgba(255,209,102,.3);
+  background:rgba(255,209,102,.045);
+  padding:16px 16px 18px;
+  display:grid; gap:8px;
+}
+.half.det{
+  border-color:rgba(58,214,232,.32);
+  background:rgba(58,214,232,.045);
+}
+.half .hk{
+  font-family:var(--mono); font-size:9px; letter-spacing:.24em;
+  text-transform:uppercase; color:var(--gold);
+}
+.half.det .hk{ color:var(--cyan); }
+.half .hn{
+  font-family:var(--mono); font-size:clamp(14px,3.8vw,20px); letter-spacing:-.01em;
+  color:#fff; font-weight:600;
+}
+.half .hd{ font-size:13px; line-height:1.5; color:var(--ink-dim); margin:0; }
+.half ul{ margin:4px 0 0; padding-left:16px; }
+.half li{ font-size:12px; line-height:1.55; color:var(--ink-mute); font-family:var(--mono); }
+.half .stamp{
+  font-family:var(--mono); font-size:9px; letter-spacing:.18em; text-transform:uppercase;
+  border:1px solid currentColor; display:inline-block; padding:3px 8px; color:var(--gold);
+  justify-self:start;
+}
+.half.det .stamp{ color:var(--cyan); }
+
+/* ---- point 9 — BUILD ORDER ---- */
+.buildorder{ margin-top:clamp(30px,6vw,60px); }
+.bo-head{
+  display:flex; flex-wrap:wrap; gap:10px 16px; align-items:baseline;
+  border-bottom:1px solid var(--rule-2); padding-bottom:12px; margin-bottom:0;
+}
+.bo-head .n{ font-family:var(--mono); font-size:11px; color:var(--ice); letter-spacing:.2em; }
+.bo-head h3{
+  margin:0; font-family:var(--mono); font-size:clamp(15px,4vw,24px);
+  letter-spacing:-.02em; color:#fff; font-weight:600;
+}
+.rail{ display:grid; gap:1px; background:var(--rule); border:1px solid var(--rule); border-top:0; }
+@media (min-width:900px){ .rail{ grid-template-columns:repeat(5,1fr); } }
+.stage{
+  background:var(--bg-2);
+  padding:16px 15px 18px;
+  display:grid; gap:8px; align-content:start;
+  position:relative;
+}
+.stage .sn{
+  font-family:var(--mono); font-size:26px; font-weight:600; line-height:1;
+  color:transparent; -webkit-text-stroke:1px rgba(159,216,255,.5);
+}
+.stage .st{
+  font-family:var(--mono); font-size:12.5px; letter-spacing:.04em; color:#fff; font-weight:600; line-height:1.3;
+}
+.stage .sd{ font-size:12.5px; line-height:1.5; color:var(--ink-mute); margin:0; }
+.stage .track{ height:2px; background:var(--rule-2); margin-top:4px; }
+.stage:nth-child(1) .track{ background:linear-gradient(to right,var(--ice),rgba(159,216,255,.15)); }
+.stage:nth-child(2) .track{ background:linear-gradient(to right,rgba(159,216,255,.85),rgba(159,216,255,.13)); }
+.stage:nth-child(3) .track{ background:linear-gradient(to right,rgba(159,216,255,.7),rgba(159,216,255,.11)); }
+.stage:nth-child(4) .track{ background:linear-gradient(to right,rgba(255,209,102,.8),rgba(255,209,102,.12)); }
+.stage:nth-child(5) .track{ background:linear-gradient(to right,var(--green),rgba(70,221,147,.13)); }
+
+.stopnote{
+  margin-top:20px;
+  border:1px solid rgba(255,90,81,.35);
+  background:rgba(255,90,81,.05);
+  padding:14px 16px;
+  font-family:var(--mono);
+  font-size:12.6px; line-height:1.6; color:#f0cfcc;
+}
+.stopnote b{ color:var(--red); letter-spacing:.06em; }
+
+/* =========================================================
+   FOOTER
+   ========================================================= */
+
+footer{
+  padding:clamp(34px,7vw,64px) 0 clamp(44px,9vw,80px);
+}
+.foot-grid{
+  display:grid; gap:20px;
+  grid-template-columns:1fr;
+  align-items:end;
+}
+@media (min-width:760px){ .foot-grid{ grid-template-columns:1fr auto; } }
+.foot-mark{
+  font-family:var(--mono);
+  font-size:clamp(17px,4.4vw,28px);
+  letter-spacing:-.02em; color:var(--ink-dim); margin:0 0 8px;
+}
+.foot-mark b{ color:var(--ink); font-weight:600; }
+.foot-meta{ font-family:var(--mono); font-size:10px; letter-spacing:.18em; text-transform:uppercase; color:var(--ink-mute); }
+.tape{
+  display:flex; gap:2px; flex-wrap:wrap; max-width:340px;
+}
+.tape i{ width:5px; height:20px; background:var(--rule-2); display:block; }
+.tape i.a{ background:var(--amber); }
+.tape i.c{ background:var(--cyan); }
+.tape i.m{ background:var(--magenta); }
+.tape i.r{ background:var(--red); }
+.tape i.l{ background:var(--lime); }
+
+/* small screens: tighter type in dense fields */
+@media (max-width:520px){
+  .flip,.opt,.prey-def,.tz-body,.bug{ font-size:13px; }
+  .brief-row{ grid-template-columns:78px 1fr; gap:10px; }
+  .gauge{ padding:14px 8px 12px; }
+}
+</style>
+</head>
+<body>
+
+<!-- ============================ MASTHEAD ============================ -->
+<header class="mast">
+  <div class="wrap">
+    <div class="mast-strip">
+      <span class="rec"><span class="dot"></span>REC · SESSION CLOSED</span>
+      <span>2026&#8209;09&#8209;19 · 17:06</span>
+      <span>MODE: AUTONOMOUS</span>
+      <span>CHANNEL: COACH</span>
+      <span>BUFFER: 138 ENTRIES</span>
+    </div>
+
+    <h1 class="title">ORCHESTRATOR<br><span class="fade">FLIGHT</span> RECORDER</h1>
+    <p class="subtitle">// a full-tape readout of one ideation run on the factory floor</p>
+
+    <dl class="brief">
+      <div class="brief-row">
+        <dt>Topic</dt>
+        <dd>Claude Code <b>agent-orchestration system</b>: one orchestrator the user talks to, single-responsibility subagents (jira / analyst / planner / executor / tester / verifier / committer) reporting only upward, worktree-per-feature, Docker sandbox, ephemeral resources, local web observability app, terminal-first, token-minimal.</dd>
+      </div>
+      <div class="brief-row">
+        <dt>Goal</dt>
+        <dd>Build <b>the factory floor Deep uses to build other products</b> — must generalize across projects, not one repo.</dd>
+      </div>
+      <div class="brief-row">
+        <dt>Status</dt>
+        <dd><span class="status-ok">■ COMPLETE</span></dd>
+      </div>
+    </dl>
+
+    <div class="readout">
+      <div class="gauge g1">
+        <span class="num">127</span>
+        <span class="lab">ideas</span>
+        <span class="bar"><span></span></span>
+      </div>
+      <div class="gauge g2">
+        <span class="num">5</span>
+        <span class="lab">lenses</span>
+        <span class="bar"><span></span></span>
+      </div>
+      <div class="gauge g3">
+        <span class="num">138</span>
+        <span class="lab">logged entries</span>
+        <span class="bar"><span></span></span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ============================ LENS 01 ============================ -->
+<section class="lens" id="l1">
+  <div class="wrap">
+    <div class="lens-head">
+      <span class="lens-no">01</span>
+      <h2 class="lens-name">ASSUMPTION REVERSAL</h2>
+      <div class="lens-meta"><span>33 IDEAS</span><span>OPERATION: INVERT</span><span>14 LOAD-BEARING BELIEFS</span></div>
+      <p class="lens-insight">Spec rests on 14 unexamined assumptions; flipping each is the fastest route to the design space Deep has not seen. <span class="ii">Each plate below shows the belief that was struck out, and what stood up in its place.</span></p>
+    </div>
+
+    <div class="flipfield">
+
+      <article class="flip">
+        <span class="fid">REV·01</span>
+        <span class="was">Human attention is free and interruptible at will</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Interrupt budget:</b> each subagent gets N human-interrupt tokens per feature, spending one reaches Deep directly — makes attention a priced resource instead of orchestrator whim.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·02</span>
+        <span class="was">Questions are served first-come, first-answered</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Escalation auction:</b> blocked agents bid their interrupt budget, highest-value question surfaces first, Deep answers one question not a queue.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·03</span>
+        <span class="was">The orchestrator's job is coordination</span>
+        <span class="pivot">⇄</span>
+        <p class="now">Name the orchestrator role precisely as <b>The Interviewer</b> — its real job is question compression, merging 5 subagent questions into 1 human question.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·04</span>
+        <span class="was">Agents must message each other to collaborate</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Blackboard architecture:</b> no agent-to-agent messaging, but a shared append-only blackboard per worktree, any agent reads, only section owner writes.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·05</span>
+        <span class="was">Report-upward means total mutual blindness</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Read-only peering:</b> agents may read each other outputs but may never ask each other anything — kills round-trips while preserving report-upward rule.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·06</span>
+        <span class="was">Coordination overhead is invisible and untracked</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Transcript tax:</b> every orchestrator-relayed message logs its token cost to the dashboard so coordination overhead becomes a visible first-class metric.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·07</span>
+        <span class="was">Domain ownership is enforced by written policy</span>
+        <span class="pivot">⇄</span>
+        <p class="now">Enforce domain ownership with <b>capability tokens not policy</b> — the jira credential exists in exactly one sandbox, so agents cannot disobey what they cannot reach.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·08</span>
+        <span class="was">Every external integration deserves an agent</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Tool-server subagents:</b> jira / github / slack are not agents but MCP servers with a tiny LLM in front for intent translation — cheaper, deterministic, cacheable.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·09</span>
+        <span class="was">Every call has to go through a model</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Deterministic shim first:</b> jira agent answers 80 percent of calls from a typed API with zero LLM tokens, escalating to a model only for fuzzy lookups.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·10</span>
+        <span class="was">Ephemeral means destroyed on completion</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Worktree hibernation instead of destruction:</b> snapshot container plus db to a tarball, delete compute, resurrect instantly when the feature reopens.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·11</span>
+        <span class="was">Cleanup should happen the instant work ends</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Destroy on merge plus 24h post-mortem window</b> so a bad merge can be inspected with its original environment still alive.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·12</span>
+        <span class="was">Ephemeral resources means ephemeral evidence</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Keep the artifact, kill the compute:</b> worktree dies but the flight recorder (transcripts, diffs, decisions, costs) persists forever and is indexed for future retrieval.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·13</span>
+        <span class="was">Agents specialize by verb — plan, execute, test</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Codebase-region agents:</b> agents own directories not verbs, so an auth agent accumulates real expertise in its region across many features.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·14</span>
+        <span class="was">Specialization runs along one axis only</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Verbs × regions matrix:</b> role agents stay stateless, region agents are stateful memory-holders that role agents consult before acting.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·15</span>
+        <span class="was">Every feature starts from a blank slate</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>The Historian subagent:</b> only job is answering have-we-done-this-before from the flight-recorder index — cheap model, big retrieval index.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·16</span>
+        <span class="was">Fewer tokens out is always cheaper</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Minimal output is a false economy</b> when it causes rework — measure tokens-per-merged-feature not tokens-per-call.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·17</span>
+        <span class="was">Compression and brevity are the same thing</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Structured output not short output:</b> enforce a JSON schema per agent to get compression and machine-checkable handoffs simultaneously.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·18</span>
+        <span class="was">Verbosity always costs money</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Two-channel output:</b> thin control channel (schema, enters orchestrator context) plus fat evidence channel (disk / dashboard, never enters context unless requested) — verbosity becomes free.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·19</span>
+        <span class="was">Tokens are the scarce resource</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Reframe the scarce resource as orchestrator context window</b> not tokens — design for what the orchestrator must hold, let everything else be fat and on disk.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·20</span>
+        <span class="was">One plan, one executor, one attempt</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Speculative parallel execution:</b> planner emits 3 plans, 3 executors run in 3 worktrees at once, verifier picks the winner — compute is cheap, Deep time is not.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·21</span>
+        <span class="was">Tests are written after the code exists</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Test-first inversion:</b> tester runs FIRST and writes failing tests from the feature description, making executor definition-of-done mechanical and killing verify ambiguity.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·22</span>
+        <span class="was">Work flows forward: spec → code → commit</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Backward chaining from the commit:</b> start by writing the commit message and PR description, work backwards to the diff required — forces intent clarity up front.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·23</span>
+        <span class="was">Observability is a read-only window</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Steerable dashboard:</b> click any running agent to pause, inject a note, kill, or fork it — observability without control is just anxiety.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·24</span>
+        <span class="was">The past is fixed once it has happened</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Time-travel replay:</b> scrub the timeline backward, change one decision, re-run from that point — the flight recorder makes this possible.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·25</span>
+        <span class="was">The web app is the primary interface</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Build the TUI first</b> and the web app as a second renderer of the same event stream — Deep is a terminal multitasker, one event log two front-ends.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·26</span>
+        <span class="was">Timelines are measured in elapsed time</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Cost heat-map:</b> color the timeline by dollars rather than duration to expose which agent is the money pit at a glance.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·27</span>
+        <span class="was">When an agent is unsure, it asks the human</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Answer-from-repo first:</b> every clarifying question must be attempted against code, git history and past features before reaching Deep — track the deflection rate as a metric.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·28</span>
+        <span class="was">An answer is consumed once and forgotten</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Decision ledger:</b> every answer Deep gives becomes a durable reusable project rule, checked before any agent asks again — answer once, never again.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·29</span>
+        <span class="was">The system waits to be prompted</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Ambient backlog:</b> orchestrator watches jira, CI failures and flaky tests and proposes features to Deep rather than waiting to be prompted.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·30</span>
+        <span class="was">Done means merged</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Extend the pipeline past merge</b> with deploy agent, canary watcher and auto-revert — done becomes a production metric not a git event.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·31</span>
+        <span class="was">Resources are created fresh per feature</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Resource pool with leases:</b> pre-warmed postgres / redis containers leased to worktrees and wiped on return, killing per-feature cold-start cost.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·32</span>
+        <span class="was">Each agent is pinned to one fixed model</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Model ladder with automatic promotion:</b> every subtask starts on the cheapest model and retries on a stronger one only on failed verification.</p>
+      </article>
+
+      <article class="flip">
+        <span class="fid">REV·33</span>
+        <span class="was">Model assignment is hand-tuned forever</span>
+        <span class="pivot">⇄</span>
+        <p class="now"><b>Escalation telemetry is a map of where cheap models fail</b>, and it auto-tunes the default model assignment over time.</p>
+      </article>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============================ LENS 02 ============================ -->
+<section class="lens" id="l2">
+  <div class="wrap">
+    <div class="lens-head">
+      <span class="lens-no">02</span>
+      <h2 class="lens-name">MORPHOLOGICAL ANALYSIS</h2>
+      <div class="lens-meta"><span>26 IDEAS</span><span>OPERATION: RECOMBINE</span><span>15 PARAMETERS</span></div>
+      <p class="lens-insight">The design space has 15 independent parameters — topology, specialization axis, isolation unit, resource lifecycle, human touchpoint, memory scope, model assignment, comms medium, trigger, verification, failure handling, observability transport, concurrency, state persistence, cost control. <span class="ii">Deep's spec picks one value each, leaving most combinations untried.</span></p>
+    </div>
+
+    <div class="morphbox">
+      <div class="morphbox-cap">
+        <span>MORPHOLOGICAL BOX · <span class="k">PARAMETER COVERAGE THIS RUN</span></span>
+        <span>LIT CELL = OPTION GENERATED</span>
+      </div>
+      <div class="matrix">
+        <div class="mcell"><span class="p">P01 Topology</span><span class="pips"><i class="on"></i><i class="on"></i><i></i></span></div>
+        <div class="mcell"><span class="p">P02 Specialization axis</span><span class="pips"><i class="on"></i><i class="on"></i><i></i></span></div>
+        <div class="mcell"><span class="p">P03 Isolation unit</span><span class="pips"><i class="on"></i><i></i><i></i></span></div>
+        <div class="mcell"><span class="p">P04 Resource lifecycle</span><span class="pips"><i class="on"></i><i></i><i></i></span></div>
+        <div class="mcell"><span class="p">P05 Human touchpoint</span><span class="pips"><i class="on"></i><i class="on"></i><i></i></span></div>
+        <div class="mcell"><span class="p">P06 Memory scope</span><span class="pips"><i class="on"></i><i class="on"></i><i></i></span></div>
+        <div class="mcell"><span class="p">P07 Model assignment</span><span class="pips"><i class="on"></i><i></i><i></i></span></div>
+        <div class="mcell"><span class="p">P08 Comms medium</span><span class="pips"><i class="on"></i><i></i><i></i></span></div>
+        <div class="mcell empty"><span class="p">P09 Trigger</span><span class="pips"><i></i><i></i><i></i></span></div>
+        <div class="mcell"><span class="p">P10 Verification</span><span class="pips"><i class="on"></i><i class="on"></i><i class="on"></i></span></div>
+        <div class="mcell"><span class="p">P11 Failure handling</span><span class="pips"><i class="on"></i><i></i><i></i></span></div>
+        <div class="mcell"><span class="p">P12 Observability transport</span><span class="pips"><i class="on"></i><i class="on"></i><i></i></span></div>
+        <div class="mcell"><span class="p">P13 Concurrency</span><span class="pips"><i class="on"></i><i></i><i></i></span></div>
+        <div class="mcell"><span class="p">P14 State persistence</span><span class="pips"><i class="on"></i><i class="on"></i><i class="on"></i></span></div>
+        <div class="mcell"><span class="p">P15 Cost control</span><span class="pips"><i class="on"></i><i class="on"></i><i class="on"></i></span></div>
+      </div>
+    </div>
+
+    <div class="optlist">
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·01</span><span class="odim">P08 comms medium</span></div>
+        <p><b>Git-as-the-message-bus:</b> agents communicate by committing to the worktree, every handoff is a commit, the timeline IS git log — audit, replay and observability come free.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·02</span><span class="odim">P14 state persistence</span></div>
+        <p><b>Git notes for agent metadata:</b> attach reasoning, cost and decisions to commits via git notes so context travels with the repo and needs zero extra infra.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·03</span><span class="odim">P12 observability</span></div>
+        <p><b>OTel-native instrumentation:</b> every agent turn is a span, the dashboard is just a trace viewer — reuse Jaeger / Grafana instead of building observability from scratch.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·04</span><span class="odim">P12 observability</span></div>
+        <p><b>SQLite append-only event store per feature:</b> single portable file the dashboard tails, crash-safe, trivially inspectable.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·05</span><span class="odim">P14 state persistence</span></div>
+        <p><b>Event-sourced system state:</b> state is a fold over the event log, agents are crash-safe, the dashboard is just a projection.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·06</span><span class="odim">P01 topology</span></div>
+        <p><b>Hierarchy of orchestrators:</b> a feature-orchestrator per worktree plus a meta-orchestrator across features as the thing Deep talks to — scales to N parallel features without context explosion.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·07</span><span class="odim">P02 specialization</span></div>
+        <p><b>Risk-tiered agents</b> classified by blast radius (read-only, writes-code, writes-prod, spends-money) with different approval gates and sandbox strictness per tier.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·08</span><span class="odim">P05 human touchpoint</span></div>
+        <p><b>Approval gates replace questions entirely:</b> agents make assumptions, record them in an assumption log, Deep approves or rejects at gate points instead of answering a question queue.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·09</span><span class="odim">P05 human touchpoint</span></div>
+        <p><b>Async question inbox:</b> questions accumulate and Deep batch-answers them like email — never interrupted, fits terminal multitasking.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·10</span><span class="odim">P07 model assignment</span></div>
+        <p><b>Task-complexity router:</b> a tiny classifier scores file count, diff size and ambiguity, then routes to haiku / sonnet / opus per task instead of fixed per-agent models.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·11</span><span class="odim">P06 memory scope</span></div>
+        <p><b>Cross-repo global memory:</b> patterns learned building product A are available when building product B — this is the actual leverage of one-system-many-products.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·12</span><span class="odim">P06 memory scope</span></div>
+        <p><b>Per-region memory files:</b> every directory gets an auto-maintained AGENTS.md that agents update as they learn, so memory lives beside the code it describes.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·13</span><span class="odim">P10 verification</span></div>
+        <p><b>Two-tier verification economics:</b> typecheck, lint and tests as gate 1 (free, deterministic), LLM review as gate 2 — never pay for gate 2 if gate 1 fails.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·14</span><span class="odim">P10 verification</span></div>
+        <p><b>Canary-as-final-verifier:</b> for products with production traffic, the last verification step is real users not another model.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·15</span><span class="odim">P03 isolation unit</span></div>
+        <p><b>Three-tier isolation ladder</b> chosen by risk classification: in-place edit for a typo, branch-only for small changes, full worktree plus container for real features.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·16</span><span class="odim">P02 specialization</span></div>
+        <p><b>Generalist model with tool-scoped personas:</b> no separate agents at all, just one model with different system prompts and different tool grants — an agent is merely a capability profile.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·17</span><span class="odim">P14 state persistence</span></div>
+        <p><b>Agent as a pure function:</b> stateless, takes a typed input file, emits a typed output file — fully resumable, unit-testable, and replayable.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·18</span><span class="odim">P01 topology</span></div>
+        <p><b>Deterministic workflow engine with LLM only at the leaves:</b> the pipeline is code, not a model deciding what comes next — huge token savings and far higher reliability.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·19</span><span class="odim">P15 cost control</span></div>
+        <p><b>Dry-run mode:</b> the whole pipeline executes against a mock executor to show the plan and a cost estimate before a single real dollar is spent.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·20</span><span class="odim">P10 verification</span></div>
+        <p><b>Shadow mode benchmarking:</b> run the system against a feature Deep already built and diff its output against the real commit — earn trust empirically before delegating.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·21</span><span class="odim">P15 cost control</span></div>
+        <p><b>Cost-per-feature leaderboard:</b> historical table of feature vs cost vs rework rate used to tune the system with evidence instead of intuition.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·22</span><span class="odim">P15 cost control</span></div>
+        <p><b>Dollar cap with graceful degradation:</b> at 80 percent of budget the system downshifts every agent to the cheapest model and narrows scope rather than dying.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·23</span><span class="odim">P15 cost control</span></div>
+        <p><b>Wall-clock cap per feature</b> forcing agents to report partial progress, preventing silent runaway.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·24</span><span class="odim">P11 failure handling</span></div>
+        <p><b>Step cap per agent</b> as the cheapest possible infinite-loop guard.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·25</span><span class="odim">P04 resource lifecycle</span></div>
+        <p><b>Pooled warm containers plus snapshot-hibernate:</b> worktree state snapshots into the pool on pause, eliminating cold-start on both provision and resume.</p>
+      </div>
+
+      <div class="opt">
+        <div class="otop"><span class="oid">MOR·26</span><span class="odim">P13 concurrency</span></div>
+        <p><b>N-plans-parallel then vote:</b> three planners produce three plans, the orchestrator merges or picks, cost is trivial compared to executing the wrong plan.</p>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============================ LENS 03 ============================ -->
+<section class="lens" id="l3">
+  <div class="wrap">
+    <div class="lens-head">
+      <span class="lens-no">03</span>
+      <h2 class="lens-name">TRIZ CONTRADICTION</h2>
+      <div class="lens-meta"><span>24 IDEAS</span><span>OPERATION: DISSOLVE</span><span>12 CORE CONTRADICTIONS</span></div>
+      <p class="lens-insight">Twelve core contradictions sit inside the spec — each one Deep currently resolves by trading off, and TRIZ says most can be won on both sides <span class="ii">by separating in time, space, or scale.</span></p>
+    </div>
+
+    <div class="triz">
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">agents need rich context</div><div class="clash">⚡</div><div class="f fb">must emit few tokens</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·01</span><span class="sep">separate in space</span></div>
+          <p>Context contradiction resolved by separation in space: <b>rich context lives in the agent's own scratch on disk, only a thin schema crosses the boundary.</b></p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">agents need rich context</div><div class="clash">⚡</div><div class="f fb">must emit few tokens</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·02</span><span class="sep">separate in time</span></div>
+          <p>Same contradiction resolved by separation in time: <b>rich context during the exploration turns, compressed summary only at handoff</b> — compression becomes a pipeline step not a standing constraint.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">complete context up front</div><div class="clash">⚡</div><div class="f fb">context must stay cheap</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·03</span><span class="sep">on condition</span></div>
+          <p><b>Retrieval-not-injection:</b> agents pull the context they need on demand rather than being handed everything up front, making context cost proportional to actual need.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">orchestrator must know everything</div><div class="clash">⚡</div><div class="f fb">its window is finite</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·04</span><span class="sep">separate in space</span></div>
+          <p><b>Orchestrator holds pointers not content:</b> a manifest of artifacts with one-line summaries, reading a full artifact only when a decision requires it — orchestrator context is an index not a library.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">long-running session</div><div class="clash">⚡</div><div class="f fb">fixed context window</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·05</span><span class="sep">separate in time</span></div>
+          <p><b>Rolling orchestrator:</b> re-instantiate the orchestrator per phase from a durable state file so context never accumulates — state is on disk, context is disposable.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">full autonomy</div><div class="clash">⚡</div><div class="f fb">human control</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·06</span><span class="sep">rename the variable</span></div>
+          <p><b>Autonomy-versus-control dissolves once the real variable is named as reversibility not trust</b> — auto-approve reversible actions, gate irreversible ones.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">move fast unattended</div><div class="clash">⚡</div><div class="f fb">never break anything</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·07</span><span class="sep">system level</span></div>
+          <p><b>Undo-first design:</b> engineer everything to be reversible (worktree, branch, canary, auto-revert) and then full autonomy becomes safe by construction.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">isolate every feature</div><div class="clash">⚡</div><div class="f fb">features touch shared files</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·08</span><span class="sep">on condition</span></div>
+          <p><b>Merge-conflict predictor:</b> a cheap agent checks which files in-flight features touch and serializes only the overlapping ones — isolation by default, coordination only on collision.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">isolated worktrees</div><div class="clash">⚡</div><div class="f fb">shared knowledge</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·09</span><span class="sep">separate in space</span></div>
+          <p><b>Shared read-only knowledge base plus per-feature code overlay:</b> knowledge is shared while code stays isolated, winning both sides of the isolation contradiction.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">one owner per domain</div><div class="clash">⚡</div><div class="f fb">owner becomes a bottleneck</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·10</span><span class="sep">split the object</span></div>
+          <p><b>Split the jira agent into a deterministic cache plus an LLM shim</b> so the ownership bottleneck disappears — 80 percent of requests become local reads.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">single-writer discipline</div><div class="clash">⚡</div><div class="f fb">many concurrent readers</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·11</span><span class="sep">separate in space</span></div>
+          <p><b>Read-replica pattern for owned domains:</b> any agent may read a cached snapshot, only the owning agent may write — preserves single-writer discipline without serializing readers.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">resources ready instantly</div><div class="clash">⚡</div><div class="f fb">nothing idles at cost</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·12</span><span class="sep">separate in time</span></div>
+          <p><b>Provision-ahead:</b> predict resource needs from the plan and warm containers during the planning phase, hiding provisioning latency in time that was already being spent.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">cheap model</div><div class="clash">⚡</div><div class="f fb">correct output</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·13</span><span class="sep">system level</span></div>
+          <p><b>A cheap executor paired with a stronger reviewer is frequently cheaper than a strong executor alone</b> — buy verification not generation.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">task is too hard</div><div class="clash">⚡</div><div class="f fb">bigger model costs more</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·14</span><span class="sep">separate in scale</span></div>
+          <p><b>Decomposition as a cost strategy:</b> when a cheap model fails, the right move is often splitting the task smaller rather than escalating to a bigger model.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">keep everything</div><div class="clash">⚡</div><div class="f fb">storage and attention cost</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·15</span><span class="sep">on condition</span></div>
+          <p><b>Fidelity sampling for observability:</b> full transcripts retained for failed runs, compressed summaries for successful ones — detail where it actually pays.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">rich telemetry</div><div class="clash">⚡</div><div class="f fb">agents must spend no tokens</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·16</span><span class="sep">move to the harness</span></div>
+          <p><b>Observability written by the runtime not by the agents:</b> the harness records what agents did so agents never spend tokens describing themselves — free telemetry.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">maximum parallelism</div><div class="clash">⚡</div><div class="f fb">merge safety</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·17</span><span class="sep">on condition</span></div>
+          <p><b>Parallelism bounded by conflict domain rather than by a fixed count:</b> run as many features at once as have disjoint file sets.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">needs the network</div><div class="clash">⚡</div><div class="f fb">network is the attack surface</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·18</span><span class="sep">separate in time</span></div>
+          <p><b>Two-phase sandbox:</b> a provisioning phase with network access to install dependencies, then network-off for execution — safety and capability separated in time.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">keep network access</div><div class="clash">⚡</div><div class="f fb">keep containment</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·19</span><span class="sep">separate in space</span></div>
+          <p><b>Egress allowlist proxy</b> so agents keep network access but only to approved hosts, every call logged.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">thorough verification</div><div class="clash">⚡</div><div class="f fb">fast turnaround</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·20</span><span class="sep">separate in time</span></div>
+          <p><b>Pipeline the phases</b> so verification of feature N runs concurrently with planning of feature N+1, hiding verification latency entirely.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">fast feedback</div><div class="clash">⚡</div><div class="f fb">full-suite cost</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·21</span><span class="sep">separate in scale</span></div>
+          <p><b>Progressive verification:</b> lint on every file write, tests on every logical chunk, full suite once at the end — fast feedback without paying full-suite cost repeatedly.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">one universal engine</div><div class="clash">⚡</div><div class="f fb">every project differs</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·22</span><span class="sep">separate in space</span></div>
+          <p><b>Generic engine plus per-project profile:</b> the orchestration engine is universal and every scrap of project knowledge lives in one profile file (stack, commands, conventions, resources).</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">works on any repo</div><div class="clash">⚡</div><div class="f fb">onboarding each repo costs time</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·23</span><span class="sep">system level</span></div>
+          <p><b>Bootstrap agent whose only job is analyzing a brand-new repo and authoring its project profile</b> — the system onboards itself to each new product.</p>
+        </div>
+      </article>
+
+      <article class="tz">
+        <div class="tz-forces">
+          <div class="f fa">many constraints at once</div><div class="clash">⚡</div><div class="f fb">one pair of eyes</div>
+        </div>
+        <div class="tz-body">
+          <div class="tz-tags"><span class="tz-id">TRZ·24</span><span class="sep">on condition</span></div>
+          <p><b>Surface the currently binding constraint in the dashboard</b> (is it cost, context, wall-clock, or conflicts) so Deep always knows which bottleneck to attack next.</p>
+        </div>
+      </article>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============================ LENS 04 ============================ -->
+<section class="lens" id="l4">
+  <div class="wrap">
+    <div class="lens-head">
+      <span class="lens-no">04</span>
+      <h2 class="lens-name">PREDATOR &amp; PREY</h2>
+      <div class="lens-meta"><span>24 IDEAS</span><span>OPERATION: SURVIVE</span><span>15 PREDATORS</span></div>
+      <p class="lens-insight">Fifteen predators stalk this system. <span class="ii">Every card below is an evolved defense — the trait this organism grows in order to not be eaten.</span></p>
+    </div>
+
+    <div class="bestiary">
+      <span>◤ context poisoning</span><span>◤ cost blowout</span><span>◤ plausible-but-wrong code</span><span>◤ merge hell</span><span>◤ orchestrator bottleneck</span><span>◤ trust collapse</span><span>◤ nondeterminism</span><span>◤ secret leakage</span><span>◤ destructive actions</span><span>◤ spec drift</span><span>◤ model deprecation</span><span>◤ maintenance burden</span><span>◤ alert fatigue</span><span>◤ tool outages</span><span>◤ sandbox escape</span>
+    </div>
+
+    <div class="preyfield">
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">context poisoning</span><span class="pid">PRE·01</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Immune checkpoint against context poisoning:</b> a cheap sanity agent validates every artifact against the ORIGINAL feature request before it propagates downstream.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">context poisoning</span><span class="pid">PRE·02</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Re-grounding rule:</b> every agent re-reads the original request verbatim, never a summary of a summary — prevents generation loss through the pipeline.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">context poisoning</span><span class="pid">PRE·03</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Provenance tags on every claim</b> so a wrong output can be traced back to the exact agent and step that introduced the error.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">cost blowout</span><span class="pid">PRE·04</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Metabolic cap with hibernation reflex:</b> a hard dollar ceiling per feature where the system sleeps and pings Deep rather than burning through the night.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">cost blowout</span><span class="pid">PRE·05</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Cost anomaly detector</b> that alerts when spend-per-step deviates from the historical baseline for similar features.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">plausible-but-wrong code</span><span class="pid">PRE·06</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Adversarial tester agent as a deliberate predator:</b> its job is to BREAK the implementation, not confirm it, and it is rewarded for finding failures.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">plausible-but-wrong code</span><span class="pid">PRE·07</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Property-based tests over example tests</b> so plausible-but-wrong code has nowhere to hide.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">merge hell</span><span class="pid">PRE·08</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Territorial marking:</b> features declare their file territory up front and the orchestrator refuses overlapping concurrent features or forces rebase-early.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">trust collapse</span><span class="pid">PRE·09</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Trust earned in phases:</b> phase 1 the system only analyzes and proposes while Deep merges manually, and autonomy is unlocked per risk tier as measured accuracy accrues.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">nondeterminism</span><span class="pid">PRE·10</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Determinism pinning:</b> temperature zero where possible, pinned model versions, full inputs recorded so any run is replayable, with nondeterminism quarantined to explicitly creative steps.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">secret leakage</span><span class="pid">PRE·11</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Secrets never enter context:</b> credentials injected as env vars into the tool-server container only, with output scanners redacting patterns before anything is logged or posted.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">destructive actions</span><span class="pid">PRE·12</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>No claws in the sandbox:</b> the executor container holds no push rights and no prod credentials, and only a separate gated committer agent can push, never force-push.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">destructive actions</span><span class="pid">PRE·13</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Protected branches as the immune barrier</b> — the last line of defense that holds even when every agent-level guard fails.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">spec drift</span><span class="pid">PRE·14</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Spec echo:</b> before any code is written the orchestrator restates the feature as acceptance criteria for Deep to confirm in one keystroke — the cheapest possible drift-killer.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">model deprecation</span><span class="pid">PRE·15</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Prompt and model abstraction layer plus a golden-task regression suite</b>, so swapping models becomes a tested migration rather than a leap of faith.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">maintenance burden · apex</span><span class="pid">PRE·16</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Biggest real predator is maintenance burden</b> — the orchestrator eating the very time it was built to save — so build on Claude Code's existing primitives (subagents, hooks, MCP, worktrees) as config plus small scripts, never a bespoke platform.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">alert fatigue</span><span class="pid">PRE·17</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Dashboard shows exceptions by default</b> with the full timeline available on demand — silence should mean success, or alert fatigue kills the tool.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">tool outages</span><span class="pid">PRE·18</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Circuit breaker plus cached read-replica</b> so a jira outage degrades to a stale read instead of halting the entire pipeline.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">sandbox escape</span><span class="pid">PRE·19</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Least-privilege container:</b> read-only root filesystem, only the worktree mounted, no docker socket, non-root user, dropped capabilities, seccomp profile.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">maintenance burden</span><span class="pid">PRE·20</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Design for the real predator — Deep's own future self at 2am</b> — by favoring boring inspectable state (files, git, sqlite) over clever distributed machinery.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">orchestrator bottleneck</span><span class="pid">PRE·21</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Escape hatch command</b> that dumps all in-flight work to an ordinary branch and detaches the system, so manual takeover is always one keystroke away.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">cost blowout</span><span class="pid">PRE·22</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Playing dead:</b> on repeated failure the system halts, writes a complete handoff document, and gets out of the way rather than thrashing expensively.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">tool outages</span><span class="pid">PRE·23</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Rate-limit aware scheduling for external tools</b>, with the owning agent holding a token bucket the rest of the system cannot deplete.</p></div>
+      </article>
+
+      <article class="prey">
+        <div class="prey-threat"><span class="fang">▲</span><span class="tname">orchestrator bottleneck</span><span class="pid">PRE·24</span></div>
+        <div class="prey-def"><span class="dlab">evolved defense</span>
+          <p><b>Chaos drill as an architecture test:</b> kill a random agent mid-run and see whether the system degrades or halts.</p></div>
+      </article>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============================ LENS 05 ============================ -->
+<section class="lens" id="l5">
+  <div class="wrap">
+    <div class="lens-head">
+      <span class="lens-no">05</span>
+      <h2 class="lens-name">SWARM LOGIC</h2>
+      <div class="lens-meta"><span>20 IDEAS</span><span>OPERATION: DECENTRALISE</span><span>NO MASTER PLAN</span></div>
+      <p class="lens-insight">Forbidding the master plan exposes that most of the orchestrator's job is work ASSIGNMENT, which a shared queue plus local rules does for free — <span class="ii">the orchestrator's real irreducible job is the human contract, not coordination.</span></p>
+    </div>
+
+    <div class="colony">
+      <div class="swarmgrid">
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·01</span><span class="brule">pheromone</span></div>
+          <p><b>Stigmergy via the filesystem:</b> agents leave marks (failing tests, TODO files, lint errors) and other agents are attracted to them — a failing test IS the pheromone, no coordinator required.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·02</span><span class="brule">local rules</span></div>
+          <p><b>Three dumb local rules replace the assignment logic:</b> fix a failing test you can fix, claim any work item matching your capability, write a note and die if you cannot progress in N steps.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·03</span><span class="brule">claiming</span></div>
+          <p><b>Claim-by-lockfile work distribution</b> eliminates the assignment step entirely and makes concurrency safe with no central scheduler.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·04</span><span class="brule">allocation</span></div>
+          <p><b>Ant-colony task allocation with response thresholds:</b> the longer a task waits and the more important it is, the more likely a lower-threshold agent picks it up — load balances itself.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·05</span><span class="brule">emergence</span></div>
+          <p><b>Emergent decomposition:</b> rather than a planner breaking the feature down, spawn agents that each attempt the whole feature and abort where competence runs out, leaving a note — the breakdown is discovered not designed.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·06</span><span class="brule">selection</span></div>
+          <p><b>Evolutionary variant selection:</b> N executors, brutal selection on test pass rate and diff size, then breed the survivor approach into the next round.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·07</span><span class="brule">quorum</span></div>
+          <p><b>Quorum sensing as a spec-drift defense:</b> do not begin executing until 2 of 3 analysts independently converge on the same interpretation of the request.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·08</span><span class="brule">signalling</span></div>
+          <p><b>Waggle dance:</b> an agent that found a productive approach broadcasts a compact how-I-did-it that other agents copy, giving cross-feature learning without designing a central memory.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·09</span><span class="brule">boundedness</span></div>
+          <p><b>Termite-mound bounded build:</b> agents may only modify files adjacent to already-changed files, naturally constraining diff sprawl.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·10</span><span class="brule">extensibility</span></div>
+          <p><b>Capability-tagged work queue</b> where agents pull what matches their profile — adding a new agent type is just adding a new puller, making the system trivially extensible.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·11</span><span class="brule">mortality</span></div>
+          <p><b>Death as a feature:</b> agents are cheap and mortal, any agent exceeding its step budget dies and leaves its partial work as a pheromone for the next one — robustness through disposability.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·12</span><span class="brule">ingestion</span></div>
+          <p><b>In a swarm there is no jira agent</b>, jira is simply another pheromone source polled into the shared work queue.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·13</span><span class="brule">telemetry</span></div>
+          <p><b>Local rules generate observability for free</b> — the event log of claims, releases and deaths IS the timeline the dashboard renders.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·14</span><span class="brule">decay</span></div>
+          <p><b>Pheromone decay:</b> stale work items lose priority and eventually expire, preventing a growing graveyard of half-finished tasks.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·15</span><span class="brule">recruitment</span></div>
+          <p><b>Recruitment instead of escalation:</b> a stuck agent raises its pheromone to attract a stronger model rather than escalating up a chain of command — the model ladder as swarm recruitment.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·16</span><span class="brule">locality</span></div>
+          <p><b>No global state at all:</b> everything an agent needs lives in the worktree it is standing in, giving portability and resumability for free.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·17</span><span class="brule">economy</span></div>
+          <p><b>Minimal viable swarm is radically cheaper to build than eight bespoke role agents</b> — three rules, one shared queue, N identical workers differing only in tool grants.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug">
+          <div class="bhead"><span class="bid">SWM·18</span><span class="brule">resilience</span></div>
+          <p><b>Anti-fragility architecture test:</b> kill a random agent mid-run, because a swarm shrugs where a pipeline halts.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug hybrid">
+          <div class="bhead"><span class="bid">SWM·19</span><span class="brule">settlement</span></div>
+          <p><b>The honest synthesis is hybrid</b> — swarm dynamics for the messy divergent middle (analysis, planning, exploration), strict pipeline for the convergent human-facing edges (spec confirmation, commit, merge).</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+        <article class="bug hybrid">
+          <div class="bhead"><span class="bid">SWM·20</span><span class="brule">settlement</span></div>
+          <p><b>Swarm for exploration and pipeline for delivery</b> makes the orchestrator responsible only for the two boundaries Deep actually cares about: what was asked, and what shipped.</p>
+          <span class="pher"><i></i><i></i><i></i></span>
+        </article>
+
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SYNTHESIS ============================ -->
+<section class="synth">
+  <div class="wrap">
+    <div class="synth-kicker">final entry · tape end · convergence</div>
+    <h1 class="synth-title">THE <em>SYNTHESIS</em></h1>
+    <p class="synth-lede">Five lenses, 127 ideas, and then the collapse — where separate ideas turn out to have been the same idea wearing different clothes, and one structural cut ends the argument.</p>
+
+    <div class="conv">
+
+      <div class="cv">
+        <div class="cvn">01</div>
+        <div class="cvb">
+          <h4>One plane, not three</h4>
+          <p>Two-channel output, orchestrator-holds-pointers and runtime-writes-telemetry are one principle — <b>separate the control plane from the evidence plane</b>; build the evidence plane once and all three come free.</p>
+        </div>
+      </div>
+
+      <div class="cv">
+        <div class="cvn">02</div>
+        <div class="cvb">
+          <h4>Git is five systems at once</h4>
+          <p><b>Git-as-message-bus solves comms, observability, replay, flight recorder and swarm stigmergy</b> with a single decision.</p>
+        </div>
+      </div>
+
+      <div class="cv">
+        <div class="cvn">03</div>
+        <div class="cvb">
+          <h4>Policy becomes physics</h4>
+          <p><b>Capability tokens convert the jira ownership rule from policy into physics</b> — agents cannot disobey what they cannot reach.</p>
+        </div>
+      </div>
+
+      <div class="cv">
+        <div class="cvn">04</div>
+        <div class="cvb">
+          <h4>The hidden axis is reversibility</h4>
+          <p><b>Reversibility not trust</b> is the hidden axis under the autonomy dial, trust collapse and risk tiers — blast radius is engineerable.</p>
+        </div>
+      </div>
+
+      <div class="cv">
+        <div class="cvn">05</div>
+        <div class="cvb">
+          <h4>The wrong resource was optimized</h4>
+          <p>Deep optimized the wrong resource: <b>compute is pooled and cheap, context and history are scarce</b>, so recycle compute aggressively and keep artifacts forever.</p>
+        </div>
+      </div>
+
+      <div class="cv">
+        <div class="cvn">06</div>
+        <div class="cvb">
+          <h4>Terseness was never the metric</h4>
+          <p>Minimal-output-to-save-tokens was the wrong goal — three lenses converged independently; <b>the metric is tokens-per-merged-feature</b> and terseness barely moves it while causing rework.</p>
+        </div>
+      </div>
+
+      <div class="cv">
+        <div class="cvn">07</div>
+        <div class="cvb">
+          <h4>Memory is the missing compounding asset</h4>
+          <p><b>The Historian plus cross-repo memory plus waggle dance are one idea</b> — memory across features and products is the compounding advantage and is absent from the current spec.</p>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ---------- BREAKTHROUGH ---------- -->
+    <div class="breakthrough">
+      <div class="bt-cap">
+        <span class="n">08</span>
+        <span class="w">▚ Breakthrough</span>
+      </div>
+      <div class="bt-body">
+        <p class="bt-claim">Make the orchestrator a dumb deterministic workflow engine with <span>intelligence only at the leaves.</span></p>
+
+        <div class="split">
+          <div class="split-src">
+            <span class="t">The Orchestrator</span>
+            <span class="s">a conversation and a scheduler, fused together</span>
+          </div>
+
+          <div class="crack" aria-hidden="true">
+            <svg viewBox="0 0 600 54" preserveAspectRatio="none" role="presentation">
+              <defs>
+                <linearGradient id="gsplit" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#ffd166" stop-opacity=".9"/>
+                  <stop offset="100%" stop-color="#ffd166" stop-opacity=".15"/>
+                </linearGradient>
+              </defs>
+              <path d="M300 0 L300 12 L288 20 L300 27 L286 35 L300 54" stroke="url(#gsplit)" stroke-width="2" fill="none"/>
+              <path d="M300 14 C 300 34, 150 26, 150 52" stroke="#ffd166" stroke-opacity=".5" stroke-width="1.2" fill="none"/>
+              <path d="M300 14 C 300 34, 450 26, 450 52" stroke="#3ad6e8" stroke-opacity=".5" stroke-width="1.2" fill="none"/>
+              <circle cx="150" cy="52" r="2.6" fill="#ffd166"/>
+              <circle cx="450" cy="52" r="2.6" fill="#3ad6e8"/>
+            </svg>
+          </div>
+
+          <div class="split-out">
+            <div class="half">
+              <span class="hk">keeps the model</span>
+              <span class="hn">The Interviewer</span>
+              <p class="hd">The only thing left running as a live LLM. Owns the human contract: compressing five agent questions into one human question.</p>
+              <ul>
+                <li>what was asked</li>
+                <li>what shipped</li>
+              </ul>
+              <span class="stamp">LLM · live</span>
+            </div>
+            <div class="half det">
+              <span class="hk">loses the model</span>
+              <span class="hn">The Scheduler</span>
+              <p class="hd">A deterministic workflow engine. The pipeline is code, not a model deciding what comes next — intelligence moves out to the leaves.</p>
+              <ul>
+                <li>assignment</li>
+                <li>sequencing</li>
+                <li>gates</li>
+              </ul>
+              <span class="stamp">CODE · deterministic</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ---------- BUILD ORDER ---------- -->
+    <div class="buildorder">
+      <div class="bo-head">
+        <span class="n">09</span>
+        <h3>BUILD ORDER</h3>
+      </div>
+      <div class="rail">
+        <div class="stage">
+          <span class="sn">01</span>
+          <span class="st">Event log + git-as-bus</span>
+          <p class="sd">The evidence plane first. Comms, replay and observability arrive together.</p>
+          <div class="track"></div>
+        </div>
+        <div class="stage">
+          <span class="sn">02</span>
+          <span class="st">Deterministic engine — 3 agents, not 8</span>
+          <p class="sd">The pipeline is code. Models only at the leaves.</p>
+          <div class="track"></div>
+        </div>
+        <div class="stage">
+          <span class="sn">03</span>
+          <span class="st">TUI on the event stream</span>
+          <p class="sd">Terminal-first. The web app is a second renderer of the same log.</p>
+          <div class="track"></div>
+        </div>
+        <div class="stage">
+          <span class="sn">04</span>
+          <span class="st">Shadow mode to measure</span>
+          <p class="sd">Run it against features already built. Diff against the real commit.</p>
+          <div class="track"></div>
+        </div>
+        <div class="stage">
+          <span class="sn">05</span>
+          <span class="st">Earn autonomy</span>
+          <p class="sd">Unlock per risk tier, only as measured accuracy accrues.</p>
+          <div class="track"></div>
+        </div>
+      </div>
+
+      <p class="stopnote"><b>&gt; CRITICAL:</b> shadow mode and dry run exist to tell Deep <b>when to STOP building</b> — the defense against maintenance burden as the likeliest project-killer.</p>
+    </div>
+
+  </div>
+</section>
+
+<!-- ============================ FOOTER ============================ -->
+<footer>
+  <div class="wrap">
+    <div class="foot-grid">
+      <div>
+        <p class="foot-mark">End of tape. <b>127 ideas</b> · <b>5 lenses</b> · <b>138 logged entries</b>.</p>
+        <p class="foot-meta">brainstorm-agent-orchestration-system · 2026-09-19 · mode autonomous · status complete</p>
+      </div>
+      <div class="tape" aria-hidden="true">
+        <i class="a"></i><i class="a"></i><i></i><i class="a"></i><i></i><i class="c"></i><i class="c"></i><i></i><i class="c"></i><i></i><i class="m"></i><i class="m"></i><i></i><i class="m"></i><i></i><i class="r"></i><i class="r"></i><i></i><i class="r"></i><i></i><i class="l"></i><i class="l"></i><i></i><i class="l"></i><i></i><i></i><i></i><i></i>
+      </div>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

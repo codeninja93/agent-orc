@@ -1,0 +1,1747 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reconciled Pipeline Walkthrough</title>
+<meta name="description" content="An interactive walkthrough of the Agent Orchestration System architecture spine: the paradigm, the feature lifecycle, and all 34 architecture decisions.">
+<style>
+:root{
+  --bg:#fbfbf9;
+  --surface:#ffffff;
+  --surface-2:#f4f4f1;
+  --surface-3:#ecece8;
+  --ink:#15181d;
+  --ink-2:#434a55;
+  --ink-3:#6c7484;
+  --line:#dcdcd6;
+  --line-strong:#bfbfb7;
+  --accent:#1f4fd8;
+  --accent-soft:#e7edfd;
+  --warn:#9a4a05;
+  --warn-soft:#fdf0e3;
+  --stop:#a11b2e;
+  --stop-soft:#fdeaed;
+  --ok:#14634a;
+  --ok-soft:#e5f3ee;
+  --code-bg:#f4f4f1;
+  --mono:ui-monospace,"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --t1:#1f4fd8; --t1b:#e7edfd;
+  --t2:#0f6b5c; --t2b:#e2f1ee;
+  --t3:#8a4b00; --t3b:#fbefdf;
+  --t4:#a11b2e; --t4b:#fbe9ec;
+  --t5:#5b3cad; --t5b:#eee9fb;
+  --t6:#155e8a; --t6b:#e3f0f8;
+  --t7:#4a5240; --t7b:#eef0e9;
+  --shadow:0 1px 2px rgba(20,24,30,.06),0 1px 1px rgba(20,24,30,.04);
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0e1014;
+    --surface:#15181e;
+    --surface-2:#191d25;
+    --surface-3:#212630;
+    --ink:#e7eaef;
+    --ink-2:#b2bac7;
+    --ink-3:#848d9c;
+    --line:#272d38;
+    --line-strong:#3a424f;
+    --accent:#7aa2ff;
+    --accent-soft:#182236;
+    --warn:#e0a463;
+    --warn-soft:#2a2013;
+    --stop:#f08a9b;
+    --stop-soft:#2c1419;
+    --ok:#66c2a5;
+    --ok-soft:#10241e;
+    --code-bg:#11151b;
+    --t1:#7aa2ff; --t1b:#16203a;
+    --t2:#5cc3ae; --t2b:#0f2420;
+    --t3:#dba05a; --t3b:#2a2013;
+    --t4:#f08a9b; --t4b:#2c1419;
+    --t5:#b39aff; --t5b:#211b36;
+    --t6:#6ab6e0; --t6b:#10242f;
+    --t7:#a9b394; --t7b:#1e2119;
+    --shadow:0 1px 2px rgba(0,0,0,.4);
+  }
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--bg);color:var(--ink);
+  font-family:var(--sans);font-size:15px;line-height:1.6;
+  overflow-x:hidden;
+}
+.wrap{max-width:1180px;margin:0 auto;padding:0 16px}
+code,kbd,pre,.mono{font-family:var(--mono)}
+code{
+  font-size:.86em;background:var(--code-bg);border:1px solid var(--line);
+  border-radius:4px;padding:.06em .32em;word-break:break-word;
+}
+pre{
+  background:var(--code-bg);border:1px solid var(--line);border-radius:8px;
+  padding:14px 16px;overflow-x:auto;font-size:12.5px;line-height:1.62;margin:0;
+}
+pre code{background:none;border:0;padding:0;font-size:inherit}
+a{color:var(--accent)}
+h1,h2,h3,h4{line-height:1.25;margin:0;font-weight:650;letter-spacing:-.011em}
+p{margin:0 0 .85em}
+p:last-child{margin-bottom:0}
+hr{border:0;border-top:1px solid var(--line);margin:34px 0}
+
+/* ---------- masthead ---------- */
+header.mast{
+  border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg,var(--surface),var(--bg));
+}
+.mast .wrap{padding-top:40px;padding-bottom:30px}
+.eyebrow{
+  font-family:var(--mono);font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--ink-3);margin-bottom:12px;
+}
+h1{font-size:clamp(28px,6.2vw,44px);margin-bottom:10px}
+.subtitle{font-size:clamp(15px,2.4vw,18px);color:var(--ink-2);max-width:66ch}
+.meta-strip{
+  display:flex;flex-wrap:wrap;gap:8px;margin-top:20px;
+}
+.pill{
+  font-family:var(--mono);font-size:11.5px;padding:4px 9px;border-radius:999px;
+  border:1px solid var(--line-strong);background:var(--surface);color:var(--ink-2);
+  white-space:nowrap;
+}
+.pill.solid{background:var(--accent-soft);border-color:transparent;color:var(--accent)}
+
+/* ---------- nav ---------- */
+nav.toc{
+  position:sticky;top:0;z-index:40;background:var(--bg);
+  border-bottom:1px solid var(--line);
+}
+nav.toc .scroller{
+  display:flex;gap:2px;overflow-x:auto;padding:0 16px;max-width:1180px;margin:0 auto;
+  scrollbar-width:thin;
+}
+nav.toc a{
+  font-family:var(--mono);font-size:11.5px;text-decoration:none;color:var(--ink-3);
+  padding:11px 10px;white-space:nowrap;border-bottom:2px solid transparent;
+}
+nav.toc a:hover{color:var(--ink);border-bottom-color:var(--line-strong)}
+
+/* ---------- sections ---------- */
+section{padding:44px 0;border-top:1px solid var(--line)}
+section:first-of-type{border-top:0}
+.sec-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:8px}
+.sec-num{
+  font-family:var(--mono);font-size:12px;color:var(--ink-3);
+  border:1px solid var(--line);border-radius:4px;padding:2px 7px;flex:none;
+}
+h2{font-size:clamp(21px,3.6vw,28px)}
+.lede{color:var(--ink-2);max-width:74ch;margin-bottom:24px;font-size:15.5px}
+h3{font-size:17px;margin:28px 0 10px}
+h4{font-size:14px;margin:18px 0 6px;color:var(--ink-2)}
+
+.card{
+  background:var(--surface);border:1px solid var(--line);border-radius:10px;
+  padding:18px;box-shadow:var(--shadow);
+}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:14px}
+
+.buys{border-left:3px solid var(--accent);background:var(--surface);padding:14px 16px;border-radius:0 8px 8px 0;border-top:1px solid var(--line);border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
+.buys h4{margin-top:0;color:var(--accent);font-family:var(--mono);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase}
+
+.note{
+  border:1px dashed var(--line-strong);border-radius:8px;padding:12px 14px;
+  background:var(--surface-2);font-size:14px;color:var(--ink-2);
+}
+.note strong{color:var(--ink)}
+
+/* ---------- tables ---------- */
+.tw{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:520px}
+th,td{text-align:left;padding:10px 13px;border-bottom:1px solid var(--line);vertical-align:top}
+th{
+  font-family:var(--mono);font-size:11px;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--ink-3);background:var(--surface-2);font-weight:600;position:sticky;top:0;
+}
+tr:last-child td{border-bottom:0}
+td.v{font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+
+/* ---------- diagrams ---------- */
+.figure{margin:22px 0}
+.figcap{
+  font-family:var(--mono);font-size:11.5px;color:var(--ink-3);margin-bottom:8px;
+  letter-spacing:.04em;text-transform:uppercase;
+}
+.dscroll{
+  overflow-x:auto;border:1px solid var(--line);border-radius:10px;
+  background:var(--surface);padding:10px;
+}
+.dscroll svg{display:block;width:100%;height:auto}
+.hint{font-size:12px;color:var(--ink-3);margin-top:6px;font-style:italic}
+
+svg text{font-family:var(--sans);fill:var(--ink)}
+svg .lbl{font-size:12.5px;font-weight:600}
+svg .sub{font-size:10.5px;fill:var(--ink-3);font-family:var(--mono)}
+svg .edge{font-size:10px;fill:var(--ink-3);font-family:var(--mono)}
+svg .nbox{fill:var(--surface-2);stroke:var(--line-strong);stroke-width:1.2}
+svg .nbox.key{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.5}
+svg .nbox.truth{fill:var(--t2b);stroke:var(--t2);stroke-width:1.5}
+svg .nbox.term{fill:var(--surface-3);stroke:var(--line-strong)}
+svg .nbox.bad{fill:var(--stop-soft);stroke:var(--stop)}
+svg .ln{stroke:var(--line-strong);stroke-width:1.3;fill:none}
+svg .ln.dash{stroke-dasharray:4 3}
+svg .ln.strong{stroke:var(--accent);stroke-width:1.7}
+svg g.node{transition:opacity .16s ease}
+svg g.node.dim{opacity:.26}
+svg g.node.hot rect{stroke:var(--accent);stroke-width:2.4;fill:var(--accent-soft)}
+svg g.node.hot text.lbl{fill:var(--accent)}
+
+/* ---------- lifecycle ---------- */
+.rail{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:18px 0 20px;
+}
+.stage{
+  text-align:left;cursor:pointer;font:inherit;color:inherit;
+  background:var(--surface);border:1px solid var(--line);border-radius:9px;
+  padding:10px 11px;display:flex;flex-direction:column;gap:3px;
+  transition:border-color .15s ease,background .15s ease,transform .15s ease;
+}
+.stage:hover{border-color:var(--line-strong);background:var(--surface-2)}
+.stage[aria-pressed="true"]{
+  border-color:var(--accent);background:var(--accent-soft);
+  box-shadow:inset 0 0 0 1px var(--accent);
+}
+.stage .n{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);letter-spacing:.07em}
+.stage[aria-pressed="true"] .n{color:var(--accent)}
+.stage .t{font-size:13.5px;font-weight:620;line-height:1.3}
+.stage .who{font-family:var(--mono);font-size:10.5px;color:var(--ink-3)}
+
+.stagepanel{
+  border:1px solid var(--line);border-radius:10px;background:var(--surface);
+  padding:18px;box-shadow:var(--shadow);
+}
+.sp-top{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;margin-bottom:6px}
+.sp-top h3{margin:0;font-size:19px}
+.sp-cap{font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+.sp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px;margin-top:14px}
+.sp-block h4{
+  margin:0 0 6px;font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+.sp-block p,.sp-block ul{font-size:14px;color:var(--ink-2);margin:0}
+.sp-block ul{padding-left:18px}
+.sp-block li{margin-bottom:3px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.adchip{
+  font-family:var(--mono);font-size:11.5px;padding:3px 8px;border-radius:5px;
+  border:1px solid var(--line-strong);background:var(--surface-2);color:var(--ink-2);
+  cursor:pointer;text-decoration:none;
+}
+.adchip:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+
+/* ---------- AD browser ---------- */
+.controls{
+  position:sticky;top:41px;z-index:30;background:var(--bg);
+  padding:12px 0 12px;border-bottom:1px solid var(--line);margin-bottom:18px;
+}
+.searchrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+#adsearch{
+  flex:1 1 220px;min-width:0;font:inherit;font-size:14px;padding:8px 11px;
+  border:1px solid var(--line-strong);border-radius:8px;background:var(--surface);color:var(--ink);
+}
+#adsearch:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
+.btn{
+  font:inherit;font-size:12.5px;padding:8px 12px;border-radius:8px;cursor:pointer;
+  border:1px solid var(--line-strong);background:var(--surface);color:var(--ink-2);
+}
+.btn:hover{background:var(--surface-2);color:var(--ink)}
+.filterrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}
+.fchip{
+  font-family:var(--mono);font-size:11.5px;padding:4px 9px;border-radius:999px;cursor:pointer;
+  border:1px solid var(--line-strong);background:var(--surface);color:var(--ink-2);
+}
+.fchip:hover{border-color:var(--ink-3)}
+.fchip[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.fchip .dot{display:inline-block;width:7px;height:7px;border-radius:99px;margin-right:5px;vertical-align:1px}
+.count{font-family:var(--mono);font-size:12px;color:var(--ink-3);margin-top:9px}
+
+.adlist{display:flex;flex-direction:column;gap:12px}
+.ad{
+  border:1px solid var(--line);border-left:4px solid var(--tc,var(--line-strong));
+  border-radius:10px;background:var(--surface);box-shadow:var(--shadow);overflow:hidden;
+  scroll-margin-top:150px;
+}
+.ad.hidden{display:none}
+.ad.flash{animation:flash 1.4s ease}
+@keyframes flash{0%,40%{background:var(--accent-soft)}100%{background:var(--surface)}}
+.ad-head{
+  display:flex;gap:11px;align-items:flex-start;padding:13px 15px;cursor:pointer;
+  user-select:none;
+}
+.ad-head:hover{background:var(--surface-2)}
+.ad-id{
+  font-family:var(--mono);font-size:12px;font-weight:700;color:var(--tc,var(--ink));
+  background:var(--tb,var(--surface-2));border-radius:5px;padding:3px 7px;flex:none;
+  white-space:nowrap;
+}
+.ad-title{flex:1;font-size:14.5px;font-weight:620;line-height:1.38;min-width:0}
+.ad-tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:5px}
+.tag{
+  font-family:var(--mono);font-size:10px;letter-spacing:.05em;text-transform:uppercase;
+  padding:2px 6px;border-radius:4px;background:var(--surface-3);color:var(--ink-3);
+}
+.tag.added{background:var(--t5b);color:var(--t5)}
+.tag.amended{background:var(--t3b);color:var(--t3)}
+.tag.theme{background:var(--tb);color:var(--tc)}
+.caret{
+  flex:none;font-family:var(--mono);font-size:13px;color:var(--ink-3);
+  transition:transform .16s ease;margin-top:2px;
+}
+.ad.open .caret{transform:rotate(90deg)}
+.ad-body{padding:0 15px 15px}
+.prevents{
+  background:var(--stop-soft);border:1px solid transparent;border-radius:8px;
+  padding:11px 13px;margin:0 15px 13px;
+}
+.prevents .k{
+  font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--stop);font-weight:700;display:block;margin-bottom:3px;
+}
+.prevents .v{font-size:13.8px;color:var(--ink);line-height:1.55}
+.field{margin-bottom:12px}
+.field:last-child{margin-bottom:0}
+.field .k{
+  font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--ink-3);font-weight:700;display:block;margin-bottom:4px;
+}
+.field .v{font-size:13.8px;color:var(--ink-2);line-height:1.62}
+.field.rule .v{color:var(--ink)}
+.why{
+  background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:11px 13px;
+}
+.why .k{color:var(--accent)}
+.why .v{font-size:13.5px}
+.ad-body{display:none}
+.ad.open .ad-body{display:block}
+.ad.open .prevents{margin-bottom:13px}
+
+.retired{
+  border:1px dashed var(--line-strong);border-radius:10px;background:transparent;
+  padding:13px 15px;color:var(--ink-3);font-size:13.5px;
+}
+.retired .ad-id{background:transparent;border:1px solid var(--line-strong);color:var(--ink-3);text-decoration:line-through}
+
+/* ---------- collapsible generic ---------- */
+details.fold{
+  border:1px solid var(--line);border-radius:10px;background:var(--surface);
+  margin-bottom:12px;overflow:hidden;
+}
+details.fold>summary{
+  cursor:pointer;padding:12px 15px;font-weight:620;font-size:14.5px;list-style:none;
+  display:flex;align-items:center;gap:9px;
+}
+details.fold>summary::-webkit-details-marker{display:none}
+details.fold>summary::before{
+  content:"▸";font-family:var(--mono);color:var(--ink-3);transition:transform .16s ease;
+}
+details.fold[open]>summary::before{transform:rotate(90deg)}
+details.fold>summary:hover{background:var(--surface-2)}
+.fold-body{padding:0 15px 15px}
+
+/* ---------- misc lists ---------- */
+ul.tight{margin:0;padding-left:20px}
+ul.tight li{margin-bottom:7px}
+ul.tight li:last-child{margin-bottom:0}
+.defer{border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:14px 16px;margin-bottom:10px}
+.defer .dt{font-weight:650;font-size:14.5px;margin-bottom:5px}
+.defer .safe{font-size:13.6px;color:var(--ink-2)}
+.defer .safe b{color:var(--ok);font-family:var(--mono);font-size:11px;letter-spacing:.07em;text-transform:uppercase}
+
+.flagged{
+  border:1px solid var(--warn);border-left-width:4px;background:var(--warn-soft);
+  border-radius:0 9px 9px 0;padding:13px 15px;margin-bottom:12px;
+}
+.flagged .ft{font-weight:650;font-size:14px;color:var(--warn);margin-bottom:4px;font-family:var(--mono)}
+.flagged .fb{font-size:13.8px;color:var(--ink-2)}
+
+.scope{border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:14px 16px}
+.scope .st{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--accent);margin-bottom:4px}
+.scope .sd{font-size:13.5px;color:var(--ink-2)}
+
+.statline{display:flex;gap:16px;flex-wrap:wrap;margin:6px 0 20px}
+.stat{border:1px solid var(--line);border-radius:9px;background:var(--surface);padding:11px 15px;min-width:120px}
+.stat .num{font-family:var(--mono);font-size:24px;font-weight:700;line-height:1.1}
+.stat .cap{font-family:var(--mono);font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3);margin-top:3px}
+
+footer{border-top:1px solid var(--line);padding:28px 0 48px;color:var(--ink-3);font-size:13px}
+
+@media (max-width:640px){
+  body{font-size:14.5px}
+  .mast .wrap{padding-top:28px;padding-bottom:22px}
+  section{padding:34px 0}
+  .controls{top:39px}
+  .ad-head{padding:11px 12px}
+  .prevents{margin-left:12px;margin-right:12px}
+  .ad-body{padding:0 12px 12px}
+}
+@media (prefers-reduced-motion:reduce){
+  *{animation-duration:.001ms !important;animation-iteration-count:1 !important;transition-duration:.001ms !important;scroll-behavior:auto !important}
+}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+
+<header class="mast">
+  <div class="wrap">
+    <div class="eyebrow">Architecture Spine · SPEC-agent-orchestrator · status: final</div>
+    <h1>Reconciled Pipeline</h1>
+    <p class="subtitle">A controller-style reconciler loop owns durable on-disk state and advances each feature by at most one action per pass; each action is a pure-function pipeline stage executed as an OS subprocess; everything observable is appended to a per-run event log that is the durable truth.</p>
+    <div class="meta-strip">
+      <span class="pill solid">34 live decisions</span>
+      <span class="pill">CAP-1 &rarr; CAP-23</span>
+      <span class="pill">altitude: initiative</span>
+      <span class="pill">created 2026-09-19</span>
+      <span class="pill">AD-6 retired</span>
+    </div>
+  </div>
+</header>
+
+<nav class="toc" aria-label="Sections">
+  <div class="scroller">
+    <a href="#paradigm">1 · Paradigm</a>
+    <a href="#lifecycle">2 · Feature lifecycle</a>
+    <a href="#decisions">3 · All 34 ADs</a>
+    <a href="#conventions">4 · Conventions</a>
+    <a href="#stack">5 · Stack</a>
+    <a href="#disk">6 · On disk</a>
+    <a href="#capmap">7 · Capability map</a>
+    <a href="#deferred">8 · Deferred</a>
+    <a href="#review">9 · What the review changed</a>
+  </div>
+</nav>
+
+<main class="wrap">
+
+<!-- ======================= 1. PARADIGM ======================= -->
+<section id="paradigm">
+  <div class="sec-head"><span class="sec-num">01</span><h2>The paradigm, in plain language</h2></div>
+  <p class="lede">Four words carry the whole design: <b>reconciler</b>, <b>durable</b>, <b>subprocess</b>, <b>append-only</b>. Each one converts a property that would otherwise have to be maintained by discipline into one the operating system or the filesystem maintains for you. Read this before any rule below; every rule is downstream of it.</p>
+
+  <div class="grid2">
+    <div class="card">
+      <h3 style="margin-top:0">A reconciler, not a supervisor</h3>
+      <p>A supervisor holds the run in memory: it knows which step is live, which container is leased, what to do next. Kill it and that knowledge is gone, so correctness depends on shutdown handlers firing in the right order — the code path least often exercised and hardest to test.</p>
+      <p>A reconciler holds nothing. Every pass it reads the checkpoint from disk, decides the single next action, takes it, writes the checkpoint back. There is no in-memory authority to lose.</p>
+      <p><b>What it buys:</b> closing the laptop mid-feature is not an incident. Crash recovery, instant disengage and the escape hatch stop being features that must be written and start being consequences of the loop's shape.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Durable on-disk state, ranked</h3>
+      <p>Two files per run. <code>events.jsonl</code> is append-only and is the truth. <code>state.json</code> is a checkpoint <em>derived</em> from it, kept only so the loop does not replay the world on every pass.</p>
+      <p>The ranking is the point. When they disagree after a crash — and they will — there is no arbitration to design: the log wins, the checkpoint is discarded and rebuilt.</p>
+      <p><b>What it buys:</b> one fact never has two named authorities. Every surface — TUI, web, shadow mode, consolidation — is a projection of the same log, so no two surfaces can disagree about what happened.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Stages that are OS subprocesses</h3>
+      <p>Every step agent is one <code>claude -p</code> process, spawned with a typed input file and a JSON schema for its output. Not a library call, not an in-process SDK object.</p>
+      <p>A subprocess <em>is</em> a pure function over typed files, and the process boundary is what enforces it. A stage cannot smuggle state to the next stage because there is nothing to smuggle it in. Kill and fork become trivial because the unit of work is a pid.</p>
+      <p><b>What it buys:</b> statelessness is enforced by the kernel and by a recorded baseline commit, not by reviewer vigilance. Re-running a step is safe by construction rather than by promise.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">An append-only event log</h3>
+      <p>One JSON object per line, one file per run, one writer. Nothing is ever mutated. Adding a new event type is never a breaking change because readers are required to ignore what they do not recognise.</p>
+      <p>Every emitter — engine phases, tool servers, step subprocesses — writes the same envelope, so a single timeline renders without special cases.</p>
+      <p><b>What it buys:</b> the run is debuggable with <code>jq</code> and <code>tail</code> at 2am, six weeks later, with no database to stand up. Any index is a derived projection you can throw away and rebuild.</p>
+    </div>
+  </div>
+
+  <div class="buys" style="margin-top:18px">
+    <h4>The compound effect</h4>
+    <p style="margin-bottom:0">Each property independently removes a class of bug. Together they remove the need for the system to be <em>careful</em>. A step cannot double-apply an edit (baseline reset). The engine cannot lose a run (nothing authoritative in memory). Two surfaces cannot disagree (one log). A stale answer cannot leak forward (config snapshot per run). The architecture's job is to make the failure modes structurally unavailable, so the single developer maintaining it does not have to hold them in his head.</p>
+  </div>
+
+  <h3 id="deps">Dependency direction</h3>
+  <p style="color:var(--ink-2);max-width:74ch">An arrow means <em>may depend on</em>; no edge may be reversed and no cycle may be introduced. <code>contracts</code> depends on nothing. No renderer, step subprocess, tool server or installer may import the engine; renderers reach it only by writing command intent files per <a class="adchip" data-goto="AD-19" href="#AD-19">AD-19</a>.</p>
+
+  <div class="figure">
+    <div class="figcap">Figure 1 — dependency direction</div>
+    <div class="dscroll">
+      <svg viewBox="0 0 900 450" role="img" aria-label="Dependency graph: installer, engine, TUI and web all depend on contracts; engine depends on runtime recorder and step subprocesses; step subprocesses depend on tool servers; everything depends on contracts." style="min-width:640px">
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+        </defs>
+        <g style="color:var(--line-strong)">
+          <!-- engine -> runtime -->
+          <path class="ln" d="M255,90 L255,120 L230,120 L230,148" marker-end="url(#ar)"/>
+          <!-- engine -> steps -->
+          <path class="ln" d="M320,90 L320,120 L430,120 L430,148" marker-end="url(#ar)"/>
+          <!-- steps -> tools -->
+          <path class="ln" d="M430,196 L430,254" marker-end="url(#ar)"/>
+          <!-- installer -> contracts -->
+          <path class="ln" d="M100,90 L100,368" marker-end="url(#ar)"/>
+          <!-- engine -> contracts (gutter between runtime and steps) -->
+          <path class="ln" d="M335,90 L335,368" marker-end="url(#ar)"/>
+          <!-- runtime -> contracts -->
+          <path class="ln" d="M230,196 L230,368" marker-end="url(#ar)"/>
+          <!-- steps -> contracts (around tools) -->
+          <path class="ln" d="M515,172 L540,172 L540,368" marker-end="url(#ar)"/>
+          <!-- tools -> contracts -->
+          <path class="ln" d="M430,302 L430,368" marker-end="url(#ar)"/>
+          <!-- tui -> contracts -->
+          <path class="ln" d="M620,90 L620,368" marker-end="url(#ar)"/>
+          <!-- web -> contracts -->
+          <path class="ln" d="M790,90 L790,368" marker-end="url(#ar)"/>
+        </g>
+        <g>
+          <rect class="nbox" x="30" y="44" width="140" height="46" rx="7"/>
+          <text class="lbl" x="100" y="65" text-anchor="middle">installer</text>
+          <text class="sub" x="100" y="80" text-anchor="middle">npx init</text>
+
+          <rect class="nbox key" x="200" y="44" width="160" height="46" rx="7"/>
+          <text class="lbl" x="280" y="65" text-anchor="middle">engine</text>
+          <text class="sub" x="280" y="80" text-anchor="middle">reconciler</text>
+
+          <rect class="nbox" x="560" y="44" width="120" height="46" rx="7"/>
+          <text class="lbl" x="620" y="65" text-anchor="middle">tui</text>
+          <text class="sub" x="620" y="80" text-anchor="middle">Ink</text>
+
+          <rect class="nbox" x="700" y="44" width="180" height="46" rx="7"/>
+          <text class="lbl" x="790" y="65" text-anchor="middle">web</text>
+          <text class="sub" x="790" y="80" text-anchor="middle">control surface</text>
+
+          <rect class="nbox" x="140" y="150" width="180" height="46" rx="7"/>
+          <text class="lbl" x="230" y="171" text-anchor="middle">runtime</text>
+          <text class="sub" x="230" y="186" text-anchor="middle">recorder</text>
+
+          <rect class="nbox" x="345" y="150" width="170" height="46" rx="7"/>
+          <text class="lbl" x="430" y="171" text-anchor="middle">steps</text>
+          <text class="sub" x="430" y="186" text-anchor="middle">claude -p</text>
+
+          <rect class="nbox" x="345" y="256" width="170" height="46" rx="7"/>
+          <text class="lbl" x="430" y="277" text-anchor="middle">tools</text>
+          <text class="sub" x="430" y="292" text-anchor="middle">MCP servers</text>
+
+          <rect class="nbox truth" x="30" y="370" width="840" height="50" rx="7"/>
+          <text class="lbl" x="450" y="392" text-anchor="middle">contracts</text>
+          <text class="sub" x="450" y="408" text-anchor="middle">Zod v4 schemas + Command enum · depends on nothing</text>
+        </g>
+      </svg>
+    </div>
+    <p class="hint">Scroll the panel sideways on a narrow screen.</p>
+  </div>
+</section>
+
+<!-- ======================= 2. LIFECYCLE ======================= -->
+<section id="lifecycle">
+  <div class="sec-head"><span class="sec-num">02</span><h2>One feature, end to end</h2></div>
+  <p class="lede">This is the centrepiece. Follow a single feature from the sentence typed in a terminal to a merged branch. Click any stage to see what happens, which component acts, and which decisions govern it — the matching components light up in the run diagram below.</p>
+
+  <div class="rail" id="rail" role="group" aria-label="Lifecycle stages"></div>
+
+  <div class="stagepanel" id="stagepanel" aria-live="polite"></div>
+
+  <div class="figure">
+    <div class="figcap">Figure 2 — a feature run</div>
+    <div class="dscroll">
+      <svg id="runsvg" viewBox="0 0 980 660" role="img" aria-label="Run flow: user to Interviewer to questions and commands to the engine reconciler, which reads and writes the checkpoint, spawns step subprocesses, executes write intents against tool servers and writes a merge note to git; the runtime recorder appends everything to events.jsonl, which both renderers project." style="min-width:700px">
+        <defs>
+          <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+        </defs>
+        <g style="color:var(--line-strong)">
+          <path class="ln" d="M182,46 L226,46" marker-end="url(#ar2)"/>
+          <path class="ln" d="M442,46 L486,46" marker-end="url(#ar2)"/>
+          <path class="ln" d="M595,70 L595,120" marker-end="url(#ar2)"/>
+          <path class="ln" d="M700,136 L746,136" marker-end="url(#ar2)"/>
+          <path class="ln" d="M746,156 L700,156" marker-end="url(#ar2)"/>
+          <path class="ln" d="M565,170 L565,220" marker-end="url(#ar2)"/>
+          <path class="ln" d="M700,246 L726,246" marker-end="url(#ar2)"/>
+          <path class="ln" d="M430,255 L386,255 L386,322 L366,322" marker-end="url(#ar2)"/>
+          <path class="ln" d="M490,146 L408,146 L408,342 L366,342" marker-end="url(#ar2)"/>
+          <path class="ln" d="M565,270 L565,396" marker-end="url(#ar2)"/>
+          <path class="ln" d="M265,354 L265,418 L426,418" marker-end="url(#ar2)"/>
+          <path class="ln" d="M565,442 L565,486" marker-end="url(#ar2)"/>
+          <path class="ln" d="M660,136 L660,110 L826,110 L826,306" marker-end="url(#ar2)"/>
+          <path class="ln" d="M470,530 L250,576" marker-end="url(#ar2)"/>
+          <path class="ln" d="M660,530 L730,576" marker-end="url(#ar2)"/>
+          <path class="ln dash" d="M120,602 L26,602 L26,92 L520,92 L520,72" marker-end="url(#ar2)"/>
+          <path class="ln dash" d="M850,602 L954,602 L954,98 L668,98 L668,72" marker-end="url(#ar2)"/>
+        </g>
+        <g>
+          <text class="edge" x="298" y="36" text-anchor="middle">question + resolved answer</text>
+          <text class="edge" x="605" y="100" text-anchor="start">durable intent files</text>
+          <text class="edge" x="723" y="130" text-anchor="middle">read + rebuild</text>
+          <text class="edge" x="723" y="172" text-anchor="middle">write checkpoint</text>
+          <text class="edge" x="575" y="196" text-anchor="start">spawn one per step,</text>
+          <text class="edge" x="575" y="208" text-anchor="start">--strict-mcp-config</text>
+          <text class="edge" x="712" y="236" text-anchor="start">typed output,</text>
+          <text class="edge" x="712" y="224" text-anchor="start">re-parsed vs Zod</text>
+          <text class="edge" x="380" y="316" text-anchor="end">reads only</text>
+          <text class="edge" x="400" y="358" text-anchor="end">write intents, once</text>
+          <text class="edge" x="400" y="370" text-anchor="end">per idempotency key</text>
+          <text class="edge" x="575" y="336" text-anchor="start">stream-json</text>
+          <text class="edge" x="575" y="470" text-anchor="start">append</text>
+          <text class="edge" x="836" y="200" text-anchor="start">merge note</text>
+          <text class="edge" x="300" y="560" text-anchor="middle">project</text>
+          <text class="edge" x="716" y="560" text-anchor="middle">project</text>
+          <text class="edge" x="300" y="86" text-anchor="middle">Command enum</text>
+          <text class="edge" x="800" y="92" text-anchor="middle">Command enum</text>
+        </g>
+        <g class="node" id="n-user">
+          <rect class="nbox" x="30" y="24" width="152" height="44" rx="7"/>
+          <text class="lbl" x="106" y="51" text-anchor="middle">User terminal</text>
+        </g>
+        <g class="node" id="n-interviewer">
+          <rect class="nbox key" x="228" y="24" width="214" height="44" rx="7"/>
+          <text class="lbl" x="335" y="44" text-anchor="middle">Interviewer</text>
+          <text class="sub" x="335" y="59" text-anchor="middle">claude -p</text>
+        </g>
+        <g class="node" id="n-q">
+          <rect class="nbox" x="488" y="24" width="212" height="46" rx="7"/>
+          <text class="lbl" x="594" y="44" text-anchor="middle">questions/ + commands/</text>
+          <text class="sub" x="594" y="60" text-anchor="middle">compare-and-set · intent files</text>
+        </g>
+        <g class="node" id="n-eng">
+          <rect class="nbox key" x="490" y="122" width="210" height="48" rx="7"/>
+          <text class="lbl" x="595" y="143" text-anchor="middle">Engine reconciler</text>
+          <text class="sub" x="595" y="159" text-anchor="middle">one action per pass</text>
+        </g>
+        <g class="node" id="n-state">
+          <rect class="nbox" x="748" y="122" width="182" height="48" rx="7"/>
+          <text class="lbl" x="839" y="143" text-anchor="middle">state.json</text>
+          <text class="sub" x="839" y="159" text-anchor="middle">rebuildable checkpoint</text>
+        </g>
+        <g class="node" id="n-step">
+          <rect class="nbox key" x="430" y="222" width="270" height="48" rx="7"/>
+          <text class="lbl" x="565" y="243" text-anchor="middle">Step subprocess</text>
+          <text class="sub" x="565" y="259" text-anchor="middle">claude -p --json-schema</text>
+        </g>
+        <g class="node" id="n-tool">
+          <rect class="nbox" x="156" y="310" width="210" height="46" rx="7"/>
+          <text class="lbl" x="261" y="330" text-anchor="middle">Tool servers</text>
+          <text class="sub" x="261" y="346" text-anchor="middle">one MCP server per domain</text>
+        </g>
+        <g class="node" id="n-git">
+          <rect class="nbox" x="728" y="222" width="202" height="48" rx="7"/>
+          <text class="lbl" x="829" y="243" text-anchor="middle">Run worktree</text>
+          <text class="sub" x="829" y="259" text-anchor="middle">branch · baseline_ref</text>
+        </g>
+        <g class="node" id="n-rec">
+          <rect class="nbox" x="430" y="398" width="270" height="44" rx="7"/>
+          <text class="lbl" x="565" y="418" text-anchor="middle">Runtime recorder</text>
+          <text class="sub" x="565" y="433" text-anchor="middle">redaction · seq assignment</text>
+        </g>
+        <g class="node" id="n-ev">
+          <rect class="nbox truth" x="400" y="488" width="330" height="46" rx="7"/>
+          <text class="lbl" x="565" y="509" text-anchor="middle">events.jsonl</text>
+          <text class="sub" x="565" y="525" text-anchor="middle">append-only · the durable truth</text>
+        </g>
+        <g class="node" id="n-tui">
+          <rect class="nbox" x="120" y="578" width="170" height="46" rx="7"/>
+          <text class="lbl" x="205" y="598" text-anchor="middle">Ink TUI</text>
+          <text class="sub" x="205" y="614" text-anchor="middle">sufficient alone</text>
+        </g>
+        <g class="node" id="n-web">
+          <rect class="nbox" x="620" y="578" width="230" height="46" rx="7"/>
+          <text class="lbl" x="735" y="598" text-anchor="middle">Loopback web surface</text>
+          <text class="sub" x="735" y="614" text-anchor="middle">optional accelerator</text>
+        </g>
+      </svg>
+    </div>
+    <p class="hint">Dashed edges are the command path: both renderers write the same durable intent files. The web server is an accelerator, never a second command path.</p>
+  </div>
+
+  <div class="figure">
+    <div class="figcap">Figure 3 — feature state lifecycle, as recorded in the checkpoint</div>
+    <div class="dscroll">
+      <svg viewBox="0 0 1010 700" role="img" aria-label="State machine: drafting to confirmed to running; running can move to blocked, degraded, interrupted, verifying, killed or handed off; verifying returns to running on gate failure or reaches committed; degraded reaches hibernated. Terminal states are committed, hibernated, killed and handed off." style="min-width:780px">
+        <defs>
+          <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+        </defs>
+        <g style="color:var(--line-strong)">
+          <path class="ln" d="M500,30 L500,42" marker-end="url(#ar3)"/>
+          <path class="ln" d="M500,86 L500,140" marker-end="url(#ar3)"/>
+          <path class="ln" d="M500,184 L500,248" marker-end="url(#ar3)"/>
+          <path class="ln" d="M430,262 L212,262" marker-end="url(#ar3)"/>
+          <path class="ln" d="M212,282 L430,282" marker-end="url(#ar3)"/>
+          <path class="ln" d="M590,262 L798,262" marker-end="url(#ar3)"/>
+          <path class="ln" d="M798,282 L590,282" marker-end="url(#ar3)"/>
+          <path class="ln" d="M452,250 C408,244 392,230 404,222 C418,214 440,224 446,248" marker-end="url(#ar3)"/>
+          <path class="ln" d="M455,302 L455,340 L140,340 L140,378" marker-end="url(#ar3)"/>
+          <path class="ln" d="M212,400 L380,400 L380,294 L408,294" marker-end="url(#ar3)"/>
+          <path class="ln" d="M500,302 L500,378" marker-end="url(#ar3)"/>
+          <path class="ln" d="M590,394 L690,394 L690,318 L560,318 L560,304" marker-end="url(#ar3)"/>
+          <path class="ln" d="M500,422 L500,498" marker-end="url(#ar3)"/>
+          <path class="ln" d="M880,292 L880,378" marker-end="url(#ar3)"/>
+          <path class="ln" d="M430,298 L395,298 L395,478 L140,478 L140,498" marker-end="url(#ar3)"/>
+          <path class="ln" d="M590,298 L640,298 L640,520 L798,520" marker-end="url(#ar3)"/>
+          <path class="ln" d="M100,292 L100,318 L26,318 L26,660 L980,660 L980,521 L962,521" marker-end="url(#ar3)"/>
+          <path class="ln" d="M800,400 L764,400" marker-end="url(#ar3)"/>
+          <path class="ln" d="M140,542 L140,576" marker-end="url(#ar3)"/>
+          <path class="ln" d="M500,542 L500,576" marker-end="url(#ar3)"/>
+          <path class="ln" d="M880,542 L880,576" marker-end="url(#ar3)"/>
+        </g>
+        <g>
+          <text class="edge" x="512" y="118" text-anchor="start">criteria confirmed by user</text>
+          <text class="edge" x="512" y="220" text-anchor="start">reconciler claims next step</text>
+          <text class="edge" x="321" y="252" text-anchor="middle">irreversible gate reached</text>
+          <text class="edge" x="321" y="302" text-anchor="middle">approval, or default-on-timeout taken</text>
+          <text class="edge" x="694" y="252" text-anchor="middle">eighty percent of a ceiling</text>
+          <text class="edge" x="694" y="302" text-anchor="middle">scope narrowed, tier downshifted</text>
+          <text class="edge" x="396" y="228" text-anchor="end">step completed, state advanced</text>
+          <text class="edge" x="300" y="332" text-anchor="middle">engine killed, crash, or laptop closed</text>
+          <text class="edge" x="222" y="440" text-anchor="start">resume by session id, else</text>
+          <text class="edge" x="222" y="452" text-anchor="start">baseline reset and re-run</text>
+          <text class="edge" x="512" y="345" text-anchor="start">implementation steps complete</text>
+          <text class="edge" x="700" y="350" text-anchor="start">gate failed,</text>
+          <text class="edge" x="700" y="362" text-anchor="start">tier promoted</text>
+          <text class="edge" x="512" y="452" text-anchor="start">gates passed, committer</text>
+          <text class="edge" x="512" y="464" text-anchor="start">opens a pull request</text>
+          <text class="edge" x="868" y="334" text-anchor="end">ceiling reached</text>
+          <text class="edge" x="222" y="470" text-anchor="start">user steering command</text>
+          <text class="edge" x="650" y="470" text-anchor="start">escape hatch, or repeated failure</text>
+          <text class="edge" x="500" y="652" text-anchor="middle">escape hatch</text>
+        </g>
+        <g>
+          <circle cx="500" cy="22" r="7" fill="var(--ink)"/>
+          <rect class="nbox" x="410" y="44" width="180" height="42" rx="7"/><text class="lbl" x="500" y="70" text-anchor="middle">drafting</text>
+          <rect class="nbox" x="410" y="142" width="180" height="42" rx="7"/><text class="lbl" x="500" y="168" text-anchor="middle">confirmed</text>
+          <rect class="nbox key" x="410" y="250" width="180" height="52" rx="7"/><text class="lbl" x="500" y="281" text-anchor="middle">running</text>
+          <rect class="nbox" x="40" y="250" width="172" height="42" rx="7"/><text class="lbl" x="126" y="276" text-anchor="middle">blocked</text>
+          <rect class="nbox" x="798" y="250" width="164" height="42" rx="7"/><text class="lbl" x="880" y="276" text-anchor="middle">degraded</text>
+          <rect class="nbox" x="40" y="380" width="172" height="42" rx="7"/><text class="lbl" x="126" y="406" text-anchor="middle">interrupted</text>
+          <rect class="nbox" x="410" y="380" width="180" height="42" rx="7"/><text class="lbl" x="500" y="406" text-anchor="middle">verifying</text>
+          <rect class="nbox" x="798" y="380" width="164" height="42" rx="7"/><text class="lbl" x="880" y="406" text-anchor="middle">hibernated</text>
+          <rect class="nbox term" x="40" y="500" width="172" height="42" rx="7"/><text class="lbl" x="126" y="526" text-anchor="middle">killed</text>
+          <rect class="nbox truth" x="410" y="500" width="180" height="42" rx="7"/><text class="lbl" x="500" y="526" text-anchor="middle">committed</text>
+          <rect class="nbox term" x="798" y="500" width="164" height="42" rx="7"/><text class="lbl" x="880" y="526" text-anchor="middle">handed_off</text>
+          <circle cx="140" cy="584" r="8" fill="none" stroke="var(--ink)" stroke-width="1.4"/><circle cx="140" cy="584" r="4" fill="var(--ink)"/>
+          <circle cx="500" cy="584" r="8" fill="none" stroke="var(--ink)" stroke-width="1.4"/><circle cx="500" cy="584" r="4" fill="var(--ink)"/>
+          <circle cx="880" cy="584" r="8" fill="none" stroke="var(--ink)" stroke-width="1.4"/><circle cx="880" cy="584" r="8" fill="none"/><circle cx="880" cy="584" r="4" fill="var(--ink)"/>
+          <circle cx="756" cy="400" r="8" fill="none" stroke="var(--ink)" stroke-width="1.4"/><circle cx="756" cy="400" r="4" fill="var(--ink)"/>
+        </g>
+      </svg>
+    </div>
+    <p class="hint">Four terminal dispositions: <code>committed</code>, <code>hibernated</code>, <code>killed</code>, <code>handed_off</code>. Only <code>interrupted</code> is resumable — see <a class="adchip" data-goto="AD-8" href="#AD-8">AD-8</a>.</p>
+  </div>
+
+  <div class="figure">
+    <div class="figcap">Figure 4 — question lifecycle, per AD-25</div>
+    <div class="dscroll">
+      <svg viewBox="0 0 940 370" role="img" aria-label="Question lifecycle: a question is asked, then exactly one of three resolvers wins a compare-and-set to reach resolved, which writes the decision ledger; alternatively the question is deflected by answering it from the repository, history or ledger." style="min-width:640px">
+        <defs>
+          <marker id="ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+        </defs>
+        <g style="color:var(--line-strong)">
+          <path class="ln" d="M68,60 L118,60" marker-end="url(#ar4)"/>
+          <path class="ln" d="M302,48 C400,8 470,8 558,42" marker-end="url(#ar4)"/>
+          <path class="ln" d="M302,60 L558,60" marker-end="url(#ar4)"/>
+          <path class="ln" d="M302,74 C400,114 470,114 558,80" marker-end="url(#ar4)"/>
+          <path class="ln" d="M210,84 L210,258" marker-end="url(#ar4)"/>
+          <path class="ln" d="M650,84 L650,178" marker-end="url(#ar4)"/>
+          <path class="ln" d="M650,224 L650,284" marker-end="url(#ar4)"/>
+          <path class="ln" d="M302,282 L352,282" marker-end="url(#ar4)"/>
+        </g>
+        <g>
+          <text class="edge" x="430" y="18" text-anchor="middle">TUI answer wins the compare-and-set</text>
+          <text class="edge" x="430" y="54" text-anchor="middle">web answer wins the compare-and-set</text>
+          <text class="edge" x="430" y="128" text-anchor="middle">timeout default wins · question.default_taken</text>
+          <text class="edge" x="222" y="162" text-anchor="start">answered from repo,</text>
+          <text class="edge" x="222" y="174" text-anchor="start">history or ledger</text>
+          <text class="edge" x="662" y="124" text-anchor="start">question.resolved</text>
+          <text class="edge" x="662" y="136" text-anchor="start">writes the decision</text>
+          <text class="edge" x="378" y="286" text-anchor="start">question.deflected</text>
+          <text class="edge" x="60" y="40" text-anchor="middle">question.asked</text>
+        </g>
+        <g>
+          <circle cx="60" cy="60" r="7" fill="var(--ink)"/>
+          <rect class="nbox key" x="120" y="38" width="182" height="44" rx="7"/><text class="lbl" x="211" y="65" text-anchor="middle">asked</text>
+          <rect class="nbox truth" x="560" y="38" width="182" height="44" rx="7"/><text class="lbl" x="651" y="65" text-anchor="middle">resolved</text>
+          <rect class="nbox" x="560" y="180" width="182" height="44" rx="7"/><text class="lbl" x="651" y="207" text-anchor="middle">decision ledger</text>
+          <rect class="nbox" x="120" y="260" width="182" height="44" rx="7"/><text class="lbl" x="211" y="287" text-anchor="middle">deflected</text>
+          <circle cx="360" cy="282" r="8" fill="none" stroke="var(--ink)" stroke-width="1.4"/><circle cx="360" cy="282" r="4" fill="var(--ink)"/>
+          <circle cx="650" cy="292" r="8" fill="none" stroke="var(--ink)" stroke-width="1.4"/><circle cx="650" cy="292" r="4" fill="var(--ink)"/>
+        </g>
+      </svg>
+    </div>
+    <p class="hint">Losing resolvers receive an already-resolved result and write nothing.</p>
+  </div>
+</section>
+
+<!-- ======================= 3. DECISIONS ======================= -->
+<section id="decisions">
+  <div class="sec-head"><span class="sec-num">03</span><h2>All 34 architecture decisions</h2></div>
+  <p class="lede">Each decision fixes one invariant that two independently-built units could otherwise choose incompatibly. The <b>Prevents</b> line is the interesting half — it names the concrete divergence the rule exists to stop. Search, filter by theme or by origin, and open any card for its Binds, its Rule, and the reasoning the spine deliberately omits.</p>
+
+  <div class="statline">
+    <div class="stat"><div class="num">34</div><div class="cap">live decisions</div></div>
+    <div class="stat"><div class="num">17</div><div class="cap">added by review</div></div>
+    <div class="stat"><div class="num">11</div><div class="cap">amended</div></div>
+    <div class="stat"><div class="num">1</div><div class="cap">retired (AD-6)</div></div>
+  </div>
+
+  <div class="controls">
+    <div class="searchrow">
+      <input id="adsearch" type="search" placeholder="Search id, title, rule, or bound capability…" aria-label="Search architecture decisions" autocomplete="off">
+      <button class="btn" id="expandall" type="button">Expand all</button>
+      <button class="btn" id="collapseall" type="button">Collapse all</button>
+      <button class="btn" id="resetf" type="button">Reset</button>
+    </div>
+    <div class="filterrow" id="themefilter" role="group" aria-label="Filter by theme"></div>
+    <div class="filterrow" id="originfilter" role="group" aria-label="Filter by origin"></div>
+    <div class="count" id="adcount"></div>
+  </div>
+
+  <div class="adlist" id="adlist"></div>
+  <p id="noresults" style="display:none;color:var(--ink-3);font-family:var(--mono);font-size:13px;padding:24px 0">No decision matches that filter.</p>
+</section>
+
+<!-- ======================= 4. CONVENTIONS ======================= -->
+<section id="conventions">
+  <div class="sec-head"><span class="sec-num">04</span><h2>Consistency conventions</h2></div>
+  <p class="lede">Below the level of an AD, these are the spellings every unit shares. They are not decisions so much as the alphabet the decisions are written in.</p>
+
+  <details class="fold" open>
+    <summary>Naming — entities, files, interfaces, events</summary>
+    <div class="fold-body">
+      <p>Event type names are dot-namespaced and past-tense. The vocabulary includes <code>step.started</code>, <code>agent.tool_used</code>, <code>fetch.recorded</code>, <code>write.attempted</code>, <code>write.executed</code>, <code>permission.denied</code>, <code>redaction.failed</code>, <code>budget.degraded</code>, <code>budget.exhausted</code>, <code>question.asked</code>, <code>question.resolved</code>, <code>question.default_taken</code>, <code>question.deflected</code>. Feature slugs are kebab-case. Step ids are stable declared names, never positional indexes. Readers ignore unknown event types rather than erroring.</p>
+    </div>
+  </details>
+
+  <details class="fold" open>
+    <summary>Data &amp; formats — ids, dates, error shapes, envelopes</summary>
+    <div class="fold-body">
+      <p>Run id is a ULID minted by the engine per <a class="adchip" data-goto="AD-29" href="#AD-29">AD-29</a>; <code>project-id</code> is the first-commit SHA per <a class="adchip" data-goto="AD-10" href="#AD-10">AD-10</a>. All timestamps are RFC3339 with milliseconds in UTC, carried as <code>z.string()</code> because <code>z.date()</code> is outside the structured-outputs subset. Every failure crossing a unit boundary uses the shape <code>code</code>, <code>message</code>, <code>retryable</code>, <code>cause</code>, and every code appears in the <a class="adchip" data-goto="AD-35" href="#AD-35">AD-35</a> disposition table. Human-edited configuration is TOML; machine-owned state and events are JSON; every on-disk artifact carries a <code>schema_version</code> per <a class="adchip" data-goto="AD-28" href="#AD-28">AD-28</a>. Every schema is defined once as a Zod v4 schema and exported with <code>z.toJSONSchema(schema, { target: "draft-7" })</code> — never with default arguments, since Zod 4 defaults to draft-2020-12 and the <code>--json-schema</code> validator rejects it. Step contracts use no recursive or self-referential schemas, no <code>minLength</code>, no <code>minItems</code> greater than one and no <code>minimum</code>.</p>
+    </div>
+  </details>
+
+  <details class="fold" open>
+    <summary>State &amp; cross-cutting — mutation, errors, logging, config, auth</summary>
+    <div class="fold-body">
+      <p>One writer per file: only the reconciler writes a <code>state.json</code>, only the runtime recorder appends to an <code>events.jsonl</code>, only the committer writes the git note; one engine per <code>ORCH_HOME</code> per <a class="adchip" data-goto="AD-30" href="#AD-30">AD-30</a>. State writes are atomic — temporary file in the same directory, then rename. Event lines are never mutated and every event passes redaction before append. No unit writes diagnostics to stdout; everything observable goes to the event log. Reconciliation is concurrent across features but serializes any features whose declared file territories overlap. Auth is the user's own Claude Code subscription login via non-bare <code>claude -p</code>, asserted at startup; no <code>ANTHROPIC_API_KEY</code> path and no bundled credential.</p>
+    </div>
+  </details>
+</section>
+
+<!-- ======================= 5. STACK ======================= -->
+<section id="stack">
+  <div class="sec-head"><span class="sec-num">05</span><h2>The pinned stack</h2></div>
+  <p class="lede">Every row was verified against the live registry. Two of the pins are counter-intuitive enough that a future reader will be tempted to "fix" them — both were reproduced empirically and both are load-bearing. The table also now carries the two things that used to be deferred: the web surface's bundler, and the model ladder's actual rungs.</p>
+
+  <div class="flagged">
+    <div class="ft">TypeScript 5.9.3 — not 7.0.2, which is newer</div>
+    <div class="fb">TypeScript 7 is real, current and shipping, but it is Project Corsa: a native Go port that <b>ships no compiler API until 7.1</b>. Without that API, <code>typescript-eslint</code> and <code>ts-morph</code> do not work — which means adopting 7 silently decides that the repository cannot lint itself, directly contradicting the plan to turn conventions into lint rules. TS 7 also removes ES5, AMD, UMD, SystemJS and <code>baseUrl</code>, and ships no musl binary, so the executor Dockerfile could not be Alpine-based. 5.9.3 is the last 5.x line and the last line shipping the compiler API. The pin is now mechanically enforced by the stack itself: <code>typescript-eslint</code> 8.70.0 peers <code>typescript &gt;=4.8.4 &lt;6.1.0</code>, so its peer range — not the compiler — is the blocker, and it is also the adoption trigger.</div>
+  </div>
+
+  <div class="flagged">
+    <div class="ft">npm pinned below 12 — not "latest"</div>
+    <div class="fb">npm 12 turns off git-dependency resolution by default (<code>--allow-git</code> defaults to none) and disables install and prepare scripts, with the changelog stating that <code>allow-scripts</code> covers <code>npx</code>. The onboarding path in <a class="adchip" data-goto="AD-12" href="#AD-12">AD-12</a> is <code>npx github:&lt;owner&gt;/&lt;repo&gt; init</code>, which depends on exactly that resolution. The pin buys time: no supported Node currently bundles npm 12 (Node 24.21 bundles 11.19.0, Node 22.23.2 bundles 10.9.8), and before npm 12 becomes the bundled npm of a supported Node the delivery path must be re-verified empirically or replaced.</div>
+  </div>
+
+  <div class="tw" style="margin-top:18px">
+    <table>
+      <thead><tr><th>Name</th><th>Version</th></tr></thead>
+      <tbody>
+        <tr><td class="v">Node.js</td><td><code>&gt;=22.22</code>; 24.x LTS recommended. 22.18 is the true minimum, being where native TypeScript type stripping lands, which the <code>bin/init.ts</code> npx entry point requires</td></tr>
+        <tr><td class="v">TypeScript</td><td>5.9.3 — the last line shipping the compiler API, so the repository can lint itself</td></tr>
+        <tr><td class="v">React</td><td>19.3.0 — required by Ink; the web control surface reuses it rather than adding a second UI paradigm</td></tr>
+        <tr><td class="v">react-dom</td><td>19.3.0</td></tr>
+        <tr><td class="v">Vite</td><td>8.3.0 — bundler for the web control surface</td></tr>
+        <tr><td class="v">Vitest</td><td>5.0.1 — runner for the AD-31 verification floor</td></tr>
+        <tr><td class="v">typescript-eslint</td><td>8.70.0 — peers <code>typescript &gt;=4.8.4 &lt;6.1.0</code>, which is what excludes TypeScript 7</td></tr>
+        <tr><td class="v">Zod</td><td>4.6.5 — <code>z.toJSONSchema(schema, { target: "draft-7" })</code></td></tr>
+        <tr><td class="v">Ink</td><td>7.1.1 — ESM-only; peers <code>react</code> and <code>@types/react</code> <code>&gt;=19.2.0</code>, <code>react-devtools-core</code> <code>&gt;=6.1.2</code></td></tr>
+        <tr><td class="v"><code>claude</code> CLI</td><td><code>&gt;=2.1.259</code> — the max of <code>--permission-prompts</code> at 2.1.259, cross-project <code>--resume</code> at 2.1.223, <code>--mcp-config</code> connect-before-first-turn at 2.1.221, nested-subagent stream events at 2.1.219</td></tr>
+        <tr><td class="v">Docker Engine</td><td><code>&gt;=29.7</code></td></tr>
+        <tr><td class="v">Model rungs</td><td><code>claude-haiku-4-5</code> &rarr; <code>claude-sonnet-5</code> &rarr; <code>claude-opus-5</code>; one promotion per step per run, on a failed verification gate or a second schema-invalid output</td></tr>
+        <tr><td class="v">npm</td><td><code>&lt;12</code> — npm 12 disables git-dependency resolution and install scripts by default, which breaks the AD-12 delivery path</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ======================= 6. ON DISK ======================= -->
+<section id="disk">
+  <div class="sec-head"><span class="sec-num">06</span><h2>What lives where on disk</h2></div>
+  <p class="lede">The split is one sentence: <b>config in-repo, state central, configuration snapshotted per run</b>. A teammate who clones the repository inherits the setup without inheriting anyone's run history, and a worktree of the repository contains only committed config that is identical in every worktree — so there is never a second copy of state with no rule for which one wins.</p>
+
+  <div class="grid3" style="margin-bottom:20px">
+    <div class="scope">
+      <div class="st">machine scope</div>
+      <div class="sd"><code>ORCH_HOME/config.toml</code> — ports, paths, docker endpoint, machine defaults. Never committed.</div>
+    </div>
+    <div class="scope">
+      <div class="st">project scope</div>
+      <div class="sd"><code>&lt;target-repo&gt;/.orch/</code> — profile, permissions, agent roster, manifest. Committed.</div>
+    </div>
+    <div class="scope">
+      <div class="st">run scope</div>
+      <div class="sd"><code>runs/&lt;run-id&gt;/config/</code> — the immutable snapshot taken at run start. The only configuration a step reads.</div>
+    </div>
+    <div class="scope">
+      <div class="st">cross-project scope</div>
+      <div class="sd"><code>ORCH_HOME/memory/</code> — spans projects, so it can belong to no repository.</div>
+    </div>
+  </div>
+
+  <div class="note" style="margin-bottom:22px"><strong>A value is declared in exactly one scope.</strong> There is no merging and no overriding between scopes (<a class="adchip" data-goto="AD-34" href="#AD-34">AD-34</a>). Mid-run edits to <code>.orch/</code> never affect a live run, because the run reads only its snapshot (<a class="adchip" data-goto="AD-9" href="#AD-9">AD-9</a>).</div>
+
+  <h3>The orchestrator package</h3>
+  <p style="color:var(--ink-2)">One TypeScript package; directories map one-to-one onto the paradigm's layers.</p>
+<pre><code>agent-orcastrator/
+  bin/
+    init.ts        # npx github:&lt;owner&gt;/&lt;repo&gt; init entry point, AD-12
+  src/
+    installer/     # interactive prompts, .orch/ scaffolding, manifest, schema_version
+    contracts/     # Zod v4 schemas, Command enum, question type, event envelope, error shape
+    engine/        # reconciler, roster discovery, spawner, ceilings, intent executor, lock
+    runtime/       # recorder: redaction, seq assignment, events.jsonl, fetch record
+    container/     # the single docker wrapper, AD-20
+    tui/           # Ink renderer, built against the Command enum
+    web/           # loopback HTTP + SSE accelerator, built against the Command enum
+    tools/         # one MCP server per external domain; jira first
+  templates/       # .orch/ skeletons the installer writes; no BMad file ever, AD-18
+  tests/           # the three AD-31 suites: contracts, crash injection, container assertion
+  docker/
+    Dockerfile     # tier-2 executor image, built locally, tagged by content hash</code></pre>
+
+  <h3>Committed configuration in a target repository</h3>
+  <p style="color:var(--ink-2)">Per <a class="adchip" data-goto="AD-9" href="#AD-9">AD-9</a>, <a class="adchip" data-goto="AD-12" href="#AD-12">AD-12</a>, <a class="adchip" data-goto="AD-17" href="#AD-17">AD-17</a>. This directory is the only thing the orchestrator writes inside the target repository besides the feature branch and git notes.</p>
+<pre><code>&lt;target-repo&gt;/
+  .orch/
+    profile.toml       # mechanics + project knowledge, AD-16
+    permissions.toml   # granted tools, reversibility gates, egress allowlist
+    manifest.toml      # schema_version + every file the installer created, AD-12, AD-28
+    agents/
+      &lt;agent-id&gt;.toml  # one file per agent, referencing a registered contract id, AD-17
+  .gitignore           # installer appends the runtime paths; .orch/ itself is committed</code></pre>
+
+  <h3>Runtime state layout</h3>
+  <p style="color:var(--ink-2)">Per <a class="adchip" data-goto="AD-9" href="#AD-9">AD-9</a> — never inside a target repository.</p>
+<pre><code>$ORCH_HOME/                     # default ~/.orch
+  config.toml                   # machine scope: ports, paths, docker endpoint; never committed, AD-34
+  engine.lock                   # exclusive, pid + start time, AD-30
+  memory/                       # cross-project pattern memory; belongs to no repository, AD-34
+  runs/&lt;run-id&gt;/
+    events.jsonl                # append-only; sole writer is the runtime recorder, AD-29
+    state.json                  # rebuildable checkpoint; sole writer is the reconciler, AD-4
+    config/                     # per-run config snapshot taken at run start, AD-9
+    commands/                   # durable steering intent files, AD-19
+    questions/                  # question state files, compare-and-set resolved, AD-25
+    fetch-record.json           # run shared external fetch record, AD-13 / AD-14
+  worktrees/&lt;run-id&gt;/           # reclaimed by a reconcile pass at terminal disposition, AD-20, AD-32
+  pool/                         # leased ephemeral resources, reclaimed by reconcile, AD-32
+  projects/&lt;project-id&gt;/        # registration pointer and per-project ledger; keyed by AD-10, AD-33</code></pre>
+</section>
+
+<!-- ======================= 7. CAP MAP ======================= -->
+<section id="capmap">
+  <div class="sec-head"><span class="sec-num">07</span><h2>Capability &rarr; architecture map</h2></div>
+  <p class="lede">Every capability in the spec has a named home in the tree and a named set of decisions that govern it. If a capability is not in this table, it has no architectural coverage.</p>
+  <div class="tw">
+    <table id="captable">
+      <thead><tr><th>Capability / area</th><th>Lives in</th><th>Governed by</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ======================= 8. DEFERRED ======================= -->
+<section id="deferred">
+  <div class="sec-head"><span class="sec-num">08</span><h2>Deferred, and why each is safe</h2></div>
+  <p class="lede">A deferral is safe only when no unit's interface depends on the answer. Each entry below names the decision that makes it so — that named decision is what you check before assuming the deferral still holds. <b>Three remain, down from seven.</b> Each of the three now carries a concrete, checkable trigger rather than an invitation to revisit, and the npm one carries a pre-decided fallback: a deferral with a named trigger and a named fallback is a scheduled decision, not an open risk.</p>
+  <div id="deferlist"></div>
+</section>
+
+<!-- ======================= 9. REVIEW ======================= -->
+<section id="review">
+  <div class="sec-head"><span class="sec-num">09</span><h2>What the review changed</h2></div>
+  <p class="lede">The spine went from <b>18 decisions to 34</b> after a four-lens Reviewer Gate — reconcile-spec, rubric, technology-verification and adversarial — which produced roughly sixty findings. The shape of the growth is the useful fact. In the same pass the <b>deferrals went from seven to three</b>, and the spec's open questions went to <b>zero</b>: the shadow-mode accuracy threshold is now provisionally set (over a rolling window of at least twenty shadow runs in one project, at least 80% produce a diff accepted without material change, and zero produce a write intent that would have been destructive — the destructive count being a hard gate, not a percentage), and the web renderer's stack is decided and pinned. <code>ARCHITECTURE-SPINE.md</code> is now an adopted companion of <code>SPEC.md</code>.</p>
+
+  <div class="card" style="margin-bottom:18px">
+    <h3 style="margin-top:0">Nearly every addition was lateral, not vertical</h3>
+    <p>A <em>vertical</em> decision picks one option over another: subprocess or SDK, TypeScript or Go, central or in-repo. Those were mostly right the first time. The adversarial lens confirmed <a class="adchip" data-goto="AD-1" href="#AD-1">AD-1</a>, <a class="adchip" data-goto="AD-10" href="#AD-10">AD-10</a> (named the strongest decision in the document), <a class="adchip" data-goto="AD-11" href="#AD-11">AD-11</a>, <a class="adchip" data-goto="AD-13" href="#AD-13">AD-13</a>, <a class="adchip" data-goto="AD-18" href="#AD-18">AD-18</a>, the <a class="adchip" data-goto="AD-5" href="#AD-5">AD-5</a> ignore-unknown-types rule and all six deferrals as closed.</p>
+    <p>A <em>lateral</em> decision fixes a contract <b>between</b> two units that both existed and both looked fine alone. Those were almost all missing. The command path between the renderers and the engine had never been named, so <code>src/tui</code> and <code>src/web</code> were literally unbuildable (<a class="adchip" data-goto="AD-19" href="#AD-19">AD-19</a>). Containment had no decision at all, leaving CAP-10's own success criterion untestable (<a class="adchip" data-goto="AD-20" href="#AD-20">AD-20</a>). The control/evidence split — identified in the source sessions as the highest-leverage architectural idea in the whole system — appeared nowhere (<a class="adchip" data-goto="AD-23" href="#AD-23">AD-23</a>).</p>
+    <p style="margin-bottom:0"><b>The lesson to carry forward:</b> when you add a unit, the risk is not the decision inside it. It is the contract it shares with a unit someone else is building.</p>
+  </div>
+
+  <h3>The three direct contradictions</h3>
+  <div class="grid2" style="margin-bottom:22px">
+    <div class="card">
+      <h4 style="margin-top:0;color:var(--stop)">AD-4 vs AD-7 — two named authorities</h4>
+      <p style="margin-bottom:0">AD-4 called <code>events.jsonl</code> the durable truth while AD-7 called <code>state.json</code> the sole authority on progress. The web surface folds the log; the TUI morning brief reads the checkpoint. After every crash they diverge and both are "right". Fixed by ranking them: the checkpoint is a rebuildable projection of the log, and where they disagree the log wins.</p>
+    </div>
+    <div class="card">
+      <h4 style="margin-top:0;color:var(--stop)">AD-8 vs CAP-15 — the kill control undone</h4>
+      <p style="margin-bottom:0">The kill control SIGTERMs a step. The reconciler then sees a recorded session id with no live process and helpfully resumes it. The safety control is silently reversed by the recovery loop. Fixed by recording a disposition on every step termination, where only <code>interrupted</code> is resumable and <code>killed</code> is never resumed or re-run.</p>
+    </div>
+    <div class="card">
+      <h4 style="margin-top:0;color:var(--stop)">AD-2 vs AD-17 — schemas in two places</h4>
+      <p style="margin-bottom:0">AD-17 said an agent's TOML file declares its step contract schemas; AD-2 requires every schema to be a Zod schema in code. Both legal, mutually exclusive, and AD-17's claim that adding an agent needs no engine change was false as written. Fixed by making the TOML reference a <em>registered contract id</em>, never an inline schema.</p>
+    </div>
+    <div class="card">
+      <h4 style="margin-top:0;color:var(--stop)">Bonus: AD-13 + AD-4 composed into a leak</h4>
+      <p style="margin-bottom:0">Neither was wrong alone. "Record every external request and response" composed with "events are never mutated" manufactures a permanent, un-redactable secret leak — the exact Critical threat in the threat model. Fixed by <a class="adchip" data-goto="AD-21" href="#AD-21">AD-21</a>: redaction is a write-path invariant that fails closed, because there is no after-the-fact remedy.</p>
+    </div>
+  </div>
+
+  <h3>Two blockers caught empirically</h3>
+  <p style="color:var(--ink-2);max-width:74ch">These were not reasoned about — they were reproduced. Both would have failed on the first real run, and both are now written into rule text rather than guidance, because guidance is what gets skipped.</p>
+
+  <div class="flagged">
+    <div class="ft">T-1 · Zod 4 emits draft-2020-12; <code>--json-schema</code> requires draft-07</div>
+    <div class="fb">The spine mandated <code>z.toJSONSchema()</code> with no arguments. Zod 4 defaults to draft-2020-12, while the <code>claude --json-schema</code> validator is draft-07 and rejects it outright with <code>no schema with key or ref https://json-schema.org/draft/2020-12/schema</code>. The entire <a class="adchip" data-goto="AD-2" href="#AD-2">AD-2</a> step-contract chain — the mechanism by which every agent is a typed pure function — failed as written. The fix is <code>z.toJSONSchema(schema, { target: "draft-7" })</code>, and that argument is now part of the Rule, not a note beside it.</div>
+  </div>
+
+  <div class="flagged">
+    <div class="ft">T-2 · npm 12 breaks <code>npx github:</code></div>
+    <div class="fb">npm 12 disables git-dependency resolution and install scripts by default, and <a class="adchip" data-goto="AD-12" href="#AD-12">AD-12</a> makes <code>npx github:&lt;owner&gt;/&lt;repo&gt; init</code> the <em>only</em> supported onboarding path. The original stack pin of "npm 12.x" was wrong on two further counts: the dev machine ran 11.4.2, and neither recommended Node ships npm 12. The decision taken was to keep npx-from-git and document the hazard as a stated revisit condition rather than redesign distribution now — with npm pinned below 12 so no unit may assume the newer behaviour.</div>
+  </div>
+
+  <h3>Dimensions that were silent</h3>
+  <p style="color:var(--ink-2);max-width:74ch">Findings of the form "this is not wrong, it is simply absent". Each became a decision.</p>
+  <ul class="tight" style="color:var(--ink-2)">
+    <li><b>Command transport</b> — no path from renderer into engine was ever named &rarr; <a class="adchip" data-goto="AD-19" href="#AD-19">AD-19</a>. The Deferred entry on the web renderer had justified itself by citing AD-3, which was circular.</li>
+    <li><b>Containment</b> — the threat model specified hardened run flags, worktree-only mounts, no docker socket, two-phase network and an egress proxy; the spine fixed only image provenance &rarr; <a class="adchip" data-goto="AD-20" href="#AD-20">AD-20</a>.</li>
+    <li><b>Control vs evidence plane</b> — never appeared, despite being the highest-leverage idea in the source sessions &rarr; <a class="adchip" data-goto="AD-23" href="#AD-23">AD-23</a>.</li>
+    <li><b>Ceilings</b> — the three dimensions, hibernation and 80% degradation had no decision and no event types &rarr; <a class="adchip" data-goto="AD-24" href="#AD-24">AD-24</a>.</li>
+    <li><b>The question envelope</b> — CAP-1 through CAP-4 were governed only by a prose pointer &rarr; <a class="adchip" data-goto="AD-25" href="#AD-25">AD-25</a>.</li>
+    <li><b>Re-run safety for git effects</b> — AD-15 fenced only external writes; nothing said whether a re-run resets the worktree &rarr; <a class="adchip" data-goto="AD-26" href="#AD-26">AD-26</a>.</li>
+    <li><b>The system's own tests</b> — wholly silent, despite maintenance burden being the named top risk &rarr; <a class="adchip" data-goto="AD-31" href="#AD-31">AD-31</a>.</li>
+    <li><b>One-writer enforcement</b> — asserted everywhere, mechanised nowhere &rarr; <a class="adchip" data-goto="AD-29" href="#AD-29">AD-29</a> and <a class="adchip" data-goto="AD-30" href="#AD-30">AD-30</a>.</li>
+    <li><b>Schema versioning and migration</b> — an engine meeting an older <code>.orch/</code> was undefined behaviour &rarr; <a class="adchip" data-goto="AD-28" href="#AD-28">AD-28</a>.</li>
+    <li><b>Failure dispositions</b> — retry, backoff and the repeated-failure handoff threshold were unspecified &rarr; <a class="adchip" data-goto="AD-35" href="#AD-35">AD-35</a>.</li>
+  </ul>
+
+  <div class="note" style="margin-top:20px"><strong>AD-6 was retired.</strong> It deferred the SQLite query index — but its Prevents was premature-work avoidance rather than a divergence between two units, its "acceptably" clause was unenforceable, and it was duplicated verbatim under Deferred. A deferral wearing an AD's clothes. It now lives only in the Deferred list, where it belongs.</div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>Walkthrough generated from <code>ARCHITECTURE-SPINE.md</code> (status: final, 2026-09-19) and <code>SPEC.md</code> (SPEC-agent-orchestrator). All decision ids, rule text, version numbers and paths are reproduced from the spine verbatim; the "why" notes are restored from the decision log, which the spine deliberately omits.</p>
+    <p style="margin-bottom:0">Self-contained single file — no external dependencies.</p>
+  </div>
+</footer>
+
+<script>
+(function(){
+"use strict";
+
+/* ===================== THEMES ===================== */
+var THEMES = [
+  {id:"invocation", name:"Invocation & contracts", v:"1"},
+  {id:"truth",      name:"State & truth",          v:"2"},
+  {id:"lifecycle",  name:"Lifecycle & recovery",   v:"3"},
+  {id:"containment",name:"Containment & security", v:"4"},
+  {id:"interaction",name:"Interaction & control",  v:"5"},
+  {id:"config",     name:"Configuration & identity",v:"6"},
+  {id:"ops",        name:"Operations",             v:"7"}
+];
+var THEME_BY_ID = {};
+THEMES.forEach(function(t){THEME_BY_ID[t.id]=t;});
+
+/* ===================== DECISIONS =====================
+   binds / prevents / rule are reproduced verbatim from ARCHITECTURE-SPINE.md.
+   why is restored from the decision log (.memlog.md) and is not spine text.
+   ==================================================== */
+var ADS = [
+{
+ id:"AD-1", theme:"invocation", origin:"amended",
+ title:"Step agents are <code>claude -p</code> subprocesses, never the in-process Agent SDK",
+ binds:"every step agent, the engine, CAP-6, CAP-7, CAP-12, CAP-13",
+ prevents:"one unit embedding the Agent SDK in-process while another shells out, producing two incompatible agent contracts, two permission surfaces and two failure models",
+ rule:"the engine spawns exactly one <code>claude -p</code> process per step, passing the step contract with <code>--json-schema</code>, consuming <code>--output-format stream-json</code>, and passing <code>--strict-mcp-config</code> and <code>--restricted</code> on every spawn so only engine-supplied MCP servers load and the target repository's own <code>.mcp.json</code> and hooks cannot introduce tools or credentials. Bare mode is forbidden positively, not by absence of a flag: the engine asserts subscription authentication at startup and refuses to run if the CLI resolves to API-key mode. The engine re-parses <code>structured_output</code> against the originating Zod schema before accepting a step output. No unit may link the Claude Agent SDK as a library; permission plumbing is parsed from the JSON stream.",
+ why:"A subprocess <em>is</em> a stateless pure function enforced by the OS rather than by discipline; kill and fork controls become trivial when the unit of work is a pid. The cost accepted is <code>canUseTool</code> and typed message objects, replaced by parsing the JSON stream. Two hard constraints drove the flags: bare mode does not use the subscription login and requires <code>ANTHROPIC_API_KEY</code>, which the subscription-only constraint forbids outright — so the engine must run non-bare; but a non-bare <code>-p</code> session runs the hooks in a project's <code>.claude/settings.json</code> and connects the servers in its <code>.mcp.json</code> even in a folder never trusted, with no trust dialog and no per-server approval. <code>--strict-mcp-config</code> and <code>--restricted</code> close that supply-chain hole."
+},
+{
+ id:"AD-2", theme:"invocation", origin:"amended",
+ title:"One TypeScript package on Node owns engine, TUI and web",
+ binds:"all units",
+ prevents:"engine and renderers speaking different languages, with the step-contract schemas defined twice and drifting apart",
+ rule:"engine, TUI, web control surface and installer live in one TypeScript package; every step contract is a Zod v4 schema in code, exported as <code>z.toJSONSchema(schema, { target: \"draft-7\" })</code> — the target argument is part of this rule, not guidance — and passed to <code>claude -p --json-schema</code>. Step contracts stay inside the structured-outputs subset: no <code>z.date()</code>, timestamps being <code>z.string()</code> carrying the RFC3339 convention; no recursive or self-referential schemas; no <code>minLength</code>, no <code>minItems</code> greater than one, no <code>minimum</code>. No second implementation language is introduced for any unit.",
+ why:"The earlier lean toward Python rested on the pydantic&rarr;JSON-Schema chain being unique to Python; Zod v4 ships the identical chain natively, so that argument did not survive. NDJSON is the native runtime format and the entire CLI interface is NDJSON; one language spans engine, TUI and web. Cost accepted: Go's stronger process supervision. The <code>target: \"draft-7\"</code> argument sits in the Rule because it was an empirically reproduced blocker — see §9."
+},
+{
+ id:"AD-3", theme:"interaction", origin:"amended",
+ title:"The web renderer is a control surface, and the TUI alone is sufficient",
+ binds:"CAP-14, CAP-15, both renderers",
+ prevents:"the renderers diverging into a rich web app and a degraded terminal view, or the reverse",
+ rule:"every steering control is a member of a single <code>Command</code> enum defined once in <code>contracts/</code>, and both renderers are built against that enum, so a control present in one and absent from the other is a compile error. The system must remain fully operable with the web renderer absent; the TUI alone is sufficient and no reply ever requires a browser. The web server binds loopback only and serves a single local user.",
+ why:"The tiebreaker was a direct answer: the web renderer is an <em>actual</em> control surface — clickable timeline, pause/inject/kill/fork, cost heat-map — not a convenience view. But the first draft over-corrected into pure symmetry, dropping the spec's terminal-complete constraint and the interface-contract rule that a browser is never required to reply. The review restored both, and added the loopback and single-user binding the now control-capable surface needed against the no-shared-server non-goal."
+},
+{
+ id:"AD-4", theme:"truth", origin:"amended",
+ title:"The event log is the durable truth; <code>state.json</code> is a rebuildable checkpoint",
+ binds:"CAP-8, CAP-9, CAP-14, CAP-15, CAP-17, CAP-21 and every renderer",
+ prevents:"two named authorities for one fact diverging after a crash, and one unit treating a database or checkpoint as authoritative while another replays the log",
+ rule:"every event is appended as one JSON object on one line and is never mutated; exactly one writer per file per AD-29. <code>events.jsonl</code> is the sole durable truth and <code>state.json</code> is a checkpoint derived from it; where they disagree the log wins and the checkpoint is discarded and rebuilt. No reader may treat <code>state.json</code> as authoritative for anything the log records. Any index or database is a derived projection reconstructable by replay.",
+ why:"The shape was chosen by asking how a run would be debugged six weeks later: jq over a file. That gives no write contention across concurrently running features, since each owns its own file; crash-safety by construction; and inspectability with <code>tail</code> at 2am, consistent with the git-and-plain-text grain of the rest of the system. The ranking clause was added by the review, which found AD-4 and AD-7 each claiming a different sole authority — see §9."
+},
+{
+ id:"AD-5", theme:"invocation", origin:"original",
+ title:"A single event envelope is shared by every emitter",
+ binds:"all units that write or read events",
+ prevents:"each agent, tool server and engine phase inventing its own event shape, which makes one timeline unrenderable and breaks replay",
+ rule:"every line carries <code>ts</code>, <code>seq</code>, <code>feature</code>, <code>run</code>, <code>step</code>, <code>emitter</code>, <code>type</code> and <code>payload</code>; <code>ts</code> is RFC3339 with milliseconds and <code>seq</code> is monotonic per file; when the event originates from a <code>claude -p</code> stream the original <code>parent_tool_use_id</code> and <code>session_id</code> are preserved verbatim; readers must ignore unknown types rather than error, so adding an event type is never a breaking change.",
+ why:"<code>parent_tool_use_id</code> is what makes the full subagent nesting tree reconstructable for the timeline, so preserving it verbatim is not tidiness — it is the only way the TUI can render nesting at all. The ignore-unknown-types rule is the forward-compatibility escape valve: it is what lets a new event type ship without coordinating a release across every reader. Confirmed closed by the adversarial lens."
+},
+{
+ id:"AD-7", theme:"truth", origin:"amended",
+ title:"The engine is a reconciler over on-disk state, not an in-memory supervisor",
+ binds:"the engine, every step agent, the worktree/container/resource lifecycle, CAP-5, CAP-6, CAP-23",
+ prevents:"one unit assuming an in-memory owner it can call into while another assumes durable state it can re-read, making crash recovery and the escape hatch behave differently depending on which unit is asked",
+ rule:"the loop reads the checkpoint, takes at most one next action, writes the checkpoint, and holds no authoritative run state in memory; the checkpoint ranks below the log per AD-4. Killing the engine at any instant and restarting it must produce identical behaviour to never having stopped. Idempotency is not asserted but mechanised: by the step baseline of AD-26 for worktree and git effects, and by the idempotency key of AD-15 for external writes.",
+ why:"The requirement that decided it: closing the laptop mid-feature must resume exactly where it was. That makes instant disengage and the escape hatch properties of the design rather than shutdown handlers that must be correct — and <code>claude -p</code> already owns resumable sessions by id, so keeping them alive in memory duplicates state the CLI manages better. The review's objection was that the first draft <em>asserted</em> crash-identical behaviour and idempotency with no mechanism named, in contrast to AD-15 which correctly named an idempotency key. The final clause names both mechanisms."
+},
+{
+ id:"AD-8", theme:"lifecycle", origin:"amended",
+ title:"Resume by session id only from an <code>interrupted</code> disposition",
+ binds:"every step agent, the reconciler, CAP-6, CAP-15",
+ prevents:"one unit assuming resume semantics and another assuming re-run semantics, and the kill control being silently undone by the recovery loop",
+ rule:"the checkpoint records the <code>claude</code> session id as soon as the subprocess reports it, and every step termination records a disposition. Only the disposition <code>interrupted</code> is resumable: the reconciler attempts <code>claude -p --resume</code> with the recorded id and, on failure, re-runs the step from its typed input file after the AD-26 baseline reset. A step terminated by a user steering command records <code>killed</code> and is never resumed or re-run by the reconciler.",
+ why:"The original rule said simply \"resume by id, else re-run\". The adversarial lens found the hole: the kill control SIGTERMs a step, the reconciler then sees a recorded session id with no live process, and resumes it. The user's safety control is silently reversed by the recovery loop. Recording a disposition on every termination — and making only <code>interrupted</code> resumable — is what closes it."
+},
+{
+ id:"AD-9", theme:"config", origin:"amended",
+ title:"Config in-repo, state central, configuration snapshotted per run",
+ binds:"the installer, the engine, both renderers, the profile loader, the resource pool, the worktree lifecycle, CAP-19, CAP-20",
+ prevents:"one unit looking in the repository for something the other writes centrally; and the profile loader reading the main checkout while the step spawner reads a worktree whose feature branch can itself edit <code>.orch/</code>",
+ rule:"the installer writes <code>profile.toml</code>, <code>agents/*.toml</code> and <code>permissions.toml</code> into <code>&lt;target-repo&gt;/.orch/</code> and appends the runtime paths to <code>.gitignore</code>; that directory is the only thing the orchestrator writes inside the target repository besides the feature branch and git notes. All runtime state lives under <code>ORCH_HOME</code>, defaulting to <code>~/.orch</code>: <code>runs/&lt;run-id&gt;/</code>, <code>worktrees/&lt;run-id&gt;/</code>, <code>pool/</code>, and central project registration and memory at <code>projects/&lt;project-id&gt;/</code> keyed per AD-10 — no profile is stored there. A config snapshot is taken once at run start into <code>runs/&lt;run-id&gt;/config/</code> and is the only configuration any step of that run reads; mid-run edits to <code>.orch/</code> never affect a live run. A prune command must exist to remove central state orphaned by a deleted project directory.",
+ why:"The first version said nothing orchestrator-owned is ever written inside the target repository — chosen because the user thinks in terms of runs rather than projects when reviewing what happened. The npx installer requirement forced the amendment, and the split landed where it did for one reason: a teammate cloning the repository inherits the setup without inheriting anyone's run history, and the worktree ambiguity disappears because only committed config lives in the repo and it is identical in every worktree. The run snapshot was added because a feature branch can itself edit <code>.orch/</code> mid-run."
+},
+{
+ id:"AD-10", theme:"config", origin:"original",
+ title:"A project is identified by the SHA of its first commit",
+ binds:"project registration, the profile lookup, memory scoping, every unit resolving a repo to its configuration, CAP-19, CAP-20",
+ prevents:"one unit keying a project by path while another keys it by remote URL or directory name, silently splitting one project into several after a move or rename",
+ rule:"<code>project-id</code> is the first-commit SHA, recorded at registration; the filesystem path is a mutable pointer updated on mismatch; a repository with no commits cannot be registered until it has one.",
+ why:"Named the strongest decision in the document by the adversarial lens, and it survived every pass untouched. The failure it prevents is quiet and permanent: move or rename a repo, and a path-keyed or URL-keyed system silently scatters its profile, its memory and its decision ledger across two identities with no error message. Its corollary — that a missing path must never be read as abandonment — became AD-33."
+},
+{
+ id:"AD-11", theme:"containment", origin:"original",
+ title:"The executor container image is built locally from a Dockerfile in this repository",
+ binds:"the isolation tiers, the threat-model containment layer, CAP-10, CAP-11",
+ prevents:"one unit expecting a registry-pinned tag while another builds locally, giving two different sandboxes with different hardening",
+ rule:"the image is tagged with the content hash of its Dockerfile and rebuilt automatically when that hash changes and never otherwise; no image is pulled from a registry; the build is the only step permitted network access outside the egress allowlist.",
+ why:"Keeps the supply-chain surface at zero, consistent with the egress allowlist proxy already specified. Confirmed closed by the adversarial lens. A downstream consequence worth remembering: TypeScript 7 ships no musl binary, so this Dockerfile could not be Alpine-based if the stack ever moved to 7 — one more reason the stack pins 5.9.3."
+},
+{
+ id:"AD-12", theme:"ops", origin:"amended",
+ title:"Distribution is an interactive npx installer run from git",
+ binds:"installation, project onboarding, the replication model, CAP-20",
+ prevents:"divergent setup where one project is scaffolded by hand and another by tool; an unrecoverable half-install; and an engine meeting an older <code>.orch/</code> with undefined behaviour",
+ rule:"<code>npx github:&lt;owner&gt;/&lt;repo&gt; init</code> is the only supported way to onboard a project — not clone-and-run and not a published npm package; it is interactive, writes only into <code>&lt;target-repo&gt;/.orch/</code> and <code>.gitignore</code>, and bundles no credential, every user authenticating with their own Claude Code login. It writes a <code>schema_version</code> and a manifest of every file it created, so a half-install is detectable and recoverable. Upgrade re-runs the installer, which must be idempotent and must preserve answers already on disk. Stated revisit condition: npm 12 disables git-dependency resolution and install scripts by default, so before npm 12 becomes the bundled npm of a supported Node this delivery path must be re-verified empirically or replaced; the Stack pins npm below 12 until then.",
+ why:"Started as clone-and-run, chosen partly because the Agent SDK terms forbid offering claude.ai login or rate limits to third parties without prior approval. An npx installer does not breach that, so long as it bundles no credentials and every user authenticates with their own login — the installer only scaffolds files and never proxies a subscription. Running from git rather than the npm registry needs no registry account. The npm 12 hazard was reproduced empirically; the decision taken was to keep the path and document the revisit condition rather than redesign distribution now."
+},
+{
+ id:"AD-13", theme:"containment", origin:"amended",
+ title:"External domains are one MCP server per domain, and every external read is recorded",
+ binds:"every step agent, every tool server, CAP-3, CAP-7, and the re-run guarantee in AD-8",
+ prevents:"one unit exploring a domain live while another expects its inputs pre-resolved, making the same step non-deterministic across re-runs",
+ rule:"each domain runs as exactly one MCP server passed with <code>--mcp-config</code> under the <code>--strict-mcp-config</code> of AD-1, holding that domain's credential and no other; agents may explore it freely; the runtime records every request and response, through the redaction pass of AD-21, to the event log and to the run shared fetch record; on re-run the fetch record is served first and the domain is contacted only for a request not already recorded.",
+ why:"The choice was exploration versus determinism, and the answer refused both horns: record/replay gives exploration at authoring time and determinism at re-run time. Exploration buys genuinely better analysis; the fetch record restores the determinism AD-8 re-run safety depends on. Two review corrections: the stated confinement was <em>false</em> as written, because passing servers via <code>--mcp-config</code> binds only those servers while the target repository's own <code>.mcp.json</code> loads alongside them — defeating CAP-7's success criterion. Hence the explicit tie to <code>--strict-mcp-config</code>. And recording everything, composed with an immutable log, needed AD-21 to not become a permanent leak."
+},
+{
+ id:"AD-14", theme:"containment", origin:"original",
+ title:"The run shared fetch record is readable by every later step in that run",
+ binds:"all step agents, CAP-6, CAP-9",
+ prevents:"each step re-fetching what an earlier step already pulled, and two steps in one run seeing different versions of the same external record",
+ rule:"a fetch recorded by any step is visible to every subsequent step of the same run and is served from the record rather than re-requested; within one run an external record has exactly one value.",
+ why:"The second clause is the real one. Cost and latency are the obvious benefit, but the correctness benefit is that a planning step and a verification step in the same run cannot disagree about what a Jira ticket says because one of them read it an hour later. Within one run, an external record has exactly one value — which is what makes the run reproducible at all."
+},
+{
+ id:"AD-15", theme:"containment", origin:"amended",
+ title:"Agents never write; the engine executes an enumerated write surface",
+ binds:"every step agent, the engine, the committer, CAP-7, CAP-12",
+ prevents:"an agent performing a side effect that AD-8 re-run would double-apply, and two units disagreeing about whether a declared write has already happened",
+ rule:"the write surface is enumerated: <code>git push</code>, pull request creation, git notes, tags, and every MCP domain mutation are engine-executed write intents, and none may be performed by an agent; no MCP server exposes a mutating tool. The engine executes each intent exactly once against an idempotency key derived from run id plus intent id. Durability order is fixed: a <code>write.attempted</code> record carrying that key is durable before the call; recovery finding <code>attempted</code> with no recorded outcome reconciles against the target rather than blindly re-executing.",
+ why:"The original wording fenced \"external domains\", but never defined the term. The adversarial lens found the gap: a committer granted <code>Bash(git *)</code> under AD-17 may legally push and open the PR itself, while another implementation legally emits a write intent for the engine — and the first duplicates the pull request on every AD-8 re-run. Enumerating the surface explicitly, git operations included, closes it. The durability ordering clause closes the narrower window where a crash between the call and its recorded outcome would otherwise re-execute blindly."
+},
+{
+ id:"AD-16", theme:"config", origin:"amended",
+ title:"The per-repo profile carries project knowledge, and its precedence against repo instructions is fixed",
+ binds:"CAP-20, the bootstrap agent, every step agent, the profile loader",
+ prevents:"the two-sources-of-truth failure where the profile and the repository's own <code>CLAUDE.md</code> or <code>AGENTS.md</code> disagree and different steps follow different guidance",
+ rule:"the profile is authoritative for mechanics — test, lint, build and run commands, package manager, source layout, resource needs, risk tiers, conflict-domain hints; the repository's own instructions are authoritative for code conventions; where both speak to the same point the repository wins and the profile entry is flagged stale rather than silently applied; profile knowledge sections are additive only and may never contradict the repository; every knowledge entry carries provenance and a decay policy in the vocabulary of <code>memory-design.md</code> — permanent, until-refactor, N-features, session — and a re-validation sweep flags entries whose anchors no longer resolve; the profile is authored by the installer and the bootstrap agent, reviewed by the user before first use, and stored at <code>&lt;target-repo&gt;/.orch/profile.toml</code> per AD-9.",
+ why:"A thin profile was the safer design; a thick one was chosen deliberately, accepting the duplication risk, because the system must work against repositories that do not document themselves. Rot is the price, and the mitigation is the agreed one: provenance plus a decay policy on every knowledge entry, and a re-validation sweep that flags entries whose anchors no longer resolve. The precedence rule — repository wins, profile entry flagged stale rather than silently applied — is what stops the duplication becoming a contradiction."
+},
+{
+ id:"AD-17", theme:"invocation", origin:"amended",
+ title:"The agent roster is declarative configuration referencing registered contracts",
+ binds:"the engine, the installer, every step agent, CAP-20",
+ prevents:"one unit hardcoding the built-in roster while another reads it from config, making a user-defined agent invisible to half the system",
+ rule:"every agent, built-in or user-defined, is declared by one TOML file in <code>&lt;target-repo&gt;/.orch/agents/</code> specifying its id, a reference to a registered contract id — never inline schemas, since AD-2 requires every schema to be a Zod schema in code — its granted tools and MCP domains, its reversibility class, and a <code>model</code> field declaring a starting tier and a promotion policy, never a fixed assignment. The engine discovers agents only by reading that directory and holds no compiled-in list. Adding an agent that reuses an existing contract requires no engine change; a genuinely new contract shape does.",
+ why:"Two review corrections landed here. First, the original said the TOML declares its step contract <em>schemas</em>, which contradicts AD-2's requirement that every schema be a Zod schema in code — and made the \"no engine change\" claim false as written. The fix is a reference to a registered contract id, plus an honest caveat: reusing a contract is free, a genuinely new shape is not. Second, model assignment was inverted against the spec, which calls for a ladder with promotion on verification failure and explicitly <em>not</em> a fixed per-agent assignment; the <code>model</code> field now declares a starting tier and a promotion policy."
+},
+{
+ id:"AD-18", theme:"config", origin:"original",
+ title:"No BMad dependency and no BMad files in a target project",
+ binds:"the installer and every unit",
+ prevents:"the design-time toolchain leaking into the runtime product",
+ rule:"nothing under <code>&lt;target-repo&gt;/.orch/</code> and no runtime code path may require <code>_bmad</code>, a BMad skill or a BMad command.",
+ why:"BMad is the tool being used to <em>design</em> the orchestrator, not a runtime dependency of it. The failure this prevents is the ordinary one where a scaffolding tool's conventions quietly become load-bearing in the shipped product, and removing it later means rewriting the thing it scaffolded. Confirmed closed by the adversarial lens."
+},
+{
+ id:"AD-19", theme:"interaction", origin:"added",
+ title:"Command transport is durable intent files",
+ binds:"both renderers, the engine, every steering control",
+ prevents:"<code>src/tui</code> and <code>src/web</code> being unbuildable because no path into the engine was named, and one renderer using a socket while the other writes files",
+ rule:"every steering command is a durable intent file written under <code>runs/&lt;run-id&gt;/commands/</code> and is the only thing the reconciler consumes; the loopback HTTP plus SSE server is an optional accelerator that writes those same files and streams the event log, never a second command path; every command records its principal so approvals are attributable; with the server down every control remains available through the file path.",
+ why:"The single most concrete finding of the whole review. AD-3 required steering to go through \"the same command path into the engine\", but no decision anywhere said what that path <em>was</em> — so the two renderer directories could not be built independently at all. Worse, the Deferred entry on the web renderer justified its own safety by citing AD-3, which was circular. Files rather than a socket is the choice consistent with the reconciler: an intent file survives a crash, and the loop already reads from disk every pass."
+},
+{
+ id:"AD-20", theme:"containment", origin:"added",
+ title:"One containment boundary, owned by one wrapper",
+ binds:"CAP-10, the executor, the committer, the threat-model containment layer",
+ prevents:"the container boundary being defined differently by each unit, leaving CAP-10's success criterion untestable",
+ rule:"one wrapper script owns every <code>docker</code> invocation and no unit composes its own flags: read-only root filesystem, tmpfs for temp, only the run worktree and its session directory mounted — never <code>HOME</code>, ssh or cloud credential paths — non-root user, all capabilities dropped, no-new-privileges, seccomp profile, memory and pid limits. <code>--rm</code> is not used while a run is live because it would destroy the session transcript AD-8 resume depends on; removal happens only after the run reaches a terminal disposition. The executor holds no push and no production credential, only the committer may push, force-push is never permitted, and branch protection on the default branch is asserted at run start. A provisioning phase with network precedes execution; execution runs behind the egress allowlist proxy.",
+ why:"The containment boundary had <em>no</em> decision at all. The threat model specified hardened run flags, worktree-only mounts, no docker socket, two-phase network, an egress allowlist proxy, no push credential in the executor, a single gated committer, no force-push and protected main — and the spine fixed only image provenance (AD-11), leaving CAP-10's own success criterion unenforceable. Concentrating every <code>docker</code> flag in one wrapper is what makes it testable at all; AD-31 then requires an assertion test proving no push credential and no docker socket are reachable from inside. The <code>--rm</code> clause is a subtle interlock: removing the container eagerly would destroy the session transcript AD-8 resume depends on."
+},
+{
+ id:"AD-21", theme:"containment", origin:"added",
+ title:"Redaction before append, failing closed",
+ binds:"the runtime recorder and every emitter",
+ prevents:"AD-13's record-everything composing with AD-4's immutability to manufacture a permanent un-redactable secret leak",
+ rule:"every event passes a redaction pass on the boundary between producer and log, covering known token prefixes, high-entropy strings, env-file contents, private-key headers and the literal values of injected credentials; the pass fails closed, dropping the artifact and recording a <code>redaction.failed</code> event rather than writing unredacted content. Redaction is a write-path invariant; there is no after-the-fact remedy.",
+ why:"The clearest example in the review of a composition failure: neither AD-13 nor AD-4 is wrong alone, but the <em>pair</em> manufactures the exact Critical threat in the threat model. \"Record every external request and response\" plus \"event lines are never mutated\" equals a permanent, un-redactable secret in an append-only file. The spec's redaction constraint was unanchored — no decision owned it. Failing closed rather than open is deliberate: losing one artifact is recoverable, writing a credential into an immutable log is not."
+},
+{
+ id:"AD-22", theme:"truth", origin:"added",
+ title:"The in-repository durable record is a git note on the merge commit",
+ binds:"the committer, CAP-8, the SPEC success signal",
+ prevents:"the timeline being irrecoverable from the repository once the worktree and central state are gone",
+ rule:"the committer writes a git note on the merge commit under a single named ref carrying the run id, the ordered step list with dispositions, the acceptance criteria, usage totals and the decisions taken; the note shape is a versioned contract and the committer is its only writer; the note is the durable in-repo record and <code>events.jsonl</code> is the full-fidelity record. The committer also owns branch naming: the pattern is declared once in the project profile, defaulting to <code>feature/&lt;feature-slug&gt;</code>, the committer is the only unit that creates or names a branch, and no other unit may infer a branch name from a feature slug.",
+ why:"CAP-8 and the spec's success signal both require the timeline to be reconstructable from <code>git log</code> and notes alone, with no other datastore. But AD-4 makes <code>events.jsonl</code> the truth and AD-9 places it outside the repository — so after worktree destruction the only record was central, and no decision said what git notes must durably carry. The resolution is a two-tier record: the note is the durable in-repo summary, the log is full fidelity. Branch naming was folded in here because it is the same failure mode: two units independently deriving a branch name from a slug is two units disagreeing about which branch a run is on."
+},
+{
+ id:"AD-23", theme:"truth", origin:"added",
+ title:"Control plane and evidence plane are separated",
+ binds:"the engine, every step agent, CAP-9",
+ prevents:"evidence volume entering orchestrator context",
+ rule:"the control plane is the typed step input and output plus the state checkpoint and nothing else, and it alone may enter model context; the evidence plane is transcripts, diffs, fetch records and telemetry, written by the runtime to disk and referenced by pointer; a declared token ceiling bounds the control plane per run, and exceeding it is a hard failure, never a degradation.",
+ why:"Identified in the source sessions as the highest-leverage architectural decision in the system — and it appeared nowhere in the first spine, with CAP-9's declared token ceiling unfixed. Without the split, orchestrator context grows with evidence volume, which means a long run degrades in quality precisely when it most needs not to. \"Hard failure, never a degradation\" is the load-bearing phrase: a ceiling that silently truncates is a ceiling that produces wrong answers quietly."
+},
+{
+ id:"AD-24", theme:"lifecycle", origin:"added",
+ title:"Run ceilings, degradation and hibernation",
+ binds:"CAP-16, the reconciler",
+ prevents:"each unit inventing its own limit semantics",
+ rule:"every run carries three ceilings — step count, wall-clock and consumed rate-limit budget — and no currency dimension. At eighty percent of any ceiling the run degrades by downshifting model tier and narrowing scope, emitting <code>budget.degraded</code>. On reaching a ceiling the run hibernates, writing a handoff note and a terminal-pending disposition and emitting <code>budget.exhausted</code>, rather than dying mid-write or continuing.",
+ why:"CAP-16's three ceiling dimensions, its hibernation-on-hit and its 80% graceful degradation were governed by nothing at all, with no event types. The absence of a currency dimension is a spec constraint made structural: cost is subscription usage, not money, so there is no per-token billing to optimize and no dollar ceiling to invent. Hibernating rather than dying mid-write is the reconciler's grain — a terminal-pending disposition is a state the loop can act on, an abrupt death is not."
+},
+{
+ id:"AD-25", theme:"interaction", origin:"added",
+ title:"The question lifecycle is one compare-and-set transition",
+ binds:"the Interviewer, both renderers, CAP-1, CAP-2, CAP-3, CAP-4, CAP-18",
+ prevents:"the three resolvers — TUI answer, web answer, timeout default — racing and poisoning the decision ledger with conflicting answers",
+ rule:"a question is a contract type in <code>contracts/</code> with a single state machine; exactly one transition from <code>asked</code> to <code>resolved</code> is accepted, decided by a compare-and-set on the question state file, later resolvers receiving an already-resolved result; the winning transition records its resolver and principal; only a resolved question writes to the decision ledger; the event vocabulary includes <code>question.asked</code>, <code>question.resolved</code>, <code>question.default_taken</code> and <code>question.deflected</code>.",
+ why:"CAP-1 through CAP-4 — the entire conversational entry point, spec echo, question compression and default-on-timeout — were governed only by a prose pointer. There was no question envelope in <code>contracts/</code> and no event types for asked, default taken, decision recorded or deflection. The race is real and three-way: with two renderers and a timeout, three resolvers can answer the same question, and the decision ledger is a durable artifact that later features read. One accepted transition, decided by compare-and-set on a file, is the smallest mechanism that makes it impossible."
+},
+{
+ id:"AD-26", theme:"lifecycle", origin:"added",
+ title:"Every step records a baseline commit that re-run resets to",
+ binds:"every step agent, the reconciler, AD-8 re-run safety",
+ prevents:"one implementation re-running against a half-mutated worktree while another hard-resets, one double-applying edits and the other discarding work",
+ rule:"every step records a <code>baseline_ref</code>, the exact commit of the run worktree at the instant the step began; re-running a step first resets the worktree to its <code>baseline_ref</code>; a step may therefore be re-run any number of times with identical effect.",
+ why:"AD-8's original claim was that \"no step may depend on having run exactly once\" — an unenforceable negative. AD-15 fenced only <em>external</em> writes, and nothing said whether a re-run resets the worktree, so re-run safety for worktree and git effects was simply unestablished. This is the mechanism that makes AD-7's idempotency claim real rather than asserted: a commit ref recorded at step start, and a reset to it before any re-run."
+},
+{
+ id:"AD-27", theme:"lifecycle", origin:"added",
+ title:"Shadow mode is an ordinary run carrying a mode flag",
+ binds:"CAP-21, the stage-3 autonomy gate",
+ prevents:"shadow being built as a replay runner over past events by one unit and as live execution with writes suppressed by another, making the autonomy gate measure different things",
+ rule:"a shadow run is an ordinary run carrying <code>mode: shadow</code> in its state; only the intent executor and the committer honour it, by recording every write intent and executing none; every other component behaves identically to a live run.",
+ why:"Shadow mode is what unlocks the first autonomy tier, so what it <em>measures</em> is load-bearing. Two reasonable implementations — replay over past events, versus live execution with writes suppressed — would produce different accuracy numbers from the same feature, and the gate would be measuring an artifact of the implementation. Confining the flag's effect to exactly two components, the intent executor and the committer, is what keeps a shadow run genuinely comparable to a live one."
+},
+{
+ id:"AD-28", theme:"config", origin:"added",
+ title:"Every on-disk contract carries a schema version, and the runtime is pinned",
+ binds:"the installer, the engine, every on-disk artifact, every spawned subprocess",
+ prevents:"an engine meeting an older <code>.orch/</code> or an older run layout being undefined behaviour; and a stale version-manager <code>PATH</code> silently handing subprocesses a Node below the floor, whose observed failure is an opaque TypeScript syntax error rather than an unsupported-version message",
+ rule:"every on-disk configuration and state artifact carries a <code>schema_version</code>; the engine refuses to operate on a version it does not recognise and states which installer version wrote it. Forward compatibility for events is covered by the AD-5 ignore-unknown-types rule; configuration and state have no such latitude. The required Node version is declared once, in <code>.nvmrc</code> and the <code>package.json</code> <code>engines</code> field; the installer and the engine each assert the running Node meets that floor at startup and fail fast naming the required version. The engine resolves the absolute path of a Node executable satisfying the floor, passes that absolute path to every child process rather than relying on <code>PATH</code> resolution, and records the resolved version in the run event log.",
+ why:"Two silent dimensions in one decision. Config schema versioning and migration between installer and engine were unspecified, so an upgrade meeting an older <code>.orch/</code> had no defined behaviour. Separately, the Node floor bites concretely: <code>bin/init.ts</code> as an npx entry point needs native TypeScript type stripping, which requires Node 22.18 or later — and the dev machine ran 22.14.0. The failure mode is the nasty part: a version-manager <code>PATH</code> handing a subprocess an older Node produces an opaque TypeScript syntax error, not an unsupported-version message. Resolving an absolute Node path and passing it explicitly is what makes the failure legible."
+},
+{
+ id:"AD-29", theme:"truth", origin:"added",
+ title:"Identifier minting and sequence assignment have single owners",
+ binds:"the engine, the runtime recorder, every emitter",
+ prevents:"two units both appending to one <code>events.jsonl</code> — concrete where an MCP server is a child of <code>claude -p</code> — and unminted or colliding run ids",
+ rule:"run ids are ULIDs minted solely by the engine at run creation; the runtime recorder is the single process that appends to a run's <code>events.jsonl</code> and is the sole assigner of <code>seq</code>; every other producer, including MCP servers and step subprocesses, emits through the recorder rather than writing the file; ordering is by <code>seq</code>, and timestamps carry no ordering authority across processes.",
+ why:"One writer per file was asserted in the conventions table and mechanised nowhere. The concrete case is not hypothetical: an MCP server runs as a child of <code>claude -p</code>, so without this rule it is a second process with every reason to append to the same log. The last clause matters more than it looks — timestamps carry no ordering authority across processes, because clock skew between a subprocess and the engine would otherwise silently reorder a timeline that <code>seq</code> gets right."
+},
+{
+ id:"AD-30", theme:"truth", origin:"added",
+ title:"One engine instance per <code>ORCH_HOME</code>",
+ binds:"the engine, the one-writer guarantees in AD-4 and AD-29",
+ prevents:"two concurrently running engines on one <code>ORCH_HOME</code> silently interleaving writes",
+ rule:"the engine acquires an exclusive lock file under <code>ORCH_HOME</code> at startup and exits with a clear message if it is held; the lock records pid and start time, and a stale lock is reclaimed only after verifying the pid is gone.",
+ why:"AD-4 and AD-29 both rest on one-writer-per-file, and both are defeated instantly by a second engine process — which a single developer will start by accident, from a second terminal, on the first day. Reclaiming a stale lock only after verifying the pid is gone is what stops the lock itself becoming the failure: a crash that leaves a lock behind must not require manual cleanup, but neither may it be cleared blindly."
+},
+{
+ id:"AD-31", theme:"ops", origin:"added",
+ title:"Three test suites are the floor before any unattended run",
+ binds:"every unit of this codebase",
+ prevents:"the named top risk, maintenance burden, arriving through an untested codebase",
+ rule:"every contract in <code>contracts/</code> has round-trip tests asserting that its Zod schema, its draft-7 export and a recorded real <code>structured_output</code> agree; the reconciler has crash-injection tests that kill it at every state transition and assert AD-7 resume-identical behaviour; the container wrapper has an assertion test proving no push credential and no docker socket are reachable from inside. These three suites are required before any unattended run.",
+ why:"Testing and verification strategy for the system's own units was wholly silent — no decision, not even a Deferred entry — despite maintenance burden being the spec's named likeliest cause of project failure. The three suites are not a general testing policy; each one pins an invariant that a different decision merely asserts. Contracts round-trip proves AD-2's chain actually holds against a real CLI response. Crash injection proves AD-7's resume-identical claim. The container assertion proves AD-20's boundary, which is the only way CAP-10's success criterion becomes testable."
+},
+{
+ id:"AD-32", theme:"lifecycle", origin:"added",
+ title:"Lifecycle reclamation is a reconcile action, never a shutdown handler",
+ binds:"the reconciler, the resource pool, the container wrapper, the worktree lifecycle, CAP-11",
+ prevents:"one unit releasing a lease in an exit path a crash skips while another expects the reconciler to reclaim it, stranding containers and leases after every hard kill",
+ rule:"every resource, container and worktree is reclaimed by a reconcile pass comparing live resources against runs, never by a process exiting cleanly; a resource whose run has reached a terminal disposition, or whose run state no longer exists, is reclaimed on the next pass; nothing is reclaimed while its run holds a non-terminal disposition.",
+ why:"The direct corollary of AD-7, applied to resources. A cleanup path in an exit handler is correct exactly when the process exits cleanly — and the whole design assumes it often will not. Reclaiming by comparing live resources against runs means a hard kill strands nothing, because the next pass sees a container whose run is terminal and reclaims it. The final clause is the safety catch: nothing is reclaimed while its run is still non-terminal, so a slow step is never mistaken for an abandoned one."
+},
+{
+ id:"AD-33", theme:"ops", origin:"added",
+ title:"Prune never infers abandonment from a missing path",
+ binds:"prune, project registration, AD-10",
+ prevents:"the reclamation sweep destroying the history of a project that was merely moved, since AD-10 keys projects by first-commit SHA and the recorded path is an explicitly mutable pointer",
+ rule:"an unresolvable project path marks the registration <code>unlocated</code> and nothing more; central state is deleted only by an explicit prune naming a <code>project-id</code>; re-registering a moved repository reattaches its existing history by first-commit SHA rather than creating a second project.",
+ why:"AD-9 accepted that deleting a project directory orphans its central state, and required a prune command. AD-10 then made the recorded path an explicitly mutable pointer. Composed carelessly, prune would read \"path not found\" as \"project gone\" and delete the memory, ledger and run history of a repository that was simply moved to another directory. <code>unlocated</code> and nothing more is the conservative reading; deletion requires a human naming a <code>project-id</code>."
+},
+{
+ id:"AD-34", theme:"config", origin:"added",
+ title:"Configuration scopes are fixed and disjoint",
+ binds:"the installer, the engine, both renderers, the memory layer, CAP-19",
+ prevents:"two units disagreeing about which file answers a question, and leaves no per-machine setting or cross-repo memory without a declared home",
+ rule:"machine scope is <code>ORCH_HOME/config.toml</code>, holding ports, paths, docker endpoint and machine defaults, and is never committed; project scope is <code>&lt;target-repo&gt;/.orch/</code> and is committed; run scope is the immutable snapshot at <code>runs/&lt;run-id&gt;/config/</code> per AD-9 and is the only configuration a step reads; cross-project memory is <code>ORCH_HOME/memory/</code>, because it spans projects and can belong to no repository. A value is declared in exactly one scope; there is no merging and no overriding between scopes.",
+ why:"AD-9 fixed config-in-repo and state-central, but left two things homeless: per-machine settings that must never be committed, such as a docker endpoint or a port, and cross-repo pattern memory, which by definition belongs to no repository. The final sentence is the strict half. Merging and overriding between scopes is the ordinary configuration design, and it is exactly what produces two units disagreeing about which file answers a question — so it is forbidden outright rather than specified."
+},
+{
+ id:"AD-35", theme:"lifecycle", origin:"added",
+ title:"Every failure code carries a declared disposition",
+ binds:"every unit emitting the error shape, the reconciler acting on it",
+ prevents:"two units treating the same failure differently, one retrying what another abandons",
+ rule:"the error shape <code>code</code>, <code>message</code>, <code>retryable</code>, <code>cause</code> is accompanied by a disposition table in <code>contracts/</code> beside the error schema, mapping every code to exactly one of retry-with-backoff, escalate-model-tier, escalate-to-human, or abandon-and-hand-off; an unknown code is treated as abandon-and-hand-off and never retried.",
+ why:"The error <em>shape</em> was a convention from early on; what to <em>do</em> with each code was not, so retry, backoff and the repeated-failure handoff threshold were silent. A shared shape with unshared semantics is worse than no shape, because it looks interoperable. The unknown-code default is deliberately the pessimistic one: abandon and hand off, never retry. An unrecognised failure retried in a loop is how a system that was meant to free the user's time consumes it instead."
+}
+];
+
+/* ===================== LIFECYCLE STAGES ===================== */
+var STAGES = [
+{
+ n:"01", t:"Describe", who:"Interviewer",
+ cap:"CAP-1",
+ nodes:["n-user","n-interviewer"],
+ what:"The user types one sentence in one terminal session and never addresses any other component. The Interviewer is itself a <code>claude -p</code> process, not special-cased engine code.",
+ acts:["<b>User terminal</b> — the only surface the user must touch","<b>Interviewer</b> — one <code>claude -p</code> session","<code>src/contracts</code> — the question type"],
+ ads:["AD-1","AD-25","AD-23","AD-13"],
+ note:"Everything the Interviewer reads from an external domain goes through a tool server and is recorded, so the conversation is reproducible on re-run."
+},
+{
+ n:"02", t:"Spec echo", who:"Interviewer",
+ cap:"CAP-2",
+ nodes:["n-interviewer","n-q"],
+ what:"The request is restated as an acceptance-criteria list and confirmed. No feature enters execution without a user-confirmed list; editing a criterion line amends the contract rather than restarting the interview.",
+ acts:["<b>Interviewer</b> — produces typed output against a Zod contract","<b>questions/</b> — the criteria confirmation is itself a question"],
+ ads:["AD-25","AD-2","AD-5"],
+ note:"The confirmed criteria are carried into the git note at merge time (AD-22), so the contract a feature was judged against stays recoverable from the repository."
+},
+{
+ n:"03", t:"Questions", who:"questions/ + renderers",
+ cap:"CAP-3, CAP-4",
+ nodes:["n-q","n-tui","n-web"],
+ what:"Subagent questions are answered from the repository, history and decision ledger first — deflected — or merged, before any reach the user. Those that do reach the user declare what happens if ignored.",
+ acts:["<b>questions/</b> — one state file per question, compare-and-set","<b>Ink TUI</b> and <b>web surface</b> — two of the three possible resolvers","<b>timeout default</b> — the third resolver"],
+ ads:["AD-25","AD-19","AD-3"],
+ note:"Three resolvers, exactly one accepted transition. Losing resolvers receive an already-resolved result and write nothing — see Figure 4."
+},
+{
+ n:"04", t:"Run created", who:"Engine",
+ cap:"CAP-19, CAP-20",
+ nodes:["n-eng","n-state"],
+ what:"The engine mints a ULID run id, resolves the repository to its <code>project-id</code> by first-commit SHA, snapshots the configuration into <code>runs/&lt;run-id&gt;/config/</code>, and provisions the isolation tier the risk classification calls for — in place, on a branch, or a worktree with a container.",
+ acts:["<b>Engine</b> — sole minter of run ids, holder of the <code>ORCH_HOME</code> lock","<b>Container wrapper</b> — the only unit that invokes <code>docker</code>","<b>Worktree lifecycle</b> — under <code>ORCH_HOME/worktrees/</code>"],
+ ads:["AD-29","AD-10","AD-9","AD-34","AD-28","AD-30","AD-20","AD-11"],
+ note:"The config snapshot is the only configuration any step of this run will read. Mid-run edits to <code>.orch/</code> — including edits made by the feature branch itself — never affect a live run."
+},
+{
+ n:"05", t:"Reconcile", who:"Engine",
+ cap:"CAP-5, CAP-6",
+ nodes:["n-eng","n-state"],
+ what:"The loop reads the checkpoint, decides the single next action, takes it, writes the checkpoint back. Nothing authoritative is held in memory. Concurrent across features, but serialized for any features whose declared file territories overlap.",
+ acts:["<b>Engine reconciler</b> — at most one action per pass","<b>state.json</b> — read and rewritten atomically, temp file then rename"],
+ ads:["AD-7","AD-4","AD-24","AD-32","AD-30"],
+ note:"This is the stage that makes every other guarantee cheap. Kill the engine here and restart it: by construction, behaviour is identical to never having stopped."
+},
+{
+ n:"06", t:"Step spawn", who:"Engine &rarr; step subprocess",
+ cap:"CAP-6, CAP-12",
+ nodes:["n-eng","n-step","n-git"],
+ what:"Exactly one <code>claude -p</code> process per step. The engine passes the step's typed input file and its contract as <code>--json-schema</code>, consumes <code>--output-format stream-json</code>, and passes <code>--strict-mcp-config</code> and <code>--restricted</code>. The worktree commit at the instant the step began is recorded as <code>baseline_ref</code>.",
+ acts:["<b>Engine spawner</b> — absolute Node path, roster read from <code>.orch/agents/</code>","<b>Step subprocess</b> — a pure function over typed files","<b>Run worktree</b> — records the baseline"],
+ ads:["AD-1","AD-2","AD-17","AD-26","AD-23","AD-28"],
+ note:"The engine re-parses <code>structured_output</code> against the originating Zod schema before accepting the output. The CLI validated it once; the engine does not take that on trust."
+},
+{
+ n:"07", t:"Tools &amp; reads", who:"MCP tool servers",
+ cap:"CAP-7",
+ nodes:["n-step","n-tool"],
+ what:"Each external domain is exactly one MCP server holding that domain's credential and no other. Agents explore freely. Every request and response is recorded to the run's shared fetch record; on re-run the record is served first.",
+ acts:["<b>Tool servers</b> — <code>src/tools</code>, one per domain, jira first","<b>fetch-record.json</b> — shared by every later step in the run"],
+ ads:["AD-13","AD-14","AD-15","AD-7"],
+ note:"No MCP server exposes a mutating tool. A non-owning agent attempting another domain's API fails for absence of credential — which is what makes CAP-7 testable rather than instructional."
+},
+{
+ n:"08", t:"Record", who:"Runtime recorder",
+ cap:"CAP-9, CAP-14",
+ nodes:["n-rec","n-ev","n-step","n-tool"],
+ what:"Every emitter — engine phases, step subprocesses, tool servers — emits through the recorder. The recorder redacts, assigns <code>seq</code>, and appends one JSON object per line. It is the only process that writes the file.",
+ acts:["<b>Runtime recorder</b> — <code>src/runtime</code>, sole writer and sole <code>seq</code> assigner","<b>events.jsonl</b> — append-only, never mutated"],
+ ads:["AD-29","AD-21","AD-5","AD-4","AD-23"],
+ note:"Redaction happens on the boundary <em>before</em> the append and fails closed, dropping the artifact and emitting <code>redaction.failed</code>. In an append-only log there is no after-the-fact remedy."
+},
+{
+ n:"09", t:"Writes", who:"Engine intent executor",
+ cap:"CAP-12",
+ nodes:["n-eng","n-tool","n-git"],
+ what:"Agents never write. A step output declares write intents; the engine executes each exactly once against an idempotency key derived from run id plus intent id. The surface is enumerated: <code>git push</code>, pull request creation, git notes, tags, and every MCP domain mutation.",
+ acts:["<b>Intent executor</b> — inside <code>src/engine</code>","<b>Tool servers</b> — the mutation target","<b>Committer</b> — the only unit that may push"],
+ ads:["AD-15","AD-27","AD-35","AD-12"],
+ note:"A <code>write.attempted</code> record carrying the key is durable before the call. Recovery finding <code>attempted</code> with no recorded outcome reconciles against the target rather than re-executing blindly. In shadow mode the intents are recorded and none is executed."
+},
+{
+ n:"10", t:"Verify", who:"Gates + verification agents",
+ cap:"CAP-13",
+ nodes:["n-eng","n-step"],
+ what:"Deterministic gates — typecheck, lint, tests — run before any model-based review, and no review spend occurs on a run that fails them. On failure the model tier is promoted and the step re-runs after a baseline reset.",
+ acts:["<b>Engine gates</b> — commands named by the project profile","<b>Verification step agents</b> — declared in the roster like any other"],
+ ads:["AD-17","AD-35","AD-24","AD-31","AD-8","AD-26"],
+ note:"Model assignment is a ladder with promotion on verification failure, never a fixed per-agent assignment — the <code>model</code> field declares a starting tier and a promotion policy."
+},
+{
+ n:"11", t:"Commit &amp; merge", who:"Committer",
+ cap:"CAP-8",
+ nodes:["n-eng","n-git"],
+ what:"The committer — the only unit holding a push credential and the only unit that creates or names a branch — opens a pull request by default, under the user's own git identity. On merge it writes a git note on the merge commit.",
+ acts:["<b>Committer</b> — sole writer of the git note, sole pusher","<b>Run worktree</b> — the feature branch, default pattern <code>feature/&lt;feature-slug&gt;</code>"],
+ ads:["AD-22","AD-15","AD-20","AD-4"],
+ note:"The note carries the run id, the ordered step list with dispositions, the acceptance criteria, usage totals and the decisions taken. It is the durable in-repo record; <code>events.jsonl</code> is full fidelity. Force-push is never permitted and branch protection is asserted at run start."
+},
+{
+ n:"12", t:"Reclaim", who:"Reconcile pass",
+ cap:"CAP-11",
+ nodes:["n-eng","n-state"],
+ what:"A reconcile pass compares live resources against runs. Anything whose run has reached a terminal disposition, or whose run state no longer exists, is reclaimed. Nothing is reclaimed while its run holds a non-terminal disposition.",
+ acts:["<b>Reclamation pass</b> — inside <code>src/engine</code>","<b>Container wrapper</b> — container removal only after a terminal disposition","<b>pool/</b> — leases returned and verified empty"],
+ ads:["AD-32","AD-20","AD-9","AD-33"],
+ note:"Never a shutdown handler. A hard kill strands nothing, because the next pass sees a container whose run is terminal and reclaims it."
+},
+{
+ n:"&#8635;", t:"At any instant", who:"Steering &amp; recovery",
+ cap:"CAP-5, CAP-15, CAP-16, CAP-23",
+ nodes:["n-tui","n-web","n-q","n-eng","n-state"],
+ what:"Pause, inject a note, kill or fork from the timeline; or close the laptop. Every steering command is a durable intent file under <code>runs/&lt;run-id&gt;/commands/</code>, recording its principal. Every control remains available with the web server down.",
+ acts:["<b>Both renderers</b> — built against the same <code>Command</code> enum","<b>commands/</b> — the only thing the reconciler consumes","<b>Engine</b> — records a disposition on every termination"],
+ ads:["AD-19","AD-3","AD-7","AD-8","AD-26","AD-24","AD-35","AD-23"],
+ note:"A kill records <code>killed</code> and is never resumed or re-run. Only <code>interrupted</code> is resumable. At eighty percent of a ceiling the run degrades; on reaching one it hibernates with a handoff note rather than dying mid-write."
+}
+];
+
+/* ===================== CAPABILITY MAP ===================== */
+var CAPMAP = [
+["CAP-1, CAP-2, CAP-3, CAP-4 — conversation, spec echo, question compression, default-on-timeout","Interviewer session as a <code>claude -p</code> process; question contract in <code>src/contracts</code>, state files under <code>runs/&lt;run-id&gt;/questions/</code>","AD-25, AD-1, AD-13"],
+["CAP-5, CAP-23 — mode visibility, disengage, escape hatch, handoff","<code>src/engine</code> reconciler, <code>runs/&lt;run-id&gt;/commands/</code>, both renderers","AD-7, AD-19, AD-8, AD-35"],
+["CAP-6 — deterministic orchestration and step re-run","<code>src/engine</code> reconciler, <code>src/contracts</code>","AD-1, AD-7, AD-8, AD-26, AD-13, AD-14"],
+["CAP-7 — capability-scoped tool access","<code>src/tools</code> MCP servers, engine spawn arguments","AD-13, AD-15, AD-1"],
+["CAP-8 — git as message bus","committer, git note on the merge commit","AD-22, AD-4, AD-15"],
+["CAP-9 — control and evidence plane separation","<code>src/engine</code> control plane, <code>src/runtime</code> evidence plane","AD-23, AD-4, AD-5"],
+["CAP-10 — tiered isolation","<code>src/container</code> wrapper, <code>docker/Dockerfile</code>","AD-20, AD-11"],
+["CAP-11 — ephemeral pooled resources","<code>src/engine</code> reclamation pass, <code>pool/</code>","AD-32, AD-20, AD-9"],
+["CAP-12, CAP-13 — reversibility-tiered autonomy, test-first verification","<code>src/engine</code> gates, verification step agents","AD-15, AD-17, AD-1, AD-8"],
+["CAP-14, CAP-15 — two renderers, steerability","<code>src/tui</code>, <code>src/web</code>, the <code>Command</code> enum in <code>src/contracts</code>","AD-19, AD-3, AD-4, AD-5"],
+["CAP-16 — cost governance","<code>src/engine</code> ceiling enforcement, <code>src/runtime</code> usage events","AD-24, AD-23, AD-5"],
+["CAP-17, CAP-18 — consolidation, decision ledger","consolidation pass over <code>runs/</code>, ledger under <code>projects/&lt;project-id&gt;/</code>","AD-4, AD-9, AD-10, AD-25, AD-33"],
+["CAP-19 — cross-repo pattern memory","<code>ORCH_HOME/memory/</code>","AD-34, AD-10, AD-4"],
+["CAP-20 — universal engine, per-repo profile and agent roster","<code>bin/init.ts</code> and <code>src/installer</code>; roster discovery and profile loader in <code>src/engine</code>","AD-9, AD-12, AD-16, AD-17, AD-18, AD-28"],
+["CAP-21 — shadow mode","ordinary run carrying <code>mode: shadow</code>; intent executor and committer","AD-27, AD-15, AD-4"],
+["CAP-22 — morning brief and ambient status","<code>src/tui</code>, fold over <code>events.jsonl</code>","AD-4, AD-3, AD-24"]
+];
+
+/* ===================== DEFERRED ===================== */
+var DEFERRED = [
+["A SQLite query index over the event log.","AD-4 makes any index a derived projection reconstructable by replay, so introducing or losing one changes no unit's interface. Build it when a shadow-mode or trust-record query exceeds two seconds scanning JSONL, or when one project passes roughly two hundred runs — whichever comes first.","This is where retired AD-6 sat. It was a deferral wearing an AD's clothes — its Prevents was premature-work avoidance rather than a divergence between units — so it was retired and folded into this entry. Note the trigger is now a number rather than a feeling: two seconds, or two hundred runs."],
+["The npm 12 delivery path.","AD-12 states the revisit condition and the Stack pins npm below 12, so no unit may assume the newer behaviour. The fallback is pre-decided rather than left open: if npm 12 becomes the bundled npm of a supported Node line and git-dependency resolution is confirmed off by default, distribution moves to <code>git clone</code> plus <code>npm run init --target</code>. AD-12 is unaffected, because it fixes what the installer produces, not how it is fetched.","One of the two empirically reproduced blockers — see §9. The last sentence is the reason this is a safe deferral rather than an open risk: the decision governs the installer's <em>output</em>, and a change of fetch mechanism does not touch it."],
+["TypeScript 7 adoption.","the Stack pins 5.9.3 and nothing depends on 7's behaviour. Adopt when typescript-eslint publishes a peer range including the 7.x line — its exclusion, not the compiler, is the blocker, and the repository must be able to lint itself because <code>memory-design.md</code> converts conventions into lint rules.","The trigger is now checkable with one command against the registry, rather than resting on a reading of the TypeScript 7.1 roadmap."]
+];
+var DEFERRED_RESOLVED = "Four items previously deferred here are now decided and live elsewhere: the web renderer framework and bundler, and the model-ladder rungs and promotion rule, are in <strong>Stack</strong> above; the shadow-mode accuracy threshold and the installer question set are in <code>build-sequencing.md</code>.";
+
+/* ===================== RENDER: AD BROWSER ===================== */
+var listEl = document.getElementById("adlist");
+var countEl = document.getElementById("adcount");
+var noResEl = document.getElementById("noresults");
+var searchEl = document.getElementById("adsearch");
+
+var ORIGINS = [
+  {id:"original", label:"in the first draft"},
+  {id:"amended",  label:"amended by review"},
+  {id:"added",    label:"added by review"}
+];
+var ORIGIN_LABEL = {original:"first draft", amended:"amended", added:"added by review"};
+
+var activeThemes = {};
+var activeOrigins = {};
+
+function esc(s){return String(s).replace(/&(?!#?\w+;)/g,"&amp;");}
+
+function buildCard(ad){
+  var t = THEME_BY_ID[ad.theme];
+  var el = document.createElement("article");
+  el.className = "ad";
+  el.id = ad.id;
+  el.setAttribute("data-theme", ad.theme);
+  el.setAttribute("data-origin", ad.origin);
+  el.style.setProperty("--tc","var(--t"+t.v+")");
+  el.style.setProperty("--tb","var(--t"+t.v+"b)");
+
+  var originTag = ad.origin === "original" ? "" :
+    '<span class="tag '+ad.origin+'">'+ORIGIN_LABEL[ad.origin]+'</span>';
+
+  el.innerHTML =
+    '<div class="ad-head" role="button" tabindex="0" aria-expanded="false">'+
+      '<span class="ad-id">'+ad.id+'</span>'+
+      '<span class="ad-title">'+ad.title+
+        '<span class="ad-tags"><span class="tag theme">'+t.name+'</span>'+originTag+'</span>'+
+      '</span>'+
+      '<span class="caret" aria-hidden="true">&#9656;</span>'+
+    '</div>'+
+    '<div class="prevents"><span class="k">Prevents</span><span class="v">'+ad.prevents+'</span></div>'+
+    '<div class="ad-body">'+
+      '<div class="field"><span class="k">Binds</span><span class="v">'+ad.binds+'</span></div>'+
+      '<div class="field rule"><span class="k">Rule</span><span class="v">'+ad.rule+'</span></div>'+
+      '<div class="field why"><span class="k">Why — restored from the decision log</span><span class="v">'+ad.why+'</span></div>'+
+    '</div>';
+
+  var head = el.querySelector(".ad-head");
+  function toggle(){
+    var open = el.classList.toggle("open");
+    head.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+  head.addEventListener("click", toggle);
+  head.addEventListener("keydown", function(e){
+    if(e.key === "Enter" || e.key === " "){ e.preventDefault(); toggle(); }
+  });
+
+  // searchable blob
+  el._blob = (ad.id+" "+ad.title+" "+ad.binds+" "+ad.prevents+" "+ad.rule+" "+ad.why+" "+t.name)
+             .replace(/<[^>]+>/g," ").toLowerCase();
+  return el;
+}
+
+ADS.forEach(function(ad, i){
+  listEl.appendChild(buildCard(ad));
+  // retired marker sits where AD-6 would have been: after AD-5
+  if(ad.id === "AD-5"){
+    var r = document.createElement("div");
+    r.className = "retired";
+    r.setAttribute("data-retired","1");
+    r.innerHTML = '<span class="ad-id">AD-6</span> &nbsp;<b>Retired.</b> It deferred the SQLite query index. Retired because its <em>Prevents</em> was premature-work avoidance rather than a divergence between two units, its qualifier was unenforceable, and it was duplicated verbatim under Deferred. It now lives only in <a href="#deferred">§8 Deferred</a>.';
+    listEl.appendChild(r);
+  }
+});
+
+/* filter chips */
+var tf = document.getElementById("themefilter");
+THEMES.forEach(function(t){
+  var b = document.createElement("button");
+  b.className = "fchip";
+  b.type = "button";
+  b.setAttribute("aria-pressed","false");
+  b.setAttribute("data-theme", t.id);
+  var n = ADS.filter(function(a){return a.theme===t.id;}).length;
+  b.innerHTML = '<span class="dot" style="background:var(--t'+t.v+')"></span>'+t.name+' ('+n+')';
+  b.addEventListener("click", function(){
+    var on = b.getAttribute("aria-pressed")==="true";
+    b.setAttribute("aria-pressed", on?"false":"true");
+    if(on){ delete activeThemes[t.id]; } else { activeThemes[t.id]=1; }
+    apply();
+  });
+  tf.appendChild(b);
+});
+
+var of_ = document.getElementById("originfilter");
+ORIGINS.forEach(function(o){
+  var b = document.createElement("button");
+  b.className = "fchip";
+  b.type = "button";
+  b.setAttribute("aria-pressed","false");
+  var n = ADS.filter(function(a){return a.origin===o.id;}).length;
+  b.textContent = o.label+" ("+n+")";
+  b.addEventListener("click", function(){
+    var on = b.getAttribute("aria-pressed")==="true";
+    b.setAttribute("aria-pressed", on?"false":"true");
+    if(on){ delete activeOrigins[o.id]; } else { activeOrigins[o.id]=1; }
+    apply();
+  });
+  of_.appendChild(b);
+});
+
+function apply(){
+  var q = searchEl.value.trim().toLowerCase();
+  var themeKeys = Object.keys(activeThemes);
+  var originKeys = Object.keys(activeOrigins);
+  var shown = 0;
+  var cards = listEl.querySelectorAll(".ad");
+  for(var i=0;i<cards.length;i++){
+    var c = cards[i];
+    var ok = true;
+    if(themeKeys.length && !activeThemes[c.getAttribute("data-theme")]) ok = false;
+    if(ok && originKeys.length && !activeOrigins[c.getAttribute("data-origin")]) ok = false;
+    if(ok && q && c._blob.indexOf(q) === -1) ok = false;
+    c.classList.toggle("hidden", !ok);
+    if(ok) shown++;
+  }
+  var ret = listEl.querySelector('[data-retired]');
+  if(ret) ret.style.display = (themeKeys.length || originKeys.length || q) ? "none" : "";
+  countEl.textContent = "Showing " + shown + " of " + ADS.length + " decisions";
+  noResEl.style.display = shown ? "none" : "block";
+}
+searchEl.addEventListener("input", apply);
+
+document.getElementById("expandall").addEventListener("click", function(){
+  listEl.querySelectorAll(".ad").forEach(function(c){
+    c.classList.add("open");
+    c.querySelector(".ad-head").setAttribute("aria-expanded","true");
+  });
+});
+document.getElementById("collapseall").addEventListener("click", function(){
+  listEl.querySelectorAll(".ad").forEach(function(c){
+    c.classList.remove("open");
+    c.querySelector(".ad-head").setAttribute("aria-expanded","false");
+  });
+});
+document.getElementById("resetf").addEventListener("click", function(){
+  searchEl.value = "";
+  activeThemes = {}; activeOrigins = {};
+  document.querySelectorAll(".fchip").forEach(function(b){b.setAttribute("aria-pressed","false");});
+  apply();
+});
+apply();
+
+/* deep-link from any AD chip anywhere on the page */
+function gotoAD(id){
+  var card = document.getElementById(id);
+  if(!card) return;
+  activeThemes = {}; activeOrigins = {};
+  searchEl.value = "";
+  document.querySelectorAll(".fchip").forEach(function(b){b.setAttribute("aria-pressed","false");});
+  apply();
+  card.classList.add("open");
+  card.querySelector(".ad-head").setAttribute("aria-expanded","true");
+  card.scrollIntoView({block:"start"});
+  card.classList.remove("flash");
+  void card.offsetWidth;
+  card.classList.add("flash");
+}
+document.addEventListener("click", function(e){
+  var a = e.target.closest ? e.target.closest("[data-goto]") : null;
+  if(a){ e.preventDefault(); gotoAD(a.getAttribute("data-goto")); }
+});
+
+/* ===================== RENDER: LIFECYCLE ===================== */
+var rail = document.getElementById("rail");
+var panel = document.getElementById("stagepanel");
+var runsvg = document.getElementById("runsvg");
+var current = 0;
+
+STAGES.forEach(function(s, i){
+  var b = document.createElement("button");
+  b.className = "stage";
+  b.type = "button";
+  b.setAttribute("aria-pressed", i===0 ? "true":"false");
+  b.innerHTML = '<span class="n">'+s.n+'</span><span class="t">'+s.t+'</span><span class="who">'+s.who+'</span>';
+  b.addEventListener("click", function(){ select(i); });
+  rail.appendChild(b);
+});
+
+function select(i){
+  current = i;
+  var s = STAGES[i];
+  rail.querySelectorAll(".stage").forEach(function(b,j){
+    b.setAttribute("aria-pressed", j===i ? "true":"false");
+  });
+  panel.innerHTML =
+    '<div class="sp-top">'+
+      '<h3>'+s.n+' · '+s.t+'</h3>'+
+      '<span class="sp-cap">'+s.cap+'</span>'+
+    '</div>'+
+    '<p style="color:var(--ink-2);max-width:78ch;margin:0">'+s.what+'</p>'+
+    '<div class="sp-grid">'+
+      '<div class="sp-block"><h4>Which component acts</h4><ul>'+
+        s.acts.map(function(a){return "<li>"+a+"</li>";}).join("")+
+      '</ul></div>'+
+      '<div class="sp-block"><h4>Governed by</h4><div class="chips">'+
+        s.ads.map(function(id){return '<a class="adchip" data-goto="'+id+'" href="#'+id+'">'+id+'</a>';}).join("")+
+      '</div></div>'+
+    '</div>'+
+    (s.note ? '<div class="note" style="margin-top:14px">'+s.note+'</div>' : '');
+
+  // highlight the run diagram
+  var groups = runsvg.querySelectorAll("g.node");
+  var wanted = {};
+  s.nodes.forEach(function(n){wanted[n]=1;});
+  for(var k=0;k<groups.length;k++){
+    var g = groups[k];
+    var hot = !!wanted[g.id];
+    g.classList.toggle("hot", hot);
+    g.classList.toggle("dim", !hot);
+  }
+}
+select(0);
+
+/* ===================== RENDER: CAP MAP ===================== */
+var capBody = document.querySelector("#captable tbody");
+CAPMAP.forEach(function(r){
+  var tr = document.createElement("tr");
+  tr.innerHTML =
+    "<td>"+r[0]+"</td>"+
+    "<td>"+r[1]+"</td>"+
+    '<td class="v">'+r[2].split(", ").map(function(id){
+      return '<a class="adchip" data-goto="'+id+'" href="#'+id+'">'+id+'</a>';
+    }).join(" ")+"</td>";
+  capBody.appendChild(tr);
+});
+
+/* ===================== RENDER: DEFERRED ===================== */
+var dl = document.getElementById("deferlist");
+DEFERRED.forEach(function(d){
+  var el = document.createElement("div");
+  el.className = "defer";
+  el.innerHTML =
+    '<div class="dt">'+d[0]+'</div>'+
+    '<div class="safe"><b>Safe because</b> &nbsp;'+d[1]+'</div>'+
+    (d[2] ? '<div class="safe" style="margin-top:8px;color:var(--ink-3);font-size:13px">'+d[2]+'</div>' : '');
+  dl.appendChild(el);
+});
+var dres = document.createElement("div");
+dres.className = "note";
+dres.style.marginTop = "6px";
+dres.innerHTML = DEFERRED_RESOLVED;
+dl.appendChild(dres);
+
+/* keyboard: / focuses search */
+document.addEventListener("keydown", function(e){
+  if(e.key === "/" && document.activeElement !== searchEl &&
+     !/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)){
+    e.preventDefault();
+    searchEl.focus();
+  }
+});
+
+})();
+</script>
+</body>
+</html>

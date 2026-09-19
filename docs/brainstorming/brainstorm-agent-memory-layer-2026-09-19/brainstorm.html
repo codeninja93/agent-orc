@@ -1,0 +1,1813 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Memory Core</title>
+<style>
+/* ============================================================
+   THE MEMORY CORE — a core sample drilled through one session
+   All styles inline. No external anything.
+   ============================================================ */
+
+:root{
+  /* sediment */
+  --ink:        #0b0a08;
+  --ink-2:      #100e0b;
+  --ink-3:      #16130f;
+  --ink-4:      #1d1915;
+  --bone:       #ece3d4;
+  --bone-2:     #cdc2b0;
+  --muted:      #8d8474;
+  --faint:      #5e574c;
+  --rule:       rgba(236,227,212,.13);
+  --rule-2:     rgba(236,227,212,.07);
+
+  /* strata pigments */
+  --ochre:      #dba64a;
+  --rust:       #c05a33;
+  --sage:       #86a077;
+  --clay:       #ad7752;
+  --slate:      #6f8797;
+  --phos:       #eec55f;
+  --verdigris:  #6fb2ab;
+
+  /* lens keys */
+  --l1: var(--ochre);
+  --l2: var(--sage);
+  --l3: var(--slate);
+  --l4: var(--rust);
+
+  --serif: "Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,"Times New Roman",serif;
+  --sans: -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono: ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+
+  --gutter: 16px;
+  --maxw: 1160px;
+}
+
+*,*::before,*::after{box-sizing:border-box;}
+
+html{ -webkit-text-size-adjust:100%; }
+
+body{
+  margin:0;
+  background:var(--ink);
+  color:var(--bone);
+  font-family:var(--serif);
+  font-size:17px;
+  line-height:1.62;
+  overflow-x:clip;
+  /* faint sediment grain */
+  background-image:
+    radial-gradient(1px 1px at 12% 8%, rgba(236,227,212,.045) 50%, transparent 51%),
+    radial-gradient(1px 1px at 63% 24%, rgba(236,227,212,.04) 50%, transparent 51%),
+    radial-gradient(1px 1px at 31% 61%, rgba(236,227,212,.035) 50%, transparent 51%),
+    radial-gradient(1px 1px at 84% 77%, rgba(236,227,212,.04) 50%, transparent 51%),
+    radial-gradient(1px 1px at 47% 91%, rgba(236,227,212,.03) 50%, transparent 51%);
+  background-size:340px 340px,290px 290px,410px 410px,370px 370px,320px 320px;
+}
+
+img,svg{max-width:100%;}
+
+.wrap{
+  max-width:var(--maxw);
+  margin:0 auto;
+  padding-inline:var(--gutter);
+}
+
+/* ---------- shared micro-typography ---------- */
+.eyebrow{
+  font-family:var(--mono);
+  font-size:10.5px;
+  letter-spacing:.22em;
+  text-transform:uppercase;
+  color:var(--muted);
+  margin:0;
+}
+.num{ font-family:var(--mono); font-variant-numeric:tabular-nums; }
+.hair{ height:1px; background:var(--rule); border:0; margin:0; }
+
+/* ============================================================
+   DEPTH RAIL (desktop only) — the core column as navigation
+   ============================================================ */
+.rail{
+  position:fixed;
+  left:18px; top:50%;
+  transform:translateY(-50%);
+  width:26px;
+  display:none;
+  z-index:40;
+}
+@media (min-width:1080px){ .rail{display:block;} }
+.rail ol{ list-style:none; margin:0; padding:0; }
+.rail li{ position:relative; }
+.rail a{
+  display:block;
+  width:10px; height:var(--h,52px);
+  margin-left:8px;
+  background:var(--c,#3a342c);
+  opacity:.34;
+  transition:opacity .35s ease, transform .35s ease;
+  text-decoration:none;
+  position:relative;
+  border-top:1px solid rgba(11,10,8,.65);
+}
+.rail a::after{
+  content:attr(data-label);
+  position:absolute;
+  left:20px; top:50%;
+  transform:translateY(-50%);
+  font-family:var(--mono);
+  font-size:9px;
+  letter-spacing:.16em;
+  text-transform:uppercase;
+  color:var(--muted);
+  white-space:nowrap;
+  opacity:0;
+  transition:opacity .3s ease;
+  pointer-events:none;
+}
+.rail a:hover::after{ opacity:1; }
+.rail a:hover,.rail a.on{ opacity:1; transform:scaleX(1.7); transform-origin:left; }
+
+/* ============================================================
+   MASTHEAD
+   ============================================================ */
+.masthead{
+  position:relative;
+  padding-top:clamp(40px,9vw,88px);
+  padding-bottom:clamp(36px,7vw,64px);
+  overflow:hidden;
+}
+.masthead::before{
+  content:"";
+  position:absolute; inset:0;
+  background:
+    radial-gradient(120% 80% at 50% -20%, rgba(219,166,74,.10), transparent 60%),
+    radial-gradient(80% 60% at 85% 10%, rgba(111,178,171,.07), transparent 70%);
+  pointer-events:none;
+}
+.mast-grid{
+  position:relative;
+  display:grid;
+  grid-template-columns:1fr;
+  gap:clamp(26px,5vw,52px);
+  align-items:start;
+}
+@media (min-width:860px){
+  .mast-grid{ grid-template-columns:104px 1fr; }
+}
+
+.coreviz{ display:none; }
+@media (min-width:860px){ .coreviz{ display:block; } }
+
+.mast-file{
+  font-family:var(--mono);
+  font-size:10.5px;
+  letter-spacing:.2em;
+  text-transform:uppercase;
+  color:var(--faint);
+  display:flex; flex-wrap:wrap; gap:6px 16px;
+  padding-bottom:14px;
+  border-bottom:1px solid var(--rule);
+}
+.mast-file b{ color:var(--ochre); font-weight:400; }
+
+h1.title{
+  font-family:var(--serif);
+  font-weight:400;
+  font-size:clamp(46px,12.5vw,116px);
+  line-height:.92;
+  letter-spacing:-.025em;
+  margin:26px 0 0;
+  color:var(--bone);
+}
+h1.title .drop{
+  display:block;
+  color:var(--ochre);
+  font-style:italic;
+  letter-spacing:-.035em;
+}
+.subtitle{
+  margin:20px 0 0;
+  max-width:44ch;
+  font-size:clamp(16px,2.4vw,20px);
+  color:var(--bone-2);
+  line-height:1.58;
+}
+.subtitle em{ color:var(--phos); font-style:italic; }
+
+/* catalogue card: topic + goal */
+.catalogue{
+  margin-top:34px;
+  border:1px solid var(--rule);
+  background:linear-gradient(180deg, rgba(236,227,212,.035), rgba(236,227,212,.012));
+  padding:clamp(16px,3.2vw,24px);
+  position:relative;
+}
+.catalogue::before{
+  content:"";
+  position:absolute; left:0; top:0; bottom:0; width:3px;
+  background:linear-gradient(180deg,var(--ochre),var(--clay) 40%,var(--sage) 72%,var(--slate));
+}
+.cat-row{ display:grid; grid-template-columns:1fr; gap:4px; padding:10px 0; }
+.cat-row + .cat-row{ border-top:1px dotted var(--rule); }
+@media (min-width:680px){
+  .cat-row{ grid-template-columns:96px 1fr; gap:18px; align-items:baseline; }
+}
+.cat-k{
+  font-family:var(--mono); font-size:10px; letter-spacing:.2em;
+  text-transform:uppercase; color:var(--muted);
+}
+.cat-v{ font-size:15.5px; color:var(--bone-2); line-height:1.55; }
+.cat-v strong{ color:var(--bone); font-weight:400; }
+
+/* stats */
+.stats{
+  margin-top:34px;
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  border-top:1px solid var(--rule);
+  border-bottom:1px solid var(--rule);
+}
+.stat{
+  padding:18px 0 16px;
+  text-align:left;
+}
+.stat + .stat{ border-left:1px solid var(--rule-2); padding-left:16px; }
+.stat .v{
+  font-family:var(--mono);
+  font-size:clamp(28px,7vw,44px);
+  line-height:1;
+  color:var(--phos);
+  font-variant-numeric:tabular-nums;
+  letter-spacing:-.03em;
+}
+.stat .k{
+  margin-top:8px;
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.2em;
+  text-transform:uppercase; color:var(--muted);
+}
+
+/* ============================================================
+   LENS DIVIDERS
+   ============================================================ */
+.lens-open{
+  padding:clamp(56px,11vw,110px) 0 clamp(22px,4vw,34px);
+}
+.lens-mark{
+  display:flex; align-items:baseline; gap:14px; flex-wrap:wrap;
+  font-family:var(--mono); font-size:10.5px; letter-spacing:.2em;
+  text-transform:uppercase; color:var(--muted);
+}
+.lens-mark .dot{
+  width:9px; height:9px; border-radius:50%;
+  background:var(--key); flex:0 0 auto;
+  box-shadow:0 0 0 4px color-mix(in srgb, var(--key) 18%, transparent);
+}
+.lens-mark .seq{ color:var(--key); }
+h2.lens-title{
+  font-family:var(--serif);
+  font-weight:400;
+  font-size:clamp(32px,7.2vw,62px);
+  line-height:1.02;
+  letter-spacing:-.022em;
+  margin:14px 0 0;
+}
+h2.lens-title .k{ color:var(--key); }
+.lens-insight{
+  margin:20px 0 0;
+  padding-left:18px;
+  border-left:2px solid var(--key);
+  max-width:62ch;
+  font-size:clamp(16px,2.3vw,19px);
+  line-height:1.58;
+  color:var(--bone-2);
+  font-style:italic;
+}
+.lens-count{
+  margin-top:18px;
+  font-family:var(--mono); font-size:10px; letter-spacing:.18em;
+  text-transform:uppercase; color:var(--faint);
+}
+
+/* ============================================================
+   LENS I — JOB TO BE DONE :: the hiring board
+   ============================================================ */
+.board{
+  --key:var(--l1);
+  padding-bottom:clamp(30px,6vw,54px);
+}
+.board-head{
+  display:flex; justify-content:space-between; align-items:flex-end;
+  gap:14px; flex-wrap:wrap;
+  padding-bottom:10px;
+  border-bottom:2px solid var(--l1);
+  margin-bottom:0;
+}
+.board-head h3{
+  font-family:var(--mono); font-size:11px; letter-spacing:.24em;
+  text-transform:uppercase; color:var(--l1); margin:0; font-weight:400;
+}
+.board-head span{
+  font-family:var(--mono); font-size:10px; letter-spacing:.16em;
+  color:var(--faint); text-transform:uppercase;
+}
+.reqs{
+  display:grid; grid-template-columns:1fr; gap:0;
+}
+@media (min-width:760px){ .reqs{ grid-template-columns:1fr 1fr; column-gap:28px; } }
+.req{
+  padding:20px 0 20px 0;
+  border-bottom:1px dotted var(--rule);
+  display:grid;
+  grid-template-columns:44px 1fr;
+  gap:14px;
+  align-items:start;
+}
+.req-no{
+  font-family:var(--mono);
+  font-size:11px;
+  letter-spacing:.06em;
+  color:var(--ink);
+  background:var(--l1);
+  width:38px; height:38px;
+  display:flex; align-items:center; justify-content:center;
+  border-radius:1px;
+  transform:rotate(-1.4deg);
+  font-weight:700;
+}
+.req:nth-child(even) .req-no{ transform:rotate(1.2deg); background:var(--clay); color:#140f0a; }
+.req h4{
+  margin:0 0 7px;
+  font-family:var(--serif);
+  font-size:clamp(18px,3vw,21px);
+  font-weight:400;
+  line-height:1.24;
+  letter-spacing:-.01em;
+  color:var(--bone);
+}
+.req p{
+  margin:0;
+  font-size:14.5px;
+  line-height:1.6;
+  color:var(--muted);
+  font-family:var(--sans);
+}
+.req p::first-letter{ text-transform:uppercase; }
+
+/* terms of employment */
+.terms{
+  margin-top:clamp(34px,6vw,58px);
+  border:1px solid var(--rule);
+  background:rgba(219,166,74,.035);
+  padding:clamp(18px,3.4vw,28px);
+}
+.terms > .eyebrow{ color:var(--l1); }
+.terms ol{
+  list-style:none; counter-reset:t; margin:18px 0 0; padding:0;
+}
+.terms li{
+  counter-increment:t;
+  position:relative;
+  padding:13px 0 13px 46px;
+  font-size:15.5px;
+  line-height:1.56;
+  color:var(--bone-2);
+  font-family:var(--sans);
+}
+.terms li + li{ border-top:1px solid var(--rule-2); }
+.terms li::before{
+  content:"§ " counter(t,decimal-leading-zero);
+  position:absolute; left:0; top:13px;
+  font-family:var(--mono); font-size:10.5px; letter-spacing:.06em;
+  color:var(--l1); opacity:.85;
+}
+.terms li b{ color:var(--bone); font-weight:400; font-family:var(--serif); font-size:17px; }
+
+/* ============================================================
+   LENS II — NATURE'S SOLUTIONS :: the specimen catalogue
+   ============================================================ */
+.field{ --key:var(--l2); }
+.plates{
+  display:grid;
+  grid-template-columns:1fr;
+  gap:14px;
+}
+@media (min-width:600px){ .plates{ grid-template-columns:1fr 1fr; } }
+@media (min-width:980px){ .plates{ grid-template-columns:repeat(3,1fr); } }
+.plate{
+  position:relative;
+  border:1px solid var(--rule);
+  background:
+    linear-gradient(180deg, rgba(134,160,119,.055), rgba(236,227,212,.012));
+  padding:16px 16px 18px;
+  display:flex; flex-direction:column; gap:10px;
+  /* herbarium corner */
+}
+.plate::after{
+  content:"";
+  position:absolute; right:-1px; bottom:-1px;
+  width:16px; height:16px;
+  background:var(--ink);
+  border-top:1px solid var(--rule);
+  border-left:1px solid var(--rule);
+}
+.plate-top{
+  display:flex; align-items:center; gap:11px;
+  padding-bottom:9px;
+  border-bottom:1px solid var(--rule-2);
+}
+.motif{
+  flex:0 0 auto;
+  width:34px; height:34px;
+  color:var(--sage);
+  opacity:.9;
+}
+.plate-id{
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.18em;
+  text-transform:uppercase; color:var(--faint);
+  margin-left:auto;
+}
+.plate h4{
+  margin:0;
+  font-family:var(--serif);
+  font-style:italic;
+  font-weight:400;
+  font-size:18px;
+  line-height:1.2;
+  color:var(--sage);
+  letter-spacing:-.005em;
+}
+.plate h4 small{
+  display:block;
+  font-style:normal;
+  font-family:var(--mono);
+  font-size:9px;
+  letter-spacing:.16em;
+  text-transform:uppercase;
+  color:var(--faint);
+  margin-top:5px;
+}
+.plate p{
+  margin:0;
+  font-family:var(--sans);
+  font-size:14px;
+  line-height:1.58;
+  color:var(--bone-2);
+}
+.plate .transfer{
+  margin-top:auto;
+  padding-top:10px;
+  border-top:1px dotted var(--rule-2);
+  font-family:var(--mono);
+  font-size:9.5px;
+  letter-spacing:.14em;
+  text-transform:uppercase;
+  color:var(--muted);
+}
+
+/* ============================================================
+   LENS III — CROSS-POLLINATION :: the card catalogue drawer
+   ============================================================ */
+.exchange{ --key:var(--l3); }
+.hubviz{
+  margin:6px 0 34px;
+  border:1px solid var(--rule);
+  background:rgba(111,135,151,.045);
+  padding:10px;
+}
+.cards{
+  display:grid;
+  grid-template-columns:1fr;
+  gap:14px;
+}
+@media (min-width:640px){ .cards{ grid-template-columns:1fr 1fr; } }
+@media (min-width:1000px){ .cards{ grid-template-columns:repeat(3,1fr); } }
+.card{
+  position:relative;
+  background:
+    repeating-linear-gradient(180deg, transparent 0 25px, rgba(236,227,212,.05) 25px 26px),
+    linear-gradient(180deg, rgba(236,227,212,.045), rgba(236,227,212,.018));
+  border:1px solid var(--rule);
+  border-top:2px solid var(--f, var(--slate));
+  padding:14px 16px 18px 16px;
+  transform:rotate(var(--r,0deg));
+  transition:transform .3s cubic-bezier(.2,.7,.3,1), background .3s ease;
+}
+.card:hover{ transform:rotate(0deg) translateY(-2px); }
+.card-tab{
+  display:flex; align-items:center; justify-content:space-between;
+  gap:10px; margin-bottom:9px;
+}
+.card-tab .disc{
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.2em;
+  text-transform:uppercase; color:var(--f,var(--slate));
+}
+.card-tab .hole{
+  width:9px; height:9px; border-radius:50%;
+  background:var(--ink);
+  box-shadow:inset 0 0 0 1px var(--rule);
+  flex:0 0 auto;
+}
+.card h4{
+  margin:0 0 7px;
+  font-family:var(--serif); font-weight:400;
+  font-size:17.5px; line-height:1.26; letter-spacing:-.008em;
+  color:var(--bone);
+}
+.card p{
+  margin:0;
+  font-family:var(--sans);
+  font-size:13.8px; line-height:1.6;
+  color:var(--muted);
+}
+.card.flag{ border-top-color:var(--phos); background-image:
+    repeating-linear-gradient(180deg, transparent 0 25px, rgba(236,227,212,.05) 25px 26px),
+    linear-gradient(180deg, rgba(238,197,95,.10), rgba(236,227,212,.02)); }
+.card.flag h4{ color:var(--phos); }
+.card .stamp{
+  margin-top:11px;
+  display:inline-block;
+  font-family:var(--mono); font-size:8.5px; letter-spacing:.2em;
+  text-transform:uppercase;
+  color:var(--phos);
+  border:1px solid rgba(238,197,95,.45);
+  padding:3px 7px;
+  transform:rotate(-1.6deg);
+}
+
+/* ============================================================
+   LENS IV — TIME HORIZON LADDER :: the strata column
+   ============================================================ */
+.ladder{ --key:var(--l4); }
+.strata{
+  margin-top:8px;
+  border-left:1px solid var(--rule);
+}
+.rung{
+  position:relative;
+  display:grid;
+  grid-template-columns:1fr;
+  gap:12px;
+  padding:26px 0 28px 18px;
+  border-bottom:1px solid var(--rule-2);
+}
+@media (min-width:820px){
+  .rung{ grid-template-columns:168px 1fr; gap:28px; padding-left:26px; align-items:start; }
+}
+.rung::before{
+  content:"";
+  position:absolute; left:-1px; top:0; bottom:0; width:3px;
+  background:var(--band,#3a332b);
+}
+.rung-depth{ position:relative; }
+.rung-depth .n{
+  font-family:var(--mono);
+  font-size:clamp(30px,7.5vw,50px);
+  line-height:.9;
+  letter-spacing:-.04em;
+  color:var(--band,#7a6f60);
+  font-variant-numeric:tabular-nums;
+}
+.rung-depth .u{
+  margin-top:7px;
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.2em;
+  text-transform:uppercase; color:var(--faint);
+}
+.rung-depth .bar{
+  margin-top:12px; height:var(--bh,12px);
+  background:
+    repeating-linear-gradient(var(--ang,90deg), var(--band) 0 2px, transparent 2px 6px);
+  opacity:.55;
+  max-width:150px;
+}
+.rung-body h4{
+  margin:0 0 8px;
+  font-family:var(--serif); font-weight:400;
+  font-size:clamp(19px,3.4vw,25px); line-height:1.24; letter-spacing:-.015em;
+  color:var(--bone);
+}
+.rung-body p{
+  margin:0;
+  font-family:var(--sans); font-size:15px; line-height:1.62; color:var(--bone-2);
+  max-width:60ch;
+}
+.rung-body .tag{
+  display:inline-block; margin-top:12px;
+  font-family:var(--mono); font-size:9px; letter-spacing:.2em; text-transform:uppercase;
+  color:var(--band); border:1px solid color-mix(in srgb, var(--band) 40%, transparent);
+  padding:3px 8px;
+}
+
+/* survives vs breaks */
+.verdict{
+  margin-top:clamp(32px,6vw,54px);
+  display:grid; grid-template-columns:1fr; gap:0;
+  border:1px solid var(--rule);
+}
+@media (min-width:760px){ .verdict{ grid-template-columns:1fr 1fr; } }
+.verdict > div{ padding:clamp(18px,3.4vw,26px); }
+.verdict > div + div{ border-top:1px solid var(--rule); }
+@media (min-width:760px){
+  .verdict > div + div{ border-top:0; border-left:1px solid var(--rule); }
+}
+.v-survives{ background:linear-gradient(180deg, rgba(111,178,171,.09), transparent); }
+.v-breaks{ background:linear-gradient(180deg, rgba(192,90,51,.10), transparent); }
+.verdict h4{
+  margin:0 0 12px;
+  font-family:var(--mono); font-size:10px; letter-spacing:.24em; text-transform:uppercase;
+  font-weight:400;
+}
+.v-survives h4{ color:var(--verdigris); }
+.v-breaks h4{ color:var(--rust); }
+.verdict p{
+  margin:0; font-family:var(--serif);
+  font-size:clamp(17px,2.8vw,21px); line-height:1.44; color:var(--bone);
+}
+
+/* anchor durability ladder */
+.anchors{
+  margin-top:clamp(32px,6vw,54px);
+}
+.anchors ol{ list-style:none; margin:16px 0 0; padding:0; }
+.anchors li{
+  display:grid; grid-template-columns:30px 1fr auto; gap:12px; align-items:center;
+  padding:12px 0; border-bottom:1px solid var(--rule-2);
+  font-family:var(--sans); font-size:15px;
+}
+.anchors li .r{
+  font-family:var(--mono); font-size:10px; color:var(--faint); letter-spacing:.08em;
+}
+.anchors li .name{ color:var(--bone); font-family:var(--mono); font-size:13.5px; letter-spacing:.02em; }
+.anchors li .meter{
+  width:clamp(60px,22vw,160px); height:6px; background:rgba(236,227,212,.08); position:relative;
+}
+.anchors li .meter i{ position:absolute; inset:0 auto 0 0; width:var(--w); background:var(--verdigris); display:block; }
+.anchors li.dead .name{ color:var(--rust); text-decoration:line-through; text-decoration-color:rgba(192,90,51,.6); }
+.anchors li.dead .meter i{ background:var(--rust); }
+
+/* core log annotations */
+.corelog{
+  margin-top:clamp(32px,6vw,54px);
+  display:grid; grid-template-columns:1fr; gap:0;
+  border-top:1px solid var(--rule);
+}
+@media (min-width:820px){ .corelog{ grid-template-columns:1fr 1fr; column-gap:32px; } }
+.logline{
+  padding:16px 0 16px 0;
+  border-bottom:1px solid var(--rule-2);
+  display:grid; grid-template-columns:auto 1fr; gap:12px; align-items:start;
+}
+.logline .mk{
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.1em;
+  color:var(--rust); padding-top:4px; white-space:nowrap;
+}
+.logline p{ margin:0; font-family:var(--sans); font-size:14.5px; line-height:1.6; color:var(--bone-2); }
+
+/* ============================================================
+   SYNTHESIS — the consolidation pass (climax)
+   ============================================================ */
+.synth{
+  margin-top:clamp(70px,13vw,130px);
+  position:relative;
+  background:
+    radial-gradient(120% 70% at 50% 0%, rgba(238,197,95,.09), transparent 65%),
+    linear-gradient(180deg, var(--ink-2), var(--ink) 70%);
+  border-top:1px solid rgba(238,197,95,.3);
+  padding:clamp(44px,8vw,90px) 0 clamp(50px,9vw,100px);
+}
+.synth-head{ text-align:left; max-width:72ch; }
+.synth-head .eyebrow{ color:var(--phos); }
+.synth-head h2{
+  font-family:var(--serif); font-weight:400;
+  font-size:clamp(34px,8.6vw,76px);
+  line-height:.98; letter-spacing:-.028em;
+  margin:16px 0 0;
+}
+.synth-head h2 em{ color:var(--phos); font-style:italic; }
+.synth-head .lede{
+  margin:20px 0 0; font-size:clamp(16px,2.4vw,19px); color:var(--bone-2); line-height:1.6;
+  max-width:56ch;
+}
+.consolidation{ margin:clamp(30px,5vw,46px) 0 clamp(36px,6vw,60px); }
+
+.points{ display:grid; gap:14px; }
+.pt{
+  position:relative;
+  border:1px solid var(--rule);
+  background:linear-gradient(180deg, rgba(236,227,212,.035), rgba(236,227,212,.01));
+  padding:clamp(20px,4vw,34px);
+}
+.pt-no{
+  font-family:var(--mono);
+  font-size:clamp(34px,8vw,64px);
+  line-height:.8;
+  letter-spacing:-.05em;
+  color:rgba(238,197,95,.22);
+  font-variant-numeric:tabular-nums;
+}
+.pt h3{
+  margin:12px 0 10px;
+  font-family:var(--serif); font-weight:400;
+  font-size:clamp(22px,4.6vw,34px); line-height:1.14; letter-spacing:-.02em;
+  color:var(--bone);
+  max-width:24ch;
+}
+.pt p{
+  margin:0; font-family:var(--sans); font-size:15px; line-height:1.66; color:var(--bone-2);
+  max-width:66ch;
+}
+.pt.major{
+  border-color:rgba(238,197,95,.34);
+  background:linear-gradient(180deg, rgba(238,197,95,.075), rgba(236,227,212,.012));
+}
+.pt.major .pt-no{ color:var(--phos); opacity:.55; }
+.pt.major h3{ color:var(--phos); }
+.pt-split{
+  display:grid; grid-template-columns:1fr; gap:22px; align-items:center;
+}
+@media (min-width:880px){
+  .pt-split{ grid-template-columns:1.05fr .95fr; gap:38px; }
+}
+.trio{ display:grid; grid-template-columns:1fr; gap:14px; }
+@media (min-width:860px){ .trio{ grid-template-columns:repeat(3,1fr); } }
+.trio .pt h3{ font-size:clamp(19px,3vw,23px); }
+.trio .pt-no{ font-size:clamp(26px,5vw,38px); }
+.trio .pt p{ font-size:14px; }
+
+/* the big git line */
+.bigline{
+  font-family:var(--mono);
+  font-size:clamp(30px,10vw,78px);
+  line-height:1.02;
+  letter-spacing:-.05em;
+  color:var(--phos);
+  margin:0;
+  word-break:break-word;
+}
+.bigline small{
+  display:block; margin-top:12px;
+  font-family:var(--mono); font-size:10px; letter-spacing:.2em; text-transform:uppercase;
+  color:var(--muted);
+}
+.zero{
+  font-family:var(--mono);
+  font-size:clamp(90px,26vw,190px);
+  line-height:.8;
+  letter-spacing:-.06em;
+  color:transparent;
+  -webkit-text-stroke:1.5px rgba(238,197,95,.6);
+  text-align:center;
+  display:block;
+}
+.zero-cap{
+  display:block; text-align:center; margin-top:14px;
+  font-family:var(--mono); font-size:10px; letter-spacing:.24em; text-transform:uppercase;
+  color:var(--muted);
+}
+
+/* point 8 — self reference */
+.selfref{
+  margin-top:20px;
+  border:1px solid rgba(238,197,95,.36);
+  background:linear-gradient(180deg, rgba(238,197,95,.10), rgba(11,10,8,.4));
+  padding:clamp(22px,4.6vw,44px);
+  position:relative;
+  overflow:hidden;
+}
+.selfref::before{
+  content:"";
+  position:absolute; inset:0;
+  background:repeating-linear-gradient(180deg, transparent 0 3px, rgba(11,10,8,.18) 3px 4px);
+  pointer-events:none;
+}
+.selfref .pt-no{ color:var(--phos); opacity:.6; }
+.selfref h3{
+  margin:12px 0 14px;
+  font-family:var(--serif); font-weight:400;
+  font-size:clamp(26px,6.4vw,54px); line-height:1.06; letter-spacing:-.025em;
+  color:var(--phos); max-width:20ch;
+}
+.selfref > p{
+  margin:0 0 22px; font-family:var(--sans); font-size:15.5px; line-height:1.66;
+  color:var(--bone-2); max-width:62ch;
+}
+.memlog{
+  font-family:var(--mono);
+  font-size:12px;
+  line-height:1.85;
+  color:var(--muted);
+  background:rgba(11,10,8,.55);
+  border:1px solid var(--rule);
+  padding:16px;
+  overflow-x:auto;
+  white-space:pre-wrap;
+  word-break:break-word;
+  position:relative;
+}
+.memlog .t{ color:var(--verdigris); }
+.memlog .i{ color:var(--bone-2); }
+.memlog .s{ color:var(--phos); }
+.memlog .cursor{
+  display:inline-block; width:8px; height:14px; vertical-align:-2px;
+  background:var(--phos);
+  animation:blink 1.3s steps(2,start) infinite;
+}
+@keyframes blink{ 50%{ opacity:0; } }
+
+/* ============================================================
+   COLOPHON
+   ============================================================ */
+.colophon{
+  padding:clamp(40px,7vw,72px) 0 clamp(50px,8vw,90px);
+  border-top:1px solid var(--rule);
+}
+.colo-grid{
+  display:grid; grid-template-columns:1fr; gap:26px;
+}
+@media (min-width:760px){ .colo-grid{ grid-template-columns:1.2fr 1fr; gap:40px; } }
+.colo-grid p{
+  margin:0; font-family:var(--sans); font-size:14px; line-height:1.68; color:var(--muted);
+  max-width:52ch;
+}
+.tally{ display:grid; grid-template-columns:1fr; gap:0; }
+.tally div{
+  display:flex; justify-content:space-between; align-items:baseline; gap:16px;
+  padding:10px 0; border-bottom:1px solid var(--rule-2);
+  font-family:var(--mono); font-size:10.5px; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--muted);
+}
+.tally div b{ color:var(--phos); font-weight:400; font-size:15px; letter-spacing:0; }
+.seal{
+  margin-top:30px;
+  font-family:var(--mono); font-size:9.5px; letter-spacing:.24em; text-transform:uppercase;
+  color:var(--faint);
+}
+
+/* ============================================================
+   REVEAL
+   ============================================================ */
+.rv{ opacity:0; transform:translateY(14px); transition:opacity .7s ease, transform .7s cubic-bezier(.2,.7,.25,1); }
+.rv.in{ opacity:1; transform:none; }
+@media (prefers-reduced-motion:reduce){
+  .rv{ opacity:1; transform:none; transition:none; }
+  .card{ transition:none; }
+  .memlog .cursor{ animation:none; }
+  html{ scroll-behavior:auto; }
+}
+html{ scroll-behavior:smooth; }
+
+::selection{ background:rgba(238,197,95,.28); color:var(--bone); }
+a{ color:inherit; }
+</style>
+</head>
+<body>
+
+<!-- ============ SVG SPRITE: specimen motifs ============ -->
+<svg width="0" height="0" aria-hidden="true" style="position:absolute" focusable="false">
+  <defs>
+    <g id="m-moon" fill="none" stroke="currentColor" stroke-width="1.1">
+      <path d="M22 5a11 11 0 1 0 0 22 13 13 0 0 1 0-22z"/>
+      <circle cx="9" cy="9" r="1"/><circle cx="7" cy="22" r="1"/>
+    </g>
+    <g id="m-cell" fill="none" stroke="currentColor" stroke-width="1.1">
+      <circle cx="16" cy="16" r="10"/><circle cx="16" cy="16" r="3.4"/>
+      <path d="M16 6v3M16 23v3M6 16h3M23 16h3M9 9l2 2M23 23l-2-2M23 9l-2 2M9 23l2-2"/>
+    </g>
+    <g id="m-synapse" fill="none" stroke="currentColor" stroke-width="1.1">
+      <path d="M3 16h7M22 16h7"/>
+      <circle cx="13" cy="16" r="3"/><circle cx="19" cy="16" r="3"/>
+      <path d="M13 13l-4-6M13 19l-4 6M19 13l4-6M19 19l4 6" stroke-dasharray="2 2.5"/>
+    </g>
+    <g id="m-helix" fill="none" stroke="currentColor" stroke-width="1.1">
+      <path d="M10 3c0 7 12 7 12 13s-12 6-12 13"/>
+      <path d="M22 3c0 7-12 7-12 13s12 6 12 13"/>
+      <path d="M11 9h10M11 16h10M11 23h10" stroke-dasharray="1.5 2"/>
+    </g>
+    <g id="m-seed" fill="none" stroke="currentColor" stroke-width="1.1">
+      <path d="M16 4c5 5 5 13 0 18-5-5-5-13 0-18z"/>
+      <path d="M16 22v6M12 26l4 2 4-2"/>
+      <circle cx="16" cy="12" r="1.4"/>
+    </g>
+    <g id="m-accretion" fill="none" stroke="currentColor" stroke-width="1.1">
+      <path d="M3 27h26"/><path d="M6 27v-5h6v5M13 27v-9h6v9M20 27v-14h6v14"/>
+      <path d="M6 22h6M13 18h6M20 13h6" stroke-dasharray="1.5 2"/>
+    </g>
+    <g id="m-radial" fill="none" stroke="currentColor" stroke-width="1.1">
+      <circle cx="16" cy="16" r="3.6"/>
+      <path d="M16 12V3M16 20v9M12 16H3M20 16h9M13 13L7 7M19 19l6 6M19 13l6-6M13 19l-6 6"/>
+      <circle cx="16" cy="3" r="1.3"/><circle cx="29" cy="16" r="1.3"/><circle cx="16" cy="29" r="1.3"/><circle cx="3" cy="16" r="1.3"/>
+    </g>
+    <g id="m-field" fill="none" stroke="currentColor" stroke-width="1.1">
+      <path d="M16 3v26"/>
+      <path d="M16 6c7 3 7 17 0 20M16 6C9 9 9 23 16 26"/>
+      <path d="M12 16h8" stroke-dasharray="1.5 2"/>
+    </g>
+    <g id="m-wave" fill="none" stroke="currentColor" stroke-width="1.1">
+      <path d="M3 16c3-9 5 9 8 0s5 9 8 0 5 7 8 2"/>
+      <path d="M3 25h26" stroke-dasharray="1.5 2.5"/>
+    </g>
+    <g id="m-dissolve" fill="none" stroke="currentColor" stroke-width="1.1">
+      <path d="M5 8h10M5 13h13M5 18h8"/>
+      <path d="M20 8h2M23 13h2M17 18h2M21 22h2M26 18h1M14 23h2" opacity=".75"/>
+      <circle cx="27" cy="24" r=".9"/><circle cx="23" cy="27" r=".9"/>
+    </g>
+    <g id="m-pair" fill="none" stroke="currentColor" stroke-width="1.1">
+      <circle cx="12" cy="16" r="7"/><circle cx="20" cy="16" r="7"/>
+      <path d="M16 10.2c1.5 1.6 1.5 10 0 11.6" stroke-dasharray="1.5 2"/>
+    </g>
+  </defs>
+</svg>
+
+<!-- ============ DEPTH RAIL ============ -->
+<nav class="rail" aria-label="Core depth">
+  <ol>
+    <li><a href="#top"      data-label="Core head"      style="--c:#3f382f;--h:38px"></a></li>
+    <li><a href="#lens-1"   data-label="I · Jobs"        style="--c:#dba64a;--h:60px"></a></li>
+    <li><a href="#lens-2"   data-label="II · Nature"     style="--c:#86a077;--h:60px"></a></li>
+    <li><a href="#lens-3"   data-label="III · Exchange"  style="--c:#6f8797;--h:66px"></a></li>
+    <li><a href="#lens-4"   data-label="IV · Horizons"   style="--c:#c05a33;--h:60px"></a></li>
+    <li><a href="#synthesis" data-label="Consolidation"  style="--c:#eec55f;--h:46px"></a></li>
+  </ol>
+</nav>
+
+<!-- ============ MASTHEAD ============ -->
+<header class="masthead" id="top">
+  <div class="wrap mast-grid">
+
+    <!-- core sample column -->
+    <div class="coreviz" aria-hidden="true">
+      <svg viewBox="0 0 84 520" width="84" height="520" role="presentation">
+        <defs>
+          <clipPath id="tube"><rect x="18" y="8" width="40" height="504" rx="3"/></clipPath>
+          <linearGradient id="sheen" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#000" stop-opacity=".45"/>
+            <stop offset=".35" stop-color="#fff" stop-opacity=".07"/>
+            <stop offset="1" stop-color="#000" stop-opacity=".5"/>
+          </linearGradient>
+        </defs>
+        <g clip-path="url(#tube)">
+          <rect x="18" y="8"   width="40" height="96"  fill="#dba64a" opacity=".82"/>
+          <rect x="18" y="104" width="40" height="18"  fill="#c9913c" opacity=".55"/>
+          <rect x="18" y="122" width="40" height="104" fill="#86a077" opacity=".78"/>
+          <rect x="18" y="226" width="40" height="14"  fill="#6d8560" opacity=".5"/>
+          <rect x="18" y="240" width="40" height="118" fill="#6f8797" opacity=".76"/>
+          <rect x="18" y="358" width="40" height="16"  fill="#5c7181" opacity=".5"/>
+          <rect x="18" y="374" width="40" height="100" fill="#c05a33" opacity=".78"/>
+          <rect x="18" y="474" width="40" height="38"  fill="#eec55f" opacity=".85"/>
+          <!-- grain lines -->
+          <g stroke="#0b0a08" stroke-opacity=".28" stroke-width="1">
+            <path d="M18 26h40M18 47h40M18 63h40M18 88h40M18 140h40M18 163h40M18 191h40M18 212h40M18 258h40M18 281h40M18 306h40M18 334h40M18 392h40M18 415h40M18 441h40M18 462h40M18 490h40"/>
+          </g>
+          <rect x="18" y="8" width="40" height="504" fill="url(#sheen)"/>
+        </g>
+        <rect x="18" y="8" width="40" height="504" rx="3" fill="none" stroke="rgba(236,227,212,.28)"/>
+        <!-- depth scale -->
+        <g font-family="ui-monospace,Menlo,monospace" font-size="7.5" fill="#6b6357" letter-spacing=".08em">
+          <g stroke="rgba(236,227,212,.22)" stroke-width="1">
+            <path d="M62 8h8M62 112h8M62 232h8M62 366h8M62 474h8M62 511h6"/>
+          </g>
+          <text x="72" y="11" transform="rotate(90 72 11)">0</text>
+          <text x="72" y="115" transform="rotate(90 72 115)">I</text>
+          <text x="72" y="235" transform="rotate(90 72 235)">II</text>
+          <text x="72" y="369" transform="rotate(90 72 369)">III</text>
+          <text x="72" y="477" transform="rotate(90 72 477)">IV</text>
+        </g>
+        <g font-family="ui-monospace,Menlo,monospace" font-size="7" fill="#6b6357" letter-spacing=".14em">
+          <text x="8" y="56" transform="rotate(-90 8 56)">JOBS</text>
+          <text x="8" y="188" transform="rotate(-90 8 188)">NATURE</text>
+          <text x="8" y="318" transform="rotate(-90 8 318)">EXCHANGE</text>
+          <text x="8" y="438" transform="rotate(-90 8 438)">HORIZONS</text>
+        </g>
+      </svg>
+    </div>
+
+    <div>
+      <div class="mast-file">
+        <span>Core log</span>
+        <span><b>BRAINSTORM-AGENT-MEMORY-LAYER</b></span>
+        <span>2026 · 09 · 19</span>
+        <span>Mode: autonomous</span>
+        <span>Status: complete</span>
+      </div>
+
+      <h1 class="title">The Memory<span class="drop">Core</span></h1>
+
+      <p class="subtitle">Four lenses drilled through one question, logged line by line and never edited — then read back as a single column of sediment. <em>Eighty-eight entries, bottom to top.</em></p>
+
+      <div class="catalogue">
+        <div class="cat-row">
+          <div class="cat-k">Topic</div>
+          <div class="cat-v">The memory layer for the agent-orchestration system: cross-feature and cross-repo memory — <strong>what gets remembered and when</strong>, retrieval without context bloat, the Historian interface, memory that survives refactors, how product A teaches product B.</div>
+        </div>
+        <div class="cat-row">
+          <div class="cat-k">Goal</div>
+          <div class="cat-v">Turn the orchestrator from a task runner into <strong>a factory that compounds</strong> — memory is the barely-specced piece that makes the difference.</div>
+        </div>
+        <div class="cat-row">
+          <div class="cat-k">Method</div>
+          <div class="cat-v">Append-only memlog. One line per idea. No edits. A single consolidation pass at the end.</div>
+        </div>
+      </div>
+
+      <div class="stats" role="group" aria-label="Session statistics">
+        <div class="stat"><div class="v">79</div><div class="k">Ideas</div></div>
+        <div class="stat"><div class="v">4</div><div class="k">Lenses</div></div>
+        <div class="stat"><div class="v">88</div><div class="k">Logged entries</div></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main>
+
+<!-- ============================================================
+     LENS I — JOB TO BE DONE
+     ============================================================ -->
+<section class="board" id="lens-1" style="--key:var(--l1)">
+  <div class="wrap">
+    <div class="lens-open rv">
+      <div class="lens-mark"><span class="dot"></span><span class="seq">Lens I</span><span>started — Job to Be Done</span><span>Stratum 01</span></div>
+      <h2 class="lens-title">What memory is <span class="k">hired</span> to do</h2>
+      <p class="lens-insight">There is no single thing called memory — there are about ten distinct jobs with different shapes, lifetimes and retrieval patterns, and building one vector store for all of them is the classic failure.</p>
+      <p class="lens-count">19 ideas · 10 postings · 9 terms</p>
+    </div>
+
+    <div class="board-head rv">
+      <h3>Open requisitions</h3>
+      <span>Attention saved is the only accepted currency</span>
+    </div>
+
+    <div class="reqs">
+      <article class="req rv"><div class="req-no">01</div><div>
+        <h4>Do not make me explain my conventions twice</h4>
+        <p>But the best form of a remembered convention is not retrieval, it is a generated lint rule or test that fails the build, costing zero tokens at read time.</p>
+      </div></article>
+
+      <article class="req rv"><div class="req-no">02</div><div>
+        <h4>Do not rewrite code that already exists</h4>
+        <p>Prior-art retrieval keyed on the PLAN not the prompt, running after decomposition using concrete subtasks as queries.</p>
+      </div></article>
+
+      <article class="req rv"><div class="req-no">03</div><div>
+        <h4>Do not repeat a mistake that already cost money</h4>
+        <p>And the right artifact for a remembered failure is a regression test, not a note.</p>
+      </div></article>
+
+      <article class="req rv"><div class="req-no">04</div><div>
+        <h4>Make an agent productive in an unfamiliar region of the repo fast</h4>
+        <p>Region expertise memory attached to directories.</p>
+      </div></article>
+
+      <article class="req rv"><div class="req-no">05</div><div>
+        <h4>Let product B benefit from product A</h4>
+        <p>Cross-repo pattern memory — the only job that justifies the whole system existing across projects.</p>
+      </div></article>
+
+      <article class="req rv"><div class="req-no">06</div><div>
+        <h4>Tell me WHY the code is like this</h4>
+        <p>Rationale memory whose primary consumer is human, so it must be readable prose not machine soup.</p>
+      </div></article>
+
+      <article class="req rv"><div class="req-no">07</div><div>
+        <h4>Estimate what this feature will cost before committing budget</h4>
+        <p>Historical cost memory answering: features touching auth have averaged X dollars and Y rework cycles.</p>
+      </div></article>
+
+      <article class="req rv"><div class="req-no">08</div><div>
+        <h4>Know which areas are fragile and which tests are flaky</h4>
+        <p>Risk memory used as a ROUTING input that selects verification depth, not as context.</p>
+      </div></article>
+
+      <article class="req rv"><div class="req-no">09</div><div>
+        <h4>Resume a feature paused three weeks ago</h4>
+        <p>Episodic memory, which is just an append-only per-feature log and is nearly free.</p>
+      </div></article>
+
+      <article class="req rv"><div class="req-no">10</div><div>
+        <h4>Survive a model version change without re-teaching everything</h4>
+        <p>Memory stored as structured facts rather than tuned prompt text.</p>
+      </div></article>
+    </div>
+
+    <div class="terms rv">
+      <p class="eyebrow">Terms of employment — the nine clauses attached to every hire</p>
+      <ol>
+        <li><b>The real reframe.</b> Deep is not hiring memory, he is hiring do-not-waste-my-attention-twice — every memory feature must be justified by a specific attention saving.</li>
+        <li><b>Memory that enforces itself beats memory that must be recalled.</b> Convert every remembered preference into an executable check wherever the preference is checkable.</li>
+        <li><b>Memory write is a privilege, not a default.</b> Only verified and merged outcomes may write to long-term memory; failed experiments write to episodic only — this is the primary defense against memory poisoning.</li>
+        <li><b>Every entry carries a decay policy chosen at write time:</b> permanent, until-refactor, N-features, or this-session-only.</li>
+        <li><b>Learning is a pipeline step with an owner.</b> The committer agent writes what was learned, so memory is a first-class output rather than a hopeful side effect.</li>
+        <li><b>A hard read budget per feature</b> caps how many tokens of memory may enter context, which forces ranking quality to actually matter instead of being decorative.</li>
+        <li><b>Negative memory — we tried this and it did not work —</b> is higher value per token than positive memory, and almost nobody builds it.</li>
+        <li><b>Record the QUESTION SHAPE alongside the answer</b> in the decision ledger, so similar-but-not-identical questions can be recognized and deflected.</li>
+        <li><b>If a new human developer cannot read the memory store,</b> it is too machine-shaped to audit and will silently rot.</li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================
+     LENS II — NATURE'S SOLUTIONS
+     ============================================================ -->
+<section class="field" id="lens-2" style="--key:var(--l2)">
+  <div class="wrap">
+    <div class="lens-open rv">
+      <div class="lens-mark"><span class="dot"></span><span class="seq">Lens II</span><span>started — Nature's Solutions</span><span>Stratum 02</span></div>
+      <h2 class="lens-title">A field guide to <span class="k">organisms that remember</span></h2>
+      <p class="lens-insight">Biology solved memory many times over and the transfers are unusually literal here — the strongest is sleep consolidation, which says do not write long-term memory during the run at all.</p>
+      <p class="lens-count">19 specimens · collected in one pass</p>
+    </div>
+
+    <div class="plates">
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-moon"/></svg><span class="plate-id">Spec. 01</span></div>
+        <h4>Sleep consolidation<small>Hippocampus → neocortex</small></h4>
+        <p>A consolidation job runs BETWEEN features or nightly, compacting fast lossy episodic logs into slow structured durable facts — tokens are cheap then and outcomes are finally known.</p>
+        <div class="transfer">Transfer — never write long-term during the run</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-cell"/></svg><span class="plate-id">Spec. 02</span></div>
+        <h4>Immune memory<small>Memory B cells</small></h4>
+        <p>Remember specific threats and respond faster on re-exposure, so a past bug pattern triggers a pre-emptive check when something similar appears.</p>
+        <div class="transfer">Transfer — pattern-triggered pre-emptive checks</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-cell"/></svg><span class="plate-id">Spec. 03</span></div>
+        <h4>Vaccination<small>Deliberate re-exposure</small></h4>
+        <p>Deliberately re-expose the system to a past bug so it builds an antibody in the form of a permanent test.</p>
+        <div class="transfer">Transfer — failures become permanent tests</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-helix"/></svg><span class="plate-id">Spec. 04</span></div>
+        <h4>Bacterial CRISPR<small>Stored viral fragments</small></h4>
+        <p>Literally stores fragments of past viral attackers in its own genome — store the diff that caused each past incident as a recognition signature.</p>
+        <div class="transfer">Transfer — the diff is the signature</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-synapse"/></svg><span class="plate-id">Spec. 05</span></div>
+        <h4>Synaptic pruning<small>Use it or lose it</small></h4>
+        <p>Memory entries that are never retrieved get deleted, so track retrieval hit-counts from day one or you can never prune safely.</p>
+        <div class="transfer">Transfer — hit-counts from day one</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-synapse"/></svg><span class="plate-id">Spec. 06</span></div>
+        <h4>Myelination<small>Fast paths get faster</small></h4>
+        <p>Frequently retrieved memories get promoted into the always-loaded project profile while rare ones stay in cold retrieval.</p>
+        <div class="transfer">Transfer — promotion by frequency</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-helix"/></svg><span class="plate-id">Spec. 07</span></div>
+        <h4>DNA versus epigenetics<small>Slow genome, fast switches</small></h4>
+        <p>Cross-repo memory is the slow shared genome; the per-repo profile is the fast local epigenetic layer that switches genes on and off.</p>
+        <div class="transfer">Transfer — two speeds, one substrate</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-seed"/></svg><span class="plate-id">Spec. 08</span></div>
+        <h4>Spores and seeds<small>Regeneration from a kernel</small></h4>
+        <p>A tiny seed file per repo that can regenerate the entire memory index from git history, so losing the index is an inconvenience not a catastrophe.</p>
+        <div class="transfer">Transfer — index is disposable</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-accretion"/></svg><span class="plate-id">Spec. 09</span></div>
+        <h4>Coral and stromatolites<small>Accreted skeletons</small></h4>
+        <p>Structure accreted by many small organisms each building on the last skeleton — the codebase and its AGENTS.md files ARE the memory, accreted feature by feature.</p>
+        <div class="transfer">Transfer — the artifact is the record</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-radial"/></svg><span class="plate-id">Spec. 10</span></div>
+        <h4>Octopus<small>Distributed cognition</small></h4>
+        <p>Puts most neurons in the arms — per-directory memory located where the work happens beats a central store.</p>
+        <div class="transfer">Transfer — memory lives at the limb</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-radial"/></svg><span class="plate-id">Spec. 11</span></div>
+        <h4>Elephant matriarch<small>Consulted in crises</small></h4>
+        <p>Holds long-term ecological memory the herd relies on only in crises — the Historian should be consulted at decision points, not constantly.</p>
+        <div class="transfer">Transfer — the Historian is not a daemon</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-field"/></svg><span class="plate-id">Spec. 12</span></div>
+        <h4>Migratory magnetoreception<small>Navigation by stable field</small></h4>
+        <p>Navigates by a stable external field — anchor memory to the most stable references available, never to line numbers.</p>
+        <div class="transfer">Transfer — anchor to what does not move</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-synapse"/></svg><span class="plate-id">Spec. 13</span></div>
+        <h4>Slime mold<small>Reinforced paths</small></h4>
+        <p>Rebuilds optimal networks by reinforcing used paths and starving unused ones — the retrieval graph itself becomes the memory, with structure encoding what matters.</p>
+        <div class="transfer">Transfer — the graph is the content</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-moon"/></svg><span class="plate-id">Spec. 14</span></div>
+        <h4>Tardigrade cryptobiosis<small>Suspend and resume</small></h4>
+        <p>Suspend completely and resume losing nothing — the model for hibernating a paused feature.</p>
+        <div class="transfer">Transfer — lossless pause</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-seed"/></svg><span class="plate-id">Spec. 15</span></div>
+        <h4>Squirrel scatter-hoarding<small>Accepted loss</small></h4>
+        <p>Accepts that some caches are lost — embrace lossy redundant memory over a perfect fragile index.</p>
+        <div class="transfer">Transfer — redundancy over perfection</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-wave"/></svg><span class="plate-id">Spec. 16</span></div>
+        <h4>Bird song learning<small>Critical period</small></h4>
+        <p>Has a critical period with a tutor, then crystallizes — learn intensively during repo bootstrap, then stabilize the profile.</p>
+        <div class="transfer">Transfer — bootstrap, then crystallize</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-dissolve"/></svg><span class="plate-id">Spec. 17</span></div>
+        <h4>Adaptive forgetting<small>Specifics out, pattern in</small></h4>
+        <p>Organisms forget specifics to generalize, and aggressive forgetting of specifics while keeping the pattern is what stops memory becoming a liability after refactors.</p>
+        <div class="transfer">Transfer — forgetting is a feature</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-pair"/></svg><span class="plate-id">Spec. 18</span></div>
+        <h4>Lichen symbiosis<small>Two organisms, one memory</small></h4>
+        <p>Two organisms whose combined memory exceeds either — the codebase holds structure, the event log holds history, and neither alone is memory.</p>
+        <div class="transfer">Transfer — structure + history = memory</div>
+      </article>
+
+      <article class="plate rv">
+        <div class="plate-top"><svg class="motif" viewBox="0 0 32 32"><use href="#m-helix"/></svg><span class="plate-id">Spec. 19</span></div>
+        <h4>Horizontal gene transfer<small>Across species lines</small></h4>
+        <p>Lets bacteria swap useful genes across species lines — a deliberate mechanism to transplant a proven pattern from repo A into repo B, not merely hope retrieval finds it.</p>
+        <div class="transfer">Transfer — transplant, do not hope</div>
+      </article>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================
+     LENS III — CROSS-POLLINATION
+     ============================================================ -->
+<section class="exchange" id="lens-3" style="--key:var(--l3)">
+  <div class="wrap">
+    <div class="lens-open rv">
+      <div class="lens-mark"><span class="dot"></span><span class="seq">Lens III</span><span>started — Cross-Pollination</span><span>Stratum 03</span></div>
+      <h2 class="lens-title">Borrowed from <span class="k">twenty-three drawers</span></h2>
+      <p class="lens-insight">Memory is a solved problem in a dozen industries, and the single biggest scope cut available is realizing git already IS most of the memory store Deep was planning to build.</p>
+      <p class="lens-count">23 index cards · filed by discipline</p>
+    </div>
+
+    <div class="hubviz rv" aria-hidden="true">
+      <svg viewBox="0 0 900 260" width="100%" height="auto" role="presentation" preserveAspectRatio="xMidYMid meet">
+        <g font-family="ui-monospace,Menlo,monospace" font-size="10" letter-spacing=".14em" fill="#8d8474">
+          <!-- spokes -->
+          <g stroke="#6f8797" stroke-opacity=".38" stroke-width="1" fill="none">
+            <path d="M120 44 C260 44 330 100 430 126"/>
+            <path d="M120 96 C260 96 340 112 430 128"/>
+            <path d="M120 148 C260 148 340 140 430 132"/>
+            <path d="M120 200 C260 200 330 165 430 136"/>
+            <path d="M780 44 C640 44 570 100 470 126"/>
+            <path d="M780 96 C640 96 560 112 470 128"/>
+            <path d="M780 148 C640 148 560 140 470 132"/>
+            <path d="M780 200 C640 200 570 165 470 136"/>
+          </g>
+          <!-- left labels -->
+          <text x="8" y="48">DATABASES</text>
+          <text x="8" y="100">VERSION CONTROL</text>
+          <text x="8" y="152">CPU CACHE</text>
+          <text x="8" y="204">AVIATION / NTSB</text>
+          <!-- right labels -->
+          <text x="892" y="48" text-anchor="end">LAW &amp; PRECEDENT</text>
+          <text x="892" y="100" text-anchor="end">MEDICINE</text>
+          <text x="892" y="152" text-anchor="end">LIBRARY SCIENCE</text>
+          <text x="892" y="204" text-anchor="end">JAZZ &amp; CHESS</text>
+        </g>
+        <!-- hub -->
+        <g>
+          <circle cx="450" cy="130" r="46" fill="none" stroke="#eec55f" stroke-opacity=".55"/>
+          <circle cx="450" cy="130" r="30" fill="none" stroke="#eec55f" stroke-opacity=".28" stroke-dasharray="2 4"/>
+          <circle cx="450" cy="130" r="4" fill="#eec55f"/>
+          <text x="450" y="200" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="10" letter-spacing=".22em" fill="#eec55f">MEMORY LAYER</text>
+          <text x="450" y="216" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="8.5" letter-spacing=".16em" fill="#5e574c">IMPORTS, DOES NOT INVENT</text>
+        </g>
+      </svg>
+    </div>
+
+    <div class="cards">
+
+      <article class="card rv" style="--f:#6fb2ab;--r:-0.7deg">
+        <div class="card-tab"><span class="disc">Databases · 01</span><span class="hole"></span></div>
+        <h4>Write-ahead log plus compaction</h4>
+        <p>Exactly the episodic-log plus consolidation pattern, arrived at independently from sleep biology — two fields converging is a strong signal it is correct.</p>
+        <span class="stamp">Convergence</span>
+      </article>
+
+      <article class="card rv" style="--f:#6fb2ab;--r:0.5deg">
+        <div class="card-tab"><span class="disc">Databases · 02</span><span class="hole"></span></div>
+        <h4>Separate the index from the store</h4>
+        <p>So the index can be rebuilt, reshaped or thrown away without touching the durable record.</p>
+      </article>
+
+      <article class="card rv" style="--f:#6fb2ab;--r:-0.4deg">
+        <div class="card-tab"><span class="disc">Databases · 03</span><span class="hole"></span></div>
+        <h4>Materialized views</h4>
+        <p>Precomputed answers to the questions agents ask most, refreshed on merge rather than computed per query.</p>
+      </article>
+
+      <article class="card flag rv" style="--r:0.8deg">
+        <div class="card-tab"><span class="disc">Version control</span><span class="hole"></span></div>
+        <h4>git blame and git log already ARE memory</h4>
+        <p>So build nothing that stores what git can already answer — the largest single scope reduction available.</p>
+        <span class="stamp">Largest scope cut</span>
+      </article>
+
+      <article class="card rv" style="--f:#86a077;--r:-0.6deg">
+        <div class="card-tab"><span class="disc">Search engines</span><span class="hole"></span></div>
+        <h4>Authority and recency, not raw similarity</h4>
+        <p>Memory from merged and shipped code must rank above memory from an abandoned branch.</p>
+      </article>
+
+      <article class="card rv" style="--f:#dba64a;--r:0.4deg">
+        <div class="card-tab"><span class="disc">CPU cache</span><span class="hole"></span></div>
+        <h4>Design memory explicitly as tiers</h4>
+        <p>With sizes and latencies — always-loaded profile as L1, per-region AGENTS.md as L2, retrieval index as L3, raw git history as disk — with defined promotion and eviction between them.</p>
+      </article>
+
+      <article class="card rv" style="--f:#ad7752;--r:-0.9deg">
+        <div class="card-tab"><span class="disc">Zettelkasten</span><span class="hole"></span></div>
+        <h4>Atomic notes, one fact each</h4>
+        <p>Densely linked, with structure emerging from links rather than an imposed taxonomy.</p>
+      </article>
+
+      <article class="card rv" style="--f:#6f8797;--r:0.6deg">
+        <div class="card-tab"><span class="disc">Aviation · NTSB</span><span class="hole"></span></div>
+        <h4>The airworthiness directive</h4>
+        <p>A flight recorder plus mandatory incident reports, where a single finding becomes a directive binding on every aircraft — an incident in one repo becomes a guardrail in all of them.</p>
+      </article>
+
+      <article class="card rv" style="--f:#c05a33;--r:-0.5deg">
+        <div class="card-tab"><span class="disc">Medicine</span><span class="hole"></span></div>
+        <h4>A repo has a chart</h4>
+        <p>Known allergies (what breaks it), chronic conditions (tech debt), past procedures (major refactors) — and you read the chart before operating.</p>
+      </article>
+
+      <article class="card rv" style="--f:#eec55f;--r:0.7deg">
+        <div class="card-tab"><span class="disc">Law · precedent</span><span class="hole"></span></div>
+        <h4>A decision can be OVERRULED</h4>
+        <p>Decisions cite prior decisions, and a decision can be explicitly overruled with a stated reason while the old one stays visible — this is the clean answer to memory that has become wrong.</p>
+      </article>
+
+      <article class="card rv" style="--f:#86a077;--r:-0.3deg">
+        <div class="card-tab"><span class="disc">Accounting</span><span class="hole"></span></div>
+        <h4>Double-entry provenance</h4>
+        <p>Every memory claim carries provenance and can be audited back to its source event.</p>
+      </article>
+
+      <article class="card rv" style="--f:#ad7752;--r:0.9deg">
+        <div class="card-tab"><span class="disc">Library science</span><span class="hole"></span></div>
+        <h4>A controlled vocabulary for tags</h4>
+        <p>So the store stays queryable as it grows past the point where anyone remembers what they called things.</p>
+      </article>
+
+      <article class="card rv" style="--f:#6f8797;--r:-0.8deg">
+        <div class="card-tab"><span class="disc">Wikipedia</span><span class="hole"></span></div>
+        <h4>Flag contested facts, never overwrite</h4>
+        <p>Contested facts get flagged rather than silently overwritten, and memory needs a review mechanism once more than one agent writes to it.</p>
+      </article>
+
+      <article class="card rv" style="--f:#dba64a;--r:0.3deg">
+        <div class="card-tab"><span class="disc">Kitchen</span><span class="hole"></span></div>
+        <h4>Mise en place</h4>
+        <p>Pre-warm the memory context for a feature during the planning phase so execution never stalls waiting on retrieval.</p>
+      </article>
+
+      <article class="card rv" style="--f:#c05a33;--r:-0.6deg">
+        <div class="card-tab"><span class="disc">Casino</span><span class="hole"></span></div>
+        <h4>Player tracking per area</h4>
+        <p>Compute expected value per area of the codebase and learn which regions reliably cost more than estimated.</p>
+      </article>
+
+      <article class="card rv" style="--f:#86a077;--r:0.5deg">
+        <div class="card-tab"><span class="disc">Sports</span><span class="hole"></span></div>
+        <h4>Film study reviews losses more than wins</h4>
+        <p>Consolidation should weight failures substantially higher than successes.</p>
+      </article>
+
+      <article class="card rv" style="--f:#6fb2ab;--r:-0.4deg">
+        <div class="card-tab"><span class="disc">Toyota TPS</span><span class="hole"></span></div>
+        <h4>Standard work, andon, kaizen</h4>
+        <p>Standard work is convention memory, the andon cord is the escalation path, and every kaizen is a memory write with a named owner.</p>
+      </article>
+
+      <article class="card rv" style="--f:#6f8797;--r:0.6deg">
+        <div class="card-tab"><span class="disc">Actuarial</span><span class="hole"></span></div>
+        <h4>Tables price risk from history</h4>
+        <p>Route model tier and verification depth by the historical risk profile of the area being touched.</p>
+      </article>
+
+      <article class="card rv" style="--f:#ad7752;--r:-0.7deg">
+        <div class="card-tab"><span class="disc">Tradecraft</span><span class="hole"></span></div>
+        <h4>Compartmentalization</h4>
+        <p>Memory scoped by agent capability, so the executor never receives the entire project history it does not need.</p>
+      </article>
+
+      <article class="card rv" style="--f:#eec55f;--r:0.4deg">
+        <div class="card-tab"><span class="disc">Jazz</span><span class="hole"></span></div>
+        <h4>Standards make improvisation fast</h4>
+        <p>A shared repertoire everyone knows is what makes improvisation fast — a library of known-good patterns per stack is the highest-leverage memory content.</p>
+      </article>
+
+      <article class="card rv" style="--f:#dba64a;--r:-0.5deg">
+        <div class="card-tab"><span class="disc">Chess</span><span class="hole"></span></div>
+        <h4>Opening books</h4>
+        <p>Precomputed known-good sequences for common positions, so common feature shapes (add a CRUD endpoint, add a migration, add a webhook) get a stored opening.</p>
+      </article>
+
+      <article class="card rv" style="--f:#6f8797;--r:0.8deg">
+        <div class="card-tab"><span class="disc">Air traffic control</span><span class="hole"></span></div>
+        <h4>The flight strip</h4>
+        <p>The compact record handed between controllers means the agent-to-agent handoff artifact is itself the memory unit.</p>
+      </article>
+
+      <article class="card rv" style="--f:#86a077;--r:-0.3deg">
+        <div class="card-tab"><span class="disc">Changelogs</span><span class="hole"></span></div>
+        <h4>Changelogs and semver</h4>
+        <p>Memory of what changed and why, in a format humans already know how to read.</p>
+      </article>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================
+     LENS IV — TIME HORIZON LADDER
+     ============================================================ -->
+<section class="ladder" id="lens-4" style="--key:var(--l4)">
+  <div class="wrap">
+    <div class="lens-open rv">
+      <div class="lens-mark"><span class="dot"></span><span class="seq">Lens IV</span><span>started — Time Horizon Ladder</span><span>Stratum 04</span></div>
+      <h2 class="lens-title">Drilled down through <span class="k">ten thousand features</span></h2>
+      <p class="lens-insight">Stepping the memory layer through 1, 100, 1000 and 10000 features shows the dominant cost FLIPS from writing memory to invalidating it, which reverses what the design should optimize for.</p>
+      <p class="lens-count">18 ideas · 6 rungs · 2 verdicts</p>
+    </div>
+
+    <div class="strata">
+
+      <div class="rung rv" style="--band:#eec55f;--bh:8px">
+        <div class="rung-depth">
+          <div class="n">1</div>
+          <div class="u">feature</div>
+          <div class="bar"></div>
+        </div>
+        <div class="rung-body">
+          <h4>Memory is pure overhead</h4>
+          <p>v0 should contain NO memory layer at all, only the episodic event log, which is free and quietly becomes the substrate everything else is built from later.</p>
+          <span class="tag">Build nothing</span>
+        </div>
+      </div>
+
+      <div class="rung rv" style="--band:#dba64a;--bh:14px;--ang:88deg">
+        <div class="rung-depth">
+          <div class="n">20</div>
+          <div class="u">features</div>
+          <div class="bar"></div>
+        </div>
+        <div class="rung-body">
+          <h4>The decision ledger starts paying</h4>
+          <p>Conventions memory should be built first because it has the highest hit rate, the smallest size and the cheapest retrieval.</p>
+          <span class="tag">Conventions first</span>
+        </div>
+      </div>
+
+      <div class="rung rv" style="--band:#ad7752;--bh:20px;--ang:86deg">
+        <div class="rung-depth">
+          <div class="n">100</div>
+          <div class="u">features</div>
+          <div class="bar"></div>
+        </div>
+        <div class="rung-body">
+          <h4>Naive load-all-memory breaks</h4>
+          <p>Real indexing plus ranking becomes mandatory, as does the consolidation job.</p>
+          <span class="tag">Index or drown</span>
+        </div>
+      </div>
+
+      <div class="rung rv" style="--band:#c05a33;--bh:28px;--ang:84deg">
+        <div class="rung-depth">
+          <div class="n">1K</div>
+          <div class="u">features</div>
+          <div class="bar"></div>
+        </div>
+        <div class="rung-body">
+          <h4>Memory ROT dominates</h4>
+          <p>Most entries reference code that no longer exists — and decay, pruning and re-validation become the main engineering problem.</p>
+          <span class="tag">The cost flips here</span>
+        </div>
+      </div>
+
+      <div class="rung rv" style="--band:#6f8797;--bh:36px;--ang:82deg">
+        <div class="rung-depth">
+          <div class="n">10K</div>
+          <div class="u">features</div>
+          <div class="bar"></div>
+        </div>
+        <div class="rung-body">
+          <h4>Memory is a product with its own maintenance burden</h4>
+          <p>So it must be mostly DERIVED and recomputable from git rather than stored, or the maintenance predator returns and wins.</p>
+          <span class="tag">Derived, not stored</span>
+        </div>
+      </div>
+
+      <div class="rung rv" style="--band:#6fb2ab;--bh:44px;--ang:80deg">
+        <div class="rung-depth">
+          <div class="n">5 → 50</div>
+          <div class="u">repos</div>
+          <div class="bar"></div>
+        </div>
+        <div class="rung-body">
+          <h4>Across five repos patterns transfer; across fifty they drown</h4>
+          <p>The per-repo noise swamps cross-repo signal unless cross-repo memory stores only abstract patterns and never concrete snippets.</p>
+          <span class="tag">Abstract only</span>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="verdict rv">
+      <div class="v-survives">
+        <h4>Survives every rung</h4>
+        <p>The append-only event log and git itself — because both are immutable and always true.</p>
+      </div>
+      <div class="v-breaks">
+        <h4>Breaks at every single rung</h4>
+        <p>Anything storing file paths, line numbers or code snippets.</p>
+      </div>
+    </div>
+
+    <div class="anchors rv">
+      <p class="eyebrow" style="color:var(--l4)">Stable anchors, ranked by durability</p>
+      <ol>
+        <li><span class="r">01</span><span class="name">test names</span><span class="meter"><i style="--w:100%"></i></span></li>
+        <li><span class="r">02</span><span class="name">public API symbols</span><span class="meter"><i style="--w:78%"></i></span></li>
+        <li><span class="r">03</span><span class="name">module names</span><span class="meter"><i style="--w:54%"></i></span></li>
+        <li><span class="r">04</span><span class="name">file paths</span><span class="meter"><i style="--w:26%"></i></span></li>
+        <li class="dead"><span class="r">05</span><span class="name">line numbers</span><span class="meter"><i style="--w:6%"></i></span></li>
+      </ol>
+      <p style="margin:14px 0 0;font-family:var(--sans);font-size:14px;color:var(--muted)">Line numbers are never acceptable anchors. The design rule falling out of the ladder: memory stores <strong style="color:var(--bone);font-weight:400">questions and their durable answers plus pointers to stable anchors</strong>, never copies of code.</p>
+    </div>
+
+    <div class="corelog rv">
+      <div class="logline"><span class="mk">▸ SCHEMA</span><p>What transfers between products is how-we-do-auth, never the auth code itself — this single rule determines the schema of cross-repo memory.</p></div>
+      <div class="logline"><span class="mk">▸ INVALIDATE</span><p>Hook memory invalidation to the refactor itself — the committer detects renames and rewrites anchors as part of the commit, so memory cannot drift behind the code.</p></div>
+      <div class="logline"><span class="mk">▸ SWEEP</span><p>A periodic re-validation sweep samples memory entries and checks their anchors still resolve, flagging the dead ones instead of waiting to be misled by them.</p></div>
+      <div class="logline"><span class="mk">▸ REBUILD</span><p>Make memory rebuildable: if ninety percent can be regenerated from git history plus the event log, then corruption stops being a crisis and the schema becomes free to change.</p></div>
+      <div class="logline"><span class="mk">▸ 10 YEARS</span><p>At the ten-year rung the model has changed many times — memory as structured facts and tests survives that, memory as tuned prompt text does not.</p></div>
+      <div class="logline"><span class="mk">▸ FAR RUNG</span><p>At the absurd far rung the memory becomes more valuable than the code, because code is regenerable while accumulated decisions and constraints are not — which inverts what you back up and what you version.</p></div>
+      <div class="logline"><span class="mk">▸ SCOPE</span><p>The consolidation job is the ONLY genuinely new subsystem worth building for memory, because everything else is querying git and the event log.</p></div>
+      <div class="logline"><span class="mk">▸ KILL TEST</span><p>Measure memory ROI directly as retrieval token cost versus measured reduction in rework, and delete the memory layer outright if that number is not positive.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================
+     SYNTHESIS
+     ============================================================ -->
+<section class="synth" id="synthesis">
+  <div class="wrap">
+    <div class="synth-head rv">
+      <p class="eyebrow">Entry 88 · the single consolidation pass</p>
+      <h2>Eight things that <em>survive the night</em></h2>
+      <p class="lede">Seventy-nine ideas were logged fast and lossy. This is what remained once the outcomes were known and the tokens were cheap.</p>
+    </div>
+
+    <div class="consolidation rv" aria-hidden="true">
+      <svg viewBox="0 0 900 120" width="100%" height="auto" role="presentation" preserveAspectRatio="xMidYMid meet">
+        <g stroke="#6f8797" stroke-opacity=".5" stroke-width="1.2">
+          <path d="M6 20v14M18 26v14M30 18v14M42 30v14M54 22v14M66 34v14M78 20v14M90 28v14M102 24v14M114 32v14M126 18v14M138 30v14M150 26v14M162 20v14M174 34v14M186 22v14M198 28v14M210 18v14M222 32v14M234 24v14M246 20v14M258 30v14M270 26v14M282 34v14M294 18v14M306 28v14M318 22v14M330 32v14M342 20v14M354 26v14"/>
+        </g>
+        <text x="6" y="66" font-family="ui-monospace,Menlo,monospace" font-size="9" letter-spacing=".18em" fill="#5e574c">FAST · LOSSY · APPEND-ONLY</text>
+        <text x="6" y="80" font-family="ui-monospace,Menlo,monospace" font-size="9" letter-spacing=".18em" fill="#5e574c">79 IDEAS, 88 ENTRIES</text>
+        <!-- funnel -->
+        <path d="M380 12 L470 48 L470 72 L380 108 Z" fill="none" stroke="#eec55f" stroke-opacity=".45"/>
+        <text x="425" y="30" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="8.5" letter-spacing=".2em" fill="#eec55f">CONSOLIDATE</text>
+        <!-- output -->
+        <g stroke="#eec55f" stroke-width="2.2" stroke-opacity=".8">
+          <path d="M520 46v28M552 46v28M584 46v28M616 46v28M648 46v28M680 46v28M712 46v28M744 46v28"/>
+        </g>
+        <text x="520" y="96" font-family="ui-monospace,Menlo,monospace" font-size="9" letter-spacing=".18em" fill="#8d8474">SLOW · STRUCTURED · DURABLE · 8 FACTS</text>
+      </svg>
+    </div>
+
+    <div class="points">
+
+      <!-- 1 -->
+      <article class="pt major rv">
+        <div class="pt-split">
+          <div>
+            <div class="pt-no">01</div>
+            <h3>Two fields walked to the same door</h3>
+            <p>The strongest signal is convergence — sleep consolidation in biology and write-ahead-log plus compaction in databases are the same design reached independently, both saying <strong style="color:var(--phos);font-weight:400">never write long-term memory during the run</strong>; log fast and lossy, consolidate afterward when outcomes are known and tokens are cheap.</p>
+          </div>
+          <div aria-hidden="true">
+            <svg viewBox="0 0 420 200" width="100%" height="auto" role="presentation" preserveAspectRatio="xMidYMid meet">
+              <g fill="none" stroke="#86a077" stroke-width="1.4">
+                <path d="M12 38 C130 38 190 80 232 98"/>
+              </g>
+              <g fill="none" stroke="#6fb2ab" stroke-width="1.4">
+                <path d="M12 162 C130 162 190 120 232 102"/>
+              </g>
+              <g font-family="ui-monospace,Menlo,monospace" font-size="9" letter-spacing=".14em">
+                <text x="12" y="28" fill="#86a077">BIOLOGY</text>
+                <text x="12" y="184" fill="#6fb2ab">DATABASES</text>
+                <text x="12" y="52" fill="#5e574c" font-size="8">sleep consolidation</text>
+                <text x="12" y="150" fill="#5e574c" font-size="8">WAL + compaction</text>
+              </g>
+              <circle cx="240" cy="100" r="8" fill="none" stroke="#eec55f" stroke-width="1.4"/>
+              <circle cx="240" cy="100" r="3" fill="#eec55f"/>
+              <path d="M250 100h30" stroke="#eec55f" stroke-width="1.4"/>
+              <g font-family="ui-monospace,Menlo,monospace" font-size="9" letter-spacing=".12em" fill="#eec55f">
+                <text x="288" y="94">SAME</text>
+                <text x="288" y="108">DESIGN</text>
+              </g>
+              <text x="240" y="132" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="7.5" letter-spacing=".14em" fill="#5e574c">INDEPENDENT CONFIRMATION</text>
+            </svg>
+          </div>
+        </div>
+      </article>
+
+      <!-- 2 -->
+      <article class="pt major rv">
+        <div class="pt-split">
+          <div>
+            <div class="pt-no">02</div>
+            <h3>The biggest scope cut is a tool you already run</h3>
+            <p>Git already IS most of the memory store, so build nothing git log and git blame can answer, and require memory to be rebuildable from git plus the event log — memory becomes an index over things already held, making schema change free and corruption survivable.</p>
+          </div>
+          <div>
+            <p class="bigline">git log<br>git blame<span><small>The store already exists. Build the index only.</small></span></p>
+          </div>
+        </div>
+      </article>
+
+      <!-- 3 -->
+      <article class="pt major rv">
+        <div class="pt-split">
+          <div>
+            <div class="pt-no">03</div>
+            <h3>Memory that enforces itself costs nothing to read</h3>
+            <p>Conventions become lint rules, failures become regression tests, incidents become guardrails — so the layer's real job is CONVERTING memory into executable artifacts, and falling back to retrieval only for the irreducibly fuzzy.</p>
+          </div>
+          <div>
+            <span class="zero" aria-hidden="true">0</span>
+            <span class="zero-cap">tokens at read time</span>
+          </div>
+        </div>
+      </article>
+
+      <!-- 4 -->
+      <article class="pt major rv">
+        <div class="pt-split">
+          <div>
+            <div class="pt-no">04</div>
+            <h3>The cost flips from writing to invalidating</h3>
+            <p>The trap from the horizon ladder is that the dominant cost flips from writing memory at 100 features to INVALIDATING it at 1000 — so decay policy at write time, durability-ranked anchors with line numbers banned, and invalidation hooked to the refactor commit must all be day-one decisions.</p>
+          </div>
+          <div aria-hidden="true">
+            <svg viewBox="0 0 420 200" width="100%" height="auto" role="presentation" preserveAspectRatio="xMidYMid meet">
+              <g stroke="rgba(236,227,212,.14)" stroke-width="1">
+                <path d="M40 160h350M40 20v140"/>
+              </g>
+              <g font-family="ui-monospace,Menlo,monospace" font-size="8" fill="#5e574c" letter-spacing=".1em">
+                <text x="48" y="176">1</text>
+                <text x="118" y="176">20</text>
+                <text x="188" y="176">100</text>
+                <text x="258" y="176">1K</text>
+                <text x="330" y="176">10K</text>
+                <text x="40" y="14">COST</text>
+              </g>
+              <path d="M48 44 C130 60 200 108 380 142" fill="none" stroke="#6f8797" stroke-width="1.8"/>
+              <path d="M48 152 C150 146 220 78 380 32" fill="none" stroke="#c05a33" stroke-width="1.8"/>
+              <circle cx="222" cy="108" r="5" fill="none" stroke="#eec55f" stroke-width="1.5"/>
+              <path d="M222 108 L268 80" stroke="#eec55f" stroke-width="1" stroke-dasharray="2 3"/>
+              <g font-family="ui-monospace,Menlo,monospace" font-size="8.5" letter-spacing=".12em">
+                <text x="272" y="78" fill="#eec55f">FLIP</text>
+                <text x="300" y="130" fill="#6f8797">WRITING</text>
+                <text x="300" y="26" fill="#c05a33">INVALIDATING</text>
+              </g>
+            </svg>
+          </div>
+        </div>
+      </article>
+
+      <!-- 5,6,7 -->
+      <div class="trio">
+        <article class="pt rv">
+          <div class="pt-no">05</div>
+          <h3>Two cheap unbuilt wins</h3>
+          <p>Memory as a ROUTING input — risk memory picks verification depth, cost memory picks model tier — and negative memory, which is worth more per token than positive memory.</p>
+        </article>
+        <article class="pt rv">
+          <div class="pt-no">06</div>
+          <h3>Patterns cross repos; snippets never do</h3>
+          <p>Cross-repo memory must store abstract patterns never snippets — how-we-do-auth, not auth code — and that single rule determines the schema.</p>
+        </article>
+        <article class="pt rv">
+          <div class="pt-no">07</div>
+          <h3>The v0 verdict holds</h3>
+          <p>Agreeing with session one: build no memory layer, keep only the episodic event log, which is simultaneously flight recorder, timeline, resume mechanism and the substrate for everything later.</p>
+        </article>
+      </div>
+
+      <!-- 8 -->
+      <article class="selfref rv">
+        <div class="pt-no">08</div>
+        <h3>The log you are reading is the spec</h3>
+        <p>Self-referential: the memlog pattern this session ran on — append-only, one line per idea, never edited, a single consolidation pass at the end — IS the architecture to build.</p>
+        <div class="memlog" role="img" aria-label="An excerpt of the append-only memlog this session was written to, ending with the synthesis entry.">- <span class="t">(technique)</span> started Job to Be Done
+- <span class="i">(idea)</span> Job 1 do not make me explain my conventions twice …
+- <span class="i">(idea)</span> Memory write is a privilege not a default …
+- <span class="t">(technique)</span> started Nature's Solutions
+- <span class="i">(idea)</span> Sleep consolidation: consolidate BETWEEN features …
+- <span class="t">(technique)</span> started Cross-Pollination
+- <span class="i">(idea)</span> git blame and git log already ARE memory …
+- <span class="t">(technique)</span> started Time Horizon Ladder
+- <span class="i">(idea)</span> What survives every rung is the append-only log …
+- <span class="s">(insight)</span> SYNTHESIS: … (8) the memlog pattern IS the architecture.<span class="cursor"></span></div>
+      </article>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================
+     COLOPHON
+     ============================================================ -->
+<footer class="colophon">
+  <div class="wrap colo-grid">
+    <div>
+      <p class="eyebrow" style="margin-bottom:14px">Colophon</p>
+      <p>Drilled 2026-09-19, autonomous mode, status complete. The core was cut in four strata — Job to Be Done, Nature's Solutions, Cross-Pollination, Time Horizon Ladder — and read bottom to top in a single consolidation pass. Nothing in the log was edited after it was written; this page is only its index.</p>
+      <p class="seal">Core log · brainstorm-agent-memory-layer · sealed</p>
+    </div>
+    <div class="tally">
+      <div><span>Ideas logged</span><b>79</b></div>
+      <div><span>Lenses drilled</span><b>4</b></div>
+      <div><span>Entries in the memlog</span><b>88</b></div>
+      <div><span>Insights recorded</span><b>5</b></div>
+      <div><span>New subsystems worth building</span><b>1</b></div>
+      <div><span>Memory layers in v0</span><b>0</b></div>
+    </div>
+  </div>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var items = document.querySelectorAll('.rv');
+
+  if (reduce || !('IntersectionObserver' in window)) {
+    for (var i=0;i<items.length;i++) items[i].classList.add('in');
+  } else {
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if (e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); }
+      });
+    }, { rootMargin: '0px 0px -8% 0px', threshold: 0.06 });
+    for (var j=0;j<items.length;j++) io.observe(items[j]);
+  }
+
+  // depth rail active state
+  var links = Array.prototype.slice.call(document.querySelectorAll('.rail a'));
+  var targets = links.map(function(a){ return document.querySelector(a.getAttribute('href')); }).filter(Boolean);
+  if (targets.length && 'IntersectionObserver' in window){
+    var spy = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if (!e.isIntersecting) return;
+        links.forEach(function(a){
+          a.classList.toggle('on', a.getAttribute('href') === '#' + e.target.id);
+        });
+      });
+    }, { rootMargin: '-45% 0px -50% 0px', threshold: 0 });
+    targets.forEach(function(t){ spy.observe(t); });
+  }
+})();
+</script>
+</body>
+</html>
