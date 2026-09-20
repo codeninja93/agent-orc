@@ -902,15 +902,42 @@ describe('the dependency direction is fixed', () => {
     expect(code, file).not.toMatch(/\bconsole\.\w+\(/);
   });
 
-  it('exposes the executor port without spawning anything', () => {
+  /**
+   * The four files story 1-4 added, which are the spawn contract and are *supposed* to name its flags.
+   *
+   * Story 1-3 asserted that no engine file named a `claude -p` flag, which proved that story had not
+   * quietly started doing story 1-4's job. Now that 1-4 has landed, the claim worth holding is the
+   * narrower one it was always standing in for: the *loop* and the *port* still know nothing about
+   * process handling, so the reconciler was not edited to fit the executor. Exempting these four by
+   * name keeps that check sharp on every other file rather than deleting it.
+   */
+  const SPAWN_CONTRACT_FILES = ['cli.ts', 'node-path.ts', 'stream.ts', 'spawner.ts'];
+
+  it('keeps the loop and the port free of process handling', () => {
     for (const file of files) {
-      // Story 1-4 owns process handling. `baseline.ts` runs `git`, which is the one AD-26 mutation this
-      // story performs; no engine code spawns `claude`, passes `--resume` or names a model as a flag.
+      if (SPAWN_CONTRACT_FILES.includes(file)) continue;
+      // `baseline.ts` runs `git`, which is the one AD-26 mutation the loop performs; nothing else in
+      // the engine outside the spawn contract spawns `claude`, passes `--resume` or names a model flag.
       const code = codeOf(file);
       expect(code, file).not.toContain('--resume');
       expect(code, file).not.toContain('--json-schema');
       expect(code, file).not.toContain('stream-json');
       expect(code, file).not.toMatch(/['"]claude['"]/);
+    }
+  });
+
+  it('has a spawn contract to exempt, and exempts nothing that does not exist', () => {
+    // A stale exemption would silently switch the check off for a file that had been renamed away.
+    for (const file of SPAWN_CONTRACT_FILES) expect(files, file).toContain(file);
+  });
+
+  it('leaves the container boundary to AD-20\'s single wrapper', () => {
+    // AD-20 gives one wrapper sole ownership of every container flag, and that wrapper is story 1-5.
+    // Asserted over the whole file, comments included: a prose mention is how a flag gets composed
+    // here "just for now", and the spawner's seam means nothing if the runtime is named beside it.
+    for (const file of files) {
+      const source = readFileSync(new URL(file, engineDir), 'utf8');
+      expect(source.toLowerCase(), file).not.toContain('docker');
     }
   });
 

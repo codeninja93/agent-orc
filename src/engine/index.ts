@@ -17,11 +17,19 @@
  * - `territory` — the conflict-domain bound on concurrency;
  * - `baseline` — AD-26's recorded ref and the reset a re-run begins with;
  * - `executor` — the port story 1-4 implements, so the loop owns decisions and nothing else;
+ * - `cli` — AD-1's preflight: where `claude` is, that it meets the pinned floor, and that it
+ *   authenticates by subscription rather than by API key;
+ * - `node-path` — AD-28's absolute child Node, resolved once and handed to every child;
+ * - `stream` — the `--output-format stream-json` parser, which is the system's whole view of what a
+ *   step agent did, since AD-1 forbids linking the Agent SDK as a library;
+ * - `spawner` — the real `StepExecutor`: one `claude -p` per attempt, re-parsed output, mapped
+ *   disposition;
  * - `reconciler` — the loop: read the checkpoint, take at most one action, write the checkpoint.
  *
- * Nothing here spawns a process, wraps a container, leases a resource, reads a command intent file,
- * manages a question or renders anything. Each of those is a later story, and each plugs into a
- * boundary declared above rather than into the loop's middle.
+ * Nothing here wraps a container, leases a resource, reads a command intent file, manages a question
+ * or renders anything. Each of those is a later story, and each plugs into a boundary declared above
+ * rather than into the loop's middle — the container in particular reaches the spawner as the
+ * `SpawnWrapper` seam of AD-20, never as a flag composed here.
  */
 export * from './ulid.js';
 export * from './lock.js';
@@ -31,4 +39,8 @@ export * from './dispositions.js';
 export * from './territory.js';
 export * from './baseline.js';
 export * from './executor.js';
+export * from './cli.js';
+export * from './node-path.js';
+export * from './stream.js';
+export * from './spawner.js';
 export * from './reconciler.js';
