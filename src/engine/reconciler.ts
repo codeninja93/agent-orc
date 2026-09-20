@@ -249,6 +249,38 @@ export interface RunRefusal {
   readonly reason: string;
 }
 
+/**
+ * One resource a reclamation pass acted on, or declined to.
+ *
+ * `kind` is an open string rather than an enum for the same reason the error shape's `code` is: the unit
+ * that owns resources declares what kinds exist, and the loop only reports what it was told.
+ */
+export interface ReclaimedResource {
+  readonly kind: string;
+  readonly id: string;
+  readonly run: string;
+  readonly reason: string;
+}
+
+/** What one reclamation pass decided and did. Reported by the pass that invoked it, never acted on here. */
+export interface ReclamationSummary {
+  readonly reclaimed: readonly ReclaimedResource[];
+  readonly retained: readonly ReclaimedResource[];
+  readonly failed: readonly ReclaimedResource[];
+}
+
+/**
+ * AD-32 — the reclamation pass a reconcile pass invokes.
+ *
+ * A port, satisfied structurally, for the same reason the executor and the spawn wrapper are: the loop
+ * decides *when* reclamation happens and learns nothing about what a resource is. The rule AD-32 states
+ * is about the when — "a reconcile pass comparing live resources against runs, never a shutdown handler"
+ * — so that is the part the loop owns, and it is why this is called from `pass` rather than from `close`,
+ * from an exit hook or from a `finally` around a run. A crash skips all three of those; it cannot skip
+ * being called again by the next pass.
+ */
+export type ReclamationPass = () => ReclamationSummary;
+
 export interface PassResult {
   /** One entry per feature the pass touched, each having taken at most one action. */
   readonly actions: readonly PassAction[];
@@ -256,6 +288,8 @@ export interface PassResult {
   readonly deferred: readonly TerritoryDeferral[];
   /** Runs this pass refused to read or could not advance. Every other run still advanced. */
   readonly refusals: readonly RunRefusal[];
+  /** AD-32 — what this pass reclaimed, or `null` when no reclamation pass is wired in. */
+  readonly reclaimed: ReclamationSummary | null;
 }
 
 /** What one `load` established: the paths, the declared plan, and the state the log folds to. */
@@ -366,6 +400,15 @@ export interface ReconcilerOptions {
   readonly redaction?: RedactionPolicy;
   /** Skip the AD-30 lock. Only for a caller that already holds it; never in production. */
   readonly lock?: EngineLock | null;
+  /**
+   * AD-32 — the reclamation pass, invoked once per reconcile pass. Omitted means none is wired in.
+   *
+   * Omitted rather than defaulted because the loop cannot build one: resources live in `src/pool/`, which
+   * this package may not import — the same direction that keeps the container boundary in exactly one
+   * place. An engine with no reclamation reclaims nothing and says so, which is a visible gap rather than
+   * a silent one.
+   */
+  readonly reclamation?: ReclamationPass | null;
 }
 
 /** What accepting a feature produced. */
@@ -394,6 +437,7 @@ export class Reconciler {
   private readonly redaction: RedactionPolicy;
   private readonly engineLock: EngineLock | null;
   private readonly ownsLock: boolean;
+  private readonly reclamation: ReclamationPass | null;
   /** Open recorders, keyed by run id. An I/O handle, not run state: nothing is read back from it. */
   private readonly recorders = new Map<string, Recorder>();
   private closed = false;
@@ -412,6 +456,7 @@ export class Reconciler {
     this.redaction = options.redaction ?? {};
     this.engineLock = lock;
     this.ownsLock = ownsLock;
+    this.reclamation = options.reclamation ?? null;
   }
 
   /**
@@ -619,6 +664,12 @@ export class Reconciler {
     const entries: LoadedRun[] = [];
     const refusals: RunRefusal[] = [];
 
+    // AD-32, first thing in the pass and on every pass: a comparison of what is held against what the
+    // runs say, taken before any run advances so it reads one consistent picture of on-disk state. A run
+    // that becomes terminal later in this pass is reclaimed by the next one, which is the language AD-32
+    // itself uses. Nothing below depends on it having happened.
+    const reclaimed = this.reclaim(refusals);
+
     for (const run of this.runIds()) {
       try {
         entries.push({ run, loaded: this.load(run) });
@@ -687,7 +738,29 @@ export class Reconciler {
       else refusals.push(refusalFor(run, outcome.reason));
     }
 
-    return { actions, deferred, refusals };
+    return { actions, deferred, refusals, reclaimed };
+  }
+
+  /**
+   * Invoke the reclamation pass, reporting a rejection rather than losing the whole pass to it.
+   *
+   * A sweep that throws is one resource's problem at worst, and every feature in this pass still has to
+   * advance — the same per-artifact rule that keeps one unreadable run from wedging the loop. The
+   * `try`/`catch` here is error reporting and not a cleanup path: there is no `finally`, and nothing is
+   * reclaimed by this process ending.
+   */
+  private reclaim(refusals: RunRefusal[]): ReclamationSummary | null {
+    if (this.reclamation === null) return null;
+    try {
+      const summary = this.reclamation();
+      for (const resource of summary.reclaimed) {
+        this.boundary(`resource-reclaimed:${resource.kind}`);
+      }
+      return summary;
+    } catch (thrown: unknown) {
+      refusals.push(refusalFor('(reclamation)', thrown));
+      return null;
+    }
   }
 
   /**

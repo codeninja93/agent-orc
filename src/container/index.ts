@@ -14,5 +14,6 @@ export * from './runtime.js';
 export * from './flags.js';
 export * from './image.js';
 export * from './tiers.js';
+export * from './service.js';
 export * from './lifecycle.js';
 export * from './wrapper.js';

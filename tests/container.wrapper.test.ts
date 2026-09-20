@@ -417,6 +417,8 @@ describe('the dependency direction', () => {
       'index.ts',
       'lifecycle.ts',
       'runtime.ts',
+      // Story 1-6: the flag set for a leased service container, so a pool composes no flag of its own.
+      'service.ts',
       'tiers.ts',
       'wrapper.ts',
     ]);

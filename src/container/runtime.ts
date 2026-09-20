@@ -104,6 +104,18 @@ export const CONTAINER_SUBCOMMANDS = {
   run: ['run'] as const,
   build: ['build'] as const,
   remove: ['rm'] as const,
+  /**
+   * `exec` and `stop` exist for a leased service (`service.ts`), never for a step.
+   *
+   * A step is one invocation whose exit code is its disposition (AD-8), so there is nothing to exec
+   * into and nothing to stop. A leased instance is the opposite: it is started detached and its
+   * readiness probe, its wipe and its emptiness check are all commands run inside it, so CAP-11's
+   * "returned and verified empty" is unreachable without these two. They are spelled here rather than
+   * beside the flags that use them, because this is the file AD-20 allows to name the runtime's
+   * vocabulary.
+   */
+  exec: ['exec'] as const,
+  stop: ['stop'] as const,
   inspectImage: ['image', 'inspect'] as const,
   inspectContainer: ['container', 'inspect'] as const,
   info: ['info'] as const,
