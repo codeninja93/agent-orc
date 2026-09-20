@@ -4,7 +4,7 @@ type: 'feature'
 created: '2026-09-20'
 status: 'done'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 context:
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/interface-contract.md'
@@ -283,3 +283,47 @@ export PATH="/Users/deep/.nvm/versions/node/v24.21.0/bin:$PATH"   # node v24.21.
 - `grep -rn "from '\.\./engine" src/tui/` -- expected: no match; a renderer never imports the engine
 - `grep -rnE "%|percent" src/tui/` -- expected: no percentage rendered as progress
 - `npx vitest run tests/engine.crash-injection.test.ts` -- expected: still converges, since the relocation must change no engine behaviour
+
+## Auto Run Result
+
+Status: done
+Blocking condition: none
+
+**REVIEW WAS SKIPPED** for this story; no review layers ran. The gate, the implementer's probes and the
+parent's two mutations are the only scrutiny. Read `status: done` as implemented and gated, not reviewed.
+
+**Implemented change.** `src/tui/` — the first surface this system has had. A pure fold from `events.jsonl`
+to view state (`projection.ts`), the permanently displayed autonomy mode (`mode.ts`), the ambient segment
+carrying step count, consumed rate-limit budget and elapsed-versus-estimate (`status.ts`), the total
+`CommandMap` of controls that reach the engine only by writing an intent (`controls.ts`), and the Ink shell
+that composes them and reserves the persistent question slot story 1-10 fills. React 19.3.0 and Ink 7.1.1
+arrive pinned exactly, as story 1-1 deferred them to this story.
+
+**The contradiction it had to settle.** The spine forbids a renderer importing the engine; story 1-7 had put
+the three intent-writing functions a renderer needs inside `src/engine/`. The intent file's mechanics moved
+to `src/runtime/` — which already owns the recorder and the paths — and `src/engine/commands.ts` re-exports
+every name, so `reconciler.ts` and the engine's own suite were untouched. What stays in the engine is what
+the engine does with the files: read, order, quarantine, retire, apply.
+
+Two consequences the implementer reasoned through rather than papered over: the temp suffix became exported,
+because writer and reader now live in different modules and two private constants would be two agreements
+about one name; and a renderer mints its intent id from `node:crypto` rather than the engine's ULID minter,
+since AD-29 makes that minter the engine's alone — reusing only the punctuation that keeps the id's runs short
+enough to survive AD-21's entropy sweep in the payload that carries the exactly-once key.
+
+**Parent verification.** `typecheck`, `lint`, `build` exit 0; `npm test` → 37 files, **1015 passed**, zero
+skips. No engine import from `src/tui/` — the three matches for "engine" are prose explaining the rule. No
+percentage anywhere, including the remainder operator, so that grep means something. `react` 19.3.0 and `ink`
+7.1.1 exact, no `react-dom`. `dist/tui/index.js` imports clean, so the `.tsx` build output runs. The
+crash-injection suite still converges, confirming the relocation changed no engine behaviour.
+
+**Mutation-tested by the parent:** blanking one autonomy mode's label fails the mode suite's "describes every
+mode in the enum"; removing the `seq` sort from the fold fails "does not depend on the order the lines were
+handed to it". Both restored byte-identically.
+
+**Coverage shape.** 31 pure fold tests and exactly one rendered frame in the whole repository, which is what
+the spec asked for. An unknown event type is asserted to leave the view *identical* rather than merely not to
+throw, and one test folds a log a real reconciler wrote, to catch payload-key drift.
+
+**Follow-up review recommended: true** — no review ran, and the cross-story note below about `mode.ts` wants
+settling before story 3-1 rather than after.
