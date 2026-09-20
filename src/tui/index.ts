@@ -23,15 +23,27 @@
  * - `controls` — the total `CommandMap` of controls, each writing one durable intent file (AD-3,
  *   AD-19);
  * - `app` — the Ink shell, whose every line comes from a pure function, and which reserves the
- *   persistent question slot story 1-10 fills.
+ *   persistent question slot story 1-10 filled;
+ * - `cards/` — the six surfaces `interface-contract.md` requires, each a pure function from a view to a
+ *   plain structure: the one-question card, the spec echo, the morning brief, the kill card, the
+ *   completion notice and the handoff note;
+ * - `cards.tsx` — one Ink component per card, each laying out its view-model and nothing more;
+ * - `fleet` — every run under `runsDir`, folded, so CAP-22's brief is a fold of one log per feature and one
+ *   unreadable log costs only its own line;
+ * - `input` — the keyboard loop as a pure reducer: a keystroke names an effect, and `invokeControl`
+ *   performs the only one a renderer may (AD-19).
  *
- * What is deliberately absent: the question card, the spec echo, the morning brief, the kill card, the
- * completion notice and the handoff rendering are story 1-10's six surfaces; the loopback server and
- * the web renderer are story 3-1's; ceilings enforcement is 2-9's. This story owns the shell they live
- * in.
+ * What is deliberately absent: the loopback server and the web renderer are story 3-1's; ceilings
+ * enforcement is 2-9's, so the kill card displays usage against estimate and acts on nothing; the
+ * Interviewer, question compression and quiet hours are 2-8's; the merge a completion notice reports is
+ * 2-7's, which is why the notice states it as unrecorded rather than as a pass (R8).
  */
 export * from './projection.js';
 export * from './mode.js';
 export * from './status.js';
 export * from './controls.js';
 export * from './app.js';
+export * from './cards/index.js';
+export * from './cards.js';
+export * from './fleet.js';
+export * from './input.js';

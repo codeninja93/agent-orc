@@ -262,18 +262,15 @@ export class Checkpoint {
   }
 }
 
-/** Every run id with a directory under `ORCH_HOME/runs/`, in ULID order (chronological). */
-export const listRunIds = (runsDirectory: string): string[] => {
-  let entries: string[];
-  try {
-    entries = readdirSync(runsDirectory, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => entry.name);
-  } catch {
-    return [];
-  }
-  return entries.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-};
+/**
+ * Every run id with a directory under `ORCH_HOME/runs/` — re-exported from `src/runtime/runs.ts`.
+ *
+ * Story 1-10's morning brief folds every in-flight feature, so it has to enumerate the same directories
+ * this module used to enumerate for the reconciler — and the spine gives a renderer no edge to the engine.
+ * Enumerating a directory AD-9 lays out is the runtime's concern, so the function moved there and is
+ * re-exported here, leaving the reconciler's import untouched.
+ */
+export { listRunIds } from '../runtime/index.js';
 
 /**
  * A single `writeSync` of the serialised checkpoint, used by nothing in production and exported so a

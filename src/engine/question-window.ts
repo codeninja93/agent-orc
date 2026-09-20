@@ -14,16 +14,33 @@
  *
  * **"It timed out while I was typing" is the case worth being unambiguous about.** Two of the three
  * resolvers are a person and a clock, and they will collide. Whichever wins, the other is told plainly:
- * {@link describeDefaultTaken} is the sentence a person gets when the clock beat them, and it is part of
+ * `describeDefaultTaken` is the sentence a person gets when the clock beat them, and it is part of
  * the contract rather than an afterthought — a user who believes their answer landed and a system that
  * took the default have diverged about a decision AD-25 has already made durable.
+ *
+ * **Four of the names this module used to define now live in `src/runtime/question-view.ts`.** Story
+ * 1-10's one-question card states the recommendation, the window remaining and — when the clock won — the
+ * sentence above, and the spine forbids a renderer importing the engine. The reading half therefore moved
+ * to the runtime and is re-exported here unchanged, so every existing caller and its tests are untouched.
+ * What stayed is what *acts*: the timeout principal, the resolution the clock submits, and the
+ * compare-and-set it competes in.
  */
-import { formatTimestamp } from '../contracts/index.js';
-import type { Principal, Question, QuestionResolution, QuestionState } from '../contracts/index.js';
+import type { Principal, Question, QuestionResolution } from '../contracts/index.js';
+import { recommendedOption } from '../runtime/index.js';
 import type { RunPaths } from '../runtime/index.js';
 
 import { attemptQuestionResolution, questionResolution } from './questions.js';
 import type { QuestionClaim } from './questions.js';
+
+export {
+  describeDefaultTaken,
+  isQuestionDefaultDue,
+  questionDefaultDueAt,
+  questionDefaultDueAtMs,
+  questionWindowRemainingMs,
+  recommendedOption,
+} from '../runtime/index.js';
+export type { RecommendableQuestion, WindowedQuestion } from '../runtime/index.js';
 
 /**
  * Who a default taken by the clock is attributable to.
@@ -36,39 +53,6 @@ export const QUESTION_TIMEOUT_PRINCIPAL: Principal = Object.freeze({
   kind: 'timeout',
   id: 'question.window',
 });
-
-/** The instant a question's default becomes due: when it was asked, plus its declared window (Q2). */
-export const questionDefaultDueAtMs = (question: Question): number =>
-  Date.parse(question.asked_at) + question.default_window_ms;
-
-/** The same instant, formatted, so a message can name it. */
-export const questionDefaultDueAt = (question: Question): string =>
-  formatTimestamp(new Date(questionDefaultDueAtMs(question)));
-
-/** How long is left before the default is taken; zero once it is due. */
-export const questionWindowRemainingMs = (question: Question, now: Date): number =>
-  Math.max(questionDefaultDueAtMs(question) - now.getTime(), 0);
-
-/**
- * True when this question's window has passed and nothing has resolved it.
- *
- * The status is part of the question, not a separate check a caller might forget: a resolved question's
- * window is irrelevant, and asking whether it is "due" would invite a second default on a question that
- * already has an answer.
- */
-export const isQuestionDefaultDue = (state: QuestionState, now: Date): boolean =>
-  state.status === 'asked' && now.getTime() >= questionDefaultDueAtMs(state.question);
-
-/** The option the default takes: the recommended one, by id (Q1). */
-export const recommendedOption = (question: Question): { label: string; consequence: string } => {
-  const found =
-    question.options.find((option) => option.id === question.recommended_option_id) ??
-    (question.escape.id === question.recommended_option_id ? question.escape : null);
-  // `QuestionDraftSchema` refines that the recommended id names an offered option, so this is
-  // unreachable; it answers with the declared consequence of silence rather than throwing, because a
-  // default that could not be taken would turn CAP-4's promise into a stall.
-  return found ?? { label: question.recommended_option_id, consequence: question.default_action };
-};
 
 /**
  * The resolution the clock submits.
@@ -105,27 +89,3 @@ export const takeQuestionDefault = (
   now: Date,
 ): QuestionClaim =>
   attemptQuestionResolution(paths, questionId, questionDefaultResolution(question, now));
-
-/**
- * What a person is told when the clock beat them.
- *
- * Plain, and naming the decision that stands rather than only the failure: the losing path's message is
- * the only thing standing between "my answer landed" and a durable decision that says otherwise.
- */
-export const describeDefaultTaken = (state: QuestionState): string => {
-  const resolution = state.resolution;
-  if (resolution?.resolver !== 'timeout_default') {
-    return (
-      `Question ${state.question.id} was already ${state.status} when this answer arrived, so the ` +
-      'answer that got there first stands and nothing was written.'
-    );
-  }
-  return (
-    `Question ${state.question.id} timed out before this answer arrived: the window of ` +
-    `${String(state.question.default_window_ms)}ms passed at ` +
-    `${questionDefaultDueAt(state.question)} and the recommended default was taken ` +
-    `("${recommendedOption(state.question).label}"). That decision stands and is recorded; this ` +
-    'answer wrote nothing. ' +
-    state.question.default_action
-  );
-};

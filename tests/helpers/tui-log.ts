@@ -145,6 +145,18 @@ export const budgetDegraded = (consumed: number, wallClockMsRemaining?: number):
   },
 });
 
+/**
+ * CAP-23 — the hand-off, as the reconciler records it.
+ *
+ * The payload is `{ code, reason }` and nothing else, which is the shape the engine writes today: neither
+ * the takeover branch nor the document's path is in it, and story 1-10's handoff card is given both rather
+ * than inferring a branch name it does not own (AD-22).
+ */
+export const handoffRecorded = (
+  code = 'user.take_over',
+  reason = 'you took the work over, so the partial work is on its own branch and the run halted',
+): EventSpec => ({ type: 'handoff.recorded', payload: { code, reason } });
+
 /** An event type this build does not declare, as a newer engine would write it (AD-5). */
 export const unknownEvent = (type = 'trust.record_updated'): EventSpec => ({
   type,

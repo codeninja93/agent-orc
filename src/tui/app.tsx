@@ -19,11 +19,31 @@
  * - **No colour is load-bearing.** Nothing here sets a colour, so a terminal without colour support
  *   renders exactly what a terminal with it does. The narrow case is handled by wrapping every line to
  *   the column count rather than by letting the terminal truncate.
+ *
+ * Story 1-10 filled the slot and closed the keyboard loop, and both are deliberately thin:
+ *
+ * - **The card is chosen by `cardForView` and drawn by `CardView`.** Which card a run calls for is one
+ *   decision in one place, and it is a pure function of the view — so the frame a person sees and the card
+ *   a suite asserts are the same structure, not two agreeing implementations.
+ * - **A keystroke reaches `invokeControl` and nothing else.** {@link reduceKey} decides what a key means;
+ *   invoking a control writes one durable intent file (AD-19). Nothing in this file executes anything,
+ *   signals anything or touches run state, so the keyboard cannot become a second command path.
+ * - **The two things the shell now remembers are not run state.** A half-typed draft and the
+ *   acknowledgement of the last keystroke exist only in this process and are deliberately *not* in the
+ *   log: the recorder is the log's sole writer (AD-29), and a draft nobody has sent is not a fact about
+ *   the run. Everything else is still re-folded from the log on every frame, so the terminal still cannot
+ *   drift from the durable truth (AD-4).
  */
-import { Box, Text, render } from 'ink';
+import { Box, Text, render, useInput, useStdin } from 'ink';
 import type { ReactNode } from 'react';
 
-import { formatControlHints } from './controls.js';
+import { CardView } from './cards.js';
+import { cardForView } from './cards/index.js';
+import type { Card, CardInputs } from './cards/index.js';
+import { CONTROLS, formatControlHints, invokeControl } from './controls.js';
+import type { ControlContext, ControlOutcome } from './controls.js';
+import { initialInputState, reduceKey } from './input.js';
+import type { InputEffect, InputKey, InputState } from './input.js';
 import { formatModeExplanation, formatModeLine } from './mode.js';
 import { loadShellView, presentValue } from './projection.js';
 import type { ShellView } from './projection.js';
@@ -181,14 +201,37 @@ export const shellFrameLines = (view: ShellView, options: FrameOptions = {}): re
 export const shellFrameText = (view: ShellView, options: FrameOptions = {}): string =>
   shellFrameLines(view, options).join('\n');
 
+/**
+ * The prompt a person types an answer into.
+ *
+ * Drawn inside the question slot rather than at the bottom of the frame, because what is being typed
+ * belongs to the question it answers (R14) — a prompt that sat elsewhere would be a second place to look
+ * for the one thing the run is waiting on. The label is the control's own, so a person can see which
+ * gesture they are in the middle of, and the trailing block stands in for a cursor without any escape
+ * sequence, which keeps the frame colourless and comparable.
+ */
+export const INPUT_PROMPT_CURSOR = '\u2588';
+
+export const inputPromptLine = (input: InputState): string | null =>
+  input.mode === 'composing' && input.composingFor !== null
+    ? `${CONTROLS[input.composingFor].label} > ${input.draft}${INPUT_PROMPT_CURSOR}  ` +
+      '(enter sends it, esc discards it)'
+    : null;
+
 export interface ShellProps extends FrameOptions {
   readonly view: ShellView;
   /**
-   * The question card, when one exists.
+   * The card this run is asking for, already chosen.
    *
-   * The seam story 1-10 fills: a card passed here is drawn inside the persistent slot, and the slot's
-   * own lines stay above it so the state of the question is stated even when the card is absent.
+   * The seam story 1-9 reserved: the card is drawn inside the persistent slot, and the slot's own lines
+   * stay above it so the state of the question is stated even when no card is drawn.
    */
+  readonly card?: Card | null;
+  /** The keyboard loop's state, so a half-typed answer is visible where the question is. */
+  readonly input?: InputState;
+  /** What the last keystroke did, in one line. Never a stack trace, and never silence. */
+  readonly keystrokeNotice?: string | null;
+  /** A node to draw in the slot, for a caller composing its own. */
   readonly questionCard?: ReactNode;
 }
 
@@ -212,18 +255,41 @@ export const QuestionSlot = ({
   </Box>
 );
 
-/** The shell: the sections, in order, with the question card placed inside the slot. */
-export const Shell = ({ view, columns, now, questionCard }: ShellProps): ReactNode => {
+/** The shell: the sections, in order, with the card, the prompt and any notice inside the slot. */
+export const Shell = ({
+  view,
+  columns,
+  now,
+  card,
+  input,
+  keystrokeNotice,
+  questionCard,
+}: ShellProps): ReactNode => {
   const sections = shellSections(view, {
     ...(columns === undefined ? {} : { columns }),
     ...(now === undefined ? {} : { now }),
   });
+  const width = columns ?? DEFAULT_COLUMNS;
+  const prompt = input === undefined ? null : inputPromptLine(input);
   return (
     <Box flexDirection="column">
       {sections.map((section) =>
         section.id === 'question' ? (
           <QuestionSlot key={section.id} view={view} {...(columns === undefined ? {} : { columns })}>
+            {card === undefined || card === null ? null : (
+              <CardView card={card} {...(columns === undefined ? {} : { columns })} />
+            )}
             {questionCard}
+            {prompt === null
+              ? null
+              : wrapLine(prompt, width).map((line, index) => (
+                  <Text key={`prompt-${String(index)}-${line}`}>{line}</Text>
+                ))}
+            {keystrokeNotice === undefined || keystrokeNotice === null
+              ? null
+              : wrapLine(keystrokeNotice, width).map((line, index) => (
+                  <Text key={`keystroke-${String(index)}-${line}`}>{line}</Text>
+                ))}
           </QuestionSlot>
         ) : (
           <Box key={section.id} flexDirection="column">
@@ -237,12 +303,64 @@ export const Shell = ({ view, columns, now, questionCard }: ShellProps): ReactNo
   );
 };
 
-/** What a mounted shell hands back: a way to re-read the log, and a way to stop. */
+/**
+ * The keyboard, bound to the reducer and to nothing else.
+ *
+ * Gated on raw mode being supported, because Ink's `useInput` puts `stdin` into raw mode and a process
+ * whose `stdin` is a pipe — a test, a CI run, a shell with input redirected — cannot be put into it. The
+ * alternative to the gate is a shell that throws on mount in exactly those cases, and a renderer that
+ * cannot be mounted by a suite is a renderer whose composition nobody checks.
+ *
+ * It renders nothing. A component that both listened and drew would make the listening untestable without
+ * a terminal, which is the whole thing this directory avoids.
+ */
+export const Keyboard = ({
+  onKey,
+  active,
+}: {
+  readonly onKey: (key: InputKey) => void;
+  readonly active?: boolean;
+}): ReactNode => {
+  const { isRawModeSupported } = useStdin();
+  useInput(
+    (input, key) => {
+      onKey({
+        input,
+        return: key.return,
+        escape: key.escape,
+        backspace: key.backspace,
+        delete: key.delete,
+        ctrl: key.ctrl,
+      });
+    },
+    // Coerced to a strict boolean on purpose: Ink reads `isTTY` straight off the stream, where "not a
+    // terminal" is `undefined` rather than `false`, and its own guard is `isActive === false`. An
+    // `undefined` here would therefore read as active and throw on mount in exactly the non-TTY case this
+    // gate exists for.
+    { isActive: (active ?? true) && isRawModeSupported === true },
+  );
+  return null;
+};
+
+/** What a mounted shell hands back: a way to re-read the log, to press a key, and to stop. */
 export interface ShellHandle {
   /** Re-read the log and redraw. The log is the only input, so this is the whole of "refresh". */
   readonly refresh: () => void;
   readonly unmount: () => void;
   readonly lastView: () => ShellView;
+  /**
+   * Deliver one keystroke, exactly as the terminal would.
+   *
+   * Exposed because a keyboard loop that could only be driven by a real TTY would be a keyboard loop no
+   * suite drives: the same function Ink's handler calls, so what a test exercises is the loop itself and
+   * not a second path built for testing.
+   */
+  readonly press: (key: InputKey) => InputEffect;
+  readonly inputState: () => InputState;
+  /** The last intent a keystroke wrote, or `null` when none has. */
+  readonly lastControl: () => ControlOutcome | null;
+  /** The card the current view called for, or `null` when it called for none. */
+  readonly lastCard: () => Card | null;
 }
 
 export interface MountShellOptions extends FrameOptions {
@@ -255,6 +373,16 @@ export interface MountShellOptions extends FrameOptions {
   readonly stdout?: NodeJS.WriteStream;
   readonly questionCard?: ReactNode;
   /**
+   * Where a keystroke's intent file goes, and who it is attributable to (AD-19).
+   *
+   * Absent means the keys are inert: a shell mounted over a log with no run to steer — a demonstration, a
+   * suite asserting composition — must not write an intent into a directory nobody named. A keystroke then
+   * says so rather than failing silently.
+   */
+  readonly control?: ControlContext | null;
+  /** The facts the cards accept beyond the view; each is `(not recorded)` when absent. */
+  readonly cards?: CardInputs;
+  /**
    * Write whole frames rather than terminal escapes.
    *
    * Ink's own debug mode, exposed because it is how a suite reads a frame: with it off, what reaches
@@ -266,26 +394,104 @@ export interface MountShellOptions extends FrameOptions {
 /**
  * Mount the shell over a run's event log.
  *
- * The shell holds no state: every frame is a fresh fold of the log, which is what makes it impossible
- * for the terminal to drift from the durable truth (AD-4). Polling rather than watching because a
- * poll cannot miss a notification and cannot leak a watcher; the interval is unreferenced, so it never
- * keeps a process alive on its own (AD-32 — nothing here is a shutdown handler).
+ * Every frame is a fresh fold of the log, which is what makes it impossible for the terminal to drift from
+ * the durable truth (AD-4). Polling rather than watching because a poll cannot miss a notification and
+ * cannot leak a watcher; the interval is unreferenced, so it never keeps a process alive on its own (AD-32
+ * — nothing here is a shutdown handler).
+ *
+ * The only things held between frames are the keyboard's own state and the acknowledgement of the last
+ * keystroke. Neither is run state, neither is written anywhere, and both are lost on exit — which is
+ * correct: an answer nobody sent is not a decision, and AD-25 makes a decision durable.
  */
 export const mountShell = (options: MountShellOptions): ShellHandle => {
   const load = (): ShellView =>
     loadShellView(options.eventLog, { feature: options.feature ?? null });
   let view = load();
+  let input: InputState = initialInputState;
+  let notice: string | null = null;
+  let lastControl: ControlOutcome | null = null;
 
-  const frame = (current: ShellView): ReactNode => (
-    <Shell
-      view={current}
-      {...(options.columns === undefined ? {} : { columns: options.columns })}
-      {...(options.now === undefined ? {} : { now: options.now })}
-      {...(options.questionCard === undefined ? {} : { questionCard: options.questionCard })}
-    />
+  const cardFor = (current: ShellView): Card | null =>
+    cardForView(current, {
+      ...options.cards,
+      ...(options.now === undefined ? {} : { now: options.now }),
+      draft: input.draft === '' ? null : input.draft,
+    });
+
+  let card = cardFor(view);
+
+  const frame = (): ReactNode => (
+    <>
+      <Shell
+        view={view}
+        card={card}
+        input={input}
+        keystrokeNotice={notice}
+        {...(options.columns === undefined ? {} : { columns: options.columns })}
+        {...(options.now === undefined ? {} : { now: options.now })}
+        {...(options.questionCard === undefined ? {} : { questionCard: options.questionCard })}
+      />
+      <Keyboard onKey={press} active={options.control !== undefined && options.control !== null} />
+    </>
   );
 
-  const instance = render(frame(view), {
+  const draw = (): void => {
+    card = cardFor(view);
+    instance.rerender(frame());
+  };
+
+  /**
+   * One keystroke: decide what it means, then perform the one effect a renderer is allowed to perform.
+   *
+   * The write is `invokeControl` and nothing else — one durable intent file under `commands/`, which the
+   * reconciler picks up on its next pass (AD-19). A refusal is caught and stated in a line rather than
+   * thrown, because a person who typed a blank answer has made a correctable mistake and a terminal that
+   * died of it would lose whatever else they had typed.
+   */
+  function press(key: InputKey): InputEffect {
+    const next = reduceKey(input, key);
+    input = next.state;
+    const effect = next.effect;
+
+    switch (effect.kind) {
+      case 'invoke': {
+        const control = options.control ?? null;
+        if (control === null) {
+          notice =
+            `"${effect.command}" was not written: this shell was mounted with no run to steer, so ` +
+            'there is no commands directory to write an intent into';
+          break;
+        }
+        try {
+          lastControl = invokeControl(effect.command, control, effect.argument);
+          notice =
+            `"${effect.command}" written as a durable intent; the loop applies it on its next pass`;
+        } catch (thrown: unknown) {
+          notice = thrown instanceof Error ? thrown.message : `"${effect.command}" was not written`;
+        }
+        break;
+      }
+      case 'compose':
+        notice = null;
+        break;
+      case 'cancelled':
+        notice = `"${effect.command}" was abandoned; nothing was written`;
+        break;
+      case 'empty':
+        notice =
+          `"${effect.command}" carries your words and there are none yet, so nothing was written — ` +
+          'an empty answer would record that you said nothing';
+        break;
+      case 'ignored':
+      case 'none':
+        break;
+    }
+
+    draw();
+    return effect;
+  }
+
+  const instance = render(frame(), {
     // Never patched: a shell that rewired `console` would change the behaviour of whatever mounted it,
     // and nothing here writes diagnostics to stdout in any case (Consistency Conventions).
     patchConsole: false,
@@ -295,7 +501,7 @@ export const mountShell = (options: MountShellOptions): ShellHandle => {
 
   const refresh = (): void => {
     view = load();
-    instance.rerender(frame(view));
+    draw();
   };
 
   const timer =
@@ -306,6 +512,10 @@ export const mountShell = (options: MountShellOptions): ShellHandle => {
 
   return {
     refresh,
+    press,
+    inputState: (): InputState => input,
+    lastControl: (): ControlOutcome | null => lastControl,
+    lastCard: (): Card | null => card,
     lastView: (): ShellView => view,
     unmount: (): void => {
       if (timer !== null) clearInterval(timer);

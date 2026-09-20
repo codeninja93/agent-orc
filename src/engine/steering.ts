@@ -26,7 +26,6 @@ import { findStepRecord, inFlightStep, isTerminalFeatureState } from '../contrac
 import type {
   Command,
   CommandIntent,
-  CommandMap,
   FeatureState,
   QuestionResolver,
   RunState,
@@ -34,88 +33,29 @@ import type {
   StepRecord,
 } from '../contracts/index.js';
 
+import { COMMAND_HANDLING } from '../runtime/index.js';
+
 import type { IntentRefusalReason } from './commands.js';
 import { routeTermination } from './dispositions.js';
 import { resolverForSource } from './questions.js';
 
 /**
- * How this build treats each member of the `Command` enum.
+ * The per-command disposition table now lives in `src/runtime/steering-view.ts`, and is re-exported here.
  *
- * A total map, so adding a command to the enum is a compile error here rather than a control that
- * silently does nothing. Three dispositions, and the third is the one worth reading twice:
- *
- * - `effect` — this story owns what the command does, and applies it.
- * - `question` — the command resolves the run's active question, so its effect is the AD-25
- *   compare-and-set rather than a run-state change. It is honoured, and it is a kind of its own because
- *   the state it changes does not live in the checkpoint at all: it lives in `questions/`, where exactly
- *   one transition is ever accepted and a losing resolver is told rather than thrown at.
- * - `acknowledge` — the command changes no run state in this build, so it is recorded with its
- *   principal, exactly once, and retired. Nothing else is ever going to act on it.
- * - `awaiting` — the command's effect belongs to a named later story. The file is **left in place**,
- *   unconsumed and unrecorded, and reported so it is visible rather than invisible. Acknowledging it
- *   instead would swallow a user's answer or a user's edit, which is why the three question commands were
- *   parked here until the compare-and-set existed to receive them.
+ * Story 1-10's kill card renders `continue / narrow / kill / take over` and has to state that `narrow` is
+ * written and awaiting story 2-9 — read from this table rather than from a literal of its own, so a
+ * control's availability cannot drift from the table that decides it. The spine forbids a renderer
+ * importing the engine, so the table moved to the runtime and the engine reads it from there. What the
+ * commands *do* is still decided below, in {@link decideSteering}, and nothing of that moved.
  */
-export const COMMAND_HANDLING: CommandMap<
-  | { readonly kind: 'effect' }
-  | { readonly kind: 'question'; readonly note: string }
-  | { readonly kind: 'acknowledge'; readonly note: string }
-  | { readonly kind: 'awaiting'; readonly owner: string }
-> = {
-  answer: {
-    kind: 'question',
-    note: 'the answer resolves the run’s active question through the AD-25 compare-and-set (Q6)',
-  },
-  confirm_spec: { kind: 'effect' },
-  edit_criterion: {
-    kind: 'question',
-    note: 'the amended criterion resolves the question that asked for it, one line at a time (CAP-2)',
-  },
-  approve: { kind: 'effect' },
-  reject: {
-    kind: 'question',
-    note: 'the rejection resolves the question and its reason becomes the decision (CAP-18)',
-  },
-  continue: {
-    kind: 'acknowledge',
-    note: 'the run continues unchanged; the command is recorded so the decision is attributable',
-  },
-  narrow: { kind: 'awaiting', owner: 'story 2-9, which owns scope narrowing and the ceilings' },
-  pause: {
-    kind: 'awaiting',
-    owner: 'story 2-9, which owns hibernation — the lifecycle has no non-terminal halted state yet',
-  },
-  inject_note: { kind: 'awaiting', owner: 'story 2-10, which owns a running agent’s next input' },
-  kill: { kind: 'effect' },
-  fork: { kind: 'awaiting', owner: 'story 1-9, which owns forking a run from its current point' },
-  take_over: { kind: 'effect' },
-  disengage: { kind: 'effect' },
-  just_do_it: {
-    kind: 'acknowledge',
-    note: 'recorded now so the decision is attributable; what it suppresses is story 1-8’s questions',
-  },
-};
-
-/**
- * The commands whose effect this build applies.
- *
- * Both `effect` and `question` count, because both do something durable when consumed. Only `awaiting`
- * and `acknowledge` are excluded, and for opposite reasons: the first is not implemented yet, and the
- * second changes nothing by design.
- */
-export const HONOURED_COMMANDS: readonly Command[] = Object.freeze(
-  (Object.keys(COMMAND_HANDLING) as Command[]).filter((command) => {
-    const kind = COMMAND_HANDLING[command].kind;
-    return kind === 'effect' || kind === 'question';
-  }),
-);
-
-/** The commands that resolve a question rather than changing the run's own state. */
-export const QUESTION_COMMANDS: readonly Command[] = Object.freeze(
-  (Object.keys(COMMAND_HANDLING) as Command[]).filter(
-    (command) => COMMAND_HANDLING[command].kind === 'question',
-  ),
-);
+export {
+  COMMAND_HANDLING,
+  HONOURED_COMMANDS,
+  QUESTION_COMMANDS,
+  commandAvailabilities,
+  commandAvailability,
+} from '../runtime/index.js';
+export type { CommandAvailability, CommandHandling } from '../runtime/index.js';
 
 /**
  * The state changes one `command.applied` line makes.
