@@ -24,12 +24,20 @@
  *   step agent did, since AD-1 forbids linking the Agent SDK as a library;
  * - `spawner` — the real `StepExecutor`: one `claude -p` per attempt, re-parsed output, mapped
  *   disposition;
- * - `reconciler` — the loop: read the checkpoint, take at most one action, write the checkpoint.
+ * - `reconciler` — the loop: read the checkpoint, take at most one action, write the checkpoint;
+ * - `commands` — AD-19's durable intent files: the only path a steering command reaches the loop by;
+ * - `steering` — what a consumed intent does, and why applying one twice does it once;
+ * - `handoff` — CAP-23's escape hatch and the document written when the system gives up.
  *
- * Nothing here wraps a container, leases a resource, reads a command intent file, manages a question
- * or renders anything. Each of those is a later story, and each plugs into a boundary declared above
- * rather than into the loop's middle — the container in particular reaches the spawner as the
- * `SpawnWrapper` seam of AD-20, never as a flag composed here.
+ * The last three are what stories 1-9 and 1-10 write against. A renderer needs `writeCommandIntent`,
+ * `newCommandIntent` and `mintIntentId` and nothing else: it never learns the directory layout, never
+ * opens the event log, and never calls a method on the engine — which is the whole of AD-19's "renderers
+ * reach it only by writing command intent files".
+ *
+ * Nothing here wraps a container, leases a resource, manages a question or renders anything. Each of
+ * those is a later story, and each plugs into a boundary declared above rather than into the loop's
+ * middle — the container in particular reaches the spawner as the `SpawnWrapper` seam of AD-20, never as
+ * a flag composed here.
  */
 export * from './ulid.js';
 export * from './lock.js';
@@ -43,4 +51,7 @@ export * from './cli.js';
 export * from './node-path.js';
 export * from './stream.js';
 export * from './spawner.js';
+export * from './commands.js';
+export * from './steering.js';
+export * from './handoff.js';
 export * from './reconciler.js';

@@ -45,8 +45,12 @@ import {
   renderCause,
 } from '../contracts/index.js';
 import type {
+  Command,
+  CommandSource,
+  EventEnvelope,
   FeatureState,
   ModelRung,
+  Principal,
   RunState,
   StepInput,
   StepRecord,
@@ -63,8 +67,40 @@ import type { RedactionPolicy, RunPaths } from '../runtime/index.js';
 
 import { BaselineResetError, gitBaselineResetter, resetToBaseline } from './baseline.js';
 import type { BaselineResetter } from './baseline.js';
-import { listRunIds, readCheckpoint, sweepCheckpointTemporaries, writeCheckpoint } from './checkpoint.js';
+import {
+  checkpointPath,
+  listRunIds,
+  readCheckpoint,
+  sweepCheckpointTemporaries,
+  writeCheckpoint,
+} from './checkpoint.js';
+import {
+  COMMAND_EVENT_TYPES,
+  TORN_INTENT_GRACE_MS,
+  appliedIntentIds,
+  mintIntentId,
+  newCommandIntent,
+  quarantineIntent,
+  readIntentFiles,
+  retireIntent,
+  writeCommandIntent,
+} from './commands.js';
+import type { IntentRefusal, PendingIntent } from './commands.js';
 import { routeRefusedResume, routeTermination } from './dispositions.js';
+import {
+  DECLARED_FAILURE_ATTEMPT_LIMIT,
+  escapeHatch,
+  execFileWorktreeGit,
+  handoffTimestamp,
+  writeHandoffDocument,
+} from './handoff.js';
+import type { EscapeHatchOutcome, WorktreeGit } from './handoff.js';
+import {
+  commandAppliedPayload,
+  commandRefusedPayload,
+  decideSteering,
+} from './steering.js';
+import type { IntentEffect } from './steering.js';
 import { ResumeRefused, terminated } from './executor.js';
 import type { StepExecutor, StepStartRequest, StepTermination } from './executor.js';
 import {
@@ -96,6 +132,133 @@ const SAFE_STEP_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
  * keeps that honest: when 2-9 arrives it replaces this constant, it does not discover a magic literal.
  */
 export const DECLARED_WALL_CLOCK_MS = 60 * 60 * 1000;
+
+/**
+ * How often the loop looks at `runs/<run-id>/commands/` while a step is in flight.
+ *
+ * AD-7 forbids holding authoritative state in memory, not reading the disk: the poll reads the same
+ * durable files a pass reads, so a restart mid-step reaches the same conclusion from the same evidence.
+ * It is a poll rather than a watcher because `fs.watch` is not reliable across every platform and
+ * filesystem this will run on, and a missed watch event is a disengage the user pressed and nothing
+ * happened — the one failure this mechanism exists to prevent.
+ */
+export const STEERING_POLL_INTERVAL_MS = 25;
+
+/**
+ * The declared bound on disengagement: the interval within which a stop gesture reaches the live child.
+ *
+ * `interface-contract.md` says disengagement is "instant, obvious and always available", and "instant"
+ * is a measurable claim, so it gets a number. The budget is the poll interval, one directory read, and
+ * the call into the executor's stop — two orders of magnitude of slack over their sum, because the claim
+ * must hold on a loaded machine and not only on an idle one.
+ *
+ * What lands inside the bound is the *stop*: the child is signalled and the step's termination recorded.
+ * The run reaching its terminal `killed` state follows immediately afterwards, in the same action, since
+ * the intent that caused the stop is applied as soon as the termination is durable.
+ *
+ * Story 1-4's own `EXECUTOR_KILL_GRACE_MS` governs how long a child that ignores the first signal is
+ * given before the second; that is the child's grace, not this loop's latency, and it is deliberately
+ * not folded in here.
+ */
+export const DECLARED_DISENGAGE_BOUND_MS = 2_000;
+
+/**
+ * The commands that stop work already in flight.
+ *
+ * A stop gesture must not wait for the current step to finish — that is the whole of CAP-5 — so these
+ * are the three the mid-step watcher looks for. `take_over` is one of them because the escape hatch
+ * takes the work away from the run: leaving the step running would have the system and a person editing
+ * one worktree at the same time.
+ */
+export const STOP_COMMANDS: readonly Command[] = Object.freeze(['kill', 'disengage', 'take_over']);
+
+/**
+ * The port a steering command stops a live child through.
+ *
+ * A port for the same reason the executor is one: the loop owns the decision that a step must stop, and
+ * learns nothing about processes. Story 1-4's spawner satisfies it — `kill(step, run)` — and
+ * {@link stepStopperFrom} adapts it without this module importing the spawner's type.
+ *
+ * Returns whether anything was stopped, which the loop records rather than asserts: an executor with
+ * nothing live to stop is the ordinary case for a step that finished a millisecond earlier.
+ */
+export type StepStopper = (target: {
+  readonly run: string;
+  readonly step: string;
+  readonly command: Command;
+  readonly reason: string;
+}) => boolean;
+
+/** What the mid-step watcher saw, so the action that owns the step can report and apply it. */
+export interface StopObservation {
+  readonly intentId: string;
+  readonly command: Command;
+  /** Whether the executor had a live child to stop. `false` for a step that ended a moment earlier. */
+  readonly stopped: boolean;
+  readonly observedAt: string;
+}
+
+/** Adapt story 1-4's spawner to {@link StepStopper}, structurally so no type crosses the boundary. */
+export const stepStopperFrom = (spawner: {
+  readonly kill: (step: string, run?: string) => boolean;
+}): StepStopper => (target): boolean => spawner.kill(target.step, target.run);
+
+/** What one intent's consumption did. */
+export const INTENT_OUTCOMES = [
+  /** The effect was applied and recorded, and the file retired. */
+  'applied',
+  /** The id was already in the log: recognised, the file retired, nothing changed. */
+  'already-applied',
+  /** The run is already the way the command asked for: recognised, the file retired, nothing changed. */
+  'already-satisfied',
+  /** Recorded with its principal; this build changes no run state for it. */
+  'acknowledged',
+  /** Left in place for the unit that owns this command. */
+  'awaiting',
+] as const;
+
+export type IntentOutcomeKind = (typeof INTENT_OUTCOMES)[number];
+
+/** One intent a pass looked at, and what became of it. */
+export interface IntentOutcome {
+  readonly intentId: string;
+  readonly command: Command;
+  readonly kind: IntentOutcomeKind;
+  readonly principal: Principal;
+  readonly reason: string;
+}
+
+/** What consuming one run's intents did. Reported by the pass; never acted on again. */
+export interface IntentPassOutcome {
+  readonly run: string;
+  /** Intents whose effect or acknowledgement is now in the log. */
+  readonly applied: readonly IntentOutcome[];
+  /** Intents already in the log, retired without a second effect. */
+  readonly recognised: readonly IntentOutcome[];
+  /** Intents left for a later story's unit, named in each reason. */
+  readonly awaiting: readonly IntentOutcome[];
+  /** Intents refused and quarantined, each naming why. */
+  readonly refused: readonly IntentRefusal[];
+  /** Files not whole JSON yet, inside the grace their writer is given. Untouched. */
+  readonly incomplete: readonly string[];
+  /**
+   * The state after everything applied, or `null` for a run directory that carries no state at all —
+   * the case where the only thing that could be done with an intent was to quarantine it.
+   */
+  readonly state: RunState | null;
+}
+
+/** One line naming what a pass did to a run's intents, for the action it is reported as. */
+export const describeSteering = (outcome: IntentPassOutcome): string => {
+  const parts: string[] = [];
+  for (const entry of outcome.applied) parts.push(`${entry.command} applied (${entry.kind})`);
+  for (const entry of outcome.recognised) parts.push(`${entry.command} was already applied`);
+  for (const entry of outcome.refused) parts.push(`${entry.command ?? 'an intent'} refused: ${entry.reason}`);
+  for (const entry of outcome.awaiting) parts.push(`${entry.command} left for its owner`);
+  return parts.length === 0
+    ? 'Durable intents were read and none of them changed anything.'
+    : `Durable steering intents consumed: ${parts.join('; ')}.`;
+};
 
 /**
  * A run directory holding neither an event log nor a checkpoint.
@@ -169,6 +332,19 @@ export class UnrecordedAction extends Error {
 export type ReconcileAction =
   /** Nothing to do: the feature is terminal, or a step was stopped by a steering command. */
   | { readonly kind: 'idle'; readonly reason: string }
+  /**
+   * AD-19 — durable intents were found in `commands/` and consumed.
+   *
+   * It is an action of its own, and it takes precedence over every other, so a pass that steers a run
+   * does nothing else to it. Starting a step in the same pass that applied a kill would be two actions,
+   * and the second would be work the user has just asked to stop.
+   */
+  | {
+      readonly kind: 'apply-intents';
+      readonly applied: number;
+      readonly refused: number;
+      readonly reason: string;
+    }
   /** CAP-2 — no feature enters execution without user-confirmed criteria. */
   | { readonly kind: 'await-confirmation'; readonly reason: string }
   /** CAP-12 — an irreversible gate is waiting on a person. */
@@ -290,6 +466,8 @@ export interface PassResult {
   readonly refusals: readonly RunRefusal[];
   /** AD-32 — what this pass reclaimed, or `null` when no reclamation pass is wired in. */
   readonly reclaimed: ReclamationSummary | null;
+  /** AD-19 — one entry per run whose `commands/` directory held anything this pass looked at. */
+  readonly steering: readonly IntentPassOutcome[];
 }
 
 /** What one `load` established: the paths, the declared plan, and the state the log folds to. */
@@ -297,6 +475,14 @@ export interface LoadedState {
   readonly paths: RunPaths;
   readonly plan: FeaturePlan;
   readonly state: RunState;
+  /**
+   * The log this state was folded from.
+   *
+   * Carried rather than re-read because the exactly-once ledger lives in the log: consuming an intent
+   * has to know which ids are already applied, and folding the log twice in one pass to learn it would
+   * double the expensive part of a pass for no new information.
+   */
+  readonly events: readonly EventEnvelope[];
   readonly disagreements: readonly CheckpointDisagreement[];
   readonly checkpointRebuilt: boolean;
 }
@@ -335,32 +521,6 @@ const terminationFromThrown = (step: string, thrown: unknown): StepTermination =
     ),
   });
 };
-
-/**
- * The step whose failure blocked the run, found by the table that blocked it.
- *
- * Not "the last step": a completed step sitting last would be rewritten into an `interrupted` one and
- * re-run, and a `killed` step would be resurrected — breaking the AD-8 invariant this story states twice.
- * Asking the disposition table which record routes to `escalate-to-human` cannot pick either, because
- * neither disposition routes there.
- */
-const blockedStep = (state: RunState): StepRecord | null =>
-  [...state.steps]
-    .reverse()
-    .find(
-      (record) =>
-        record.disposition !== null &&
-        record.disposition !== 'completed' &&
-        record.disposition !== 'killed' &&
-        routeTermination({
-          step: record.step,
-          disposition: record.disposition,
-          sessionId: record.session_id,
-          error: record.error,
-          modelTier: record.model_tier,
-          promotions: record.promotions,
-        }).action === 'escalate-to-human',
-    ) ?? null;
 
 /** Supplies a feature's declared configuration. Re-supplied after a restart, never folded from the log. */
 export type FeaturePlanProvider = (feature: string) => FeaturePlan;
@@ -409,6 +569,50 @@ export interface ReconcilerOptions {
    * a silent one.
    */
   readonly reclamation?: ReclamationPass | null;
+  /**
+   * CAP-5 — how a steering command stops a step that is already running.
+   *
+   * Omitted rather than defaulted, and the consequence is stated plainly: with no stopper wired in, a
+   * disengage written mid-step is still consumed, but not until the step it arrived during has finished
+   * on its own. That is a visible gap rather than a silent one, and it is why story 1-4's spawner is
+   * adapted through {@link stepStopperFrom} by whoever assembles the two.
+   */
+  readonly stopStep?: StepStopper | null;
+  /** How often `commands/` is read while a step is in flight. Defaults to the declared interval. */
+  readonly steeringPollIntervalMs?: number;
+  /** How long a partly-written intent file is left for its writer. Defaults to the declared grace. */
+  readonly tornIntentGraceMs?: number;
+  /** CAP-23 — how the escape hatch reaches git. Defaults to real `git`. */
+  readonly worktreeGit?: WorktreeGit;
+  /**
+   * Who a steering command taken through this reconciler's own methods is attributed to.
+   *
+   * AD-19 requires every command to record a principal, and a method call carries none of its own. The
+   * default names the local user, because that is who is at the terminal; a caller with better
+   * information — a timeout, an agent — passes it per command instead.
+   */
+  readonly principal?: Principal;
+}
+
+/**
+ * What a method-shaped control supplies, beyond the run and the command.
+ *
+ * Every field has a default, because a caller at a terminal has a principal and a source whether it says
+ * so or not, and AD-19 requires both to be recorded either way. `intentId` is settable so a caller that
+ * retries a gesture can retry *the same* intent — which is the whole point of keying the effect on it:
+ * a renderer whose write may or may not have landed rewrites it under the same id and gets one effect.
+ */
+export interface SteerOptions {
+  /** AD-19 — who this command is attributable to. Defaults to the reconciler's declared principal. */
+  readonly principal?: Principal;
+  /** Which renderer or mechanism issued it. Defaults to `cli`. */
+  readonly source?: CommandSource;
+  /** The step the command targets, or `null` for a run-level command. */
+  readonly step?: string | null;
+  /** Free text; the system parses. Never impose a format on the human (Q6). */
+  readonly argument?: string | null;
+  /** The exactly-once key. Defaults to a freshly minted one. */
+  readonly intentId?: string;
 }
 
 /** What accepting a feature produced. */
@@ -438,6 +642,11 @@ export class Reconciler {
   private readonly engineLock: EngineLock | null;
   private readonly ownsLock: boolean;
   private readonly reclamation: ReclamationPass | null;
+  private readonly stopStep: StepStopper | null;
+  private readonly pollIntervalMs: number;
+  private readonly tornGraceMs: number;
+  private readonly worktreeGit: WorktreeGit;
+  private readonly principal: Principal;
   /** Open recorders, keyed by run id. An I/O handle, not run state: nothing is read back from it. */
   private readonly recorders = new Map<string, Recorder>();
   private closed = false;
@@ -457,6 +666,11 @@ export class Reconciler {
     this.engineLock = lock;
     this.ownsLock = ownsLock;
     this.reclamation = options.reclamation ?? null;
+    this.stopStep = options.stopStep ?? null;
+    this.pollIntervalMs = options.steeringPollIntervalMs ?? STEERING_POLL_INTERVAL_MS;
+    this.tornGraceMs = options.tornIntentGraceMs ?? TORN_INTENT_GRACE_MS;
+    this.worktreeGit = options.worktreeGit ?? execFileWorktreeGit;
+    this.principal = options.principal ?? { kind: 'user', id: 'local' };
   }
 
   /**
@@ -515,89 +729,361 @@ export class Reconciler {
   }
 
   /**
+   * Write a steering intent and consume it: how every method-shaped control reaches the loop.
+   *
+   * This is **not** a second command path. AD-19 admits exactly one — a durable file under
+   * `runs/<run-id>/commands/` — and this method writes that file and then consumes it, so the effect
+   * arrives by the same route a renderer's would and through the same guards. Story 1-3 left `confirm`,
+   * `approve` and `kill` as bare methods and recorded that as a deferral; this closes it without
+   * changing what a caller sees.
+   *
+   * The consumption happens here rather than being left to the next pass because a caller that asked for
+   * a state change and was handed the old state back would have to poll to discover whether anything
+   * happened. The file is written first regardless, so a crash between the two leaves the intent on disk
+   * for the next pass — the direction that loses nothing.
+   */
+  steer(run: string, command: Command, options: SteerOptions = {}): RunState {
+    this.assertOpen();
+    /**
+     * Loaded before anything is written. A run with no state must be refused by name rather than have a
+     * `commands/` directory created under it, which would turn a typo into a directory the loop then has
+     * to step over on every pass.
+     */
+    const loaded = this.load(run);
+    const intent = newCommandIntent({
+      intentId: options.intentId ?? mintIntentId(this.minter.mint()),
+      command,
+      run,
+      feature: loaded.state.feature,
+      step: options.step ?? null,
+      principal: options.principal ?? this.principal,
+      source: options.source ?? 'cli',
+      argument: options.argument ?? null,
+      issuedAt: this.now(),
+    });
+
+    writeCommandIntent(loaded.paths, intent);
+    this.boundary(`intent-written:${command}`);
+
+    const outcome = this.consumeIntents(this.load(run));
+    const refused = outcome.refused.find((entry) => entry.intentId === intent.intent_id);
+    if (refused !== undefined) {
+      // Already recorded and already quarantined. It is *also* thrown, because a caller holding a
+      // control in their hand is owed the reason it did nothing — story 1-3's guard, at its own surface.
+      throw new SteeringRefused(run, loaded.state.state, refused.detail);
+    }
+    // `consumeIntents` returns `null` only for a run directory carrying no state at all, and `load`
+    // above has already refused that case by name, so the fallback is unreachable rather than lenient.
+    return outcome.state ?? this.load(run).state;
+  }
+
+  /**
    * CAP-2 — the user confirmed the acceptance criteria, so the feature may enter execution.
    *
-   * Story 1-7 supplies this from a durable command intent file under `runs/<run-id>/commands/`; until
-   * then it is a method, because the loop needs *some* declared way out of `drafting` and inventing the
-   * intent-file format here would pre-empt that story.
+   * Refused unless the run is still `drafting`: at-least-once delivery means one gesture can leave two
+   * files, and a second confirmation applied to a running feature would drag it back to `confirmed`.
    */
-  confirm(run: string): RunState {
-    return this.transition(run, 'confirmed', 'the user confirmed the acceptance criteria (CAP-2)');
+  confirm(run: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'confirm_spec', options);
   }
 
   /**
    * CAP-12 — a person approved the gate the feature blocked at, so it may continue.
    *
-   * Two facts are recorded, and the second is what makes this a continuation rather than a loop back
-   * into the same escalation: the feature returns to `running`, *and* the blocked step's error is
-   * spent. Without the second, the next pass would read the same `permission.denied` off the same
-   * termination and block again on the thing a person has just answered.
+   * Two facts land in one line, and the second is what makes this a continuation rather than a loop back
+   * into the same escalation: the feature returns to `running`, *and* the blocked step's error is spent.
+   * Without the second, the next pass would read the same `permission.denied` off the same termination
+   * and block again on the thing a person has just answered.
    */
-  approve(run: string, reason = 'a person approved the gate the feature blocked at'): RunState {
-    this.assertOpen();
-    const { paths, plan, state } = this.load(run);
-    this.assertSteerable(state, 'There is no gate left to approve.');
-
-    const recorder = this.recorderFor(run, state.feature);
-    const blocked = blockedStep(state);
-
-    if (blocked !== null) {
-      this.emit(recorder, {
-        step: blocked.step,
-        type: ENGINE_EVENT_TYPES.StepApproved,
-        payload: { reason, approved_code: blocked.error?.code ?? null },
-        baselineRef: blocked.baseline_ref,
-      });
-    }
-    this.emit(recorder, {
-      step: blocked?.step ?? null,
-      type: ENGINE_EVENT_TYPES.FeatureStateChanged,
-      payload: { from: state.state, to: 'running', reason },
-    });
-    return this.checkpointFromLog(paths, plan);
+  approve(run: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'approve', options);
   }
 
   /**
    * AD-8 — a steering command terminated the step, which records `killed`.
    *
-   * A killed step is never resumed and never re-run. Both halves of that are enforced: the termination
-   * records `killed`, which `routeTermination` answers with `stop`, and the feature enters the terminal
-   * `killed` state, which every later pass answers with `idle`. Either alone would be enough; a
-   * recovery loop silently undoing the kill control is the failure AD-8 exists to prevent, so it is
-   * closed twice.
+   * A killed step is never resumed and never re-run, and both halves are enforced: the record says
+   * `killed`, which `routeTermination` answers with `stop`, and the feature enters the terminal `killed`
+   * state, which every later pass answers with `idle`. Either alone would do; a recovery loop silently
+   * undoing the kill control is the failure AD-8 exists to prevent, so it is closed twice.
+   *
+   * Only a step actually in flight is terminated. A kill normally arrives between passes, when the last
+   * record is a step that has already finished — rewriting that record would put a permanent line in the
+   * log saying work that was done never happened, and nothing would ever put it back.
    */
-  kill(run: string, reason = 'a steering command terminated the run (CAP-5, CAP-15)'): RunState {
-    this.assertOpen();
-    const { paths, plan, state } = this.load(run);
-    this.assertSteerable(state, 'There is nothing left running to kill.');
+  kill(run: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'kill', options);
+  }
 
-    const recorder = this.recorderFor(run, state.feature);
+  /**
+   * CAP-5 — the single gesture that always means stop.
+   *
+   * The same effect as {@link kill}, and deliberately so: the Always list says a step stopped by a
+   * steering command records `killed`, and AD-8 says the same, so the two gestures cannot differ in what
+   * they leave behind. What differs is the record — the log says which command stopped the run and who
+   * issued it — and the promise: a disengage is available at every moment, including the middle of a
+   * step, within {@link DECLARED_DISENGAGE_BOUND_MS}.
+   *
+   * Everything needed to pick the work up again stays on disk: the checkpoint, the full event log, the
+   * step's session id and its `baseline_ref`, and the worktree exactly as the step left it.
+   */
+  disengage(run: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'disengage', options);
+  }
 
-    /**
-     * Only a step actually in flight is terminated.
-     *
-     * A kill normally arrives in the gap *between* passes, when no step is running — and the last record
-     * is then a step that has already finished. Rewriting that record as `killed` would put a permanent
-     * line in the log saying work that was done never happened, and because a killed step is never
-     * re-run, nothing would ever put it back. The feature still stops; no finished step is falsified.
-     */
-    const target = inFlightStep(state);
+  /**
+   * CAP-23 — a person takes the work over: partial work onto an ordinary branch, then the run halts.
+   *
+   * The branch is named from the run id (`orch/takeover/<run-id>`) and never from a feature slug,
+   * because AD-22 gives the committer sole ownership of feature-branch naming.
+   */
+  takeOver(run: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'take_over', options);
+  }
 
-    if (target !== null) {
-      this.emit(recorder, {
-        step: target.step,
-        type: ENGINE_EVENT_TYPES.StepTerminated,
-        payload: { disposition: 'killed', reason },
-        sessionId: target.session_id,
-        baselineRef: target.baseline_ref,
+  // ---------------------------------------------------------------------------------------------
+  // Consuming durable intents
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * AD-19 — consume every durable intent for one run.
+   *
+   * The order of the motions inside is the whole of at-least-once delivery with an exactly-once effect,
+   * and none of them may be swapped:
+   *
+   * 1. the intent is *read*, and reading deletes nothing;
+   * 2. any side effect that has to survive — the escape hatch's branch, the hand-off document — happens
+   *    next, and every one of them is idempotent, so repeating it costs nothing;
+   * 3. one `command.applied` line carries the `intent_id` **and** every state change the intent makes,
+   *    so the ledger entry and the effect cannot come apart;
+   * 4. only then is the file moved into `commands/applied/`.
+   *
+   * A crash anywhere in that sequence redelivers the intent, and the id in step 3 is what makes the
+   * redelivery a no-op. A crash *before* step 3 loses nothing, because the file is still there.
+   */
+  private consumeIntents(loaded: LoadedState): IntentPassOutcome {
+    const { paths, plan } = loaded;
+    let state = loaded.state;
+    const applied = new Set(appliedIntentIds(loaded.events));
+    const read = readIntentFiles(paths, { now: this.now, tornGraceMs: this.tornGraceMs });
+
+    const appliedOutcomes: IntentOutcome[] = [];
+    const recognised: IntentOutcome[] = [];
+    const awaiting: IntentOutcome[] = [];
+    const refused: IntentRefusal[] = [];
+
+    // Files that never parsed: quarantined before anything else, so a directory full of debris cannot
+    // stop a valid intent sitting behind it from being applied in this same pass.
+    for (const found of read.refused) refused.push(this.refuseIntent(paths, state.feature, found));
+
+    for (const pending of read.pending) {
+      const intent = pending.intent;
+      const decision = decideSteering(intent, state, { applied });
+      const outcome = (kind: IntentOutcomeKind, reason: string): IntentOutcome => ({
+        intentId: intent.intent_id,
+        command: intent.command,
+        kind,
+        principal: intent.principal,
+        reason,
+      });
+
+      switch (decision.kind) {
+        case 'awaiting':
+          // Left on disk, unconsumed and unrecorded. Reported so it is visible rather than invisible.
+          awaiting.push(outcome('awaiting', decision.reason));
+          break;
+
+        case 'already-applied':
+        case 'already-satisfied':
+          // Retired, not quarantined: nothing was wrong with the intent, and nothing was left to do.
+          this.retire(paths, pending);
+          recognised.push(outcome(decision.kind, decision.reason));
+          break;
+
+        case 'refuse':
+          refused.push(
+            this.refuseIntent(paths, state.feature, {
+              reason: decision.reason,
+              fileName: pending.fileName,
+              intentId: intent.intent_id,
+              command: intent.command,
+              detail: decision.detail,
+              quarantinedTo: null,
+            }),
+          );
+          break;
+
+        case 'acknowledge':
+        case 'apply': {
+          const effect = decision.kind === 'apply' ? decision.effect : null;
+          this.applyIntent(paths, plan, state, pending, effect, decision.reason);
+          applied.add(intent.intent_id);
+          // Re-folded before the next intent is decided: two intents in one pass are applied in order,
+          // and the second must see what the first did rather than the state the pass opened with.
+          state = this.checkpointFromLog(paths, plan);
+          this.retire(paths, pending);
+          appliedOutcomes.push(
+            outcome(decision.kind === 'apply' ? 'applied' : 'acknowledged', decision.reason),
+          );
+          break;
+        }
+      }
+    }
+
+    return {
+      run: paths.runId,
+      applied: appliedOutcomes,
+      recognised,
+      awaiting,
+      refused,
+      incomplete: read.incomplete,
+      state,
+    };
+  }
+
+  /** Apply one intent's effect, as a single durable append preceded by its idempotent side effects. */
+  private applyIntent(
+    paths: RunPaths,
+    plan: FeaturePlan,
+    state: RunState,
+    pending: PendingIntent,
+    effect: IntentEffect | null,
+    reason: string,
+  ): void {
+    const recorder = this.recorderFor(state.run, state.feature);
+    let escape: EscapeHatchOutcome | null = null;
+
+    if (effect?.escapeHatch === true) {
+      /**
+       * CAP-23 — the work is put where a person can reach it *before* the line that says it was.
+       *
+       * A crash in between then leaves the work saved and the intent unretired, so the next pass does it
+       * again — and `escapeHatch` is idempotent precisely so that is free. The other order would leave a
+       * record claiming the work was preserved when it was not, which is the one outcome CAP-23 forbids.
+       */
+      escape = escapeHatch({
+        run: state.run,
+        feature: state.feature,
+        worktree: plan.worktree,
+        git: this.worktreeGit,
+      });
+      this.boundary(`escape-hatch:${escape.preserved ? 'committed' : 'branch-only'}`);
+    }
+
+    if (effect?.handoff !== undefined && effect?.handoff !== null) {
+      this.writeHandoff(paths, plan, state, {
+        code: effect.handoff.code,
+        reason: effect.handoff.reason,
+        escape,
       });
     }
+
     this.emit(recorder, {
-      step: target?.step ?? null,
-      type: ENGINE_EVENT_TYPES.FeatureStateChanged,
-      payload: { from: state.state, to: 'killed', reason },
+      step: effect === null ? pending.intent.step : effect.step,
+      type: COMMAND_EVENT_TYPES.Applied,
+      payload: commandAppliedPayload(pending.intent, { effect, reason }),
     });
-    return this.checkpointFromLog(paths, plan);
+  }
+
+  /** Record a refusal and quarantine the file, in that order, so neither is lost to the other. */
+  private refuseIntent(paths: RunPaths, feature: string, found: IntentRefusal): IntentRefusal {
+    const recorder = this.recorderFor(paths.runId, feature);
+    /**
+     * Recorded through the recorder directly rather than through `emit`, and that is the point: `emit`
+     * throws when the redaction pass drops a line, because an *action* the log cannot record must not
+     * happen. A refusal is not an action — nothing changes — so a dropped refusal line must not abort
+     * the pass that was refusing. The sidecar written beside the quarantined file is the record that
+     * cannot be dropped.
+     */
+    recorder.recordResult({
+      feature,
+      run: paths.runId,
+      step: null,
+      emitter: ENGINE_EMITTER,
+      type: COMMAND_EVENT_TYPES.Refused,
+      payload: commandRefusedPayload(found.reason, found.detail, {
+        intentId: found.intentId,
+        command: found.command,
+      }),
+    });
+    this.boundary(`event-appended:${COMMAND_EVENT_TYPES.Refused}`);
+
+    const quarantined = quarantineIntent(paths, found);
+    this.boundary(`intent-quarantined:${found.reason}`);
+    return quarantined;
+  }
+
+  /**
+   * Quarantine the intents of a run directory carrying no state at all.
+   *
+   * No recorder is opened: doing so would create an `events.jsonl` and turn the incomplete directory
+   * into a run, which is the repair AD-4 forbids. The refusal sidecar on disk is therefore the only
+   * record, and it is enough — without this, an intent addressed to a run with no state would be met,
+   * and skipped, by every pass for ever.
+   */
+  private quarantineOrphanIntents(paths: RunPaths): readonly IntentRefusal[] {
+    const read = readIntentFiles(paths, { now: this.now, tornGraceMs: this.tornGraceMs });
+    const out: IntentRefusal[] = [];
+    for (const found of read.refused) out.push(quarantineIntent(paths, found));
+    for (const pending of read.pending) {
+      out.push(
+        quarantineIntent(paths, {
+          reason: 'unknown-run',
+          fileName: pending.fileName,
+          intentId: pending.intent.intent_id,
+          command: pending.intent.command,
+          detail:
+            `Run ${paths.runId} has a directory but no state at all — no event log and no checkpoint ` +
+            '— so there is no run here to steer. The intent is quarantined rather than met by every ' +
+            'later pass.',
+          quarantinedTo: null,
+        }),
+      );
+    }
+    if (out.length > 0) this.boundary('intent-quarantined:unknown-run');
+    return out;
+  }
+
+  /** Move a consumed intent aside. Called only once its effect is in the log. */
+  private retire(paths: RunPaths, pending: PendingIntent): void {
+    retireIntent(paths, pending);
+    this.boundary(`intent-retired:${pending.intent.command}`);
+  }
+
+  /** CAP-23 — the document, written before the line that records the hand-off. */
+  private writeHandoff(
+    paths: RunPaths,
+    plan: FeaturePlan,
+    state: RunState,
+    options: {
+      readonly code: string;
+      readonly reason: string;
+      readonly escape: EscapeHatchOutcome | null;
+    },
+  ): string {
+    const document = writeHandoffDocument(
+      paths,
+      {
+        run: state.run,
+        feature: state.feature,
+        // The state the run is *entering*: the document is only ever written on the way to handing off,
+        // and telling a person the run is still `running` would be the one thing it must not do.
+        state: 'handed_off',
+        request: plan.request,
+        acceptanceCriteria: plan.acceptance_criteria,
+        code: options.code,
+        reason: options.reason,
+        steps: state.steps,
+        worktree: plan.worktree,
+        runDirectory: paths.runDir,
+        checkpoint: checkpointPath(paths),
+        escape: options.escape,
+        writtenAt: handoffTimestamp(this.now()),
+      },
+      this.redaction,
+    );
+    this.boundary('handoff-document-written');
+    return document;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -624,6 +1110,7 @@ export class Reconciler {
     return {
       paths,
       plan,
+      events,
       state: reconciled.state,
       disagreements: reconciled.disagreements,
       checkpointRebuilt: onDisk.state === null || reconciled.checkpointDiscarded,
@@ -663,6 +1150,7 @@ export class Reconciler {
 
     const entries: LoadedRun[] = [];
     const refusals: RunRefusal[] = [];
+    const steering: IntentPassOutcome[] = [];
 
     // AD-32, first thing in the pass and on every pass: a comparison of what is held against what the
     // runs say, taken before any run advances so it reads one consistent picture of on-disk state. A run
@@ -675,10 +1163,60 @@ export class Reconciler {
         entries.push({ run, loaded: this.load(run) });
       } catch (thrown: unknown) {
         // A directory with neither log nor checkpoint carries no state to reconcile and no feature to
-        // name, so it is stepped over silently rather than reported as a fault every pass forever.
-        if (thrown instanceof IncompleteRunDirectory) continue;
+        // name, so it is stepped over silently rather than reported as a fault every pass forever. Its
+        // intents are not: an intent nothing ever consumes is exactly the poison file AD-19 must not
+        // leave behind, so it is quarantined here and met by no later pass.
+        if (thrown instanceof IncompleteRunDirectory) {
+          const orphaned = this.quarantineOrphanIntents(runPaths(run, this.orchHome));
+          if (orphaned.length > 0) {
+            steering.push({
+              run,
+              applied: [],
+              recognised: [],
+              awaiting: [],
+              refused: orphaned,
+              incomplete: [],
+              state: null,
+            });
+          }
+          continue;
+        }
         refusals.push(refusalFor(run, thrown));
       }
+    }
+
+    /**
+     * AD-19 — the durable intents, consumed before anything else is decided.
+     *
+     * Before, because a steering command is the user's word about work that has not happened yet: a pass
+     * that started a step and *then* read the kill sitting in `commands/` would have done the thing it
+     * was told not to. Every loaded run is offered, including terminal ones, because an intent for a
+     * finished run has to be refused rather than left on disk for ever.
+     *
+     * A run whose intents changed something takes no *other* action this pass — that is what keeps
+     * "at most one action per pass" true — and it does not contend for a territory, because deferring a
+     * disengage behind an unrelated feature's worktree would make "always available" conditional.
+     */
+    const steered: { readonly entry: LoadedRun; readonly outcome: IntentPassOutcome }[] = [];
+    const untouched: LoadedRun[] = [];
+    for (const entry of entries) {
+      let outcome: IntentPassOutcome | null = null;
+      try {
+        outcome = this.consumeIntents(entry.loaded);
+      } catch (thrown: unknown) {
+        refusals.push(refusalFor(entry.run, thrown));
+      }
+      if (outcome === null) continue;
+      if (outcome.applied.length > 0 || outcome.refused.length > 0) {
+        steering.push(outcome);
+        steered.push({ entry, outcome });
+        continue;
+      }
+      if (outcome.recognised.length > 0 || outcome.awaiting.length > 0 || outcome.incomplete.length > 0) {
+        steering.push(outcome);
+      }
+      // Nothing changed, so the run is decided from the state the pass already loaded.
+      untouched.push(entry);
     }
 
     /**
@@ -690,7 +1228,7 @@ export class Reconciler {
      * feature was deferred behind it indefinitely. Inert runs are still *reported*, so a reader can see
      * what each is waiting for; they simply hold nothing while they wait.
      */
-    const decided = entries
+    const decided = untouched
       .filter((entry) => !isTerminalFeatureState(entry.loaded.state.state))
       .map((entry) => ({ ...entry, action: decideAction(entry.loaded.state, entry.loaded.plan) }));
     const inert = decided.filter((entry) => isInertAction(entry.action.kind));
@@ -709,7 +1247,11 @@ export class Reconciler {
     const admittedRuns = new Set(admitted.map((candidate) => candidate.run));
 
     const acting = [...inert, ...contending.filter((entry) => admittedRuns.has(entry.run))];
-    const actingRuns = new Set(acting.map((entry) => entry.run));
+    // A steered run's checkpoint was written by `consumeIntents`, so it is settled for this pass too.
+    const actingRuns = new Set([
+      ...acting.map((entry) => entry.run),
+      ...steered.map((entry) => entry.entry.run),
+    ]);
 
     // The runs this pass will not act on: terminal ones, and ones serialised behind an overlapping
     // territory. An acting run's checkpoint is written by `advance`, so writing it here too would double
@@ -732,13 +1274,27 @@ export class Reconciler {
     );
 
     const actions: PassAction[] = [];
+    for (const { entry, outcome } of steered) {
+      const settledState = outcome.state ?? entry.loaded.state;
+      actions.push({
+        run: entry.run,
+        feature: settledState.feature,
+        kind: 'apply-intents',
+        step: null,
+        from: entry.loaded.state.state,
+        to: settledState.state,
+        reason: describeSteering(outcome),
+        checkpointRebuilt: entry.loaded.checkpointRebuilt,
+        disagreements: entry.loaded.disagreements,
+      });
+    }
     for (const [index, outcome] of settled.entries()) {
       const run = acting[index]?.run ?? '(unknown)';
       if (outcome.status === 'fulfilled') actions.push(outcome.value);
       else refusals.push(refusalFor(run, outcome.reason));
     }
 
-    return { actions, deferred, refusals, reclaimed };
+    return { actions, deferred, refusals, reclaimed, steering };
   }
 
   /**
@@ -928,13 +1484,21 @@ export class Reconciler {
       }
 
       case 'hand-off': {
-        this.handOff(state, action.step, action.code, action.reason);
+        this.handOff(paths, plan, state, action.step, action.code, action.reason);
         return action.step;
       }
 
       case 'idle':
       case 'await-confirmation':
       case 'await-approval':
+        return null;
+
+      case 'apply-intents':
+        /**
+         * Never reached: intents are consumed by `pass` *before* any action is decided, and a run whose
+         * intents changed something takes no other action in that pass. The case is enumerated rather
+         * than defaulted so the compiler keeps this true if a later story routes intents differently.
+         */
         return null;
     }
   }
@@ -1016,7 +1580,7 @@ export class Reconciler {
          * through the table like any other rather than escaping the pass — which would abandon the run
          * with no recorded reason and take every other feature's pass down with it.
          */
-        this.handOff(state, options.step.step, thrown.orchError.code, thrown.orchError.message);
+        this.handOff(paths, plan, state, options.step.step, thrown.orchError.code, thrown.orchError.message);
         return;
       }
       this.emit(recorder, {
@@ -1063,20 +1627,112 @@ export class Reconciler {
      * good answer for. Recording the termination lets the table answer it: `step.spawn_failed` retries,
      * an undeclared code hands off.
      */
+    /**
+     * CAP-5 — the disengage watcher, for the whole time the step is in flight.
+     *
+     * Started after `step.started` is in the log and before the port is called, so the window it covers
+     * is exactly the window a step occupies. It is the answer to story 1-3's own deferral: an action
+     * drives a step synchronously to termination, so without this a kill could only ever land between
+     * passes.
+     */
+    const watch = this.watchForStopIntents(paths, state.run, options.step.step);
+
     let termination: StepTermination;
     try {
       termination = await this.executor.start(request);
+      watch.stop();
     } catch (thrown: unknown) {
+      // Stopped explicitly on both paths rather than in a `finally`. AD-32's rule is about behaviour on
+      // an exit path, and two visible calls cost less than a reader having to decide whether a `finally`
+      // here is a cleanup handler.
+      watch.stop();
       termination = terminationFromThrown(options.step.step, thrown);
     }
+
     this.recordTermination(state, options.step, baselineRef, termination, {
       transitionTo: options.transitionTo,
     });
+
+    if (watch.observed() !== null) {
+      /**
+       * The gesture that stopped this step is still on disk and unapplied — the watcher writes nothing.
+       * It is applied here, inside the same action, so the run reaches its halted state in the pass the
+       * user's gesture arrived in rather than in the next one. That is what makes
+       * {@link DECLARED_DISENGAGE_BOUND_MS} a claim about the run and not only about the child process.
+       */
+      this.consumeIntents(this.load(state.run));
+    }
   }
 
-  /** CAP-23 — stop and explain, as its own two recorded facts, so every caller hands off identically. */
-  private handOff(state: RunState, step: string | null, code: string, reason: string): void {
+  /**
+   * Watch `commands/` while a step is in flight, and stop the step when a stop gesture appears.
+   *
+   * This is the mechanism behind the one property AD-7 says the loop exists to host. Story 1-3 drove a
+   * step synchronously to termination, so a kill could only land *between* passes — and a pass that
+   * checks between steps cannot provide "instant", because a step is where all the time goes.
+   *
+   * What it does and does not do is worth being exact about. It only ever *stops the child*: it appends
+   * nothing to the log and applies no intent, because it runs inside somebody else's action and a second
+   * writer inside one action is how two lines end up interleaved. The intent stays pending, and the
+   * moment the step's termination is durable the same action consumes it — so the effect is recorded by
+   * the one code path that records every effect.
+   *
+   * The timer is unref'd: a poll must never be the reason a process stays alive, and it is not a cleanup
+   * path — nothing is reclaimed when it stops, so AD-32 is untouched.
+   */
+  private watchForStopIntents(
+    paths: RunPaths,
+    run: string,
+    step: string,
+  ): { readonly stop: () => void; readonly observed: () => StopObservation | null } {
+    if (this.stopStep === null) {
+      // No stopper wired in: nothing could be stopped, so nothing is watched and the gap is honest.
+      return { stop: (): void => undefined, observed: (): StopObservation | null => null };
+    }
+
+    let observation: StopObservation | null = null;
+    const poll = (): void => {
+      if (observation !== null) return;
+      const read = readIntentFiles(paths, { now: this.now, tornGraceMs: this.tornGraceMs });
+      const halting = read.pending.find((pending) => STOP_COMMANDS.includes(pending.intent.command));
+      if (halting === undefined) return;
+
+      const reason =
+        `${halting.intent.principal.kind} "${halting.intent.principal.id}" issued ` +
+        `"${halting.intent.command}" while step "${step}" was running`;
+      observation = {
+        intentId: halting.intent.intent_id,
+        command: halting.intent.command,
+        stopped: this.stopStep?.({ run, step, command: halting.intent.command, reason }) ?? false,
+        observedAt: formatTimestamp(this.now()),
+      };
+    };
+
+    const timer = setInterval(poll, this.pollIntervalMs);
+    timer.unref();
+    // Polled once immediately as well, so the latency is the executor's, not the first interval's.
+    poll();
+    return {
+      stop: (): void => {
+        clearInterval(timer);
+      },
+      observed: (): StopObservation | null => observation,
+    };
+  }
+
+  /** CAP-23 — stop and explain, as its own recorded facts, so every caller hands off identically. */
+  private handOff(
+    paths: RunPaths,
+    plan: FeaturePlan,
+    state: RunState,
+    step: string | null,
+    code: string,
+    reason: string,
+  ): void {
     const recorder = this.recorderFor(state.run, state.feature);
+    // The document first: a person having a bad day needs the note whether or not the two lines below
+    // landed, and rewriting it whole makes a repeated hand-off free.
+    this.writeHandoff(paths, plan, state, { code, reason, escape: null });
     this.emit(recorder, {
       step,
       type: ENGINE_EVENT_TYPES.HandoffRecorded,
@@ -1236,25 +1892,14 @@ export class Reconciler {
   // Plumbing
   // ---------------------------------------------------------------------------------------------
 
-  /** A terminal run takes no steering command: it has reached `[*]` and nothing walks it back. */
-  private assertSteerable(state: RunState, detail: string): void {
-    if (isTerminalFeatureState(state.state)) {
-      throw new SteeringRefused(state.run, state.state, detail);
-    }
-  }
-
-  private transition(run: string, to: FeatureState, reason: string): RunState {
-    this.assertOpen();
-    const { paths, plan, state } = this.load(run);
-    this.assertSteerable(state, `It cannot be moved to ${to}.`);
-    const recorder = this.recorderFor(run, state.feature);
-    this.emit(recorder, {
-      step: null,
-      type: ENGINE_EVENT_TYPES.FeatureStateChanged,
-      payload: { from: state.state, to, reason },
-    });
-    return this.checkpointFromLog(paths, plan);
-  }
+  /**
+   * The terminal-state guard story 1-3 added now lives in `decideSteering`, and deliberately so.
+   *
+   * Every command travels through the same decision function, so the guard is applied once to the whole
+   * enum rather than once per method — which is how story 1-3's review found `kill` relabelling a
+   * completed step and `approve` resurrecting a killed one: three methods, three chances to forget. The
+   * refusal still surfaces as {@link SteeringRefused} at the method boundary, so a caller sees no change.
+   */
 
   /**
    * Emit one event through the recorder.
@@ -1470,6 +2115,30 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
     ) ?? null;
 
   if (pending !== null && pending.disposition !== null) {
+    /**
+     * The declared failure limit: a step that has failed this many times hands off instead of retrying.
+     *
+     * Only the `failed` disposition is counted, and the exclusion matters. An `interrupted` step was
+     * interrupted by the *engine* — a crash, a closed laptop — and AD-8's resume path must not be capped
+     * by something that has nothing to say about the step's own behaviour; a run restarted often enough
+     * would otherwise hand itself off for surviving. `blocked` waits for a person rather than retrying,
+     * so counting it would turn a legitimate escalation into an abandonment.
+     *
+     * This is not one of AD-24's ceilings, which are story 2-9's: it is the "repeated failure" row of
+     * this story's own matrix, and the alternative to it is the retry loop AD-35 forbids.
+     */
+    if (pending.disposition === 'failed' && pending.attempts >= DECLARED_FAILURE_ATTEMPT_LIMIT) {
+      return {
+        kind: 'hand-off',
+        step: pending.step,
+        code: pending.error?.code ?? 'internal.invariant_violated',
+        reason:
+          `Step "${pending.step}" has been attempted ${String(pending.attempts)} times and has still ` +
+          `not completed, which is the declared limit of ${String(DECLARED_FAILURE_ATTEMPT_LIMIT)}. ` +
+          'The run stops and writes a hand-off document rather than retrying for ever (CAP-23, AD-35).',
+      };
+    }
+
     const routing = routeTermination({
       step: pending.step,
       disposition: pending.disposition,

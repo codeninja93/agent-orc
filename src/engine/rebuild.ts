@@ -40,6 +40,8 @@ import type {
   StepRecord,
 } from '../contracts/index.js';
 
+import { COMMAND_EVENT_TYPES } from './commands.js';
+
 /** The emitter name every event the reconciler originates carries. */
 export const ENGINE_EMITTER = 'engine.reconciler';
 
@@ -105,6 +107,14 @@ export const FOLDED_EVENT_TYPES: readonly string[] = Object.freeze([
   ENGINE_EVENT_TYPES.StepBaselineReset,
   ENGINE_EVENT_TYPES.StepTierPromoted,
   ENGINE_EVENT_TYPES.HandoffRecorded,
+  /**
+   * AD-19's ledger entry *and* the effect it records, in one line.
+   *
+   * It is folded here rather than in a module of its own because it is the mechanism that makes
+   * at-least-once delivery safe: the fold keys on the `intent_id` it carries and ignores an id it has
+   * already seen, so a redelivered intent — or a duplicated line — has the effect exactly once.
+   */
+  COMMAND_EVENT_TYPES.Applied,
 ]);
 
 /** One step of a feature's declared plan: a stable name, its contract, and which phase it is in. */
@@ -214,6 +224,16 @@ export const rebuildFromLog = (
 
   /** Step records in first-started order, which is the order the checkpoint declares them in. */
   const steps = new Map<string, StepRecord>();
+
+  /**
+   * Intent ids whose effect this fold has already taken.
+   *
+   * AD-19's delivery is at-least-once, so the same intent can reach the log twice — a crash between
+   * appending the effect and retiring the file leaves the file behind, and a renderer may legitimately
+   * re-write one. The fold ignoring an id it has already seen is what turns that into one effect, and
+   * it is why the ledger entry and the effect are the same line: neither can arrive without the other.
+   */
+  const appliedIntents = new Set<string>();
 
   const stepOf = (event: EventEnvelope): StepRecord | null => {
     const id = event.step;
@@ -345,6 +365,50 @@ export const rebuildFromLog = (
           model_tier: isOneOf(MODEL_RUNGS, to) ? to : record.model_tier,
           promotions: record.promotions + 1,
         });
+        break;
+      }
+
+      case COMMAND_EVENT_TYPES.Applied: {
+        const intentId = payloadString(event, 'intent_id');
+        if (intentId !== null) {
+          // Exactly-once, and the whole of it: a second line for one intent changes nothing.
+          if (appliedIntents.has(intentId)) break;
+          appliedIntents.add(intentId);
+        }
+
+        const to = payloadString(event, 'to_state');
+        if (isOneOf(FEATURE_STATES, to)) state = to;
+
+        const record = stepOf(event);
+        const declared = payloadString(event, 'step_disposition');
+        if (record !== null && isOneOf(STEP_DISPOSITIONS, declared)) {
+          /**
+           * An approval spends the condition the step blocked on, so its error and its session id go
+           * with it: leaving the error standing would make the next pass escalate the very thing a
+           * person has just answered, and leaving the session id would resume a step whose blocking
+           * gate is what needs re-deciding.
+           */
+          const spent = event.payload['clears_step_error'] === true;
+          steps.set(record.step, {
+            ...record,
+            disposition: declared,
+            session_id: spent ? null : (envelopeString(event, 'session_id') ?? record.session_id),
+            terminated_at: record.terminated_at ?? event.ts,
+            error: spent ? null : record.error,
+          });
+        }
+
+        const handoffCode = payloadString(event, 'handoff_code');
+        if (handoffCode !== null) {
+          handoff = {
+            code: handoffCode,
+            reason:
+              payloadString(event, 'handoff_reason') ??
+              'a steering command handed the run off without a recorded reason',
+            step: event.step,
+            recorded_at: event.ts,
+          };
+        }
         break;
       }
 

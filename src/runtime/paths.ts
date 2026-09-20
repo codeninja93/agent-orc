@@ -86,6 +86,35 @@ export const FETCH_RECORD_FILE_NAME = 'fetch-record.json';
 export const EVENT_LOG_LOCK_FILE_NAME = 'events.jsonl.lock';
 export const RUN_CONFIG_DIR_NAME = 'config';
 
+/**
+ * AD-19 — `runs/<run-id>/commands/`, the durable steering intent files.
+ *
+ * Spelled once here for the reason every other name in this module is: a second spelling of this
+ * directory would be a second on-disk layout, and AD-19 makes these files *the* command path. A
+ * renderer that guessed the directory and an engine that read another would leave a user's disengage
+ * sitting in a folder nothing consumes.
+ */
+export const COMMANDS_DIR_NAME = 'commands';
+
+/**
+ * `commands/applied/` and `commands/refused/` — where a consumed and a quarantined intent go.
+ *
+ * Neither is a second command path: nothing is *read* from either. They exist because an intent is
+ * never deleted — a file is moved aside once its effect is durable, so the evidence of what steered a
+ * run survives, and a file the loop cannot understand is moved out of the way rather than retried on
+ * every pass for ever.
+ */
+export const COMMANDS_APPLIED_DIR_NAME = 'applied';
+export const COMMANDS_REFUSED_DIR_NAME = 'refused';
+
+/**
+ * CAP-23 — `runs/<run-id>/HANDOFF.md`, the document written when the system gives up.
+ *
+ * Upper-case and Markdown because its only audience is a person: it is the one artifact in the system
+ * whose failure mode is being unreadable rather than being incorrect.
+ */
+export const HANDOFF_DOCUMENT_FILE_NAME = 'HANDOFF.md';
+
 /** Every path inside `runs/<run-id>/` that this story's units touch. */
 export interface RunPaths {
   /** The resolved `ORCH_HOME` these paths were built under. */
@@ -101,6 +130,14 @@ export interface RunPaths {
   readonly fetchRecord: string;
   /** `runs/<run-id>/config/` — the AD-9 per-run configuration snapshot. */
   readonly configDir: string;
+  /** `runs/<run-id>/commands/` — the AD-19 durable steering intent files, and the only command path. */
+  readonly commandsDir: string;
+  /** `runs/<run-id>/commands/applied/` — intents whose effect is durable, kept rather than deleted. */
+  readonly commandsAppliedDir: string;
+  /** `runs/<run-id>/commands/refused/` — intents the loop refused, quarantined rather than retried. */
+  readonly commandsRefusedDir: string;
+  /** `runs/<run-id>/HANDOFF.md` — the CAP-23 document, written when the system gives up. */
+  readonly handoffDocument: string;
 }
 
 /** `runs/<run-id>/` and everything under it. */
@@ -115,5 +152,9 @@ export const runPaths = (runId: string, orchHome: string = resolveOrchHome()): R
     eventLogLock: join(dir, EVENT_LOG_LOCK_FILE_NAME),
     fetchRecord: join(dir, FETCH_RECORD_FILE_NAME),
     configDir: join(dir, RUN_CONFIG_DIR_NAME),
+    commandsDir: join(dir, COMMANDS_DIR_NAME),
+    commandsAppliedDir: join(dir, COMMANDS_DIR_NAME, COMMANDS_APPLIED_DIR_NAME),
+    commandsRefusedDir: join(dir, COMMANDS_DIR_NAME, COMMANDS_REFUSED_DIR_NAME),
+    handoffDocument: join(dir, HANDOFF_DOCUMENT_FILE_NAME),
   };
 };
