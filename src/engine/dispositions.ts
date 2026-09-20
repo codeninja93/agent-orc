@@ -1,0 +1,225 @@
+/**
+ * AD-8 and AD-35 — every step termination records a disposition, and every failure code carries a
+ * declared one.
+ *
+ * This module is the single place that turns "the step ended like this" into "so the loop does that".
+ * One table keeps two units from treating one failure differently, one retrying what the other
+ * abandons; putting the decision in a pure function keeps it testable without a run and keeps the
+ * reconciler free of branches it would have to keep in step with the table by hand.
+ *
+ * Three rules do most of the work:
+ *
+ * - **Only `interrupted` is resumable.** The resumability question is answered by `isResumable` from
+ *   the contracts, never by a second list here.
+ * - **`killed` is never resumed and never re-run.** A user's kill outranks every other signal,
+ *   including an error code that would otherwise say retry, so it is decided before anything else is
+ *   consulted. A recovery loop that silently undoes the kill control is the failure AD-8 names.
+ * - **An unrecognised code is abandon-and-hand-off and never retried.** That comes free from
+ *   `dispositionFor`, which is why no code here maintains its own fallback.
+ */
+import {
+  ERROR_CODES,
+  MAX_PROMOTIONS_PER_STEP,
+  dispositionFor,
+  isResumable,
+  nextModelRung,
+} from '../contracts/index.js';
+import type { Disposition, ModelRung, OrchError, StepDisposition } from '../contracts/index.js';
+
+/**
+ * What the loop does next about a step. One member per outcome the story names, plus the two that
+ * are the absence of an action.
+ */
+export const STEP_ACTIONS = [
+  /** The step succeeded; advance the feature. */
+  'advance',
+  /** Resume by the recorded session id (AD-8). */
+  'resume',
+  /** Reset the worktree to `baseline_ref` and re-run from the typed input (AD-26). */
+  'reset-and-rerun',
+  /** Spend one model-ladder promotion, then re-run at the higher rung. */
+  'promote-model-tier',
+  /** A condition no retrying resolves but a person can; the feature blocks. */
+  'escalate-to-human',
+  /** Stop and explain, rather than thrash (CAP-23). */
+  'hand-off',
+  /** Terminal by a user's steering command: never resumed, never re-run. */
+  'stop',
+] as const;
+
+export type StepAction = (typeof STEP_ACTIONS)[number];
+
+/** A step termination, as the loop sees it. */
+export interface StepTerminationFacts {
+  readonly step: string;
+  readonly disposition: StepDisposition;
+  /** The `claude` session id, when the subprocess reported one. */
+  readonly sessionId: string | null;
+  /** The error the step reported, when it reported one. */
+  readonly error: OrchError | null;
+  /** The rung this attempt ran on. */
+  readonly modelTier: ModelRung;
+  /** Promotions already spent on this step in this run. */
+  readonly promotions: number;
+}
+
+/** The decision, with the reasoning that produced it, so a log line can state *why*. */
+export interface DispositionRouting {
+  readonly action: StepAction;
+  /** The AD-35 disposition consulted, or `null` when the step disposition decided alone. */
+  readonly errorDisposition: Disposition | null;
+  /** The code consulted, or `null` when no error was reported. */
+  readonly code: string | null;
+  /** True when the code was absent from the AD-35 table and so was handed off unretried. */
+  readonly codeWasUnknown: boolean;
+  /** The rung to run on next, when the action is a promotion. */
+  readonly promoteTo: ModelRung | null;
+  /** One line stating the decision and its grounds. */
+  readonly reason: string;
+}
+
+const routing = (
+  action: StepAction,
+  reason: string,
+  extra: Partial<Omit<DispositionRouting, 'action' | 'reason'>> = {},
+): DispositionRouting => ({
+  action,
+  errorDisposition: extra.errorDisposition ?? null,
+  code: extra.code ?? null,
+  codeWasUnknown: extra.codeWasUnknown ?? false,
+  promoteTo: extra.promoteTo ?? null,
+  reason,
+});
+
+/**
+ * Whether a code appears in the AD-35 table at all.
+ *
+ * Membership, not the resolved disposition: several declared codes map to `abandon-and-hand-off`
+ * legitimately, so inferring "unknown" from that disposition would report a declared, deliberate
+ * hand-off as an unrecognised failure. The set is built from the contracts' own exported list, so the
+ * two cannot drift.
+ */
+const DECLARED_CODES: ReadonlySet<string> = new Set<string>(ERROR_CODES);
+
+export const isDeclaredCode = (code: string): boolean => DECLARED_CODES.has(code);
+
+/**
+ * Route a termination to its next action.
+ *
+ * The order of the branches is the specification, not an implementation detail: `killed` is decided
+ * before any error code is read, and `interrupted` is decided before the AD-35 table is consulted,
+ * because a step that was interrupted has no failure to disposition — the interruption is the engine's
+ * own, not the step's.
+ */
+export const routeTermination = (facts: StepTerminationFacts): DispositionRouting => {
+  // A user's kill is final. Nothing below may reach a retry for it (AD-8).
+  if (facts.disposition === 'killed') {
+    return routing(
+      'stop',
+      `Step "${facts.step}" was terminated by a steering command, so it records "killed" and is ` +
+        'never resumed and never re-run (AD-8).',
+    );
+  }
+
+  if (facts.disposition === 'completed') {
+    return routing('advance', `Step "${facts.step}" completed, so the feature advances.`);
+  }
+
+  if (isResumable(facts.disposition)) {
+    // AD-8 — only `interrupted` is resumable, and only by a recorded session id. With no id there is
+    // nothing to resume against, so the recovery is the baseline reset and re-run straight away.
+    return facts.sessionId === null
+      ? routing(
+          'reset-and-rerun',
+          `Step "${facts.step}" was interrupted with no recorded session id, so the recovery is a ` +
+            'reset to its baseline_ref and a re-run from its typed input (AD-8, AD-26).',
+        )
+      : routing(
+          'resume',
+          `Step "${facts.step}" was interrupted and carries a session id, so a resume is attempted ` +
+            'by that id (AD-8).',
+        );
+  }
+
+  // `failed` and `blocked` are the step's own report, and the AD-35 table decides what they mean.
+  const code = facts.error?.code ?? null;
+  if (code === null) {
+    return routing(
+      'hand-off',
+      `Step "${facts.step}" terminated "${facts.disposition}" with no error code, so it is treated ` +
+        'as an unrecognised failure: abandon-and-hand-off, never a retry (AD-35).',
+      { codeWasUnknown: true },
+    );
+  }
+
+  const disposition = dispositionFor(code);
+  const unknown = !isDeclaredCode(code);
+
+  switch (disposition) {
+    case 'retry-with-backoff':
+      return routing(
+        'reset-and-rerun',
+        `"${code}" is declared retry-with-backoff, so the worktree is reset to the step's ` +
+          'baseline_ref and the step is re-run from its typed input (AD-26, AD-35).',
+        { errorDisposition: disposition, code },
+      );
+
+    case 'escalate-model-tier': {
+      const promoteTo = nextModelRung(facts.modelTier);
+      if (promoteTo === null || facts.promotions >= MAX_PROMOTIONS_PER_STEP) {
+        // The ladder is exhausted, or this step has already spent its one promotion. Promoting again
+        // would be the retry loop AD-35 forbids, dressed as a model decision.
+        return routing(
+          'escalate-to-human',
+          `"${code}" is declared escalate-model-tier, but step "${facts.step}" has spent ` +
+            `${String(facts.promotions)} of ${String(MAX_PROMOTIONS_PER_STEP)} promotions and runs ` +
+            `on ${facts.modelTier}, so the ladder is exhausted and a person decides.`,
+          { errorDisposition: disposition, code },
+        );
+      }
+      return routing(
+        'promote-model-tier',
+        `"${code}" is declared escalate-model-tier, so step "${facts.step}" is promoted from ` +
+          `${facts.modelTier} to ${promoteTo} and re-run.`,
+        { errorDisposition: disposition, code, promoteTo },
+      );
+    }
+
+    case 'escalate-to-human':
+      return routing(
+        'escalate-to-human',
+        `"${code}" is declared escalate-to-human, so the feature blocks until a person answers.`,
+        { errorDisposition: disposition, code },
+      );
+
+    case 'abandon-and-hand-off':
+      return routing(
+        'hand-off',
+        unknown
+          ? `"${code}" is absent from the AD-35 disposition table, so it is treated as ` +
+            'abandon-and-hand-off and no retry is attempted.'
+          : `"${code}" is declared abandon-and-hand-off, so the run stops and hands off.`,
+        { errorDisposition: disposition, code, codeWasUnknown: unknown },
+      );
+  }
+};
+
+/**
+ * What the loop does when the executor rejects a resume.
+ *
+ * The matrix calls this "the recovery, not an error", and AD-8 states it directly: on a failed resume
+ * the step is re-run from its typed input after the AD-26 baseline reset. The recorded session id is
+ * spent, so the next routing of the same `interrupted` disposition reaches `reset-and-rerun` on its
+ * own — which is why this returns the same action rather than a special one.
+ */
+export const routeRefusedResume = (step: string): DispositionRouting =>
+  routing(
+    'reset-and-rerun',
+    `The executor rejected the resume of step "${step}", so the recorded session id is spent and ` +
+      'the recovery is a reset to its baseline_ref and a re-run from its typed input (AD-8, AD-26).',
+    { code: 'step.resume_failed', errorDisposition: dispositionFor('step.resume_failed') },
+  );
+
+/** True when an action leaves the feature in a terminal state and no further pass acts on it. */
+export const isTerminalAction = (action: StepAction): boolean =>
+  action === 'stop' || action === 'hand-off';

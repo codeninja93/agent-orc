@@ -15,6 +15,7 @@ import { EventEnvelopeSchema } from './event.js';
 import { OrchErrorSchema } from './error.js';
 import { FetchRecordSchema } from './fetch.js';
 import { QuestionStateSchema } from './question.js';
+import { RunStateSchema } from './state.js';
 import { StepInputSchema, StepOutputSchema } from './step.js';
 
 /**
@@ -72,6 +73,15 @@ export const CONTRACTS = {
       'The run shared fetch record at runs/<run-id>/fetch-record.json (AD-13, AD-14, AD-28).',
     model_produced: false,
     schema: FetchRecordSchema,
+  },
+  'run.state': {
+    id: 'run.state',
+    kind: 'artifact',
+    description:
+      'The rebuildable run checkpoint at runs/<run-id>/state.json, written only by the reconciler ' +
+      '(AD-4, AD-7, AD-28).',
+    model_produced: false,
+    schema: RunStateSchema,
   },
   'error.shape': {
     id: 'error.shape',

@@ -20,4 +20,5 @@ export * from './node-floor.js';
 export * from './question.js';
 export * from './registry.js';
 export * from './schema-version.js';
+export * from './state.js';
 export * from './step.js';

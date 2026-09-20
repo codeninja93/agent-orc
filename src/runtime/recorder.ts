@@ -29,7 +29,13 @@ import {
 } from 'node:fs';
 import { hostname } from 'node:os';
 
-import { EventEnvelopeSchema, dispositionFor, formatTimestamp } from '../contracts/index.js';
+import {
+  EVENT_ENVELOPE_STREAM_FIELDS,
+  EVENT_ENVELOPE_VERBATIM_FIELDS,
+  EventEnvelopeSchema,
+  dispositionFor,
+  formatTimestamp,
+} from '../contracts/index.js';
 import type { EventEnvelope } from '../contracts/index.js';
 
 import { runPaths } from './paths.js';
@@ -455,9 +461,12 @@ export class Recorder {
     }
 
     /**
-     * AD-5 — a stream's `parent_tool_use_id` and `session_id` are preserved verbatim, so they are
-     * restored from the submission after the pass. They are identifiers, not credentials; a
-     * registered credential appearing in one is a genuine leak, so that fails closed instead.
+     * The verbatim allow-list of {@link EVENT_ENVELOPE_VERBATIM_FIELDS}, restored from the
+     * submission after the pass. Every entry is an identifier the system reads back — the run, the
+     * feature, the step, the AD-26 baseline ref and the two AD-5 stream fields — and each is
+     * restored only when the original is proven free of every credential class. A stream field that
+     * fails the proof fails the whole artifact closed, because AD-5 admits no rewritten value; an
+     * identity field keeps what the pass produced, so a line is still written.
      */
     const preserved = this.preservePassthrough(candidate, redacted.value);
     if (preserved === null) {
@@ -490,23 +499,34 @@ export class Recorder {
   }
 
   /**
-   * Restore the two AD-5 stream-origin fields verbatim, or refuse the artifact.
+   * Restore the {@link EVENT_ENVELOPE_VERBATIM_FIELDS} allow-list, or refuse the artifact.
    *
-   * Verbatim means the pass cannot rewrite them, so the only safe alternative to keeping a value is
-   * dropping the whole artifact. Each original is therefore run back through every pattern class —
-   * registered literals, token prefixes, private keys, URL credentials, env assignments — and a value
-   * the pass would have changed fails closed. Only the high-entropy heuristic is excluded, because it
-   * is a guess about shape and condemns the identifiers AD-5 requires unchanged.
+   * Each original is run back through every pattern class — registered literals, token prefixes,
+   * private keys, URL credentials, env assignments — and a value the pass would have changed is not
+   * restored. Only the high-entropy heuristic is excluded, because it is a guess about shape and
+   * condemns exactly the identifiers the log must carry: an unbroken ULID run id, a commit SHA and a
+   * `claude` session id all read as secret material to it.
+   *
+   * This is an allow-list by *field path*, which is the fix story 1-2 named for the case where
+   * reconstruction needs an identifier back — never a shape exemption, which is what let a real
+   * credential through there.
    */
   private preservePassthrough(
     candidate: EventEnvelope,
     redacted: EventEnvelope,
   ): EventEnvelope | null {
     const restored: Record<string, unknown> = { ...redacted };
-    for (const field of ['parent_tool_use_id', 'session_id'] as const) {
+    for (const field of EVENT_ENVELOPE_VERBATIM_FIELDS) {
       const original = candidate[field];
       if (original === undefined) continue;
-      if (typeof original === 'string' && !this.redactor.provesPatternFree(original)) return null;
+      const verbatimOrDropped = (EVENT_ENVELOPE_STREAM_FIELDS as readonly string[]).includes(field);
+      if (typeof original === 'string' && !this.redactor.provesPatternFree(original)) {
+        // AD-5 leaves a stream field no third option: it is verbatim or the artifact is dropped.
+        if (verbatimOrDropped) return null;
+        // An identity field keeps what the pass produced. The fail-safe direction is a line whose
+        // `step` reads `[redacted]`, not a run with no line at all.
+        continue;
+      }
       restored[field] = original;
     }
     return restored as EventEnvelope;
