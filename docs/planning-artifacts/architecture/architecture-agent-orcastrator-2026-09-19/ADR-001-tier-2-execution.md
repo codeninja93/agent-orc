@@ -1,7 +1,7 @@
 ---
 name: 'Tier-2 execution: what a confined step can actually do'
 type: architecture-decision-record
-status: proposed
+status: accepted
 created: '2026-09-20'
 decides:
   - AD-1
@@ -15,9 +15,8 @@ supersedes-nothing: true
 
 # ADR-001 — Tier-2 execution: what a confined step can actually do
 
-**Status: proposed.** Written by the build session that found the conflicts. It amends AD-1 and AD-20,
-which live in an adopted companion this session does not own, so it is recorded here for Deep's sign-off
-rather than edited into the spine. Stories 1-4, 1-5 and 1-6 each carry a deferred entry pointing at it.
+**Status: accepted 2026-09-20 by Deep.** All four proposals were accepted as recommended, and AD-1, AD-20 and
+AD-20's egress line have been amended in `ARCHITECTURE-SPINE.md` accordingly. Stories 1-4, 1-5 and 1-6 each carry a deferred entry pointing at it.
 
 ## The problem, stated once
 
@@ -113,18 +112,22 @@ four blockers dissolves rather than being negotiated.
 - Two containers per run in the common case (a command container, plus any leased service), where the
   original design had one.
 
-## Open questions this ADR does NOT decide
+## Decided at sign-off
 
-1. **Does the command container persist for a run, or start per command?** Per-command is cleaner and slower;
-   per-run needs its own lifecycle in the AD-32 sweep. Story 1-5's `--rm` rule and 1-6's reclamation both
-   already have opinions that would need reconciling.
-2. **Which exact tool names each built-in agent is granted.** This ADR says the grant lives in AD-17's TOML;
-   it does not fill the table in. That belongs with the roster stories, 2-3 through 2-7.
-3. **Whether a Linux deployment should keep the agent inside the container**, since there the credential
-   *is* a file. Two configurations is two things to keep correct; one is simpler but gives up confinement
-   that Linux could have had.
-4. **Whether `npm test` shelling out to git inside the container is acceptable**, given (5) above. Husky
-   hooks and version-stamping build scripts both do this routinely.
+- **Container lifetime: per command.** No lifecycle state to track, nothing to reclaim between commands, and
+  1-6's AD-32 sweep stays as built. The cost accepted is container-start latency on every command.
+- **One configuration on every platform, including Linux.** One code path rather than stronger confinement
+  where the credential happens to be a file. The trade is explicit: the configuration you develop against is
+  the same one that ships.
+- **A step does not run git.** AD-15 already requires it. If a test suite invokes git — husky, version
+  stamping — that is a per-repo profile concern, and the failure is visible rather than silent.
+
+## Open question this ADR still does NOT decide
+
+**Which exact tool names each built-in agent is granted.** The grant lives in AD-17's TOML, and this ADR does
+not fill the table in — that belongs with the roster stories, 2-3 through 2-7, where each agent's job is
+actually defined. It is now load-bearing security configuration rather than a convenience field: a roster
+entry granting `Bash` grants the ability to run commands, contained but real.
 
 ## Effect on existing stories
 

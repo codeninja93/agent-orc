@@ -13,9 +13,9 @@ context:
 warnings: ['oversized'] # 13 files and 15 I/O scenarios; the AD-20 flag set is dense and the AD-31 assertion suite is half the stage-1 gate
 deferred:
   - summary: >-
-      The tier-2 execution conflict this story recorded now has a proposed resolution.
+      RESOLVED: the tier-2 execution conflict this story recorded was accepted as ADR-001.
     evidence: |-
-      RESOLUTION PROPOSED: see ADR-001-tier-2-execution.md, which moves the containment boundary from
+      RESOLVED 2026-09-20: ADR-001-tier-2-execution.md was accepted and AD-1, AD-20 and AD-20's egress line amended in the spine, which moves the containment boundary from
       the agent process to the commands the agent runs. The decisive finding is that the subscription
       credential is in the macOS keychain rather than a file, so no mount can put it inside a
       container — making AD-20's container and AD-1's subscription-only auth incompatible on the
