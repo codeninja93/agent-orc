@@ -279,6 +279,16 @@ export const INTENT_REFUSAL_REASONS = [
   'terminal-run',
   /** The command's target is not in a state that takes it. */
   'wrong-target-state',
+  /**
+   * A question command carrying no free text, so there is nothing to record as the decision.
+   *
+   * Refused rather than applied because the decision is durable: a rejection with no reason would lose
+   * the reason the interface contract makes its whole point, and an empty answer would win the AD-25
+   * compare-and-set and record that the user said nothing.
+   */
+  'missing-answer',
+  /** A question command for a run with no question to answer, or none still open. */
+  'no-open-question',
   /** The command is declared but not honoured by this build; the owning story is named. */
   'not-yet-honoured',
 ] as const;

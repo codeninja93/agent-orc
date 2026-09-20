@@ -28,6 +28,7 @@ import type {
   CommandIntent,
   CommandMap,
   FeatureState,
+  QuestionResolver,
   RunState,
   StepDisposition,
   StepRecord,
@@ -35,6 +36,7 @@ import type {
 
 import type { IntentRefusalReason } from './commands.js';
 import { routeTermination } from './dispositions.js';
+import { resolverForSource } from './questions.js';
 
 /**
  * How this build treats each member of the `Command` enum.
@@ -43,23 +45,37 @@ import { routeTermination } from './dispositions.js';
  * silently does nothing. Three dispositions, and the third is the one worth reading twice:
  *
  * - `effect` — this story owns what the command does, and applies it.
+ * - `question` — the command resolves the run's active question, so its effect is the AD-25
+ *   compare-and-set rather than a run-state change. It is honoured, and it is a kind of its own because
+ *   the state it changes does not live in the checkpoint at all: it lives in `questions/`, where exactly
+ *   one transition is ever accepted and a losing resolver is told rather than thrown at.
  * - `acknowledge` — the command changes no run state in this build, so it is recorded with its
  *   principal, exactly once, and retired. Nothing else is ever going to act on it.
  * - `awaiting` — the command's effect belongs to a named later story. The file is **left in place**,
  *   unconsumed and unrecorded, and reported so it is visible rather than invisible. Acknowledging it
- *   instead would swallow a user's answer or a user's edit, and story 1-8's compare-and-set would then
- *   never see the answer that resolved its question.
+ *   instead would swallow a user's answer or a user's edit, which is why the three question commands were
+ *   parked here until the compare-and-set existed to receive them.
  */
 export const COMMAND_HANDLING: CommandMap<
   | { readonly kind: 'effect' }
+  | { readonly kind: 'question'; readonly note: string }
   | { readonly kind: 'acknowledge'; readonly note: string }
   | { readonly kind: 'awaiting'; readonly owner: string }
 > = {
-  answer: { kind: 'awaiting', owner: 'story 1-8, which owns the AD-25 question compare-and-set' },
+  answer: {
+    kind: 'question',
+    note: 'the answer resolves the run’s active question through the AD-25 compare-and-set (Q6)',
+  },
   confirm_spec: { kind: 'effect' },
-  edit_criterion: { kind: 'awaiting', owner: 'story 1-8, which owns the spec echo card' },
+  edit_criterion: {
+    kind: 'question',
+    note: 'the amended criterion resolves the question that asked for it, one line at a time (CAP-2)',
+  },
   approve: { kind: 'effect' },
-  reject: { kind: 'awaiting', owner: 'story 1-8, which turns a rejection reason into a ledger entry' },
+  reject: {
+    kind: 'question',
+    note: 'the rejection resolves the question and its reason becomes the decision (CAP-18)',
+  },
   continue: {
     kind: 'acknowledge',
     note: 'the run continues unchanged; the command is recorded so the decision is attributable',
@@ -80,10 +96,24 @@ export const COMMAND_HANDLING: CommandMap<
   },
 };
 
-/** The commands whose effect this build applies. */
+/**
+ * The commands whose effect this build applies.
+ *
+ * Both `effect` and `question` count, because both do something durable when consumed. Only `awaiting`
+ * and `acknowledge` are excluded, and for opposite reasons: the first is not implemented yet, and the
+ * second changes nothing by design.
+ */
 export const HONOURED_COMMANDS: readonly Command[] = Object.freeze(
+  (Object.keys(COMMAND_HANDLING) as Command[]).filter((command) => {
+    const kind = COMMAND_HANDLING[command].kind;
+    return kind === 'effect' || kind === 'question';
+  }),
+);
+
+/** The commands that resolve a question rather than changing the run's own state. */
+export const QUESTION_COMMANDS: readonly Command[] = Object.freeze(
   (Object.keys(COMMAND_HANDLING) as Command[]).filter(
-    (command) => COMMAND_HANDLING[command].kind === 'effect',
+    (command) => COMMAND_HANDLING[command].kind === 'question',
   ),
 );
 
@@ -110,9 +140,37 @@ export interface IntentEffect {
   readonly handoff: { readonly code: string; readonly reason: string } | null;
 }
 
+/**
+ * What one question command asks the compare-and-set to do.
+ *
+ * Deliberately *not* a `QuestionResolution`: building one needs the question's offered options, which live
+ * on disk, and `decideSteering` is pure. So this carries everything the intent itself determines — which
+ * gesture it was, what the person typed, and which of AD-25's three resolvers the intent's source counts
+ * as — and the reconciler completes it against the question it finds.
+ */
+export interface QuestionSteering {
+  readonly command: Command;
+  /** Free text (Q6). For a rejection this is the reason, and it becomes the decision unchanged. */
+  readonly answer: string;
+  readonly resolver: QuestionResolver;
+}
+
 export type SteeringDecision =
   /** Apply the effect, then retire the file. */
   | { readonly kind: 'apply'; readonly effect: IntentEffect; readonly reason: string }
+  /**
+   * AD-25 — resolve the run's active question through the compare-and-set, then retire the file.
+   *
+   * A kind of its own rather than an `apply` carrying an effect, because the state it changes is not in
+   * the checkpoint: an `IntentEffect` names a lifecycle state and a step disposition, and a question
+   * resolution names neither. Folding it into `apply` would have required inventing a `toState` for a
+   * transition that changes no lifecycle state at all.
+   */
+  | {
+      readonly kind: 'resolve-question';
+      readonly question: QuestionSteering;
+      readonly reason: string;
+    }
   /** The id is already in the log: recognise it, retire the file, change nothing. */
   | { readonly kind: 'already-applied'; readonly reason: string }
   /**
@@ -257,6 +315,38 @@ export const decideSteering = (
     };
   }
 
+  if (handling.kind === 'question') {
+    /**
+     * A question command with nothing to say is refused rather than recorded as a blank answer.
+     *
+     * The strictest case is `reject`: the interface contract says rejection is one keystroke *plus a
+     * reason*, and the reason becomes the ledger entry — so a rejection with no reason would produce a
+     * durable decision whose content is the empty string, which is exactly the discarded reason the rule
+     * exists to prevent. An `answer` with nothing in it is the same failure wearing a different name: it
+     * would win the compare-and-set and record that the user said nothing.
+     */
+    const answer = intent.argument ?? '';
+    if (answer.trim() === '') {
+      return {
+        kind: 'refuse',
+        reason: 'missing-answer',
+        detail:
+          `"${intent.command}" carries no argument, so there is nothing to record as the decision. ` +
+          'Answers are free text and no format is imposed (Q6), but an empty one would resolve the ' +
+          'question with a blank answer and a rejection would lose the reason that is its whole point.',
+      };
+    }
+    return {
+      kind: 'resolve-question',
+      question: {
+        command: intent.command,
+        answer,
+        resolver: resolverForSource(intent.source),
+      },
+      reason: `"${intent.command}" resolves the active question: ${handling.note}`,
+    };
+  }
+
   switch (intent.command) {
     case 'confirm_spec': {
       /**
@@ -338,8 +428,8 @@ export const decideSteering = (
       };
     }
 
-    // Every remaining member is `acknowledge` or `awaiting` and returned above. Enumerated rather
-    // than defaulted so adding a command with an effect is a compile error here.
+    // Every remaining member is `question`, `acknowledge` or `awaiting` and returned above. Enumerated
+    // rather than defaulted so adding a command with an effect is a compile error here.
     case 'answer':
     case 'edit_criterion':
     case 'reject':

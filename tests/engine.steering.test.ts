@@ -108,7 +108,11 @@ const aState = (overrides: Partial<RunState> = {}): RunState => ({
   ...overrides,
 });
 
-const anIntent = (command: CommandIntent['command'], step: string | null = null): CommandIntent =>
+const anIntent = (
+  command: CommandIntent['command'],
+  step: string | null = null,
+  argument: string | null = null,
+): CommandIntent =>
   newCommandIntent({
     intentId: mintIntentId(mintRunId()),
     command,
@@ -117,6 +121,7 @@ const anIntent = (command: CommandIntent['command'], step: string | null = null)
     step,
     principal: { kind: 'user', id: 'deep' },
     source: 'tui',
+    argument,
   });
 
 const noneApplied = { applied: new Set<string>() };
@@ -128,22 +133,70 @@ describe('every member of the Command enum has a declared handling', () => {
       expect(handling, command).toBeDefined();
       if (handling.kind === 'awaiting') expect(handling.owner, command).toMatch(/story/);
     }
-    // The five this story owns. A sixth appearing here without a test is what the list is for.
+    // The eight this build honours: story 1-3's five, plus the three question commands story 1-8
+    // un-parked once the AD-25 compare-and-set existed to receive them. A ninth appearing here without
+    // a test is what the list is for.
     expect([...HONOURED_COMMANDS].sort()).toStrictEqual([
+      'answer',
       'approve',
       'confirm_spec',
       'disengage',
+      'edit_criterion',
       'kill',
+      'reject',
       'take_over',
     ]);
   });
 
   it('leaves a command another story owns on disk rather than swallowing it', () => {
-    const decision = decideSteering(anIntent('answer'), aState(), noneApplied);
+    const decision = decideSteering(anIntent('narrow'), aState(), noneApplied);
     expect(decision.kind).toBe('awaiting');
     if (decision.kind !== 'awaiting') return;
-    // Story 1-8's compare-and-set has to be able to see the answer that resolved its question.
-    expect(decision.owner).toContain('1-8');
+    // Story 2-9 owns scope narrowing, and has to be able to see the intent that asked for it.
+    expect(decision.owner).toContain('2-9');
+  });
+
+  it('routes the three question commands through the AD-25 transition rather than parking them', () => {
+    // Story 1-7 parked these three here rather than acknowledge them, because acknowledging would have
+    // swallowed a user's answer before the compare-and-set existed. They are honoured now, and they are
+    // honoured as *question* commands: the state they change is in questions/, not in the checkpoint.
+    for (const command of ['answer', 'reject', 'edit_criterion'] as const) {
+      expect(COMMAND_HANDLING[command].kind, command).toBe('question');
+      const decision = decideSteering(anIntent(command, null, 'use the first option'), aState(), noneApplied);
+      expect(decision.kind, command).toBe('resolve-question');
+      if (decision.kind !== 'resolve-question') continue;
+      expect(decision.question.answer).toBe('use the first option');
+      // The intent's source decides which of AD-25's three resolvers it counts as.
+      expect(decision.question.resolver).toBe('tui');
+    }
+  });
+
+  it('refuses a question command carrying no free text rather than recording a blank decision', () => {
+    // A rejection is one keystroke *plus a reason*, and the reason becomes the ledger entry. An empty one
+    // would win the compare-and-set and record that the user said nothing.
+    for (const command of ['answer', 'reject', 'edit_criterion'] as const) {
+      const decision = decideSteering(anIntent(command, null, '   '), aState(), noneApplied);
+      expect(decision.kind, command).toBe('refuse');
+      if (decision.kind !== 'refuse') continue;
+      expect(decision.reason).toBe('missing-answer');
+    }
+  });
+
+  it('counts a web-sourced answer as the web resolver, so story 3-1 needs no second path', () => {
+    const intent = newCommandIntent({
+      intentId: mintIntentId(mintRunId()),
+      command: 'answer',
+      run: '01K5NQ9ZJ7V3M2P9XQWRTC4BDE',
+      feature: 'engine-reconciler',
+      step: null,
+      principal: { kind: 'user', id: 'deep' },
+      source: 'web',
+      argument: 'the second option',
+    });
+    const decision = decideSteering(intent, aState(), noneApplied);
+    expect(decision.kind).toBe('resolve-question');
+    if (decision.kind !== 'resolve-question') return;
+    expect(decision.question.resolver).toBe('web');
   });
 });
 

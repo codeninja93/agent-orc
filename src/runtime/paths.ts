@@ -108,6 +108,28 @@ export const COMMANDS_APPLIED_DIR_NAME = 'applied';
 export const COMMANDS_REFUSED_DIR_NAME = 'refused';
 
 /**
+ * AD-25 — `runs/<run-id>/questions/`, the durable question state files.
+ *
+ * Spelled once here for the same reason `commands/` is: a second spelling would be a second on-disk
+ * layout, and AD-25 makes the compare-and-set on these files *the* decision of which resolver won. A
+ * renderer that wrote an answer against one directory and an engine that resolved against another would
+ * hand two resolvers a win each, which is exactly the poisoned decision ledger AD-25 exists to prevent.
+ */
+export const QUESTIONS_DIR_NAME = 'questions';
+
+/**
+ * `questions/<question-id>/state.json` — the AD-25 question state, and `outcome.json` — the claim.
+ *
+ * Two files rather than one, and which is which is the whole mechanism. `outcome.json` is created with
+ * `O_EXCL`, so the first creator wins by construction and every later resolver's `open` fails; the
+ * state file is *derived* from it and is therefore never the thing contended for. A design that
+ * contended for the state file directly would have to read it before writing, and two processes can
+ * both read `asked`.
+ */
+export const QUESTION_STATE_FILE_NAME = 'state.json';
+export const QUESTION_OUTCOME_FILE_NAME = 'outcome.json';
+
+/**
  * CAP-23 — `runs/<run-id>/HANDOFF.md`, the document written when the system gives up.
  *
  * Upper-case and Markdown because its only audience is a person: it is the one artifact in the system
@@ -136,6 +158,8 @@ export interface RunPaths {
   readonly commandsAppliedDir: string;
   /** `runs/<run-id>/commands/refused/` — intents the loop refused, quarantined rather than retried. */
   readonly commandsRefusedDir: string;
+  /** `runs/<run-id>/questions/` — the AD-25 question state files, one directory per question. */
+  readonly questionsDir: string;
   /** `runs/<run-id>/HANDOFF.md` — the CAP-23 document, written when the system gives up. */
   readonly handoffDocument: string;
 }
@@ -155,6 +179,38 @@ export const runPaths = (runId: string, orchHome: string = resolveOrchHome()): R
     commandsDir: join(dir, COMMANDS_DIR_NAME),
     commandsAppliedDir: join(dir, COMMANDS_DIR_NAME, COMMANDS_APPLIED_DIR_NAME),
     commandsRefusedDir: join(dir, COMMANDS_DIR_NAME, COMMANDS_REFUSED_DIR_NAME),
+    questionsDir: join(dir, QUESTIONS_DIR_NAME),
     handoffDocument: join(dir, HANDOFF_DOCUMENT_FILE_NAME),
+  };
+};
+
+/** Every path belonging to one question, so no caller joins a segment of its own. */
+export interface QuestionPaths {
+  readonly runId: string;
+  readonly questionId: string;
+  /** `runs/<run-id>/questions/<question-id>/` */
+  readonly dir: string;
+  /** `.../state.json` — the AD-25 question state, derived from the outcome once one exists. */
+  readonly state: string;
+  /** `.../outcome.json` — the exclusively created claim whose first creator won the compare-and-set. */
+  readonly outcome: string;
+}
+
+/**
+ * `runs/<run-id>/questions/<question-id>/` and the two files in it.
+ *
+ * A question id reaches this module as data — minted by the engine, and in the web resolver's case
+ * arriving over a transport — so it is validated as a path segment here rather than trusted, exactly as
+ * a run id is.
+ */
+export const questionPaths = (paths: RunPaths, questionId: string): QuestionPaths => {
+  const safeQuestionId = assertSafePathSegment(questionId, 'a question id');
+  const dir = join(paths.questionsDir, safeQuestionId);
+  return {
+    runId: paths.runId,
+    questionId: safeQuestionId,
+    dir,
+    state: join(dir, QUESTION_STATE_FILE_NAME),
+    outcome: join(dir, QUESTION_OUTCOME_FILE_NAME),
   };
 };

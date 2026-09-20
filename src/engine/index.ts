@@ -27,12 +27,23 @@
  * - `reconciler` — the loop: read the checkpoint, take at most one action, write the checkpoint;
  * - `commands` — AD-19's durable intent files: the only path a steering command reaches the loop by;
  * - `steering` — what a consumed intent does, and why applying one twice does it once;
- * - `handoff` — CAP-23's escape hatch and the document written when the system gives up.
+ * - `handoff` — CAP-23's escape hatch and the document written when the system gives up;
+ * - `questions` — AD-25's compare-and-set: one accepted transition from `asked`, decided by an
+ *   exclusively created file so the first creator wins by construction rather than by careful ordering;
+ * - `question-window` — CAP-4's window, and the timeout default taken as a resolver competing in that
+ *   same compare-and-set rather than as a special case;
+ * - `decision` — the record a resolved question leaves, emitted as events because AD-4 admits no second
+ *   durable authority; story 5-3 builds the queryable index over those lines.
  *
- * The last three are what stories 1-9 and 1-10 write against. A renderer needs `writeCommandIntent`,
- * `newCommandIntent` and `mintIntentId` and nothing else: it never learns the directory layout, never
- * opens the event log, and never calls a method on the engine — which is the whole of AD-19's "renderers
- * reach it only by writing command intent files".
+ * The steering and command modules are what stories 1-9 and 1-10 write against. A renderer needs
+ * `writeCommandIntent`, `newCommandIntent` and `mintIntentId` and nothing else: it never learns the
+ * directory layout, never opens the event log, and never calls a method on the engine — which is the whole
+ * of AD-19's "renderers reach it only by writing command intent files".
+ *
+ * The question surface is the same shape, and for the same reason. Story 1-10's one-question card and story
+ * 3-1's web resolver both resolve a question by writing an `answer` intent, and both reach the *one*
+ * transition through it; `attemptQuestionResolution` is exported for the unit that has already decided
+ * which question it is resolving, and it is the only way the transition is ever made.
  *
  * Nothing here wraps a container, leases a resource, manages a question or renders anything. Each of
  * those is a later story, and each plugs into a boundary declared above rather than into the loop's
@@ -52,6 +63,9 @@ export * from './node-path.js';
 export * from './stream.js';
 export * from './spawner.js';
 export * from './commands.js';
+export * from './questions.js';
+export * from './question-window.js';
+export * from './decision.js';
 export * from './steering.js';
 export * from './handoff.js';
 export * from './reconciler.js';

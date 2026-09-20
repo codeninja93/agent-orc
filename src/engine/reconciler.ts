@@ -47,10 +47,13 @@ import {
 import type {
   Command,
   CommandSource,
+  DeflectionSource,
   EventEnvelope,
   FeatureState,
   ModelRung,
   Principal,
+  QuestionDraft,
+  QuestionState,
   RunState,
   StepInput,
   StepRecord,
@@ -85,7 +88,7 @@ import {
   retireIntent,
   writeCommandIntent,
 } from './commands.js';
-import type { IntentRefusal, PendingIntent } from './commands.js';
+import type { IntentRefusal, IntentRefusalReason, PendingIntent } from './commands.js';
 import { routeRefusedResume, routeTermination } from './dispositions.js';
 import {
   DECLARED_FAILURE_ATTEMPT_LIMIT,
@@ -100,7 +103,31 @@ import {
   commandRefusedPayload,
   decideSteering,
 } from './steering.js';
-import type { IntentEffect } from './steering.js';
+import type { IntentEffect, QuestionSteering } from './steering.js';
+import { DECISION_EVENT_TYPE, decidedQuestionIds, decisionFor, decisionPayload } from './decision.js';
+import {
+  QUESTION_EVENT_TYPES,
+  activeQuestion,
+  askQuestion,
+  askedQuestionIds,
+  attemptQuestionDeflection,
+  attemptQuestionResolution,
+  lastSettledQuestion,
+  listQuestionIds,
+  mintQuestionId,
+  parseOptionSelection,
+  questionAskedPayload,
+  questionEventPayload,
+  questionResolution,
+  settleQuestion,
+  settledQuestionIds,
+} from './questions.js';
+import type { QuestionClaim, SettledQuestion } from './questions.js';
+import {
+  describeDefaultTaken,
+  isQuestionDefaultDue,
+  takeQuestionDefault,
+} from './question-window.js';
 import { ResumeRefused, terminated } from './executor.js';
 import type { StepExecutor, StepStartRequest, StepTermination } from './executor.js';
 import {
@@ -213,6 +240,8 @@ export const INTENT_OUTCOMES = [
   'already-satisfied',
   /** Recorded with its principal; this build changes no run state for it. */
   'acknowledged',
+  /** AD-25 — the intent won the question's compare-and-set, and the decision is recorded. */
+  'resolved-question',
   /** Left in place for the unit that owns this command. */
   'awaiting',
 ] as const;
@@ -247,6 +276,68 @@ export interface IntentPassOutcome {
    */
   readonly state: RunState | null;
 }
+
+/** What became of one question in one pass. */
+export const QUESTION_PASS_OUTCOMES = [
+  /** A `question.asked` line the log still owed was appended. */
+  'asked',
+  /** A resolver won the compare-and-set and the decision is recorded (AD-25). */
+  'resolved',
+  /** CAP-4 — the window passed, the default was taken, and the decision is recorded. */
+  'default-taken',
+  /** Q4 — the question was answered without reaching the user, so no decision is recorded. */
+  'deflected',
+] as const;
+
+export type QuestionPassOutcomeKind = (typeof QUESTION_PASS_OUTCOMES)[number];
+
+/** One question a pass acted on, and what it left in the log. */
+export interface QuestionPassAction {
+  readonly questionId: string;
+  readonly kind: QuestionPassOutcomeKind;
+  /** Whether AD-25's decision record was written. False for every deflection, always. */
+  readonly decisionRecorded: boolean;
+  readonly reason: string;
+}
+
+/** A question a pass could not read, reported against its id rather than thrown. */
+export interface QuestionRefusal {
+  readonly questionId: string;
+  readonly code: string;
+  readonly reason: string;
+}
+
+/** What one run's questions did in one pass. Reported; never acted on again. */
+export interface QuestionPassOutcome {
+  readonly run: string;
+  /** Questions whose state changed, or whose owed line was appended, this pass. */
+  readonly settled: readonly QuestionPassAction[];
+  /** Questions still `asked` whose window has not yet passed. Nothing is owed for them. */
+  readonly open: readonly string[];
+  /** Questions this pass could not read — a torn state file, an unrecognised version. */
+  readonly refused: readonly QuestionRefusal[];
+}
+
+/**
+ * Which of a question's three lines the log already carries.
+ *
+ * Mutable, and threaded through one pass rather than re-read per question: every append updates it, so two
+ * questions settled in one pass cannot each decide independently that a line is still owed.
+ */
+interface QuestionLedger {
+  readonly asked: Set<string>;
+  readonly settled: Set<string>;
+  readonly decided: Set<string>;
+}
+
+/** One line naming what a pass did to a run's questions, for a reader. */
+export const describeQuestions = (outcome: QuestionPassOutcome): string => {
+  const parts = outcome.settled.map((entry) => `${entry.questionId} ${entry.kind}`);
+  for (const entry of outcome.refused) parts.push(`${entry.questionId} refused: ${entry.code}`);
+  return parts.length === 0
+    ? `${String(outcome.open.length)} question(s) open, none due.`
+    : `Questions settled: ${parts.join('; ')}.`;
+};
 
 /** One line naming what a pass did to a run's intents, for the action it is reported as. */
 export const describeSteering = (outcome: IntentPassOutcome): string => {
@@ -468,6 +559,8 @@ export interface PassResult {
   readonly reclaimed: ReclamationSummary | null;
   /** AD-19 — one entry per run whose `commands/` directory held anything this pass looked at. */
   readonly steering: readonly IntentPassOutcome[];
+  /** AD-25 — one entry per run whose `questions/` directory held anything this pass looked at. */
+  readonly questions: readonly QuestionPassOutcome[];
 }
 
 /** What one `load` established: the paths, the declared plan, and the state the log folds to. */
@@ -613,6 +706,19 @@ export interface SteerOptions {
   readonly argument?: string | null;
   /** The exactly-once key. Defaults to a freshly minted one. */
   readonly intentId?: string;
+}
+
+/** What asking a question through the reconciler supplies beyond the draft. */
+export interface AskOptions {
+  /** The step that raised the question, or `null` for a run-level one. */
+  readonly step?: string | null;
+  /**
+   * The question id, so a caller that retries an ask retries *the same* question.
+   *
+   * Defaults to a freshly minted one. Settable for the same reason `intentId` is: a renderer whose write
+   * may or may not have landed asks again under the same id and gets one question, not two.
+   */
+  readonly questionId?: string;
 }
 
 /** What accepting a feature produced. */
@@ -842,6 +948,106 @@ export class Reconciler {
   }
 
   // ---------------------------------------------------------------------------------------------
+  // Asking and resolving a question (AD-25)
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * AD-25, CAP-4 — ask a question durably.
+   *
+   * The state file lands before the `question.asked` line, and that order is the crash story: the window
+   * CAP-4 measures starts at `asked_at`, so a question whose event preceded its file would have a window
+   * nothing could evaluate. A draft that the interface contract forbids asking — no recommended default,
+   * no window, no brief, or more than three options — is refused naming the field, and nothing reaches
+   * disk.
+   */
+  ask(run: string, draft: QuestionDraft, options: AskOptions = {}): QuestionState {
+    this.assertOpen();
+    const loaded = this.load(run);
+    const questionId = options.questionId ?? mintQuestionId(this.minter.mint());
+    const asked = askQuestion({
+      paths: loaded.paths,
+      questionId,
+      feature: loaded.state.feature,
+      step: options.step ?? null,
+      draft,
+      askedAt: this.now(),
+    });
+    this.boundary(`question-asked:${asked.created ? 'created' : 'already-durable'}`);
+    this.recordQuestion(
+      loaded.paths,
+      loaded.state.feature,
+      { paths: asked.paths, state: asked.state, outcome: null, eventType: null },
+      this.questionLedger(loaded.events),
+    );
+    return asked.state;
+  }
+
+  /**
+   * Q6 — answer the run's active question. Free text; the system parses.
+   *
+   * Routed through a durable intent file like every other control (AD-19), so the answer a renderer writes
+   * and the answer a method call makes reach the compare-and-set by the same path and through the same
+   * guards. If the window has already taken the default, this throws {@link SteeringRefused} carrying the
+   * plain sentence saying so — a caller holding a control in their hand is owed the reason it did nothing,
+   * and "it timed out while I was typing" is the case that must not be silent.
+   */
+  answer(run: string, answer: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'answer', { ...options, argument: answer });
+  }
+
+  /** CAP-18 — reject, with a reason that becomes the decision. The reason is never discarded. */
+  reject(run: string, reason: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'reject', { ...options, argument: reason });
+  }
+
+  /** CAP-2 — amend one acceptance criterion, resolving the question that asked for it. */
+  editCriterion(run: string, amended: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'edit_criterion', { ...options, argument: amended });
+  }
+
+  /**
+   * Q4 — the question was answered from repository, git history or the decision ledger.
+   *
+   * It competes in the same compare-and-set as every resolver, because a deflection and a user's answer can
+   * race: the Interviewer reading the ledger while the user types must produce one outcome. Nothing is
+   * recorded as a decision — nobody was asked, so there is nobody to attribute one to (AD-25).
+   */
+  deflect(
+    run: string,
+    questionId: string,
+    deflection: {
+      readonly source: DeflectionSource;
+      readonly answer: string;
+      /** A durable anchor — a test name, API symbol or module name. Never a line number. */
+      readonly anchor: string;
+    },
+  ): QuestionClaim {
+    this.assertOpen();
+    const loaded = this.load(run);
+    const claim = attemptQuestionDeflection(loaded.paths, questionId, {
+      source: deflection.source,
+      answer: deflection.answer,
+      anchor: deflection.anchor,
+      deflected_at: formatTimestamp(this.now()),
+    });
+    this.boundary(`question-claimed:${claim.created ? 'deflection' : 'lost'}`);
+    this.recordQuestion(
+      loaded.paths,
+      loaded.state.feature,
+      settleQuestion(loaded.paths, questionId),
+      this.questionLedger(loaded.events),
+    );
+    return claim;
+  }
+
+  /** Every question of one run, each already reconciled against the outcome that stands. */
+  questions(run: string): readonly SettledQuestion[] {
+    this.assertOpen();
+    const paths = runPaths(run, this.orchHome);
+    return listQuestionIds(paths).map((questionId) => settleQuestion(paths, questionId));
+  }
+
+  // ---------------------------------------------------------------------------------------------
   // Consuming durable intents
   // ---------------------------------------------------------------------------------------------
 
@@ -912,6 +1118,51 @@ export class Reconciler {
             }),
           );
           break;
+
+        case 'resolve-question': {
+          /**
+           * AD-25 — the intent competes in the compare-and-set, and only then is it recorded.
+           *
+           * The order is the same one every other intent follows, for the same reason: the durable claim
+           * lands first, and the `command.applied` line carrying the `intent_id` lands after it. A crash in
+           * between redelivers the intent, which the id recorded *inside the claim* recognises as the same
+           * gesture rather than as a second resolver — so a redelivery is told it won, not told it lost to
+           * itself.
+           */
+          const resolved = this.resolveQuestionFromIntent(paths, state, pending, decision.question);
+          if (resolved.refusal !== null) {
+            refused.push(this.refuseIntent(paths, state.feature, resolved.refusal));
+            break;
+          }
+          /**
+           * The ledger line names the effect for what it was.
+           *
+           * An effect carrying no lifecycle state and no step disposition, because a question resolution
+           * changes neither — but a *named* one, so a reader of the log sees `question-resolved` rather than
+           * `acknowledged`, which is what a command that deliberately changes nothing records.
+           */
+          this.applyIntent(
+            paths,
+            plan,
+            state,
+            pending,
+            {
+              summary: 'question-resolved',
+              toState: null,
+              step: null,
+              stepDisposition: null,
+              clearsStepError: false,
+              escapeHatch: false,
+              handoff: null,
+            },
+            resolved.reason,
+          );
+          applied.add(intent.intent_id);
+          state = this.checkpointFromLog(paths, plan);
+          this.retire(paths, pending);
+          appliedOutcomes.push(outcome('resolved-question', resolved.reason));
+          break;
+        }
 
         case 'acknowledge':
         case 'apply': {
@@ -1050,6 +1301,251 @@ export class Reconciler {
     this.boundary(`intent-retired:${pending.intent.command}`);
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // Questions (AD-25)
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Which question lines the log already carries, so none is appended twice.
+   *
+   * This *is* the idempotence of a question transition, and it is why the question id has to survive the
+   * AD-21 pass: the durable claim precedes every line it causes, so the only way a later pass can tell
+   * "already emitted" from "still owed" is to read the ids back out of the payloads. An id the pass
+   * replaced with the redaction marker would make every pass emit the same three lines for ever.
+   */
+  private questionLedger(events: readonly EventEnvelope[]): QuestionLedger {
+    return {
+      asked: new Set(askedQuestionIds(events)),
+      settled: new Set(settledQuestionIds(events)),
+      decided: new Set(decidedQuestionIds(events)),
+    };
+  }
+
+  /**
+   * Append whatever lines a question's durable state still owes the log, in order.
+   *
+   * Every append is guarded by the ledger, so this is safe to call on every pass and after every crash:
+   * the outcome file on disk is the decision, and these lines are its report. The order — asked, then the
+   * outcome, then the decision — is the order the facts happened in, and a reader folding the log sees a
+   * question asked before it sees one resolved even when a crash meant both lines landed in one pass.
+   *
+   * **Only a resolved question records a decision.** A deflection appends `question.deflected` and stops:
+   * nobody was asked, so there is nobody the decision is attributable to (AD-25).
+   */
+  private recordQuestion(
+    paths: RunPaths,
+    feature: string,
+    settled: SettledQuestion,
+    ledger: QuestionLedger,
+  ): QuestionPassAction | null {
+    const state = settled.state;
+    const questionId = state.question.id;
+    const recorder = this.recorderFor(paths.runId, feature);
+    let kind: QuestionPassOutcomeKind | null = null;
+
+    if (!ledger.asked.has(questionId)) {
+      this.emit(recorder, {
+        step: state.question.step,
+        type: QUESTION_EVENT_TYPES.Asked,
+        payload: questionAskedPayload(state),
+      });
+      ledger.asked.add(questionId);
+      kind = 'asked';
+    }
+
+    if (settled.outcome !== null && settled.eventType !== null && !ledger.settled.has(questionId)) {
+      this.emit(recorder, {
+        step: state.question.step,
+        type: settled.eventType,
+        payload: questionEventPayload(state),
+      });
+      ledger.settled.add(questionId);
+      kind =
+        settled.eventType === QUESTION_EVENT_TYPES.Deflected
+          ? 'deflected'
+          : settled.eventType === QUESTION_EVENT_TYPES.DefaultTaken
+            ? 'default-taken'
+            : 'resolved';
+    }
+
+    const decision = decisionFor(state);
+    let decisionRecorded = false;
+    if (decision !== null && !ledger.decided.has(questionId)) {
+      this.emit(recorder, {
+        step: state.question.step,
+        type: DECISION_EVENT_TYPE,
+        payload: decisionPayload(decision),
+      });
+      ledger.decided.add(questionId);
+      decisionRecorded = true;
+      kind ??= state.resolution?.resolver === 'timeout_default' ? 'default-taken' : 'resolved';
+    }
+
+    if (kind === null) return null;
+    return {
+      questionId,
+      kind,
+      decisionRecorded,
+      reason:
+        kind === 'asked'
+          ? `Question ${questionId} is durable and asked; its default is due after ` +
+            `${String(state.question.default_window_ms)}ms (CAP-4).`
+          : `Question ${questionId} is ${state.status}` +
+            (state.resolution === null ? '' : ` by the ${state.resolution.resolver} resolver`) +
+            (decisionRecorded ? ', and the decision is recorded.' : ', and no decision is recorded.'),
+    };
+  }
+
+  /**
+   * CAP-4, AD-25 — take every due default, and finish every transition a crash left half-reported.
+   *
+   * Called once per run per pass, and it is the reason a window is a window rather than a hope: a default
+   * that only fired when something else happened to run would make "what happens if you ignore this" a
+   * promise the system keeps by coincidence.
+   *
+   * Two jobs, and the second is the crash story. A question still `asked` whose window has passed has its
+   * default taken *through the same compare-and-set* every other resolver uses, so an answer that landed a
+   * millisecond earlier wins and this call writes nothing. A question whose outcome file exists but whose
+   * lines are not in the log — a process killed between the claim and the append — has those lines
+   * appended now. Both are idempotent, so a pass that repeats does nothing the second time.
+   */
+  private settleQuestions(loaded: LoadedState): QuestionPassOutcome | null {
+    const { paths } = loaded;
+    const questionIds = listQuestionIds(paths);
+    if (questionIds.length === 0) return null;
+
+    /**
+     * The log is re-read rather than taken from the loaded state, and it has to be: consuming an intent
+     * earlier in this same pass may have appended a question's lines already, and a ledger built from the
+     * state the pass *opened* with would append them a second time. The read costs nothing for a run with
+     * no questions, because it is guarded above.
+     */
+    const ledger = this.questionLedger(readEventLog(paths.eventLog));
+    const terminal = isTerminalFeatureState(loaded.state.state);
+    const settledActions: QuestionPassAction[] = [];
+    const open: string[] = [];
+    const refused: QuestionRefusal[] = [];
+
+    for (const questionId of questionIds) {
+      try {
+        let settled = settleQuestion(paths, questionId);
+
+        /**
+         * A terminal run's window is not taken.
+         *
+         * AD-8 and the lifecycle agree that nothing walks a finished run backwards, and a default taken
+         * against a killed run would record a decision about work that has stopped. The question keeps its
+         * `asked` state, which is the honest record: it was asked and never answered.
+         */
+        if (settled.outcome === null && !terminal && isQuestionDefaultDue(settled.state, this.now())) {
+          const claim = takeQuestionDefault(paths, questionId, settled.state.question, this.now());
+          this.boundary(`question-claimed:${claim.created ? 'timeout_default' : 'lost'}`);
+          settled = settleQuestion(paths, questionId);
+        }
+
+        const acted = this.recordQuestion(paths, loaded.state.feature, settled, ledger);
+        if (acted !== null) settledActions.push(acted);
+        if (settled.outcome === null) open.push(questionId);
+      } catch (thrown: unknown) {
+        /**
+         * One unreadable question does not stop the others, for the same reason one unreadable run does not
+         * stop the pass: the refusal is per artifact. A torn state file is refused and *no* transition is
+         * attempted against it — never a partial read, and never a default taken against a question the
+         * loop cannot see the whole of.
+         */
+        const code = (thrown as { code?: unknown } | null)?.code;
+        refused.push({
+          questionId,
+          code: typeof code === 'string' ? code : 'internal.invariant_violated',
+          reason: renderCause(thrown) ?? 'the question could not be read, and said nothing about why',
+        });
+      }
+    }
+
+    return { run: paths.runId, settled: settledActions, open, refused };
+  }
+
+  /**
+   * AD-25 — resolve the run's active question from one steering intent.
+   *
+   * The compare-and-set decides, and this only reports. Three outcomes, and the middle one is the case the
+   * Design Notes single out:
+   *
+   * - the intent won, so the transition's lines are appended and the caller is told;
+   * - the intent lost — the window took the default while the person was typing, or the other renderer got
+   *   there first — and it is refused carrying the sentence that says so plainly, because a user who
+   *   believes their answer landed and a system that took the default have diverged about a decision AD-25
+   *   has already made durable;
+   * - there is no question to answer at all, which is refused by name rather than treated as a lost race.
+   */
+  private resolveQuestionFromIntent(
+    paths: RunPaths,
+    state: RunState,
+    pending: PendingIntent,
+    steering: QuestionSteering,
+  ): { readonly reason: string; readonly refusal: IntentRefusal | null } {
+    const intent = pending.intent;
+    const refusal = (reason: IntentRefusalReason, detail: string): IntentRefusal => ({
+      reason,
+      fileName: pending.fileName,
+      intentId: intent.intent_id,
+      command: intent.command,
+      detail,
+      quarantinedTo: null,
+    });
+
+    const target = activeQuestion(paths) ?? lastSettledQuestion(paths);
+    if (target === null) {
+      return {
+        reason: '',
+        refusal: refusal(
+          'no-open-question',
+          `Run ${paths.runId} has no question under questions/, so "${intent.command}" has nothing to ` +
+            'resolve. The answer is quarantined rather than met by every later pass, and nothing was ' +
+            'recorded: an answer to no question is not a decision.',
+        ),
+      };
+    }
+
+    const question = target.settled.state.question;
+    const resolution = questionResolution({
+      resolver: steering.resolver,
+      principal: intent.principal,
+      answer: steering.answer,
+      optionId: parseOptionSelection(question, steering.answer),
+      resolvedAt: this.now(),
+    });
+    const claim = attemptQuestionResolution(paths, target.questionId, resolution, {
+      intentId: intent.intent_id,
+    });
+    this.boundary(`question-claimed:${claim.created ? steering.resolver : 'lost'}`);
+
+    if (!claim.accepted) {
+      return {
+        reason: '',
+        refusal: refusal(
+          'wrong-target-state',
+          describeDefaultTaken(claim.state) +
+            ` (${claim.refusal ?? 'the first transition stands'})`,
+        ),
+      };
+    }
+
+    const acted = this.recordQuestion(
+      paths,
+      state.feature,
+      settleQuestion(paths, target.questionId),
+      this.questionLedger(readEventLog(paths.eventLog)),
+    );
+    return {
+      reason:
+        `"${intent.command}" won the compare-and-set on question ${target.questionId} as the ` +
+        `${steering.resolver} resolver` +
+        (acted?.decisionRecorded === true ? ', and the decision is recorded (AD-25).' : '.'),
+      refusal: null,
+    };
+  }
+
   /** CAP-23 — the document, written before the line that records the hand-off. */
   private writeHandoff(
     paths: RunPaths,
@@ -1151,6 +1647,7 @@ export class Reconciler {
     const entries: LoadedRun[] = [];
     const refusals: RunRefusal[] = [];
     const steering: IntentPassOutcome[] = [];
+    const questions: QuestionPassOutcome[] = [];
 
     // AD-32, first thing in the pass and on every pass: a comparison of what is held against what the
     // runs say, taken before any run advances so it reads one consistent picture of on-disk state. A run
@@ -1217,6 +1714,27 @@ export class Reconciler {
       }
       // Nothing changed, so the run is decided from the state the pass already loaded.
       untouched.push(entry);
+    }
+
+    /**
+     * CAP-4, AD-25 — the question windows, taken after the intents and before anything is decided.
+     *
+     * *After* the intents because an answer already on disk is the user's word and must beat a window that
+     * expired while it sat there: the pass that consumes the answer is the pass that would otherwise take
+     * the default, and consuming first is what makes "an answer arriving before expiry wins" true rather
+     * than a race against the loop's own scheduling.
+     *
+     * Settling a question changes no lifecycle state, so it is not one of the pass's at-most-one actions and
+     * a run does not forfeit its step to it. It appends lines and reports them — which is the whole of
+     * AD-25's record — and every append is guarded by the log, so a pass that repeats appends nothing.
+     */
+    for (const entry of entries) {
+      try {
+        const outcome = this.settleQuestions(entry.loaded);
+        if (outcome !== null) questions.push(outcome);
+      } catch (thrown: unknown) {
+        refusals.push(refusalFor(entry.run, thrown));
+      }
     }
 
     /**
@@ -1294,7 +1812,7 @@ export class Reconciler {
       else refusals.push(refusalFor(run, outcome.reason));
     }
 
-    return { actions, deferred, refusals, reclaimed, steering };
+    return { actions, deferred, refusals, reclaimed, steering, questions };
   }
 
   /**
