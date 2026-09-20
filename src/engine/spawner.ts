@@ -37,7 +37,8 @@
  * `events.jsonl`, never assigns `seq` and never writes to stdout.
  */
 import { spawn } from 'node:child_process';
-import { statSync } from 'node:fs';
+import { accessSync, constants as fsConstants, statSync } from 'node:fs';
+import { constants as osConstants } from 'node:os';
 
 import {
   exportContract,
@@ -129,6 +130,48 @@ export const STDERR_TAIL_LIMIT = 2000;
 export const EXECUTOR_KILL_SIGNAL = 'SIGTERM';
 
 /**
+ * How long a stopped child is given to exit before it is killed outright.
+ *
+ * One `SIGTERM` and nothing else is a stop that a child may simply decline, and the consequences are
+ * not local: the attempt promise never settles, so the `killed` termination never reaches the loop and
+ * `killAll()` blocks a shutdown that is holding the AD-29 writer claim. The escalation is what makes
+ * "stop this step" a statement rather than a request.
+ */
+export const EXECUTOR_KILL_GRACE_MS = 5_000;
+
+/** The signal a child that ignored {@link EXECUTOR_KILL_SIGNAL} is stopped with. */
+export const EXECUTOR_FORCE_KILL_SIGNAL = 'SIGKILL';
+
+/**
+ * The wall-clock bound on one attempt.
+ *
+ * Without one, a child that hangs means `start()` never settles: the run holds its recorder claim and
+ * its engine lock forever, and AD-30's "one engine per ORCH_HOME" turns a single wedged step into a
+ * machine that cannot be reconciled at all. The ceiling story is AD-24's and is story 2-9's to own —
+ * this is not that. It is the floor under it: a bound that always exists so a hang is an `interrupted`
+ * attempt the loop can decide about rather than silence.
+ */
+export const DEFAULT_ATTEMPT_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * Translate a shell-convention exit code back into the signal it reports.
+ *
+ * A wrapper between this executor and the CLI — the AD-20 container wrapper of story 1-5 is exactly
+ * that — does not forward its child's signal. It exits `128 + n` instead, which arrives here as an
+ * ordinary non-zero code with `signal === null`. Without this translation the same interruption maps to
+ * `interrupted` when unwrapped and to `failed` when wrapped, so resume becomes dead code precisely at
+ * the seam story 1-5 plugs into, which is the failure this story's Design Notes single out.
+ */
+export const signalFromExitCode = (code: number | null): NodeJS.Signals | null => {
+  if (code === null || code <= 128 || code >= 128 + 65) return null;
+  const number = code - 128;
+  for (const [name, value] of Object.entries(osConstants.signals)) {
+    if (value === number) return name as NodeJS.Signals;
+  }
+  return null;
+};
+
+/**
  * Patterns a refused resume is recognised by, read off the CLI's own stderr.
  *
  * A refusal is also inferred structurally — a resume whose child never announced a session id did not
@@ -188,6 +231,10 @@ export interface StepSpawnerOptions {
   readonly promptFor?: (request: StepStartRequest) => string;
   /** The draft-7 export for a contract id. Defaults to the AD-2 registry export. */
   readonly schemaFor?: (contractId: string) => JsonSchema;
+  /** The wall-clock bound on one attempt. Defaults to {@link DEFAULT_ATTEMPT_TIMEOUT_MS}. */
+  readonly attemptTimeoutMs?: number;
+  /** How long a stopped child is given before {@link EXECUTOR_FORCE_KILL_SIGNAL}. */
+  readonly killGraceMs?: number;
 }
 
 /** The executor, plus the two things a caller and a suite legitimately need to see. */
@@ -197,10 +244,18 @@ export interface StepSpawner extends StepExecutor {
   /**
    * Stop a running step. The resulting termination is `killed`, which AD-8 never resumes or re-runs —
    * this is the executor-initiated stop a steering command reaches the executor as.
+   *
+   * `run` narrows the stop to one run's attempt. One spawner serves every run and reconciliation is
+   * concurrent across features, so a step name alone does not identify a child: two runs of the same
+   * plan have a step called `implement` each, and stopping "implement" without saying whose would stop
+   * whichever was found first. Omitting `run` stops every live attempt at that step, which is what a
+   * shutdown wants and what a steering command must not rely on.
    */
-  readonly kill: (step: string) => boolean;
+  readonly kill: (step: string, run?: string) => boolean;
   /** Stop every running step. For a caller shutting down. */
   readonly killAll: () => void;
+  /** The plan one identified attempt executed, for a caller holding more than one in flight. */
+  readonly planOf: (run: string, step: string, attempt: number) => SpawnPlan | null;
 }
 
 /**
@@ -290,6 +345,24 @@ const KEEPS_ITS_OWN_CODE = [
   ChildNodeUnavailableError,
 ] as const;
 
+/**
+ * The code a non-completed output takes when the agent reported no error of its own.
+ *
+ * Named rather than inlined because the two are not interchangeable and their dispositions are
+ * opposites. A *blocked* step is waiting on a decision only a person can make, so
+ * `question.unanswerable` is `escalate-to-human`; a *failed* one produced work that did not hold up,
+ * which is what the model ladder exists for, so `step.verification_failed` is `escalate-model-tier`.
+ * Swapping them sends every blocked step to a model that cannot answer the question and every failed
+ * step to a person who has nothing to decide.
+ */
+const FALLBACK_STATUS_CODES: Readonly<Record<'blocked' | 'failed', string>> = {
+  blocked: 'question.unanswerable',
+  failed: 'step.verification_failed',
+};
+
+const fallbackDetail = (output: StepOutput): string =>
+  `The step reported status "${output.status}" without an error: ${output.summary}`;
+
 /** What one attempt observed. Everything the disposition mapping is a function of. */
 interface AttemptOutcome {
   readonly sessionId: string | null;
@@ -299,8 +372,16 @@ interface AttemptOutcome {
   readonly stderrTail: string;
   /** True when this executor stopped the child, which is what distinguishes `killed` (AD-8). */
   readonly killedByExecutor: boolean;
-  /** Set when the CLI reported an `apiKeySource` other than the subscription login. */
+  /** True when the attempt's wall-clock bound expired, which is an `interrupted`, not a `killed`. */
+  readonly timedOut: boolean;
+  /** Set only when the CLI positively named an `apiKeySource` other than the subscription login. */
   readonly apiKeySource: string | null;
+  /**
+   * What the stream said about authentication: the named source, `unreported` when the init line
+   * carried no such field, or `no-init-line` when no init line arrived. Recorded on the exit event so
+   * "the check did not run" is a fact on the log rather than a silence.
+   */
+  readonly apiKeySourceReport: string;
 }
 
 const resolveThunk = <T>(value: T | (() => T) | undefined, fallback: () => T): T => {
@@ -314,11 +395,65 @@ const appendTail = (tail: string, chunk: string): string => {
   return joined.length <= STDERR_TAIL_LIMIT ? joined : joined.slice(-STDERR_TAIL_LIMIT);
 };
 
+/**
+ * The identity of one attempt: the run, the step and the attempt number together.
+ *
+ * A step name alone is not an identity. One spawner serves every run, reconciliation is concurrent
+ * across features, and two runs of one plan each have a step called `implement` — so keying children by
+ * step name means the second attempt evicts the first from the table: a steering kill then stops the
+ * wrong child, and the evicted one becomes unkillable because the first `finish()` deletes the entry
+ * the other was found under.
+ */
+const attemptKey = (run: string, step: string, attempt: number): string =>
+  `${run}\u0000${step}\u0000${String(attempt)}`;
+
+/** A child in flight, and what is known about it without reaching for the process. */
+interface LiveAttempt {
+  readonly run: string;
+  readonly step: string;
+  readonly attempt: number;
+  /** Stop the child: the executor-initiated stop that becomes a `killed` disposition. */
+  readonly stop: () => void;
+}
+
+/** Session ids kept bounded, oldest evicted first, so a long-lived engine does not grow forever. */
+const SPENT_SESSION_MEMORY = 1024;
+
+/**
+ * Event types that must reach the log even if their stream passthrough fields cannot.
+ *
+ * Both carry an AD-5 verbatim-or-dropped field, so both can be dropped wholesale by a pass that cannot
+ * prove the id safe — and both are facts the log must state: that a tool call was refused, and that a
+ * session exists to resume.
+ */
+const MUST_SURVIVE_A_DROPPED_PASSTHROUGH: readonly string[] = [
+  'permission.denied',
+  'agent.session_announced',
+];
+
 export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
-  /** Children in flight, by step name, so a steering kill can reach one. */
-  const live = new Map<string, { readonly stop: () => void }>();
-  /** Session ids a resume has already been attempted against. AD-8 allows exactly one. */
+  /** Children in flight, by attempt identity, so a steering kill reaches exactly one of them. */
+  const live = new Map<string, LiveAttempt>();
+  /**
+   * Session ids a refused resume has already been spent on. AD-8 grants exactly one resume per
+   * recorded id, and the refusal is what spends it: a preflight that never created a process has not
+   * spent the run's one chance, and a resume that *worked* has not either — an attempt that resumed,
+   * was interrupted again and is resumed again is the loop doing its job, not a second bite.
+   *
+   * Bounded, with the oldest evicted first: an engine that runs for weeks would otherwise accumulate
+   * one entry per refused resume for its whole lifetime.
+   */
   const spentSessions = new Set<string>();
+  const rememberSpent = (sessionId: string): void => {
+    spentSessions.add(sessionId);
+    while (spentSessions.size > SPENT_SESSION_MEMORY) {
+      const oldest = spentSessions.values().next();
+      if (oldest.done === true) break;
+      spentSessions.delete(oldest.value);
+    }
+  };
+  /** The plan each attempt executed, keyed by attempt identity, plus the most recent for convenience. */
+  const plans = new Map<string, SpawnPlan>();
   let lastPlan: SpawnPlan | null = null;
 
   // Both defaults are the memoised resolutions: AD-28 says the absolute Node path is resolved *once*
@@ -336,7 +471,23 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
   const schemaFor = options.schemaFor ?? ((contractId: string): JsonSchema => exportContract(contractId));
   const promptFor = options.promptFor ?? defaultPromptFor;
 
-  /** Emit one event through the recorder. Identifiers go in envelope fields, never in the payload. */
+  /**
+   * Emit one event through the recorder. Identifiers go in envelope fields, never in the payload.
+   *
+   * Two things this does beyond forwarding:
+   *
+   * **It reads the recorder's answer.** `record` does not throw when the AD-21 pass fails; it drops the
+   * artifact, appends `redaction.failed` in its place and reports `dropped`. For an ordinary event that
+   * is the right trade, but `permission.denied` and `agent.session_announced` carry the two AD-5 stream
+   * fields, which are verbatim-or-dropped — so precisely the events that matter most are the ones that
+   * can vanish, and a refused tool call disappearing from the log is the worst direction for a
+   * permission event to fail in. A drop is therefore re-stated as a field-free event of the same type,
+   * so the log still says a refusal happened even when it may not say which.
+   *
+   * **It cannot throw.** Every call site is inside a `data` or `close` handler, where a throw escapes as
+   * an uncaught exception and leaves the attempt promise unsettled forever. An event that could not be
+   * appended must not cost the termination.
+   */
   const emit = (
     recorder: Recorder,
     event: {
@@ -348,17 +499,43 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
       readonly baselineRef?: string | null;
     },
   ): void => {
-    recorder.record({
-      feature: recorder.feature,
-      run: recorder.paths.runId,
-      step: event.step,
-      emitter: SPAWNER_EMITTER,
-      type: event.type,
-      payload: event.payload,
-      ...(event.sessionId === undefined ? {} : { session_id: event.sessionId }),
-      ...(event.parentToolUseId === undefined ? {} : { parent_tool_use_id: event.parentToolUseId }),
-      ...(event.baselineRef === undefined ? {} : { baseline_ref: event.baselineRef }),
-    });
+    const submit = (carryStreamFields: boolean): boolean => {
+      const recorded = recorder.recordResult({
+        feature: recorder.feature,
+        run: recorder.paths.runId,
+        step: event.step,
+        emitter: SPAWNER_EMITTER,
+        type: event.type,
+        payload: event.payload,
+        ...(carryStreamFields && event.sessionId !== undefined
+          ? { session_id: event.sessionId }
+          : {}),
+        ...(carryStreamFields && event.parentToolUseId !== undefined
+          ? { parent_tool_use_id: event.parentToolUseId }
+          : {}),
+        ...(event.baselineRef === undefined ? {} : { baseline_ref: event.baselineRef }),
+      });
+      return recorded.dropped;
+    };
+
+    try {
+      if (!submit(true)) return;
+      if (!MUST_SURVIVE_A_DROPPED_PASSTHROUGH.includes(event.type)) return;
+      // The artifact was dropped because a stream passthrough field failed the pass. Re-state the
+      // event without those fields: the log loses the id, not the fact.
+      recorder.recordResult({
+        feature: recorder.feature,
+        run: recorder.paths.runId,
+        step: event.step,
+        emitter: SPAWNER_EMITTER,
+        type: event.type,
+        payload: { ...event.payload, passthrough_dropped: true },
+        ...(event.baselineRef === undefined ? {} : { baseline_ref: event.baselineRef }),
+      });
+    } catch {
+      // A recorder that refuses the append does not get to cost the termination. There is nowhere
+      // else to report this: no unit writes diagnostics to stdout, and the log is the thing that failed.
+    }
   };
 
   /**
@@ -373,7 +550,12 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
    */
   const assertCliPresent = (resolvedCli: ClaudeCli): void => {
     try {
-      if (statSync(resolvedCli.path).isFile()) return;
+      if (statSync(resolvedCli.path).isFile()) {
+        // A compiled entry is executed directly, so it must be executable; a script entry is read by
+        // the resolved Node and need not be.
+        if (resolvedCli.interpreter === 'direct') accessSync(resolvedCli.path, fsConstants.X_OK);
+        return;
+      }
     } catch {
       // Falls through to the refusal; the reason is the same either way.
     }
@@ -421,9 +603,12 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
   const runAttempt = async (
     request: StepStartRequest,
     resumeSessionId: string | null,
+    recorder: Recorder,
+    // The default is a no-op by design: only `resume` needs to know a child exists, so that it can
+    // mark the session spent after the process is real rather than before it.
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    onChildStarted: () => void = (): void => {},
   ): Promise<AttemptOutcome> => {
-    const recorder = options.recorderFor(request.run, request.feature);
-
     let plan: SpawnPlan;
     try {
       plan = planFor(request, resumeSessionId);
@@ -438,15 +623,25 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
       if (KEEPS_ITS_OWN_CODE.some((kind) => thrown instanceof kind)) throw thrown;
       throw new StepSpawnFailed(request.step, renderCause(thrown) ?? 'the preflight refused the spawn');
     }
+    const key = attemptKey(request.run, request.step, request.attempt);
     lastPlan = plan;
+    plans.set(key, plan);
 
-    const missing = missingRequiredFlags(plan.cliArgs);
+    /**
+     * The guard is over the vector that will actually be executed, not the one that was built.
+     *
+     * `cliArgs` is the pre-wrap argv, and the wrapper of AD-20 is free to rebuild `args`. A wrapper
+     * that rebuilt it and dropped `--restricted` or `--strict-mcp-config` would pass a guard that only
+     * read `cliArgs` — and the resulting widening of the permission surface has no other observable
+     * symptom, which is the entire reason the constant exists. So what is asserted is what is run.
+     */
+    const observedFlags = AD1_REQUIRED_FLAGS.filter((flag) => plan.args.includes(flag));
+    const missing = missingRequiredFlags(plan.args);
     if (missing.length > 0) {
-      // Unreachable through `buildStepArgv`; asserted because a widened permission surface is silent.
       throw new StepSpawnFailed(
         request.step,
-        `the built argv is missing the AD-1 flags ${missing.join(', ')}, which would widen the ` +
-          'permission surface without any other observable difference',
+        `the argv that would be executed is missing the AD-1 flags ${missing.join(', ')}, which would ` +
+          'widen the permission surface without any other observable difference',
       );
     }
 
@@ -465,7 +660,9 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
         phase: request.phase,
         contract_id: request.contractId,
         output_format: STREAM_OUTPUT_FORMAT,
-        flags: [...AD1_REQUIRED_FLAGS],
+        // The flags observed on the executed vector, not the constant that was required: a log that
+        // records the requirement rather than the fact cannot be used to audit what actually ran.
+        flags: observedFlags,
         mcp_config_count: (options.mcpConfigs ?? []).length,
         resumed: resumeSessionId !== null,
         wrapped: options.wrap !== undefined,
@@ -477,10 +674,11 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
     return await new Promise<AttemptOutcome>((settle, reject) => {
       const parser = createStreamParser();
       let sessionReported = false;
-      let apiKeySource: string | null = null;
       let stderrTail = '';
       let stderrBytes = 0;
+      let nonSubscriptionSource: string | null = null;
       let killedByExecutor = false;
+      let timedOut = false;
       let settled = false;
 
       let child;
@@ -489,6 +687,10 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
           cwd: plan.cwd,
           env: plan.env,
           stdio: ['ignore', 'pipe', 'pipe'],
+          // Its own process group, so a stop reaches the whole tree. `claude` spawns children of its
+          // own — MCP servers, hooks — and signalling only the CLI leaves those running, holding the
+          // worktree and whatever they had open. This is what makes `-pid` below meaningful.
+          detached: true,
         });
       } catch (thrown: unknown) {
         reject(
@@ -499,12 +701,75 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
         );
         return;
       }
+      onChildStarted();
 
-      const stop = (): void => {
-        killedByExecutor = true;
-        child.kill(EXECUTOR_KILL_SIGNAL);
+      /** Signal the whole process group, falling back to the child alone. */
+      const signalTree = (signal: NodeJS.Signals): void => {
+        try {
+          if (child.pid !== undefined) process.kill(-child.pid, signal);
+          else child.kill(signal);
+        } catch {
+          // The group is already gone, or was never one. Either way there is nothing left to signal.
+          try {
+            child.kill(signal);
+          } catch {
+            // Nothing to stop.
+          }
+        }
       };
-      live.set(request.step, { stop });
+
+      let forceKillTimer: NodeJS.Timeout | null = null;
+      let attemptTimer: NodeJS.Timeout | null = null;
+      const clearTimers = (): void => {
+        if (forceKillTimer !== null) clearTimeout(forceKillTimer);
+        if (attemptTimer !== null) clearTimeout(attemptTimer);
+        forceKillTimer = null;
+        attemptTimer = null;
+      };
+
+      /**
+       * Stop the child, and mean it.
+       *
+       * `SIGTERM` is a request the child may decline; the escalation to `SIGKILL` after a grace period
+       * is what makes the stop terminate. Without it the attempt promise never settles, so the `killed`
+       * termination never reaches the loop and a shutdown blocks while still holding the AD-29 writer
+       * claim and the AD-30 engine lock.
+       */
+      const stop = (markKilled: boolean): void => {
+        if (markKilled) killedByExecutor = true;
+        signalTree(EXECUTOR_KILL_SIGNAL);
+        if (forceKillTimer !== null) return;
+        forceKillTimer = setTimeout(() => {
+          signalTree(EXECUTOR_FORCE_KILL_SIGNAL);
+        }, options.killGraceMs ?? EXECUTOR_KILL_GRACE_MS);
+        forceKillTimer.unref();
+      };
+
+      live.set(key, {
+        run: request.run,
+        step: request.step,
+        attempt: request.attempt,
+        stop: () => {
+          stop(true);
+        },
+      });
+
+      /**
+       * The wall-clock bound on the attempt.
+       *
+       * A hang is reported as `interrupted`, not `killed`: `killed` means a person or a steering command
+       * stopped this step and AD-8 never resumes or re-runs it, whereas a child that stopped making
+       * progress is exactly the case a resume exists for. Calling a timeout `killed` would quietly make
+       * every hang terminal.
+       */
+      attemptTimer = setTimeout(
+        () => {
+          timedOut = true;
+          stop(false);
+        },
+        options.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
+      );
+      attemptTimer.unref();
 
       const handle = (records: readonly StreamRecord[]): void => {
         for (const record of records) {
@@ -521,12 +786,23 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
                   sessionId: record.sessionId,
                   baselineRef: request.baselineRef,
                 });
-                request.onSessionId(record.sessionId);
+                try {
+                  request.onSessionId(record.sessionId);
+                } catch {
+                  // The callback runs inside a stdout handler, where a throw escapes as an uncaught
+                  // exception and leaves the attempt promise unsettled forever. The id is already on
+                  // the log, so the checkpoint can still be rebuilt from it (AD-4).
+                }
               }
               break;
             }
             case 'api_key_source': {
-              if (!isSubscriptionApiKeySource(record.source)) apiKeySource = record.source;
+              // The decision is taken at `finish` from the parser's own record, so the three cases —
+              // named source, unreported field, no init line at all — are distinguishable there. The
+              // assertion itself still lives in `cli.ts`, which owns what counts as subscription auth.
+              if (!isSubscriptionApiKeySource(record.source) && record.reported) {
+                nonSubscriptionSource = record.source;
+              }
               break;
             }
             case 'tool_use': {
@@ -570,9 +846,18 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
         }
       };
 
+      /** Parse and handle one chunk without letting anything escape into the `data` handler. */
+      const consume = (chunk: string): void => {
+        try {
+          handle(parser.push(chunk));
+        } catch {
+          // Nothing the parser or the recorder can do wrong is worth an unsettled attempt promise.
+        }
+      };
+
       child.stdout?.setEncoding('utf8');
       child.stdout?.on('data', (chunk: string) => {
-        handle(parser.push(chunk));
+        consume(chunk);
       });
       child.stderr?.setEncoding('utf8');
       child.stderr?.on('data', (chunk: string) => {
@@ -583,8 +868,13 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
       const finish = (exitCode: number | null, signal: NodeJS.Signals | null): void => {
         if (settled) return;
         settled = true;
-        live.delete(request.step);
-        handle(parser.end());
+        clearTimers();
+        live.delete(key);
+        try {
+          handle(parser.end());
+        } catch {
+          // As above: a failed append does not cost the termination.
+        }
         if (stderrBytes > 0) {
           emit(recorder, {
             step: request.step,
@@ -592,21 +882,30 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
             payload: { bytes: stderrBytes, tail: stderrTail },
           });
         }
+        const reported = parser.apiKeySource();
         settle({
           sessionId: parser.sessionId(),
           result: parser.result(),
           exitCode,
-          signal,
+          // A wrapper reports its child's signal as exit code 128+n, so the translation is applied
+          // here rather than at each reader of the outcome.
+          signal: signal ?? signalFromExitCode(exitCode),
           stderrTail,
           killedByExecutor,
-          apiKeySource,
+          timedOut,
+          apiKeySource: nonSubscriptionSource,
+          // Which of the three cases happened, recorded rather than collapsed: the CLI named a source,
+          // the init line carried no such field, or no init line arrived at all.
+          apiKeySourceReport:
+            reported === null ? 'no-init-line' : reported.reported ? reported.source : 'unreported',
         });
       };
 
       child.on('error', (thrown: Error) => {
         if (settled) return;
         settled = true;
-        live.delete(request.step);
+        clearTimers();
+        live.delete(key);
         // `error` before any exit means the process was never created: ENOENT on the command, a cwd
         // that does not exist, a permission problem on the executable. The port says that throws.
         reject(new StepSpawnFailed(request.step, `${thrown.name}: ${thrown.message}`));
@@ -617,21 +916,38 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
     });
   };
 
-  /** Re-parse the terminal output against the originating Zod schema (AD-1). */
+  /**
+   * Re-parse the terminal output against the originating Zod schema (AD-1).
+   *
+   * The failure *code* is part of the answer, not an afterthought. `step.schema_invalid_output` is
+   * `escalate-model-tier`, so it is the right answer only when a model produced something wrong and a
+   * better model might not. An unknown contract id and a shape the port cannot carry are both wiring
+   * faults — a registry entry missing, a contract that is not a step output — and no model rung fixes
+   * either, so promoting the ladder against them burns the run's one promotion per step on something
+   * that will fail identically. Those take `config.invalid`, which is `escalate-to-human`.
+   */
   const reparse = (
     contractId: string,
+    request: StepStartRequest,
     value: unknown,
-  ): { readonly ok: true; readonly output: StepOutput } | { readonly ok: false; readonly detail: string } => {
+  ):
+    | { readonly ok: true; readonly output: StepOutput }
+    | { readonly ok: false; readonly detail: string; readonly code: string } => {
     let contract;
     try {
       contract = getContract(contractId);
     } catch (thrown: unknown) {
-      return { ok: false, detail: renderCause(thrown) ?? `unknown contract id "${contractId}"` };
+      return {
+        ok: false,
+        code: 'config.invalid',
+        detail: renderCause(thrown) ?? `unknown contract id "${contractId}"`,
+      };
     }
     const first = contract.schema.safeParse(value);
     if (!first.success) {
       return {
         ok: false,
+        code: 'step.schema_invalid_output',
         detail: first.error.issues
           .map((issue) => `${issue.path.map((part) => String(part)).join('.') || '(root)'}: ${issue.code}`)
           .join('; '),
@@ -644,6 +960,7 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
     if (!shaped.success) {
       return {
         ok: false,
+        code: 'config.invalid',
         detail:
           `the output satisfied "${contractId}" but is not a step output the loop can read: ` +
           shaped.error.issues
@@ -651,12 +968,38 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
             .join('; '),
       };
     }
+
+    /**
+     * The output has to be about the step that was asked for.
+     *
+     * Schema validity says the shape is right, not that the content belongs to this attempt. A model
+     * that names another step — copying the step name out of the evidence it read, or resuming a session
+     * whose transcript was about something else — produces an output that parses perfectly and that the
+     * loop would then record as *this* step's result, marking a step complete that never ran.
+     */
+    if (shaped.data.step !== request.step) {
+      return {
+        ok: false,
+        code: 'step.schema_invalid_output',
+        detail: `the output reports step "${shaped.data.step}" but this attempt is step "${request.step}"`,
+      };
+    }
+    if (shaped.data.contract_id !== contractId) {
+      return {
+        ok: false,
+        code: 'step.schema_invalid_output',
+        detail: `the output reports contract "${shaped.data.contract_id}" but was validated against "${contractId}"`,
+      };
+    }
     return { ok: true, output: shaped.data };
   };
 
   /** Map one attempt's outcome onto a termination. The whole of AD-8's reachability lives here. */
-  const terminationFor = (request: StepStartRequest, outcome: AttemptOutcome): StepTermination => {
-    const recorder = options.recorderFor(request.run, request.feature);
+  const terminationFor = (
+    request: StepStartRequest,
+    outcome: AttemptOutcome,
+    recorder: Recorder,
+  ): StepTermination => {
     const sessionId = outcome.sessionId;
 
     const record = (disposition: string, error: OrchError | null): void => {
@@ -668,7 +1011,9 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
           exit_code: outcome.exitCode,
           signal: outcome.signal,
           killed_by_executor: outcome.killedByExecutor,
+          timed_out: outcome.timedOut,
           had_terminal_output: outcome.result !== null,
+          api_key_source: outcome.apiKeySourceReport,
           ...(error === null ? {} : { code: error.code }),
         },
         ...(sessionId === null ? {} : { sessionId }),
@@ -697,8 +1042,17 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
       return terminated(request.step, 'killed', withSession);
     }
 
+    if (outcome.timedOut) {
+      // The attempt's wall-clock bound expired. `interrupted` rather than `killed`, because nobody
+      // decided to stop this step — it stopped making progress, which is what a resume is for.
+      record('interrupted', null);
+      return terminated(request.step, 'interrupted', withSession);
+    }
+
     const result = outcome.result;
     if (result === null) {
+      // `outcome.signal` already carries a wrapper's 128+n translation, so a signalled inner process
+      // reaches the same branch whether the child was the CLI or a wrapper around it.
       if (outcome.signal !== null) {
         // The one mapping that makes resume reachable at all.
         record('interrupted', null);
@@ -727,7 +1081,7 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
       return terminated(request.step, 'failed', { ...withSession, error });
     }
 
-    const parsed = reparse(request.contractId, result.structuredOutput);
+    const parsed = reparse(request.contractId, request, result.structuredOutput);
     if (!parsed.ok) {
       // The invalid output never reaches the loop, and never reaches the log either: only the reason
       // is recorded. AD-35 makes this code `escalate-model-tier`, which is the Stack's promotion
@@ -739,9 +1093,9 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
         ...(sessionId === null ? {} : { sessionId }),
       });
       const error = makeError(
-        'step.schema_invalid_output',
-        `The step's structured output did not satisfy the "${request.contractId}" contract, so it was ` +
-          'not accepted as a completed step.',
+        parsed.code,
+        `The step's structured output was not accepted against the "${request.contractId}" contract, ` +
+          'so it was not accepted as a completed step.',
         parsed.detail,
       );
       record('failed', error);
@@ -755,29 +1109,35 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
     }
     // The agent reported its own work blocked or failed. The output is not carried: the port gives
     // `output` only to a `completed` step, and what the AD-35 table is consulted about is the code.
-    const error =
-      output.error ??
-      makeError(
-        output.status === 'blocked' ? 'question.unanswerable' : 'step.verification_failed',
-        `The step reported status "${output.status}" without an error: ${output.summary}`,
-      );
+    const error = output.error ?? makeError(FALLBACK_STATUS_CODES[output.status], fallbackDetail(output));
     record(output.status, error);
     return terminated(request.step, output.status, { ...withSession, error });
   };
 
   return {
     lastPlan: (): SpawnPlan | null => lastPlan,
-    kill: (step: string): boolean => {
-      const running = live.get(step);
-      if (running === undefined) return false;
-      running.stop();
-      return true;
+    planOf: (run: string, step: string, attempt: number): SpawnPlan | null =>
+      plans.get(attemptKey(run, step, attempt)) ?? null,
+    kill: (step: string, run?: string): boolean => {
+      let stopped = false;
+      for (const running of live.values()) {
+        if (running.step !== step) continue;
+        if (run !== undefined && running.run !== run) continue;
+        running.stop();
+        stopped = true;
+      }
+      return stopped;
     },
     killAll: (): void => {
       for (const running of live.values()) running.stop();
     },
-    start: async (request: StepStartRequest): Promise<StepTermination> =>
-      terminationFor(request, await runAttempt(request, null)),
+    start: async (request: StepStartRequest): Promise<StepTermination> => {
+      // Resolved once per attempt and passed down. The provider may open a recorder, and AD-29 gives a
+      // log exactly one writer — so a second call after the child has already run would hit the
+      // single-writer refusal and throw away a termination that was fully earned.
+      const recorder = options.recorderFor(request.run, request.feature);
+      return terminationFor(request, await runAttempt(request, null, recorder), recorder);
+    },
     resume: async (request: StepResumeRequest): Promise<StepTermination> => {
       // AD-8 allows exactly one resume per recorded id: the fallback is a baseline reset and a
       // re-run, which the loop already owns. A second attempt against a spent id is refused without
@@ -790,23 +1150,52 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
           'this session id has already been resumed once and is spent',
         );
       }
-      spentSessions.add(request.sessionId);
 
-      const outcome = await runAttempt(request, request.sessionId);
+      const recorder = options.recorderFor(request.run, request.feature);
+      // Whether a child existed at all. A preflight refusal has not spent the run's one resume, so the
+      // id is only remembered as spent once a process really ran and really refused.
+      let childStarted = false;
+      const outcome = await runAttempt(request, request.sessionId, recorder, () => {
+        childStarted = true;
+      });
 
+      /**
+       * The refusal is read off the CLI's own `errors` array first.
+       *
+       * Recorded: a resume against a session the CLI no longer has emits a *complete* result line —
+       * `subtype: "error_during_execution"`, `is_error: true`, `num_turns: 0`, the requested session id,
+       * and `errors: ["No conversation found with session ID: …"]` — and exits 1. So the old structural
+       * test ("no result line and no session id") was false on both conjuncts and never fired, leaving a
+       * prose match on stderr as the only live signal. `errors` is structured JSON the CLI owns, which is
+       * what this should have been keyed on.
+       *
+       * The stderr patterns stay as a secondary signal, for a refusal that produces no result line at
+       * all, and each is pinned by its own test so neither can rot unnoticed.
+       */
+      const refusedByErrors =
+        outcome.result !== null &&
+        outcome.result.isError &&
+        outcome.result.errors.length > 0 &&
+        !outcome.result.hasStructuredOutput;
       const refusedByText = RESUME_REFUSAL_PATTERNS.some((pattern) =>
         pattern.test(outcome.stderrTail),
       );
-      // A resume that never reached an `init` line never found the session: the CLI died before
-      // opening one. That is a structural signal, not a message this system owns.
-      const refusedStructurally =
+      // A resume whose child never opened a session and produced no result at all did not find it.
+      const refusedBySilence =
         outcome.sessionId === null &&
         outcome.result === null &&
         outcome.signal === null &&
         !outcome.killedByExecutor &&
+        !outcome.timedOut &&
         outcome.exitCode !== 0;
-      if (refusedByText || refusedStructurally) {
-        const recorder = options.recorderFor(request.run, request.feature);
+
+      if (refusedByErrors || refusedByText || refusedBySilence) {
+        const evidence = refusedByErrors
+          ? 'the result line carried an errors array'
+          : refusedByText
+            ? 'the CLI said so on stderr'
+            : 'no session was opened and no result was produced';
+        if (childStarted) rememberSpent(request.sessionId);
         emit(recorder, {
           step: request.step,
           type: SPAWNER_EVENT_TYPES.AgentExited,
@@ -815,21 +1204,22 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
             exit_code: outcome.exitCode,
             signal: outcome.signal,
             code: 'step.resume_failed',
-            evidence: refusedByText ? 'the CLI said so' : 'no session was opened',
+            evidence,
           },
           sessionId: request.sessionId,
           baselineRef: request.baselineRef,
         });
+        const reported = outcome.result?.errors[0] ?? outcome.stderrTail.trim();
         throw new ResumeRefused(
           request.step,
           request.sessionId,
-          outcome.stderrTail === ''
+          reported === ''
             ? `the CLI exited with code ${String(outcome.exitCode)} without opening the session`
-            : outcome.stderrTail.trim(),
+            : reported,
         );
       }
 
-      return terminationFor(request, outcome);
+      return terminationFor(request, outcome, recorder);
     },
   };
 };

@@ -12,7 +12,7 @@
  */
 import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
@@ -33,6 +33,7 @@ import {
   isSubscriptionApiKeySource,
   forgetChildNode,
   forgetClaudeCli,
+  isExecutableFile,
   nodeCandidatesOnPath,
   parseClaudeVersion,
   parseNodeVersionOutput,
@@ -322,5 +323,92 @@ describe('resolving once', () => {
       first,
     );
     forgetClaudeCli();
+  });
+});
+
+describe('a provider switch that is set to off', () => {
+  it.each(['0', 'false', 'no', 'off', 'FALSE'])(
+    'does not refuse a subscription machine that writes CLAUDE_CODE_USE_BEDROCK=%s',
+    (value) => {
+      // The switch says "not Bedrock here", which is a statement *about* being on subscription auth.
+      // Refusing it would be the assertion misreading its own evidence and blocking a machine that
+      // satisfies AD-1.
+      expect(() =>
+        assertSubscriptionAuth(cleanEnv({ CLAUDE_CODE_USE_BEDROCK: value })),
+      ).not.toThrow();
+      expect(() => assertSubscriptionAuth(cleanEnv({ CLAUDE_CODE_USE_VERTEX: value }))).not.toThrow();
+    },
+  );
+
+  it('still refuses a switch that is on', () => {
+    for (const value of ['1', 'true', 'yes']) {
+      expect(() => assertSubscriptionAuth(cleanEnv({ CLAUDE_CODE_USE_BEDROCK: value }))).toThrowError(
+        ApiKeyModeRefusedError,
+      );
+    }
+  });
+
+  it('refuses a credential variable whatever its value, because presence is the evidence', () => {
+    // A key is configured by having a value, not by being "on": `ANTHROPIC_API_KEY=0` is still a key.
+    for (const value of ['0', 'false', 'off']) {
+      expect(() => assertSubscriptionAuth(cleanEnv({ ANTHROPIC_API_KEY: value }))).toThrowError(
+        ApiKeyModeRefusedError,
+      );
+    }
+  });
+});
+
+describe('the version banner', () => {
+  it('is read from the start, so another version in the text cannot decide the floor', () => {
+    expect(parseClaudeVersion('2.1.278 (Claude Code)')).toBe('2.1.278');
+    // A notice naming a different release must not be mistaken for the version that is installed.
+    expect(parseClaudeVersion('2.1.100 (Claude Code)\nA newer release, 9.9.9, is available')).toBe(
+      '2.1.100',
+    );
+    expect(parseClaudeVersion('Claude Code version 2.1.278')).toBeNull();
+  });
+});
+
+describe('the executable bit', () => {
+  it('is part of what "found on PATH" means', () => {
+    // A name that is merely present fails later as an opaque EACCES, which is the failure these
+    // modules exist to convert into a named refusal.
+    const dir = mkdtempSync(join(tmpdir(), 'orch-nonexec-'));
+    const unreadable = join(dir, 'claude');
+    writeFileSync(unreadable, '#!/bin/sh\necho "2.1.278 (Claude Code)"\n', 'utf8');
+    chmodSync(unreadable, 0o644);
+
+    expect(isExecutableFile(unreadable)).toBe(false);
+    expect(findOnPath('claude', { PATH: dir })).toBeNull();
+    expect(() => resolveClaudeCli({ env: cleanEnv({ PATH: dir }) })).toThrowError(
+      ClaudeCliUnavailableError,
+    );
+
+    chmodSync(unreadable, 0o755);
+    expect(isExecutableFile(unreadable)).toBe(true);
+    expect(findOnPath('claude', { PATH: dir })).toBe(unreadable);
+  });
+
+  it('is part of what a child Node candidate means', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'orch-nonexec-node-'));
+    writeFileSync(join(dir, 'node'), '#!/bin/sh\necho v24.21.0\n', 'utf8');
+    chmodSync(join(dir, 'node'), 0o644);
+    expect(nodeCandidatesOnPath({ PATH: dir })).toStrictEqual([]);
+    chmodSync(join(dir, 'node'), 0o755);
+    expect(nodeCandidatesOnPath({ PATH: dir })).toStrictEqual([join(dir, 'node')]);
+  });
+});
+
+describe('the resolved child Node path', () => {
+  it('is absolute even when the parent interpreter was given relatively', () => {
+    // AD-28's invariant is that every child is handed an absolute path; taking an injected relative
+    // one as given would break it at the one place it is established.
+    const resolved = resolveChildNode({
+      env: cleanEnv(),
+      parentExecPath: 'node',
+      parentVersion: '24.21.0',
+    });
+    expect(isAbsolute(resolved.path)).toBe(true);
+    expect(resolved.path.endsWith('node')).toBe(true);
   });
 });

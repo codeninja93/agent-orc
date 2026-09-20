@@ -17,7 +17,14 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { createStreamParser, parseStream, parseStreamLine } from '../src/engine/index.js';
+import {
+  createStreamParser,
+  MAX_STREAM_LINE_BYTES,
+  parseStream,
+  parseStreamLine,
+  UNNAMED_DENIED_TOOL,
+  UNREPORTED_API_KEY_SOURCE,
+} from '../src/engine/index.js';
 import type { StreamRecord } from '../src/engine/index.js';
 
 const FIXTURES = new URL('./fixtures/stream-json/', import.meta.url);
@@ -285,5 +292,134 @@ describe('every recorded fixture parses', () => {
     const records = parseStream(fixture(name));
     expect(records.length).toBeGreaterThan(0);
     expect(of(records, 'session')).toHaveLength(1);
+  });
+});
+
+describe('the refused resume, recorded from the real CLI', () => {
+  it('is one complete result line carrying the requested id and an errors array', () => {
+    // The shape that made the old structural test dead: there *is* a result line, and it *does* carry
+    // a session id, so a check for "neither" could never fire.
+    const records = parseStream(fixture('resume-refused.jsonl'));
+    const result = of(records, 'result')[0]!;
+    expect(result.subtype).toBe('error_during_execution');
+    expect(result.isError).toBe(true);
+    expect(result.numTurns).toBe(0);
+    expect(result.hasStructuredOutput).toBe(false);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain('No conversation found with session ID');
+    // The line carries the id that was *asked for*, which is why it must not be announced.
+    expect(result.sessionId).toBe('00000000-dead-4bee-8000-000000000000');
+  });
+
+  it('announces no session, because the id on it names one that does not exist', () => {
+    const records = parseStream(fixture('resume-refused.jsonl'));
+    expect(of(records, 'session')).toHaveLength(0);
+    const parser = createStreamParser();
+    parser.push(fixture('resume-refused.jsonl'));
+    expect(parser.sessionId()).toBeNull();
+  });
+
+  it('still announces the session opened by an init line before a later error result', () => {
+    // A real session that then errors is not a refusal: the id is live and resume may use it.
+    const records = parseStream(fixture('error-result.jsonl'));
+    expect(of(records, 'session')[0]?.sessionId).toBe(REAL_SESSION_ID);
+    expect(of(records, 'result')[0]?.errors).toHaveLength(0);
+  });
+});
+
+describe('the reported authentication source', () => {
+  it('treats an init line with no apiKeySource as unreported, never as a refusal', () => {
+    const records = parseStream(fixture('api-key-source-unreported.jsonl'));
+    const source = of(records, 'api_key_source')[0]!;
+    expect(source.reported).toBe(false);
+    expect(source.source).toBe(UNREPORTED_API_KEY_SOURCE);
+    // Absence is not denial: an unreported field must not fail every spawn with an unretryable code.
+    expect(source.subscription).toBe(true);
+  });
+
+  it('treats a named non-subscription source as a refusal', () => {
+    const source = of(parseStream(fixture('api-key-mode.jsonl')), 'api_key_source')[0]!;
+    expect(source.reported).toBe(true);
+    expect(source.source).toBe('ANTHROPIC_API_KEY');
+    expect(source.subscription).toBe(false);
+  });
+
+  it('reports no record at all when no init line arrived', () => {
+    const parser = createStreamParser();
+    parser.push(fixture('resume-refused.jsonl'));
+    // Distinct from "unreported": the check never ran, and the spawner records which happened.
+    expect(parser.apiKeySource()).toBeNull();
+  });
+});
+
+describe('a denial the parser cannot fully read', () => {
+  it('is still a denial, under a placeholder name', () => {
+    // Silence is the one direction a permission event must never fail in, so an unreadable tool name
+    // costs the name, not the event.
+    const records = parseStreamLine(
+      '{"type":"system","subtype":"permission_denied","decision_reason":"blocked","session_id":"s1"}',
+    );
+    const denials = of(records, 'permission_denied');
+    expect(denials).toHaveLength(1);
+    expect(denials[0]?.toolName).toBe(UNNAMED_DENIED_TOOL);
+    expect(denials[0]?.origin).toBe('line');
+  });
+
+  it('keeps two distinct id-less refusals of the same tool for the same reason', () => {
+    const line = '{"type":"system","subtype":"permission_denied","tool_name":"Write","decision_reason":"same","session_id":"s1"}';
+    const parser = createStreamParser();
+    const records = [...parser.push(`${line}\n${line}\n`), ...parser.end()];
+    // Two refusals happened, so two events must exist. Collapsing them hides one.
+    expect(of(records, 'permission_denied')).toHaveLength(2);
+  });
+
+  it('still collapses the result line\'s repeat of an id-less refusal', () => {
+    const systemLine =
+      '{"type":"system","subtype":"permission_denied","tool_name":"Write","decision_reason":"same","session_id":"s1"}';
+    const resultLine =
+      '{"type":"result","subtype":"success","session_id":"s1","permission_denials":[{"tool_name":"Write","decision_reason":"same"}]}';
+    const parser = createStreamParser();
+    const records = [...parser.push(`${systemLine}\n${resultLine}\n`), ...parser.end()];
+    expect(of(records, 'permission_denied')).toHaveLength(1);
+  });
+});
+
+describe('the pending buffer', () => {
+  it('is capped, so an endless line cannot grow it without limit', () => {
+    const parser = createStreamParser();
+    const chunk = 'x'.repeat(1024 * 1024);
+    let skipped = 0;
+    // Five megabytes with no newline anywhere: unvalidated output from another process.
+    for (let i = 0; i < 5; i += 1) skipped += of(parser.push(chunk), 'unparseable').length;
+    expect(skipped).toBe(1);
+    expect(of(parser.push(chunk), 'unparseable')).toHaveLength(0);
+  });
+
+  it('resynchronises on the newline after an over-long line', () => {
+    const parser = createStreamParser();
+    parser.push('y'.repeat(MAX_STREAM_LINE_BYTES + 1));
+    const after = parser.push('\n{"type":"system","subtype":"init","apiKeySource":"none"}\n');
+    expect(of(after, 'api_key_source')).toHaveLength(1);
+    expect(of(after, 'unparseable')).toHaveLength(0);
+  });
+
+  it('never carries the over-long bytes into the record', () => {
+    const parser = createStreamParser();
+    const records = parser.push(`sk-ant-${'z'.repeat(MAX_STREAM_LINE_BYTES)}`);
+    const skipped = of(records, 'unparseable')[0]!;
+    expect(skipped.reason).toContain('cap');
+    expect(JSON.stringify(skipped)).not.toContain('sk-ant');
+  });
+});
+
+describe('the spliced denial fixture', () => {
+  it('names only the session that actually ran', () => {
+    // A foreign session id on a spliced line would attribute the denial the spawner suite asserts on
+    // to a session that never existed in that transcript.
+    const text = fixture('completed-with-denial.jsonl');
+    expect(text).not.toContain('68fdef4f');
+    for (const record of of(parseStream(text), 'permission_denied')) {
+      expect(record.sessionId).toBe(REAL_SESSION_ID);
+    }
   });
 });

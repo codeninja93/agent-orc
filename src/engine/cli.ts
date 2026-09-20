@@ -19,7 +19,7 @@
  * reasons are recorded beside it so a bump is an argument rather than a guess.
  */
 import { execFileSync } from 'node:child_process';
-import { closeSync, openSync, readSync, statSync } from 'node:fs';
+import { accessSync, closeSync, constants, openSync, readSync, statSync } from 'node:fs';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 
 import { compareVersions, parseVersion } from '../contracts/index.js';
@@ -52,6 +52,22 @@ export const CLAUDE_API_KEY_MODE_ENV_VARS = [
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_USE_VERTEX',
 ] as const;
+
+/**
+ * The two variables above that are switches rather than credentials.
+ *
+ * A credential variable is configured by having *any* value, so its presence is the evidence. A switch
+ * is configured by being *on*, and a deployment that writes `CLAUDE_CODE_USE_BEDROCK=0` to say "not
+ * Bedstock here" is on subscription auth — refusing it would be the assertion misreading its own
+ * evidence and blocking a machine that satisfies AD-1.
+ */
+const CLAUDE_PROVIDER_SWITCH_ENV_VARS: readonly string[] = [
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+];
+
+/** Values a switch is off at. Anything else is on. */
+const SWITCH_OFF_VALUES: readonly string[] = ['0', 'false', 'no', 'off'];
 
 /**
  * The `apiKeySource` a subscription-authenticated CLI reports on its `system`/`init` stream line.
@@ -160,6 +176,12 @@ export const assertSubscriptionAuth = (env: NodeJS.ProcessEnv = process.env): vo
   for (const variable of CLAUDE_API_KEY_MODE_ENV_VARS) {
     const value = env[variable];
     if (value === undefined || value.trim() === '') continue;
+    if (
+      CLAUDE_PROVIDER_SWITCH_ENV_VARS.includes(variable) &&
+      SWITCH_OFF_VALUES.includes(value.trim().toLowerCase())
+    ) {
+      continue;
+    }
     throw new ApiKeyModeRefusedError(
       variable,
       `${variable} is set in this environment, so the CLI would resolve to API-key mode`,
@@ -167,9 +189,15 @@ export const assertSubscriptionAuth = (env: NodeJS.ProcessEnv = process.env): vo
   }
 };
 
-/** Read the version from `claude --version` output, e.g. `2.1.278 (Claude Code)`. */
+/**
+ * Read the version from `claude --version` output, e.g. `2.1.278 (Claude Code)`.
+ *
+ * Anchored to the start of the output, so the version asserted against the floor is the one the CLI
+ * announced itself as and not some other version triple further along the banner — a deprecation
+ * notice or an update hint naming a different release would otherwise decide whether the floor holds.
+ */
 export const parseClaudeVersion = (output: string): string | null => {
-  const match = /(\d+)\.(\d+)\.(\d+)/.exec(output.trim());
+  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(output.trim());
   if (match === null) return null;
   return `${match[1] ?? '0'}.${match[2] ?? '0'}.${match[3] ?? '0'}`;
 };
@@ -182,16 +210,33 @@ const isFile = (path: string): boolean => {
   }
 };
 
+/**
+ * A file the current user can execute.
+ *
+ * A `PATH` lookup is looking for something to *run*, so the executable bit is part of the question. A
+ * name that is merely present is "found" by a stat alone and then fails at spawn with an opaque EACCES
+ * — which is exactly the opaque failure these two modules exist to convert into a named refusal.
+ */
+export const isExecutableFile = (path: string): boolean => {
+  if (!isFile(path)) return false;
+  try {
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 /** Find an executable by name on the given `PATH`, as an absolute path, or null. */
 export const findOnPath = (name: string, env: NodeJS.ProcessEnv = process.env): string | null => {
   if (name.includes('/')) {
     const direct = isAbsolute(name) ? name : resolve(name);
-    return isFile(direct) ? direct : null;
+    return isExecutableFile(direct) ? direct : null;
   }
   for (const entry of (env['PATH'] ?? '').split(delimiter)) {
     if (entry === '') continue;
     const candidate = isAbsolute(entry) ? join(entry, name) : resolve(entry, name);
-    if (isFile(candidate)) return candidate;
+    if (isExecutableFile(candidate)) return candidate;
   }
   return null;
 };

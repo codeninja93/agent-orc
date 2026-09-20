@@ -2,15 +2,115 @@
 title: 'Step spawner — the claude -p subprocess contract'
 type: 'feature'
 created: '2026-09-20'
-status: 'in-review'
+status: 'done'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 context:
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/SPEC.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-3-engine-reconciler.md'
 warnings: ['oversized'] # 9 files and 14 I/O scenarios; AD-1 is the densest single AD in the spine
-deferred: []
+deferred:
+  - summary: >-
+      CONTRACT CONFLICT, UNRESOLVED AND ESCALATED: --restricted strips every code-running tool unless
+      --tools names them, and no spawn passes --tools.
+    evidence: |-
+      VERIFIED by the parent against the installed CLI 2.1.278 help text: '--restricted ... removes
+      the built-in tools that run commands or code (Bash, PowerShell, REPL and the other code-running
+      tools) and WebFetch unless --tools names them'. AD-1 mandates --restricted on every spawn;
+      CAP-13 requires deterministic gates (typecheck, lint, tests) to run before any model-based
+      review. A step agent spawned exactly as AD-1 specifies can edit files but cannot run tests,
+      lint, typecheck or git, so stories 2-5, 2-6 and 2-7 cannot do their jobs as specified. Story 1-4
+      is correct against its own spec; the specs conflict. Three options were put to the user: pass
+      --tools naming what steps need; drop --restricted and rely on AD-20's container for containment
+      (the parent's recommendation, since a read-only root, dropped capabilities and an egress
+      allowlist bound a Bash tool far more meaningfully than a flag does); or split the flag by step
+      kind. The second and third amend ARCHITECTURE-SPINE.md, an adopted companion. NOT RESOLVED —
+      awaiting the user's decision before story 2-5.
+    location: >-
+      src/engine/spawner.ts, ARCHITECTURE-SPINE.md AD-1, SPEC.md CAP-13
+    severity: high
+  - summary: >-
+      No suite wires the real spawner into the reconciler, so every loop-facing expectation is
+      asserted at the spawner's return value.
+    evidence: |-
+      The intent phrases several expectations about the loop ('the loop never receives an output the
+      executor has not validated'). Those are proven at createStepSpawner's boundary, not through
+      reconciler.ts. The first real integration arrives with the step agents in 2-4 onward, and the
+      reconciler's new catch of spawner rejections is the intended interaction but is exercised only
+      against the scripted double.
+    location: >-
+      tests/engine.spawner.test.ts
+    severity: medium
+  - summary: >-
+      A run has no cost or token accounting: total_cost_usd, usage and modelUsage are parsed and
+      discarded.
+    evidence: |-
+      The event log is the only observability surface, so CAP-16's 'consumption is visible without
+      issuing a command' has nothing to read. Belongs with AD-24's ceilings in story 2-9, which is
+      also where the unbounded-retry deferrals from 1-3 and 1-4 land.
+    location: >-
+      src/engine/stream.ts, src/engine/spawner.ts
+    severity: medium
+  - summary: >-
+      Permanently-failing result subtypes and an argv the CLI rejects are both mapped to retryable
+      codes.
+    evidence: |-
+      error_prompt_too_long and error_max_tokens cannot be cleared by a retry, and a usage error means
+      the CLI will never accept those bytes, yet both route to retry-with-backoff. Combined with the
+      unbounded retry deferred in story 1-3 this is an infinite loop on a permanent failure. Wants
+      2-9's ceilings plus a non-retryable classification.
+    location: >-
+      src/engine/spawner.ts
+    severity: medium
+  - summary: >-
+      An orphaned child cannot be found or reaped from the log after an engine crash.
+    evidence: |-
+      agent.spawned records no pid and `live` is in-memory only, while AD-32 makes reclamation a
+      reconcile action. A child that outlives its engine is currently invisible to the sweep story 1-6
+      will build.
+    location: >-
+      src/engine/spawner.ts
+    severity: medium
+  - summary: >-
+      Auth resolved by apiKeyHelper, managed settings or --settings is caught only after a process has
+      run.
+    evidence: |-
+      assertSubscriptionAuth reads four environment variables, so 'refused before any spawn' holds
+      only for those. Every other path the CLI can resolve a credential through is caught by the
+      in-stream apiKeySource check, which now works and is now tested, but fires after the child ran.
+    location: >-
+      src/engine/cli.ts
+    severity: medium
+  - summary: >-
+      The claude CLI version floor is duplicated between cli.ts and the spine's Stack table, and the
+      pinned floor exceeds what the code exercises.
+    evidence: |-
+      The Node floor is deliberately read from package.json so it cannot gain a third home; the CLI
+      floor is a literal whose only test restates it, so it drifts silently from the doc. Separately
+      the floor 2.1.259 is justified by --permission-prompts, which buildStepArgv never passes, so no
+      test ties the floor to a feature.
+    location: >-
+      src/engine/cli.ts
+    severity: medium
+  - summary: >-
+      A permission denial alongside a completed status leaves permission.denied's escalate-to-human
+      disposition unreachable.
+    evidence: |-
+      A refused tool call completes silently. Whether a denial should force a blocked termination is a
+      policy question for the roster stories rather than a spawner bug.
+    location: >-
+      src/engine/spawner.ts
+    severity: medium
+  - summary: >-
+      PROCESS NOTE: the parent generated 1-4's review diff from an explicit file list and omitted
+      tests/engine.reconciler.test.ts.
+    evidence: |-
+      All four layers therefore reviewed a diff that would fail its own suite, and reported that as a
+      finding. The commit and the tree are correct. Recorded because it cost four reviewers attention
+      on an artifact of the parent's filtering, and because a future review should diff a commit range
+      rather than a file list.
+    severity: low
 baseline_revision: '26ec37cce1805f516f9dbfe480a129c57df25305'
 ---
 
@@ -135,6 +235,73 @@ Carried forward from stories 1-1 through 1-3:
 
 ## Review Triage Log
 
+### 2026-09-20 — Review pass
+- verdicts: 60 findings — high 12, medium 23, low 24, false 1, maybe-false 0
+- layers: blind-hunter (19), edge-case-hunter (24), verification-gap (5 gap + 4 other), intent-alignment (8)
+- the verification-gap layer demonstrated five mutations against the full suite and reverted each byte-identically, sha256-verified.
+- the intent-alignment layer measured the real CLI's resume-refusal shape without spending a model call; the parent reproduced it.
+- findings:
+  - `[high]` `[defer]` BH/VG --restricted strips Bash and every code-running tool unless --tools names them, which no spawn passes — VERIFIED by the parent against the installed CLI's own help text. AD-1 mandates --restricted on every spawn and CAP-13 requires deterministic gates (typecheck, lint, tests) to run, so a step agent spawned as specified cannot run tests, lint or git. This is a conflict between AD-1 and CAP-13, not a defect in this story, and resolving it edits ARCHITECTURE-SPINE.md. ESCALATED TO THE USER, unresolved.
+  - `[high]` `[patch]` IA/VG refusedStructurally is dead against the real CLI, leaving a stderr prose match as the only live resume-refusal signal — MEASURED by the parent with no model call (num_turns 0, cost 0): a refused resume emits a full result line with subtype error_during_execution, is_error true, session_id equal to the requested id, and a structured errors[] array. Both conjuncts of the predicate are false. Patched: the refusal now reads errors[] first, stderr patterns are secondary, and the fixture is derived from the parent's recorded transcript.
+  - `[high]` `[patch]` IA onSessionId was called with the dead id from a refusal line, before ResumeRefused was thrown — Patched: a refusal line no longer reports a session id.
+  - `[high]` `[patch]` VG both refusal tests were satisfied by the structural signal, so the text signal was unpinned — DEMONSTRATED: replacing refusedByText with false left the full suite green at 542. The fake wrote the inverse of the real shape. Patched with the recorded shape plus a case the structural signal cannot see.
+  - `[high]` `[patch]` BH/EC no wall-clock bound on an attempt: start() could never settle — VERIFIED: no setTimeout or AbortSignal anywhere in the spawner. Patched with DEFAULT_ATTEMPT_TIMEOUT_MS.
+  - `[high]` `[patch]` BH/EC SIGTERM with no escalation, so killAll() could hang forever — VERIFIED: EXECUTOR_KILL_SIGNAL with no follow-up. Patched with a grace period then SIGKILL, and a fake-claude mode that declines SIGTERM so the escalation is pinned.
+  - `[high]` `[patch]` BH/EC live and lastPlan keyed by step name alone, so two runs collide — VERIFIED. Patched: keyed on run, step and attempt.
+  - `[high]` `[patch]` BH/VG missingRequiredFlags guarded the pre-wrap vector while the post-wrap one executed — VERIFIED: the guard read plan.cliArgs while spawn used plan.args, so a story 1-5 wrapper dropping --restricted would pass it. Patched to assert the executed vector.
+  - `[high]` `[patch]` BH/EC interrupted required signal !== null, so a wrapped child's 128+n exit mapped to failed — VERIFIED. This is the failure this story's own Design Notes single out as making resume dead code, and it lands exactly at the seam story 1-5 plugs into. Patched with signalFromExitCode.
+  - `[high]` `[patch]` EC a missing apiKeySource field failed every attempt with escalate-to-human — VERIFIED: the parser defaulted the field to '(unreported)', which is not 'none', so every spawn terminated model.api_key_mode_refused. Patched.
+  - `[high]` `[patch]` VG the in-stream apiKeySource refusal was unexercised by any fixture — DEMONSTRATED: replacing the whole case body with a bare break left the full suite green at 542, so AD-1's second catch could be deleted silently. All nine fixtures carried apiKeySource none. Patched with a derived fixture.
+  - `[high]` `[patch]` VG the direct-interpreter branch — the one a real install takes — was never spawned — DEMONSTRATED: changing the direct branch's args to [] left the suite green at 542. The real claude is a Mach-O binary that classifies as direct; every test pinned interpreter node. Patched with an executable shim harness.
+  - `[medium]` `[patch]` BH/EC recorderFor called at three sites per attempt against a single-writer recorder — VERIFIED: a second open would throw after the child had already run, losing the termination. Patched: resolved once per attempt.
+  - `[medium]` `[patch]` BH/EC a dropped artifact was invisible, and emit/onSessionId ran unguarded in stream handlers — Patched: recordResult is checked, and both are wrapped so a throw cannot leave the attempt unsettled.
+  - `[medium]` `[patch]` EC the re-parsed output was never checked against the requested step or contract_id — VERIFIED. Patched, and a contract-wiring failure now carries config.invalid rather than escalate-model-tier, so a wiring bug no longer promotes the model rung for something no model can fix.
+  - `[medium]` `[patch]` EC spentSessions burned the one permitted resume before any process existed — Patched: marked spent only once a child exists.
+  - `[medium]` `[patch]` VG the fallback codes for an agent-reported blocked/failed output were unpinned — DEMONSTRATED: swapping question.unanswerable and step.verification_failed left the spawner suite green at 29/29, and those have opposite dispositions. Patched with error: null variants.
+  - `[medium]` `[patch]` VG mcpConfigs never reached a spawned child in any test — DEMONSTRATED: deleting the spread left the suite green at 542, so every configured MCP server could be dropped silently while --strict-mcp-config still suppressed the repo's own. Patched.
+  - `[medium]` `[patch]` EC CLAUDE_CODE_USE_BEDROCK/_VERTEX set to '0' refused a subscription machine — Patched: falsy values treated as off.
+  - `[medium]` `[patch]` EC the --version parse matched any version triple in the output — Patched: anchored.
+  - `[medium]` `[patch]` EC parentExecPath was never resolved, breaking AD-28's never-relative invariant — Patched.
+  - `[medium]` `[patch]` BH isExecutableFile/isFile never tested the executable bit — A non-executable claude or node was 'found' and failed later as an opaque EACCES. Patched.
+  - `[medium]` `[patch]` BH/EC the stream parser's pending buffer was unbounded — Patched with a cap that emits an unparseable skip.
+  - `[medium]` `[patch]` BH/EC a denial with an unrecognisable tool name became silence — The module's own comment calls this the worst direction for a permission event to fail in. Patched.
+  - `[low]` `[patch]` EC the denial dedup key collapsed two distinct refusals of one tool when tool_use_id was absent — Patched.
+  - `[medium]` `[patch]` BH/IA the completed-with-denial fixture carried a foreign session id — The denial event the suite asserted on was attributed to a session that never ran. Patched: normalised.
+  - `[medium]` `[patch]` BH agent.spawned logged the flag constant rather than the observed argv — The log recorded intent rather than fact. Patched.
+  - `[medium]` `[defer]` BH the claude CLI floor is duplicated in cli.ts and the spine's Stack table with nothing tying them — The Node floor is read from the manifest precisely to avoid a third home; the CLI floor is a literal whose only test restates it. Deferred: deriving it needs a machine-readable Stack table.
+  - `[low]` `[defer]` BH CHILD_NODE_ENV_VAR and CHILD_NODE_PUBLISHED_ENV_VAR hold one value, coupling a publish to an operator pin — A nested engine reads the published path as a deliberate pin, and a stale one becomes a hard refusal a level down.
+  - `[medium]` `[defer]` BH/EC total_cost_usd, usage and modelUsage are parsed and discarded, so a run has no cost or token accounting — The event log is the only observability surface, and CAP-16's usage visibility has nothing to read. Belongs with ceilings in story 2-9.
+  - `[medium]` `[defer]` BH agent.spawned records no pid and live is in-memory, so an orphaned child cannot be reaped from the log — AD-32 makes reclamation a reconcile action; a child outliving an engine crash is currently unfindable.
+  - `[low]` `[defer]` BH defaultPromptFor re-sends the full initial prompt alongside --resume, and no test asserts anything about it — Harmless today, but it is the kind of thing that silently doubles a prompt's cost.
+  - `[medium]` `[defer]` EC result subtypes other than error_max_turns map to a retryable code — error_prompt_too_long and error_max_tokens are permanent, so the loop retries identical bytes forever. Interacts with the unbounded retry deferred in story 1-3; both want 2-9's ceilings.
+  - `[medium]` `[defer]` EC a CLI that rejects the argv maps to step.stream_malformed and is retried forever with identical bytes — Same family as above.
+  - `[medium]` `[defer]` EC a permission denial alongside a completed status leaves escalate-to-human unreachable — A refused tool completes silently. Deciding whether a denial should force blocked is a policy question for the roster stories.
+  - `[low]` `[defer]` EC agent.spawned is emitted before spawn() can throw, so the log can show a spawn with no exit — Narrow window; the fold tolerates it.
+  - `[low]` `[defer]` EC/BH fake-claude has no catch on main(), so a harness bug reads as a malformed stream — Test-harness robustness.
+  - `[medium]` `[defer]` IA the port-integration surface is untouched: no suite wires the real spawner into the reconciler — Every loop-facing expectation — 'the loop never receives an output the executor has not validated' — is asserted at the spawner's return value instead. The first real integration is story 2-4 onward.
+  - `[medium]` `[defer]` IA the pinned CLI floor 2.1.259 is justified by --permission-prompts, which buildStepArgv never passes — The floor exceeds anything the code exercises and no test ties it to a feature.
+  - `[medium]` `[defer]` IA auth resolved by apiKeyHelper, managed settings or --settings is caught only post-hoc — The env-var gate cannot see those paths, so 'refused before any spawn' holds only for the four variables. The in-stream check is the fallback, and it now works, but it fires after a process ran.
+  - `[low]` `[defer]` IA stream lines with no declared event type are dropped — assistant text, tool results, rate_limit_event and thinking_tokens are recorded nowhere. The story chose the declared-vocabulary reading and said so.
+  - `[low]` `[reject]` IA/VG the version-floor refusal does create a process (--version), so 'no process created' is imprecise — cli.ts's own comment claims no-process-whatsoever only for the API-key row, which is accurate. The matrix wording is loose; the behaviour is right.
+  - `[false]` `[reject]` BH/EC/IA/VG the diff does not contain the tests/engine.reconciler.test.ts edit its change log describes, so npm test fails by construction — REFUTED as a code defect: this was the parent's diff-generation error. 1-4's diff was filtered by an explicit file list that omitted that file, which the story legitimately modified to narrow story 1-3's boundary guard. The commit and the tree are correct and green; four layers reported an artifact of the parent's filter.
+  - `[low]` `[reject]` BH/EC minor item 1 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 2 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 3 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 4 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 5 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 6 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 7 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 8 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 9 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 10 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 11 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 12 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 13 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 14 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 15 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 16 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+  - `[low]` `[reject]` BH/EC minor item 17 folded into the patches above or judged cosmetic — Counted for completeness: smaller robustness and naming observations that the patch round absorbed or that name no harm.
+
 ## Design Notes
 
 **The fixture must be recorded, not invented.** The whole value of parsing `stream-json` is that it matches what the CLI actually emits. A parser tested only against fixtures written from the parser's own assumptions proves nothing — the same trap story 1-1 avoided by recording a real `structured_output`. Record one genuine transcript with a real `claude -p --output-format stream-json` invocation, commit it, and derive the error-shape variants from it by editing that real shape rather than writing JSON from scratch.
@@ -158,3 +325,67 @@ export PATH="/Users/deep/.nvm/versions/node/v24.21.0/bin:$PATH"   # node v24.21.
 - `npm run build` -- expected: exit 0
 - `grep -rn "docker" src/engine/` -- expected: no match; the container wrapper is story 1-5
 - `grep -rn "from '\.\./" src/engine/` -- expected: only `../contracts/...` and `../runtime/...`
+
+## Auto Run Result
+
+Status: done
+Blocking condition: none — but one contract conflict is escalated and unresolved (see `deferred[0]`)
+
+**Implemented change.** `src/engine/` gained the real `StepExecutor` behind the port story 1-3 defined:
+`cli.ts` (binary location, version floor, subscription-auth preflight), `node-path.ts` (AD-28's absolute
+child Node, published to the child's env so a grandchild cannot resolve a stale one), `stream.ts` (the
+incremental `stream-json` parser), and `spawner.ts` (argv construction, one child per attempt, disposition
+mapping, `structured_output` re-parse, and the AD-20 `SpawnWrapper` seam). `reconciler.ts` and
+`executor.ts` are byte-unchanged.
+
+**Review.** Four layers reported **60 findings — high 12, medium 23, low 24, false 1**, routed to 26 patch
+entries, 9 deferred entries and the rest rejected. The verification-gap layer demonstrated five mutations
+against the full suite and reverted each byte-identically with sha256 verification. The intent-alignment
+layer measured the real CLI's behaviour without spending a model call, which produced the review's second
+most important finding.
+
+**The finding that matters most is not a defect in this story.** `--restricted` strips Bash and every
+code-running tool unless `--tools` names them — read from the installed CLI's own help text and verified by
+the parent. AD-1 mandates `--restricted` on every spawn; CAP-13 requires deterministic gates to run. A step
+agent spawned exactly as specified cannot run tests, lint, typecheck or git, so stories 2-5, 2-6 and 2-7
+cannot do their jobs. The specs conflict, the resolution amends an adopted companion, and it was escalated
+to the user rather than guessed at. See `deferred[0]`.
+
+**The second: `refusedStructurally` was dead against the real CLI.** It required `result === null &&
+sessionId === null`, but a real refused resume emits a full result line carrying `subtype:
+error_during_execution`, `is_error: true`, the requested `session_id`, and a structured `errors[]` array,
+exiting 1. Both conjuncts were false, so the only live signal was a prose regex on stderr — wording the
+module explicitly said it did not want to own. A reviewer showed the text signal was itself unpinned
+(deleting it left the suite green), and the fake CLI produced the *inverse* shape, so both refusal tests
+exercised something the CLI never emits. The parent measured the real shape (`num_turns: 0`,
+`total_cost_usd: 0` — no model call) and handed the recorded transcript to the patch round. The refusal now
+reads `errors[]` first, and the fixture is derived from those bytes.
+
+That gap traces back to the spec: the Design Note demanded recorded fixtures without saying *which shapes*
+had to be recorded, so the discipline was applied to the happy path and skipped on the refusal path — the one
+path AD-8 depends on.
+
+**Three mutations proved the suite could not see a regression in code that actually ships:** the in-stream
+`apiKeySource` refusal (all nine fixtures carried `none`, so AD-1's second catch could be deleted silently);
+the `direct`-interpreter branch, which is the one a real Mach-O `claude` install takes and which every test
+bypassed by pinning `interpreter: 'node'`; and `mcpConfigs`, which never reached a spawned child, so every
+configured MCP server could be dropped while `--strict-mcp-config` still suppressed the repository's own.
+
+**Parent verification after the patch round:** `typecheck`, `lint`, `build` exit 0; `npm test` → 16 files,
+**586 passed** (was 542). Spot-verified by reading the patched source: the refusal keys off `errors[]`; the
+committed fixture matches the measured transcript byte for byte; `DEFAULT_ATTEMPT_TIMEOUT_MS` and a
+`SIGKILL` escalation exist; `live` is keyed on run, step and attempt; `missingRequiredFlags` now reads
+`plan.args`, the executed vector; and `signalFromExitCode` treats 128+n as a signal so resume survives the
+container seam. The parent also fixed two lint failures the rate-limited agent left behind — both genuinely
+empty functions (a no-op default callback, and a handler that deliberately ignores SIGTERM to give the new
+escalation something to escalate against), suppressed at the site with the reason rather than contorted.
+
+**Process note.** The implementation agent was interrupted twice: once by a stream stall and once by a
+session rate limit. Both times it was resumed from its own transcript rather than restarted, and the second
+time the parent finished the remaining lint work directly. Separately, the parent generated this story's
+review diff from an explicit file list and omitted `tests/engine.reconciler.test.ts`, so all four layers
+reviewed a diff that would fail its own suite and three of them reported it. The tree was always correct;
+future reviews should diff a commit range.
+
+**Follow-up review recommended: true** — the escalated `--restricted` conflict is unresolved, and the patch
+round itself has not been reviewed.

@@ -15,7 +15,7 @@
  * a test could notice, so the argv is compared against the declared constant and the child is asked
  * what it actually received.
  */
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +34,7 @@ import {
   buildStepArgv,
   errorCodeForResult,
   missingRequiredFlags,
+  signalFromExitCode,
   resolveClaudeCli,
   ResumeRefused,
   SPAWNER_EMITTER,
@@ -69,6 +70,9 @@ const childNode: ChildNode = {
 
 const REAL_SESSION_ID = '33f452b6-11d0-4ea7-89e9-7dc2962643ad';
 
+/** The id the real CLI's refusal transcript was recorded against. */
+const DEAD_SESSION_ID = '00000000-dead-4bee-8000-000000000000';
+
 const stepInputFixture = (): StepInput =>
   StepInputSchema.parse(
     JSON.parse(
@@ -81,6 +85,9 @@ interface Harness {
   readonly feature: string;
   readonly worktree: string;
   readonly spawner: StepSpawner;
+  /** The same recorder the spawner writes through, for a test that builds a second spawner. */
+  readonly recorder: Recorder;
+  readonly env: NodeJS.ProcessEnv;
   readonly request: (overrides?: Partial<StepStartRequest>) => StepStartRequest;
   readonly sessionIds: string[];
   readonly events: () => readonly EventEnvelope[];
@@ -98,6 +105,11 @@ const open = (
     readonly cli?: ClaudeCli | (() => ClaudeCli);
     readonly mcpConfigs?: readonly string[];
     readonly wrap?: (plan: SpawnPlan) => SpawnPlan;
+    /** Run the fake through a `#!/bin/sh` shim, so the `direct` interpreter branch really executes. */
+    readonly direct?: boolean;
+    readonly attemptTimeoutMs?: number;
+    readonly killGraceMs?: number;
+    readonly refusalFixture?: string;
   } = {},
 ): Harness => {
   const home = mkdtempSync(join(tmpdir(), 'orch-spawner-home-'));
@@ -116,19 +128,37 @@ const open = (
       ? {}
       : { FAKE_CLAUDE_FIXTURE: join(FIXTURES, options.fixture) }),
     FAKE_CLAUDE_ARGV_OUT: argvOut,
+    FAKE_CLAUDE_REFUSAL_FIXTURE: join(FIXTURES, options.refusalFixture ?? 'resume-refused.jsonl'),
     ...options.fakeEnv,
   };
   // A developer's own API-key environment must not decide what this suite proves.
   delete env['ANTHROPIC_API_KEY'];
   delete env['ANTHROPIC_AUTH_TOKEN'];
 
+  /**
+   * A real executable that execs the fake.
+   *
+   * The `direct` branch is the one a real install takes — `claude` on this machine is a compiled
+   * Mach-O binary, which `classifyCliEntry` calls `direct` — and pinning `interpreter: 'node'` in every
+   * test left it never executed. A `#!/bin/sh` shim is a genuine executable with no Node interpreter to
+   * substitute, so the branch runs for real and the same argv assertions apply to it.
+   */
+  const directShim = (): ClaudeCli => {
+    const shim = join(home, 'claude');
+    writeFileSync(shim, `#!/bin/sh\nexec ${process.execPath} ${FAKE_CLI_PATH} "$@"\n`, 'utf8');
+    chmodSync(shim, 0o755);
+    return { path: shim, version: '2.1.278', auth: 'subscription', interpreter: 'direct' };
+  };
+
   const spawner = createStepSpawner({
     recorderFor: () => recorder,
-    cli: options.cli ?? fakeCli,
+    cli: options.cli ?? (options.direct === true ? directShim() : fakeCli),
     node: childNode,
     env,
     ...(options.mcpConfigs === undefined ? {} : { mcpConfigs: options.mcpConfigs }),
     ...(options.wrap === undefined ? {} : { wrap: options.wrap }),
+    ...(options.attemptTimeoutMs === undefined ? {} : { attemptTimeoutMs: options.attemptTimeoutMs }),
+    ...(options.killGraceMs === undefined ? {} : { killGraceMs: options.killGraceMs }),
   });
 
   const inputPath = join(worktree, 'step-input.json');
@@ -162,6 +192,8 @@ const open = (
     feature,
     worktree,
     spawner,
+    recorder,
+    env,
     request,
     sessionIds,
     events,
@@ -362,6 +394,7 @@ describe('an output that fails its schema', () => {
         structuredOutput: undefined,
         sessionId: null,
         numTurns: null,
+        errors: [],
       }),
     ).toBe('step.stream_malformed');
   });
@@ -484,30 +517,73 @@ describe('resume', () => {
     ).toBe(REAL_SESSION_ID);
   });
 
-  it('throws ResumeRefused carrying step.resume_failed when the session is gone', async () => {
-    const harness = openTracked({
-      fixture: 'completed.jsonl',
-      fakeEnv: { FAKE_CLAUDE_REFUSE_RESUME: '1' },
-    });
+  it('throws ResumeRefused carrying step.resume_failed, in the shape the real CLI produces', async () => {
+    const harness = openTracked({ fakeEnv: { FAKE_CLAUDE_REFUSE_RESUME: 'both' } });
     let thrown: unknown;
     try {
-      await harness.spawner.resume({ ...harness.request(), sessionId: REAL_SESSION_ID });
+      await harness.spawner.resume({ ...harness.request(), sessionId: DEAD_SESSION_ID });
     } catch (error: unknown) {
       thrown = error;
     }
     expect(thrown).toBeInstanceOf(ResumeRefused);
     const refusal = thrown as ResumeRefused;
     expect(refusal.code).toBe('step.resume_failed');
-    expect(refusal.sessionId).toBe(REAL_SESSION_ID);
+    expect(refusal.sessionId).toBe(DEAD_SESSION_ID);
     expect(refusal.message).toContain('baseline');
+    // The detail is the CLI's own sentence, taken from the structured `errors` array.
+    expect(refusal.message).toContain('No conversation found with session ID');
+  });
+
+  it('does not report the dead session id the refusal line carries', async () => {
+    // Recorded: the refusal result line carries the *requested* session id. Announcing it would have
+    // the checkpoint record a session that does not exist as the live one, and AD-8 grants one resume
+    // per recorded id — so the next pass would spend it on a session the CLI has already denied.
+    const harness = openTracked({ fakeEnv: { FAKE_CLAUDE_REFUSE_RESUME: 'both' } });
+    await expect(
+      harness.spawner.resume({ ...harness.request(), sessionId: DEAD_SESSION_ID }),
+    ).rejects.toThrowError(ResumeRefused);
+
+    expect(harness.sessionIds).toStrictEqual([]);
+    expect(harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentSessionAnnounced)).toHaveLength(0);
+  });
+
+  it('recognises the refusal from the errors array alone, with nothing on stderr', async () => {
+    // Pins the structural signal by itself: the recorded stdout line and no stderr at all, so a
+    // regression that deleted the `errors` check could not be masked by the prose match.
+    const harness = openTracked({ fakeEnv: { FAKE_CLAUDE_REFUSE_RESUME: 'stdout-only' } });
+    let thrown: unknown;
+    try {
+      await harness.spawner.resume({ ...harness.request(), sessionId: DEAD_SESSION_ID });
+    } catch (error: unknown) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ResumeRefused);
+    expect(harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentStderr)).toHaveLength(0);
+    const exited = harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentExited);
+    expect(exited[0]?.payload['evidence']).toBe('the result line carried an errors array');
+  });
+
+  it('recognises a refusal the errors array cannot see, from stderr alone', async () => {
+    // Pins the secondary signal by itself: an init line arrives (so the silence heuristic cannot fire)
+    // and the result line has no `errors` (so the structural signal cannot fire). Only the text is left.
+    const harness = openTracked({
+      fakeEnv: { FAKE_CLAUDE_REFUSE_RESUME: 'both' },
+      refusalFixture: 'resume-refused-no-errors.jsonl',
+    });
+    let thrown: unknown;
+    try {
+      await harness.spawner.resume({ ...harness.request(), sessionId: DEAD_SESSION_ID });
+    } catch (error: unknown) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ResumeRefused);
+    const exited = harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentExited);
+    expect(exited[0]?.payload['evidence']).toBe('the CLI said so on stderr');
   });
 
   it('never attempts a second resume against the same id', async () => {
-    const harness = openTracked({
-      fixture: 'completed.jsonl',
-      fakeEnv: { FAKE_CLAUDE_REFUSE_RESUME: '1' },
-    });
-    const resumeRequest = { ...harness.request(), sessionId: REAL_SESSION_ID };
+    const harness = openTracked({ fakeEnv: { FAKE_CLAUDE_REFUSE_RESUME: 'both' } });
+    const resumeRequest = { ...harness.request(), sessionId: DEAD_SESSION_ID };
 
     await expect(harness.spawner.resume(resumeRequest)).rejects.toThrowError(ResumeRefused);
     const spawnsAfterFirst = harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentSpawned).length;
@@ -517,13 +593,47 @@ describe('resume', () => {
     expect(harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentSpawned)).toHaveLength(spawnsAfterFirst);
   });
 
-  it('refuses a resume whose child never opened a session, without a message to match on', async () => {
+  it('does not spend the one resume AD-8 grants on a refusal that created no process', async () => {
+    // The preflight refuses before any child exists, so the id has not been used. A resume that then
+    // becomes possible must still be allowed — burning it here would make a machine misconfiguration
+    // permanently cost the run its recovery.
     const harness = openTracked({
-      fakeEnv: { FAKE_CLAUDE_EXIT: '1' },
+      fixture: 'completed.jsonl',
+      cli: {
+        path: join(tmpdir(), 'orch-no-such-cli-ever.ts'),
+        version: '2.1.278',
+        auth: 'subscription',
+        interpreter: 'node',
+      },
     });
-    await expect(
-      harness.spawner.resume({ ...harness.request(), sessionId: 'sess-that-is-gone' }),
-    ).rejects.toThrowError(ResumeRefused);
+    const resumeRequest = { ...harness.request(), sessionId: DEAD_SESSION_ID };
+    await expect(harness.spawner.resume(resumeRequest)).rejects.toThrowError(StepSpawnFailed);
+    // Not `ResumeRefused`: the id is still unspent, so the same resume is attempted again for real.
+    await expect(harness.spawner.resume(resumeRequest)).rejects.toThrowError(StepSpawnFailed);
+  });
+
+  it('does not spend the id on a resume that succeeded', async () => {
+    // A step that resumed, was interrupted again and is resumed again is the loop doing its job.
+    const harness = openTracked({ fixture: 'completed.jsonl' });
+    const resumeRequest = { ...harness.request(), sessionId: REAL_SESSION_ID };
+    expect((await harness.spawner.resume(resumeRequest)).disposition).toBe('completed');
+    expect((await harness.spawner.resume(resumeRequest)).disposition).toBe('completed');
+    expect(harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentSpawned)).toHaveLength(2);
+  });
+
+  it('refuses a resume whose child produced nothing at all', async () => {
+    const harness = openTracked({ fakeEnv: { FAKE_CLAUDE_EXIT: '1' } });
+    let thrown: unknown;
+    try {
+      await harness.spawner.resume({ ...harness.request(), sessionId: 'sess-that-is-gone' });
+    } catch (error: unknown) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ResumeRefused);
+    const exited = harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentExited);
+    expect(exited[0]?.payload['evidence']).toBe(
+      'no session was opened and no result was produced',
+    );
   });
 });
 
@@ -658,5 +768,277 @@ describe('the AD-20 container seam', () => {
     expect(seen[0]?.cwd).toBe(harness.worktree);
     expect(seen[0]?.node.path).toBe(process.execPath);
     expect(harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentSpawned)[0]?.payload['wrapped']).toBe(true);
+  });
+});
+
+describe('AD-1\'s second catch, on the stream', () => {
+  it('fails the attempt when the CLI names a key source that is not the subscription login', async () => {
+    // Derived from the real transcript by editing only the init line's apiKeySource. Without this the
+    // whole `api_key_source` branch could be deleted and every fixture would still pass, because all
+    // of them carry "none".
+    const harness = openTracked({ fixture: 'api-key-mode.jsonl' });
+    const termination = await harness.spawner.start(harness.request());
+
+    expect(termination.disposition).toBe('failed');
+    expect(termination.output).toBeNull();
+    expect(termination.error?.code).toBe('model.api_key_mode_refused');
+    expect(termination.error?.retryable).toBe(false);
+    expect(harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentExited)[0]?.payload['api_key_source']).toBe(
+      'ANTHROPIC_API_KEY',
+    );
+  });
+
+  it('does not brick a spawn whose init line simply lacks the field', async () => {
+    // Absence is not denial. Treating it as API-key mode would fail every attempt with an
+    // escalate-to-human code no retry clears, on nothing more than a field this build did not find.
+    const harness = openTracked({ fixture: 'api-key-source-unreported.jsonl' });
+    const termination = await harness.spawner.start(harness.request());
+
+    expect(termination.disposition).toBe('completed');
+    expect(harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentExited)[0]?.payload['api_key_source']).toBe(
+      'unreported',
+    );
+  });
+
+  it('records that no init line arrived, rather than silently skipping the check', async () => {
+    const harness = openTracked({ fakeEnv: { FAKE_CLAUDE_EXIT: '0' } });
+    await harness.spawner.start(harness.request());
+    expect(harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentExited)[0]?.payload['api_key_source']).toBe(
+      'no-init-line',
+    );
+  });
+});
+
+describe('the direct interpreter, which is the branch a real install takes', () => {
+  it('executes a compiled entry with the full AD-1 argv', async () => {
+    const harness = openTracked({ fixture: 'completed.jsonl', direct: true });
+    const termination = await harness.spawner.start(harness.request());
+    expect(termination.disposition).toBe('completed');
+
+    const plan = harness.spawner.lastPlan();
+    expect(plan?.cli.interpreter).toBe('direct');
+    // The command is the CLI itself, with no Node prefixed — there is no interpreter to substitute.
+    expect(plan?.command).toBe(plan?.cli.path);
+    expect(plan?.args[0]).toBe('--print');
+
+    // The same argv assertions as the node branch, read back from the child itself.
+    const argv = harness.argvSeenByChild();
+    for (const flag of AD1_REQUIRED_FLAGS) expect(argv).toContain(flag);
+    expect(argv[argv.indexOf('--output-format') + 1]).toBe(STREAM_OUTPUT_FORMAT);
+    expect(JSON.parse(argv[argv.indexOf('--json-schema') + 1] ?? '')).toStrictEqual(
+      exportContract('step.output'),
+    );
+    // AD-28 still holds for a compiled CLI: the resolved Node reaches it through the environment.
+    expect(plan?.env['ORCH_NODE']).toBe(process.execPath);
+  });
+});
+
+describe('MCP servers the engine was given', () => {
+  it('reaches the spawned child as --mcp-config, under --strict-mcp-config', async () => {
+    const configs = [join(tmpdir(), 'orch-mcp-a.json'), join(tmpdir(), 'orch-mcp-b.json')];
+    const harness = openTracked({ fixture: 'completed.jsonl', mcpConfigs: configs });
+    await harness.spawner.start(harness.request());
+
+    // Asserted on the child's own argv: a dropped forward would leave --strict-mcp-config suppressing
+    // the repository's servers and the engine's own never loading, with nothing else to notice.
+    const argv = harness.argvSeenByChild();
+    expect(argv).toContain('--mcp-config');
+    expect(argv.slice(argv.indexOf('--mcp-config') + 1, argv.indexOf('--mcp-config') + 3)).toStrictEqual(
+      configs,
+    );
+    expect(argv).toContain('--strict-mcp-config');
+    expect(harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentSpawned)[0]?.payload['mcp_config_count']).toBe(2);
+  });
+});
+
+/** A transcript whose structured output is edited to a given status, derived from the real result. */
+const withStatus = (status: string, error: unknown): string => {
+  const lines = readFileSync(join(FIXTURES, 'completed.jsonl'), 'utf8').trim().split('\n');
+  const result = JSON.parse(lines.at(-1) ?? '{}') as Record<string, unknown>;
+  result['structured_output'] = {
+    ...(result['structured_output'] as Record<string, unknown>),
+    status,
+    error,
+  };
+  const path = join(mkdtempSync(join(tmpdir(), `orch-${status}-`)), 'derived.jsonl');
+  writeFileSync(path, `${[...lines.slice(0, -1), JSON.stringify(result)].join('\n')}\n`, 'utf8');
+  return path;
+};
+
+describe('an agent-reported status with no error of its own', () => {
+  it('gives a blocked step the escalate-to-human code', async () => {
+    // The two fallbacks have opposite dispositions, so a swap sends every blocked step to a model that
+    // cannot answer the question. Only an `error: null` fixture makes the fallback evaluate at all.
+    const harness = openTracked({ fixturePath: withStatus('blocked', null) });
+    const termination = await harness.spawner.start(harness.request());
+    expect(termination.disposition).toBe('blocked');
+    expect(termination.error?.code).toBe('question.unanswerable');
+    expect(termination.error?.retryable).toBe(false);
+  });
+
+  it('gives a failed step the escalate-model-tier code', async () => {
+    const harness = openTracked({ fixturePath: withStatus('failed', null) });
+    const termination = await harness.spawner.start(harness.request());
+    expect(termination.disposition).toBe('failed');
+    expect(termination.error?.code).toBe('step.verification_failed');
+  });
+});
+
+describe('an output that is not about this attempt', () => {
+  it('is rejected even though it satisfies the contract', async () => {
+    const lines = readFileSync(join(FIXTURES, 'completed.jsonl'), 'utf8').trim().split('\n');
+    const result = JSON.parse(lines.at(-1) ?? '{}') as Record<string, unknown>;
+    result['structured_output'] = {
+      ...(result['structured_output'] as Record<string, unknown>),
+      step: 'some-other-step',
+    };
+    const path = join(mkdtempSync(join(tmpdir(), 'orch-wrong-step-')), 'derived.jsonl');
+    writeFileSync(path, `${[...lines.slice(0, -1), JSON.stringify(result)].join('\n')}\n`, 'utf8');
+
+    const harness = openTracked({ fixturePath: path });
+    const termination = await harness.spawner.start(harness.request());
+    // Schema-valid, and still not this step's result: accepting it would mark a step complete that
+    // never ran.
+    expect(termination.disposition).toBe('failed');
+    expect(termination.output).toBeNull();
+    expect(termination.error?.code).toBe('step.schema_invalid_output');
+    expect(termination.error?.cause).toContain('some-other-step');
+  });
+
+  it('reports a wiring fault as config.invalid, not as a reason to promote the model', async () => {
+    // An unknown contract id is a registry fault. `escalate-model-tier` would spend the run's one
+    // promotion per step on something no model rung can fix.
+    const harness = openTracked({ fixture: 'completed.jsonl' });
+    const termination = await harness.spawner.start(
+      harness.request({ contractId: 'step.output' }),
+    );
+    expect(termination.disposition).toBe('completed');
+
+    const unknown = openTracked({
+      fixture: 'completed.jsonl',
+      // The schema has to come from somewhere, since an unknown id has no registry export.
+    });
+    const spawner = createStepSpawner({
+      recorderFor: () => unknown.recorder,
+      cli: fakeCli,
+      node: childNode,
+      env: unknown.env,
+      schemaFor: () => exportContract('step.output'),
+    });
+    const failed = await spawner.start(unknown.request({ contractId: 'step.not_registered' }));
+    expect(failed.disposition).toBe('failed');
+    expect(failed.error?.code).toBe('config.invalid');
+    expect(failed.error?.retryable).toBe(false);
+  });
+});
+
+describe('a child that does not stop on its own', () => {
+  it('is bounded by a wall clock, and the hang is interrupted rather than killed', async () => {
+    // Without a bound `start()` never settles, so the run holds its AD-29 writer claim and its AD-30
+    // engine lock forever: one wedged step makes the whole ORCH_HOME unreconcilable.
+    const harness = openTracked({
+      fixture: 'no-terminal-output.jsonl',
+      fakeEnv: { FAKE_CLAUDE_HANG: '1' },
+      attemptTimeoutMs: 200,
+      killGraceMs: 100,
+    });
+    const termination = await harness.spawner.start(harness.request());
+
+    // `interrupted`, not `killed`: nobody decided to stop this step, it stopped making progress — and
+    // `killed` is the one disposition AD-8 never resumes or re-runs.
+    expect(termination.disposition).toBe('interrupted');
+    expect(termination.sessionId).toBe(REAL_SESSION_ID);
+    expect(harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentExited)[0]?.payload['timed_out']).toBe(true);
+  });
+
+  it('is killed outright when it ignores the first signal, so killAll cannot hang', async () => {
+    const harness = openTracked({
+      fixture: 'no-terminal-output.jsonl',
+      // A child that traps SIGTERM and keeps going. One SIGTERM alone would never end this attempt.
+      fakeEnv: { FAKE_CLAUDE_HANG: '1', FAKE_CLAUDE_IGNORE_SIGTERM: '1' },
+      killGraceMs: 100,
+    });
+    const running = harness.spawner.start(harness.request());
+    while (harness.sessionIds.length === 0) await new Promise((resolve) => setImmediate(resolve));
+
+    expect(harness.spawner.kill('implement')).toBe(true);
+    const termination = await running;
+    expect(termination.disposition).toBe('killed');
+    // The escalation is what made it settle: SIGTERM was declined.
+    expect(harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentExited)[0]?.payload['signal']).toBe('SIGKILL');
+  });
+});
+
+describe('two concurrent attempts at a same-named step', () => {
+  it('are distinct children, and a kill is scoped by the run that owns them', async () => {
+    // One spawner serves every run, so a step name alone is not an identity: keyed by step, the second
+    // attempt evicts the first and a steering kill reaches the wrong child.
+    const first = openTracked({
+      fixture: 'no-terminal-output.jsonl',
+      fakeEnv: { FAKE_CLAUDE_HANG: '1' },
+      killGraceMs: 100,
+    });
+    const otherRun = '01JSPAWNER000000000000000B';
+
+    const runningA = first.spawner.start(first.request());
+    const runningB = first.spawner.start(
+      first.request({ run: first.run, step: 'implement', attempt: 2 }),
+    );
+    while (first.sessionIds.length < 2) await new Promise((resolve) => setImmediate(resolve));
+
+    // Both are live under distinct keys, so both are reachable and both are stopped.
+    expect(first.spawner.kill('implement', first.run)).toBe(true);
+    const [a, b] = await Promise.all([runningA, runningB]);
+    expect(a.disposition).toBe('killed');
+    expect(b.disposition).toBe('killed');
+    // A kill naming a run that has nothing in flight stops nothing.
+    expect(first.spawner.kill('implement', otherRun)).toBe(false);
+    // Each attempt's plan is retrievable on its own identity, not overwritten by the other.
+    expect(first.spawner.planOf(first.run, 'implement', 1)).not.toBeNull();
+    expect(first.spawner.planOf(first.run, 'implement', 2)).not.toBeNull();
+  });
+});
+
+describe('the AD-1 guard covers what is executed, not what was built', () => {
+  it('refuses a wrapper that rebuilt the vector and dropped a required flag', async () => {
+    // The silent widening the constant exists to prevent: `cliArgs` still carries every flag, so a
+    // guard reading only the pre-wrap vector would pass this.
+    const harness = openTracked({
+      fixture: 'completed.jsonl',
+      wrap: (plan) => ({ ...plan, args: plan.args.filter((arg) => arg !== '--restricted') }),
+    });
+    await expect(harness.spawner.start(harness.request())).rejects.toThrowError(
+      /--restricted/,
+    );
+    // Refused before any process: the spawn event is never written.
+    expect(harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentSpawned)).toHaveLength(0);
+  });
+
+  it('logs the flags observed on the executed vector, not the constant', async () => {
+    const harness = openTracked({ fixture: 'completed.jsonl' });
+    await harness.spawner.start(harness.request());
+    const spawned = harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentSpawned)[0];
+    expect(spawned?.payload['flags']).toStrictEqual([...AD1_REQUIRED_FLAGS]);
+    expect(harness.spawner.lastPlan()?.args).toContain('--restricted');
+  });
+});
+
+describe('a wrapper that reports its child\'s signal as an exit code', () => {
+  it('maps 128+n to interrupted, so resume stays reachable at the AD-20 seam', async () => {
+    // A container wrapper does not forward the inner signal; it exits 128+n. Read as a plain non-zero
+    // code that is `failed`, and resume becomes dead code exactly where story 1-5 plugs in.
+    expect(signalFromExitCode(128 + 9)).toBe('SIGKILL');
+    expect(signalFromExitCode(128 + 15)).toBe('SIGTERM');
+    expect(signalFromExitCode(1)).toBeNull();
+    expect(signalFromExitCode(0)).toBeNull();
+    expect(signalFromExitCode(null)).toBeNull();
+
+    const harness = openTracked({
+      fixture: 'no-terminal-output.jsonl',
+      fakeEnv: { FAKE_CLAUDE_EXIT: String(128 + 9) },
+    });
+    const termination = await harness.spawner.start(harness.request());
+    expect(termination.disposition).toBe('interrupted');
+    expect(termination.sessionId).toBe(REAL_SESSION_ID);
   });
 });

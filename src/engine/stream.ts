@@ -45,11 +45,24 @@ export interface SessionRecord {
   readonly sessionId: string;
 }
 
-/** How the CLI says it authenticated. `none` is the subscription login (AD-1). */
+/**
+ * How the CLI says it authenticated. `none` is the subscription login (AD-1).
+ *
+ * `reported` is separate from `source` because absence and denial are different facts. An init line
+ * that simply does not carry `apiKeySource` — an older CLI, a field renamed — says nothing about how
+ * the session authenticated, and treating that silence as API-key mode would fail *every* attempt with
+ * `model.api_key_mode_refused`, an `escalate-to-human` code no retry clears. A fact the stream does
+ * not state is not evidence against the machine, so an unreported source is not a refusal; the
+ * spawner records which of the three cases happened.
+ */
 export interface ApiKeySourceRecord {
   readonly kind: 'api_key_source';
+  /** The reported value, or `(unreported)` when the init line carried no such field. */
   readonly source: string;
+  /** False only when the CLI positively named a key source that is not the subscription login. */
   readonly subscription: boolean;
+  /** True when the init line actually carried the field. */
+  readonly reported: boolean;
 }
 
 /** A tool the agent used. `parentToolUseId` is preserved verbatim per AD-5. */
@@ -62,10 +75,23 @@ export interface ToolUseRecord {
   readonly sessionId: string | null;
 }
 
+/** The name carried by a denial whose tool the CLI did not name in a shape this parser recognises. */
+export const UNNAMED_DENIED_TOOL = '(unnamed tool)';
+
 /** A tool call the permission layer refused. */
 export interface PermissionDeniedRecord {
   readonly kind: 'permission_denied';
+  /** {@link UNNAMED_DENIED_TOOL} when the refusal named no tool this parser could read. */
   readonly toolName: string;
+  /**
+   * Whether the refusal arrived as its own `system` line or inside the result's `permission_denials`.
+   *
+   * The CLI reports the same refusal in both places, so the parser must suppress the second — but the
+   * only value shared by the two reports is `tool_use_id`, and it is not always present. The origin
+   * lets the de-duplicator count occurrences *within* each report instead of across them, so two
+   * genuinely distinct refusals of the same tool for the same reason both survive.
+   */
+  readonly origin: 'line' | 'result';
   readonly toolUseId: string | null;
   /** The CLI's own explanation, e.g. `--restricted: path outside the working directory`. */
   readonly reason: string | null;
@@ -84,6 +110,17 @@ export interface ResultRecord {
   readonly structuredOutput: unknown;
   readonly sessionId: string | null;
   readonly numTurns: number | null;
+  /**
+   * The CLI's own `errors` array, verbatim.
+   *
+   * This is structured JSON the CLI owns, and it is how a refused `--resume` is recognised. Recorded:
+   * a resume against a session the CLI no longer has emits one result line carrying
+   * `subtype: "error_during_execution"`, `is_error: true`, `num_turns: 0`, the *requested* session id
+   * and `errors: ["No conversation found with session ID: …"]`. Reading the refusal off this array
+   * rather than off a stderr message means the signal does not depend on wording this system does not
+   * own. Empty for an ordinary result.
+   */
+  readonly errors: readonly string[];
 }
 
 /** A line that was not whole JSON. Carries no part of the line itself. */
@@ -122,6 +159,26 @@ const stringOrNull = (value: unknown): string | null => (typeof value === 'strin
  */
 const SUBSCRIPTION_SOURCE = 'none';
 
+/** What {@link ApiKeySourceRecord.source} reads when the init line carried no such field. */
+export const UNREPORTED_API_KEY_SOURCE = '(unreported)';
+
+/**
+ * The most a single line may grow to before the parser gives up on it.
+ *
+ * `pending` holds bytes from another process that has not yet written a newline, so without a cap a
+ * child emitting one enormous line — or no newline at all — grows it without limit from output this
+ * system does not control. Past the cap the line is skipped like any other unreadable one and the
+ * parser resynchronises on the next newline.
+ */
+export const MAX_STREAM_LINE_BYTES = 4 * 1024 * 1024;
+
+/** The CLI's own `errors` array, keeping only the strings in it. */
+const errorsOf = (line: Record<string, unknown>): readonly string[] => {
+  const raw = line['errors'];
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((entry): entry is string => typeof entry === 'string');
+};
+
 /** Tool-use blocks inside an assistant message. */
 const toolUsesIn = (line: Record<string, unknown>): readonly ToolUseRecord[] => {
   const message = line['message'];
@@ -152,13 +209,19 @@ const toolUsesIn = (line: Record<string, unknown>): readonly ToolUseRecord[] => 
 const denialFromEntry = (
   entry: unknown,
   sessionId: string | null,
+  origin: PermissionDeniedRecord['origin'],
 ): PermissionDeniedRecord | null => {
   if (!isObject(entry)) return null;
-  const toolName = stringOrNull(entry['tool_name']) ?? stringOrNull(entry['name']);
-  if (toolName === null) return null;
+  // A refusal whose tool name cannot be read is still a refusal. Reporting it under
+  // `UNNAMED_DENIED_TOOL` keeps a `permission.denied` event on the log; dropping it would make a
+  // renamed field turn a refused tool call into silence, which is the one direction a permission
+  // event must never fail in.
+  const toolName =
+    stringOrNull(entry['tool_name']) ?? stringOrNull(entry['name']) ?? UNNAMED_DENIED_TOOL;
   return {
     kind: 'permission_denied',
     toolName,
+    origin,
     toolUseId: stringOrNull(entry['tool_use_id']) ?? stringOrNull(entry['id']),
     reason: stringOrNull(entry['decision_reason']) ?? stringOrNull(entry['reason']),
     reasonType: stringOrNull(entry['decision_reason_type']),
@@ -204,23 +267,36 @@ export const parseStreamLine = (line: string, lineNumber = 1): readonly StreamRe
 
   const records: StreamRecord[] = [];
   const sessionId = stringOrNull(parsed['session_id']);
-  if (sessionId !== null) records.push({ kind: 'session', sessionId });
-
   const type = stringOrNull(parsed['type']) ?? '(untyped)';
   const subtype = stringOrNull(parsed['subtype']);
+  const errors = errorsOf(parsed);
+
+  /**
+   * A refusal line announces no session.
+   *
+   * Recorded: a refused `--resume` emits one result line carrying the *requested* session id and an
+   * `errors` array saying the conversation was not found. That id names a session that does not exist,
+   * so reporting it would have the checkpoint record a dead id as the live one — and AD-8 grants one
+   * resume per recorded id, so the next pass would spend it on a session the CLI has already denied.
+   * A session opened for real is announced by the `init` line, which is not a refusal.
+   */
+  const announcesSession = !(type === 'result' && errors.length > 0);
+  if (sessionId !== null && announcesSession) records.push({ kind: 'session', sessionId });
 
   if (type === 'system' && subtype === 'init') {
-    const source = stringOrNull(parsed['apiKeySource']) ?? '(unreported)';
+    const reported = stringOrNull(parsed['apiKeySource']);
     records.push({
       kind: 'api_key_source',
-      source,
-      subscription: source === SUBSCRIPTION_SOURCE,
+      source: reported ?? UNREPORTED_API_KEY_SOURCE,
+      // Absence is not denial: only a positively named non-subscription source is a refusal.
+      subscription: reported === null || reported === SUBSCRIPTION_SOURCE,
+      reported: reported !== null,
     });
     return records;
   }
 
   if (type === 'system' && subtype === 'permission_denied') {
-    const denial = denialFromEntry(parsed, sessionId);
+    const denial = denialFromEntry(parsed, sessionId, 'line');
     if (denial !== null) records.push(denial);
     else records.push({ kind: 'ignored', type, subtype });
     return records;
@@ -237,7 +313,7 @@ export const parseStreamLine = (line: string, lineNumber = 1): readonly StreamRe
     const denials = parsed['permission_denials'];
     if (Array.isArray(denials)) {
       for (const entry of denials) {
-        const denial = denialFromEntry(entry, sessionId);
+        const denial = denialFromEntry(entry, sessionId, 'result');
         if (denial !== null) records.push(denial);
       }
     }
@@ -250,6 +326,7 @@ export const parseStreamLine = (line: string, lineNumber = 1): readonly StreamRe
       structuredOutput: parsed['structured_output'],
       sessionId,
       numTurns: typeof numTurns === 'number' ? numTurns : null,
+      errors,
     });
     return records;
   }
@@ -267,6 +344,14 @@ export interface StreamParser {
   readonly sessionId: () => string | null;
   /** The terminal result, once seen. */
   readonly result: () => ResultRecord | null;
+  /**
+   * How the CLI said it authenticated, or `null` when no `init` line ever arrived.
+   *
+   * The distinction is recorded rather than collapsed: "the CLI said API-key mode", "the CLI said
+   * nothing about it" and "there was no init line to say anything" are three different facts, and only
+   * the first is a refusal.
+   */
+  readonly apiKeySource: () => ApiKeySourceRecord | null;
 }
 
 /**
@@ -283,11 +368,31 @@ export interface StreamParser {
  */
 export const createStreamParser = (): StreamParser => {
   let pending = '';
+  let overlong = false;
   let lineNumber = 0;
   let seenSessionId: string | null = null;
-  let seenApiKeySource = false;
+  let seenApiKeySource: ApiKeySourceRecord | null = null;
   let terminal: ResultRecord | null = null;
   const seenDenials = new Set<string>();
+  /** Denials with no `tool_use_id`, counted per origin, so the ordinal is the only thing shared. */
+  const anonymousDenials = new Map<string, number>();
+
+  /**
+   * The key one refusal is remembered by.
+   *
+   * With a `tool_use_id` the identity is the CLI's own and nothing else is needed. Without one, the
+   * ordinal *within the origin* stands in for it: the `system` lines number their id-less refusals
+   * 1, 2, 3… and the result's `permission_denials` numbers its own 1, 2, 3…, so the second report of
+   * one refusal collides with the first while two genuinely distinct refusals of the same tool for the
+   * same reason do not.
+   */
+  const denialKey = (record: PermissionDeniedRecord): string => {
+    if (record.toolUseId !== null) return `id:${record.toolUseId}`;
+    const counter = `${record.origin}:${record.toolName}:${record.reason ?? ''}`;
+    const ordinal = (anonymousDenials.get(counter) ?? 0) + 1;
+    anonymousDenials.set(counter, ordinal);
+    return `anon:${record.toolName}:${record.reason ?? ''}:${String(ordinal)}`;
+  };
 
   const keep = (records: readonly StreamRecord[]): readonly StreamRecord[] => {
     const kept: StreamRecord[] = [];
@@ -297,12 +402,12 @@ export const createStreamParser = (): StreamParser => {
         seenSessionId = record.sessionId;
       }
       if (record.kind === 'api_key_source') {
-        if (seenApiKeySource) continue;
-        seenApiKeySource = true;
+        if (seenApiKeySource !== null) continue;
+        seenApiKeySource = record;
       }
       if (record.kind === 'permission_denied') {
         // One refusal, one event — whether it arrived as a `system` line, on the result, or both.
-        const key = record.toolUseId ?? `${record.toolName}:${record.reason ?? ''}`;
+        const key = denialKey(record);
         if (seenDenials.has(key)) continue;
         seenDenials.add(key);
       }
@@ -319,13 +424,46 @@ export const createStreamParser = (): StreamParser => {
 
   return {
     push: (chunk: string): readonly StreamRecord[] => {
+      const records: StreamRecord[] = [];
       pending += chunk;
       const parts = pending.split('\n');
       // The last part is whatever followed the final newline: a partial line, or the empty string.
       pending = parts.pop() ?? '';
-      return parts.flatMap((line) => consume(line));
+      for (const line of parts) {
+        if (overlong) {
+          // The newline that ends the line already reported as overlong resynchronises the parser.
+          overlong = false;
+          continue;
+        }
+        records.push(...consume(line));
+      }
+      if (!overlong && pending.length > MAX_STREAM_LINE_BYTES) {
+        // Skip the line rather than keep buffering it: the bytes are unvalidated output from another
+        // process, and the fail-safe direction is one recorded skip, not unbounded growth.
+        lineNumber += 1;
+        records.push(
+          ...keep([
+            {
+              kind: 'unparseable',
+              reason: `the line exceeded the ${String(MAX_STREAM_LINE_BYTES)}-byte cap before any newline`,
+              bytes: pending.length,
+              line: lineNumber,
+            },
+          ]),
+        );
+        overlong = true;
+        pending = '';
+      } else if (overlong) {
+        pending = '';
+      }
+      return records;
     },
     end: (): readonly StreamRecord[] => {
+      if (overlong) {
+        overlong = false;
+        pending = '';
+        return [];
+      }
       if (pending === '') return [];
       const last = pending;
       pending = '';
@@ -333,6 +471,7 @@ export const createStreamParser = (): StreamParser => {
     },
     sessionId: (): string | null => seenSessionId,
     result: (): ResultRecord | null => terminal,
+    apiKeySource: (): ApiKeySourceRecord | null => seenApiKeySource,
   };
 };
 

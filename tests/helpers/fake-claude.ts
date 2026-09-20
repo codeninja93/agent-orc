@@ -28,8 +28,22 @@
  *   FAKE_CLAUDE_STOP_AFTER    stop replaying after this many lines
  *   FAKE_CLAUDE_SIGNAL        kill self with this signal instead of exiting
  *   FAKE_CLAUDE_HANG          stay alive after the replay until something kills it
- *   FAKE_CLAUDE_REFUSE_RESUME refuse any argv carrying --resume, as a CLI without the session does
+ *   FAKE_CLAUDE_IGNORE_SIGTERM decline SIGTERM, as a child that must be escalated against does
+ *   FAKE_CLAUDE_REFUSE_RESUME refuse any argv carrying --resume, in the recorded shape (see below)
  *   FAKE_CLAUDE_SPLIT_WRITES  write the transcript in fixed-size chunks that cut lines apart
+ *
+ * `FAKE_CLAUDE_REFUSE_RESUME` takes a mode, because the two signals the spawner recognises a refusal
+ * by have to be pinnable one at a time:
+ *
+ *   `1` / `both`  the measured reality: the recorded result line on stdout *and* the recorded stderr
+ *   `stdout-only` the recorded result line and no stderr, so only the `errors` array can be read
+ *   `stderr-only` an init line and a result line with `errors` stripped, plus the recorded stderr
+ *
+ * The refusal bytes are the real CLI's, recorded from a resume against a session id that never
+ * existed: one result line with `subtype: "error_during_execution"`, `is_error: true`,
+ * `num_turns: 0`, the *requested* session id, and
+ * `errors: ["No conversation found with session ID: …"]`, then exit 1. The earlier version of this
+ * script wrote nothing to stdout and the message to stderr, which is the inverse of what the CLI does.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -52,6 +66,18 @@ const readNumber = (name: string, fallback: number): number => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
+/** The session id the committed refusal transcript was recorded against. */
+const RECORDED_DEAD_SESSION_ID = '00000000-dead-4bee-8000-000000000000';
+
+/** The non-empty lines of a transcript named by an environment variable. */
+const readFixture = (variable: string): readonly string[] => {
+  const path = read(variable);
+  if (path === null) return [];
+  return readFileSync(path, 'utf8')
+    .split('\n')
+    .filter((line) => line !== '');
+};
+
 const write = (text: string): Promise<void> =>
   new Promise<void>((resolve) => {
     // `write` can return false when the pipe is full; the callback is what says the bytes left.
@@ -61,6 +87,15 @@ const write = (text: string): Promise<void> =>
   });
 
 const main = async (): Promise<void> => {
+  if (read('FAKE_CLAUDE_IGNORE_SIGTERM') !== null) {
+    // A child that declines the polite stop. Without an escalation behind it, the attempt promise
+    // would never settle and `killAll()` would block a shutdown forever.
+    // An empty handler is the point: it is what makes this child decline the polite stop, so the
+    // SIGKILL escalation has something to escalate against.
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    process.on('SIGTERM', () => {});
+  }
+
   const argvOut = read('FAKE_CLAUDE_ARGV_OUT');
   if (argvOut !== null) writeFileSync(argvOut, JSON.stringify(argv), 'utf8');
 
@@ -69,20 +104,21 @@ const main = async (): Promise<void> => {
     process.exit(0);
   }
 
-  if (read('FAKE_CLAUDE_REFUSE_RESUME') !== null && argv.includes('--resume')) {
-    // The shape a CLI refuses an unknown session with: a message on stderr, nothing on stdout, and a
-    // non-zero exit before any session is opened.
-    process.stderr.write('No conversation found with session ID: the transcript is gone\n');
+  const refuseResume = read('FAKE_CLAUDE_REFUSE_RESUME');
+  if (refuseResume !== null && argv.includes('--resume')) {
+    const requested = argv[argv.indexOf('--resume') + 1] ?? RECORDED_DEAD_SESSION_ID;
+    const message = `No conversation found with session ID: ${requested}`;
+    const lines = readFixture('FAKE_CLAUDE_REFUSAL_FIXTURE');
+    for (const line of lines) {
+      // The recorded refusal line, with the requested id substituted for the recorded one so the
+      // stream says what a real refusal of *this* id would say.
+      await write(`${line.replaceAll(RECORDED_DEAD_SESSION_ID, requested)}\n`);
+    }
+    if (refuseResume !== 'stdout-only') process.stderr.write(`${message}\n`);
     process.exit(1);
   }
 
-  const fixture = read('FAKE_CLAUDE_FIXTURE');
-  const lines =
-    fixture === null
-      ? []
-      : readFileSync(fixture, 'utf8')
-          .split('\n')
-          .filter((line) => line !== '');
+  const lines = readFixture('FAKE_CLAUDE_FIXTURE');
 
   const stopAfter = readNumber('FAKE_CLAUDE_STOP_AFTER', lines.length);
   const pauseAfter = readNumber('FAKE_CLAUDE_PAUSE_AFTER', -1);

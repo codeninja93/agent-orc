@@ -23,7 +23,7 @@
  * running `--version`, because the whole point is that the name `node` says nothing about the version.
  */
 import { execFileSync } from 'node:child_process';
-import { statSync } from 'node:fs';
+import { accessSync, constants, statSync } from 'node:fs';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 
 import { compareVersions, nodeFloor, parseVersion } from '../contracts/index.js';
@@ -112,9 +112,19 @@ export const probeNodeVersion = (path: string): string | null => {
   }
 };
 
+/**
+ * A file the current user can execute.
+ *
+ * The executable bit is part of the question, not an afterthought: a `node` that is present but not
+ * executable is "found" by a stat alone, is then handed to every child as the AD-28 interpreter, and
+ * fails at spawn with an opaque EACCES — the same class of opaque failure AD-28 exists to convert into
+ * a named one.
+ */
 const isExecutableFile = (path: string): boolean => {
   try {
-    return statSync(path).isFile();
+    if (!statSync(path).isFile()) return false;
+    accessSync(path, constants.X_OK);
+    return true;
   } catch {
     return false;
   }
@@ -191,7 +201,14 @@ export const resolveChildNode = (options: ResolveChildNodeOptions = {}): ChildNo
     );
   }
 
-  const parentPath = options.parentExecPath === undefined ? process.execPath : options.parentExecPath;
+  // Resolved, never taken as given: AD-28's invariant is that every child is handed an *absolute*
+  // path, and an injected relative one would quietly break it at the one place it is established.
+  const declaredParent =
+    options.parentExecPath === undefined ? process.execPath : options.parentExecPath;
+  const parentPath =
+    declaredParent === null || declaredParent === '' || isAbsolute(declaredParent)
+      ? declaredParent
+      : resolve(declaredParent);
   const parentVersion =
     options.parentVersion === undefined ? process.versions.node : options.parentVersion;
   if (parentPath !== null && parentPath !== '' && parentVersion !== null) {
