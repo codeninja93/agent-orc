@@ -19,17 +19,24 @@ deferred:
       the agent process to the commands the agent runs. The decisive finding is that the subscription
       credential is in the macOS keychain rather than a file, so no mount can put it inside a
       container — making AD-20's container and AD-1's subscription-only auth incompatible on the
-      stated primary platform. The ADR is proposed, not accepted; it awaits Deep's sign-off and amends
-      AD-1 and AD-20, which live in an adopted companion this session does not own.
+      stated primary platform. Signed off by Deep on 2026-09-20: host agent under --restricted/--add-dir/--tools, a per-command
+      container, one configuration on every platform, and no git in a step. AD-1, AD-20 and the egress line
+      are amended in the spine; the flag set, image, mount allow-list, --rm rule and AD-31 suite are all
+      unchanged, so nothing built here is wasted.
     location: >-
       docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-001-tier-2-execution.md
     severity: high
   - summary: >-
-      THE STAGE-1 CONTAINMENT GATE IS NOT MET: no container runtime daemon is reachable on this
-      machine, so the AD-31 assertion suite has never run.
+      RESOLVED 2026-09-20: the stage-1 containment gate IS NOW MET. Docker Desktop was started, the
+      AD-31 assertion suite ran against runtime 29.8.0, and all six containment properties passed.
     evidence: |-
-      VERIFIED by the parent: the Docker CLI is 29.7.2 (meeting the Stack's >=29.7) but `docker info`
-      fails, so the marker at ORCH_HOME/gates/container-assertion.json reads state: skipped. Seven
+      VERIFIED by the parent after the daemon came up: the marker now reads state: verified with all six
+      checks against runtime 29.8.0, and assertContainmentVerified() passes where it had correctly refused.
+      The image built locally as orch-executor:991044ecce0e0ac8, tag equal to the Dockerfile content hash per
+      AD-11, confirming the base-image and claude-CLI pins; the daemon accepted seccomp=builtin. The parent
+      then verified the properties independently by interrogating a real container from inside: uid 10001,
+      read-only root, no runtime socket, no host HOME, no ssh dir, egress unreachable, no git credential
+      files, CapEff 0000000000000000. Seven
       assertion tests skip. The parent confirmed the gate is genuinely undeclarable in that state and
       that it becomes declarable once a daemon answers with a full marker, so this is a machine
       condition rather than a design fault. Start a daemon (Colima or Docker Desktop) and re-run to
@@ -240,7 +247,8 @@ A container runtime is installed (Docker CLI 29.7.2, meeting the Stack's `>=29.7
 ## Auto Run Result
 
 Status: done
-Blocking condition: none — but the stage-1 containment gate is NOT met on this machine (see `deferred[0]`)
+Blocking condition: none. The stage-1 containment gate's containment half was MET on 2026-09-20 once a
+daemon was available (see `deferred[0]`).
 
 **REVIEW WAS SKIPPED** for this story; no review layers ran. The gate and the parent's own probes are the
 only scrutiny it received, which matters more here than elsewhere because the subject is a security
@@ -279,6 +287,6 @@ file under `src/engine/`, `src/runtime/` or `src/contracts/` names a container r
 imports only `../contracts/` and `../runtime/`. Runtime state: the second one — CLI present, daemon
 unreachable. No daemon was started and no model call was spent.
 
-**Follow-up review recommended: true** — no review ran, the containment gate is unverified against a real
+**Follow-up review recommended: true** — no review ran. The containment gate has since been verified against a real
 runtime, and two blockers for a working tier-2 run are recorded above: the container holds no `claude`
 credential, and the `--restricted` contract conflict escalated in story 1-4 remains open.
