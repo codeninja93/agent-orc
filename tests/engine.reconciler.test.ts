@@ -10,7 +10,7 @@
  * engine never opens `events.jsonl` itself — both structural, both invisible until a later story
  * breaks them.
  */
-import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -22,12 +22,15 @@ import {
   makeError,
 } from '../src/contracts/index.js';
 import type { OrchError, StepDisposition } from '../src/contracts/index.js';
-import { readEventLog, runPaths } from '../src/runtime/index.js';
+import { Recorder, readEventLog, runPaths, runsDir } from '../src/runtime/index.js';
 import {
+  BaselineResetError,
   ENGINE_EMITTER,
   ENGINE_EVENT_TYPES,
   Reconciler,
   ResumeRefused,
+  SteeringRefused,
+  StepSpawnFailed,
   createRecordingResetter,
   createScriptedExecutor,
   createUlidMinter,
@@ -45,7 +48,12 @@ import type {
 
 import { makeGitWorktree, makeHome, makePlan, planProvider } from './helpers/engine-fixture.js';
 
-const BASELINE = 'a'.repeat(40);
+/**
+ * A real commit SHA. `'a'.repeat(40)` carries 0.00 bits per character and so is never touched by the
+ * redaction pass — using it in the round-trip test that exists to guard the allow-list would have made
+ * that test vacuous, which is precisely the mistake story 1-2 made with its run ids.
+ */
+const BASELINE = 'ddd9bed4d286ac1f8a0f4f7bfef9530046605787';
 
 let home: string;
 const toRemove: string[] = [];
@@ -68,6 +76,7 @@ const openReconciler = (options: {
   readonly baseline?: BaselineResetter;
   readonly orchHome?: string;
   readonly onDurableBoundary?: (label: string) => void;
+  readonly redaction?: { readonly secrets?: readonly string[] };
 }): {
   readonly reconciler: Reconciler;
   readonly plan: FeaturePlan;
@@ -83,6 +92,7 @@ const openReconciler = (options: {
     ...(options.onDurableBoundary === undefined
       ? {}
       : { onDurableBoundary: options.onDurableBoundary }),
+    ...(options.redaction === undefined ? {} : { redaction: options.redaction }),
   });
   toClose.push(reconciler);
   return { reconciler, plan, executor };
@@ -96,6 +106,55 @@ const alwaysCompletes: ScriptedExecutorOptions = {
 
 const eventTypes = (run: string, orchHome = home): readonly string[] =>
   readEventLog(runPaths(run, orchHome).eventLog).map((event) => event.type);
+
+/**
+ * Append a `step.started` with no termination, exactly as a SIGKILL inside the executor leaves one.
+ *
+ * Reached through the log rather than by making the port throw, because a thrown port rejection is now a
+ * *termination* — the AD-35 table answers it — so it can no longer be used to manufacture an orphan. The
+ * reconciler must be closed first: it holds the run's single-writer claim, which is itself the state a
+ * crashed engine leaves behind.
+ */
+const appendOrphanedStart = (
+  run: string,
+  feature: string,
+  step: string,
+  sessionId: string | null = null,
+): void => {
+  const recorder = Recorder.open({ runId: run, feature, orchHome: home });
+  try {
+    recorder.record({
+      feature,
+      run,
+      step,
+      emitter: 'engine.reconciler',
+      type: ENGINE_EVENT_TYPES.StepStarted,
+      payload: {
+        attempt: 1,
+        phase: 'implementation',
+        contract_id: 'step.output',
+        model_tier: 'claude-haiku-4-5',
+        mode: 'live',
+        input: `steps/${step}/input.json`,
+      },
+      baseline_ref: BASELINE,
+    });
+    if (sessionId !== null) {
+      recorder.record({
+        feature,
+        run,
+        step,
+        emitter: 'engine.reconciler',
+        type: ENGINE_EVENT_TYPES.StepSessionRecorded,
+        payload: { attempt: 1 },
+        session_id: sessionId,
+        baseline_ref: BASELINE,
+      });
+    }
+  } finally {
+    recorder.close();
+  }
+};
 
 describe('a new feature is accepted with a minted run id', () => {
   it('mints a 26-character Crockford base32 ULID and records the checkpoint at drafting', () => {
@@ -325,21 +384,16 @@ describe('AD-8 — resume, then re-run from the baseline', () => {
   });
 
   it('adopts a step the engine died inside as interrupted, rather than guessing', async () => {
-    // Reaching the state without a real crash: the log holds a `step.started` with no termination,
-    // which is exactly what a SIGKILL inside the executor leaves behind.
-    const { reconciler } = openReconciler({
-      script: {
-        onStart: (request) => {
-          throw new OrphanSignal(request.step);
-        },
-      },
-    });
-    const accepted = reconciler.acceptFeature(makePlan());
-    reconciler.confirm(accepted.run);
-    await expect(reconciler.pass()).rejects.toBeInstanceOf(OrphanSignal);
+    const first = openReconciler({ script: alwaysCompletes });
+    const accepted = first.reconciler.acceptFeature(makePlan());
+    first.reconciler.confirm(accepted.run);
+    // The engine dies inside the step: the log keeps a start with no termination, and the claim is left
+    // behind for the next engine to reclaim.
+    first.reconciler.close();
+    appendOrphanedStart(accepted.run, 'engine-reconciler', 'implement');
 
-    const orphaned = reconciler.load(accepted.run);
-    expect(orphaned.state.steps[0]?.disposition).toBeNull();
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    expect(reconciler.load(accepted.run).state.steps[0]?.disposition).toBeNull();
 
     const adoption = await reconciler.advance(accepted.run);
     expect(adoption.kind).toBe('adopt-orphan');
@@ -373,31 +427,50 @@ describe('AD-8 — resume, then re-run from the baseline', () => {
 });
 
 describe('AD-8 — a killed step is never resumed and never re-run', () => {
-  it('records killed and takes no further action across many passes', async () => {
+  it('records killed on the step in flight, and takes no further action across many passes', async () => {
+    const first = openReconciler({ script: alwaysCompletes });
+    const accepted = first.reconciler.acceptFeature(makePlan());
+    first.reconciler.confirm(accepted.run);
+    first.reconciler.close();
+    // A step genuinely in flight, with a session id recorded — everything a resume would need.
+    appendOrphanedStart(accepted.run, 'engine-reconciler', 'implement', 'sess-implement');
+
     const resetter = createRecordingResetter(BASELINE);
-    const { reconciler, executor } = openReconciler({
-      baseline: resetter,
-      script: {
-        sessionIdFor: (request) => `sess-${request.step}`,
-        onStart: (request) =>
-          terminated(request.step, 'interrupted', { sessionId: `sess-${request.step}` }),
-      },
-    });
-    const accepted = reconciler.acceptFeature(makePlan());
-    reconciler.confirm(accepted.run);
-    await reconciler.pass();
+    const { reconciler, executor } = openReconciler({ baseline: resetter, script: alwaysCompletes });
 
     const killed = reconciler.kill(accepted.run);
     expect(killed.state).toBe('killed');
     expect(killed.steps[0]?.disposition).toBe('killed');
 
-    const startsBefore = executor.started.length;
     for (let index = 0; index < 5; index += 1) await reconciler.pass();
 
+    // Never resumed and never re-run, though the recorded session id would have allowed both.
     expect(executor.resumed).toStrictEqual([]);
-    expect(executor.started).toHaveLength(startsBefore);
+    expect(executor.started).toStrictEqual([]);
     expect(resetter.resets).toStrictEqual([]);
     expect(reconciler.load(accepted.run).state.steps[0]?.disposition).toBe('killed');
+  });
+
+  it('never rewrites a finished step when the kill arrives between passes', async () => {
+    /**
+     * The normal case: a kill lands in the gap when no step is running, and the last record is a step that
+     * has already *completed*. Rewriting it as `killed` would put a permanent line in the log saying work
+     * that was done never happened — and since a killed step is never re-run, nothing would put it back.
+     */
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+    await reconciler.pass();
+    expect(reconciler.load(accepted.run).state.steps[0]?.disposition).toBe('completed');
+
+    const killed = reconciler.kill(accepted.run);
+    expect(killed.state).toBe('killed');
+    // The finished step keeps its truthful record; only the feature stops.
+    expect(killed.steps[0]?.disposition).toBe('completed');
+    expect(killed.steps).toHaveLength(1);
+
+    const after = await reconciler.pass();
+    expect(after.actions).toStrictEqual([]);
   });
 
   it('routes a killed disposition to stop even where an error code would say retry', () => {
@@ -552,6 +625,18 @@ describe('AD-26 — a re-run from one baseline has identical effect', () => {
       steps: [{ step: 'implement', contract_id: 'step.output', phase: 'implementation' }],
     });
 
+    /**
+     * An ignored path, written before the run and read back directly afterwards.
+     *
+     * `clean` is deliberately given `-fd` and **not** `-x`: ignored paths — `node_modules`, build caches,
+     * the runtime paths the installer adds to `.gitignore` — are not a step's effects, and destroying them
+     * would turn every re-run into a cold rebuild. The omission is invisible to `listing()`, which uses
+     * `--exclude-standard` and so by construction cannot see an ignored path, so this is asserted with a
+     * direct read.
+     */
+    worktree.write('ignored-cache/build.log', 'expensive to rebuild\n');
+    expect(worktree.listing()).not.toContain('ignored-cache/build.log');
+
     let attempt = 0;
     const { reconciler } = openReconciler({
       plan,
@@ -584,6 +669,8 @@ describe('AD-26 — a re-run from one baseline has identical effect', () => {
     expect(contents).toContain('export const added = 3;');
     expect(worktree.read('src/created.ts')).toBe('export const created = 3;\n');
     expect(worktree.listing()).toStrictEqual(['.gitignore', 'src/created.ts', 'src/existing.ts']);
+    // Two resets later, the ignored path is still there. `clean -fdx` would have removed it.
+    expect(worktree.read('ignored-cache/build.log')).toBe('expensive to rebuild\n');
 
     const record = reconciler.load(accepted.run).state.steps[0];
     expect(record?.baseline_ref).toBe(worktree.head);
@@ -680,8 +767,13 @@ describe('the run id and the baseline ref survive a round trip through the log',
 
 describe('reconciliation is concurrent across features and serialised on overlap', () => {
   it('advances only one of two features whose territories overlap', async () => {
-    const overlappingA = makePlan({ feature: 'alpha', territory: ['src/engine'] });
-    const overlappingB = makePlan({ feature: 'beta', territory: ['src/engine/lock.ts'] });
+    // Separate worktrees, so the *declared territory* is the only thing that can serialise these two.
+    const overlappingA = makePlan({ feature: 'alpha', territory: ['src/engine'], worktree: '/tmp/wt-alpha' });
+    const overlappingB = makePlan({
+      feature: 'beta',
+      territory: ['src/engine/lock.ts'],
+      worktree: '/tmp/wt-beta',
+    });
     const reconciler = Reconciler.open({
       orchHome: home,
       executor: createScriptedExecutor(alwaysCompletes),
@@ -708,8 +800,12 @@ describe('reconciliation is concurrent across features and serialised on overlap
   });
 
   it('lets the serialised feature advance once the first run reaches a terminal state', async () => {
-    const overlappingA = makePlan({ feature: 'alpha', territory: ['src/engine'] });
-    const overlappingB = makePlan({ feature: 'beta', territory: ['src/engine/lock.ts'] });
+    const overlappingA = makePlan({ feature: 'alpha', territory: ['src/engine'], worktree: '/tmp/wt-alpha' });
+    const overlappingB = makePlan({
+      feature: 'beta',
+      territory: ['src/engine/lock.ts'],
+      worktree: '/tmp/wt-beta',
+    });
     const reconciler = Reconciler.open({
       orchHome: home,
       executor: createScriptedExecutor(alwaysCompletes),
@@ -728,9 +824,40 @@ describe('reconciliation is concurrent across features and serialised on overlap
     expect(reconciler.load(second.run).state.state).toBe('committed');
   });
 
+  it('serialises two features sharing one worktree, however disjoint their declared territories', async () => {
+    /**
+     * A declared territory says which files a feature means to change; the worktree says what it can
+     * destroy. A re-run resets its worktree with `reset --hard` plus `clean -fd`, which discards the other
+     * feature's work wholesale — so only the worktree bounds the conflict domain of a reset, and two
+     * features cannot hold one at the same time no matter how disjoint their file lists are.
+     */
+    const shared = '/tmp/wt-shared';
+    const left = makePlan({ feature: 'alpha', territory: ['src/engine'], worktree: shared });
+    const right = makePlan({ feature: 'beta', territory: ['docs/specs'], worktree: shared });
+    const reconciler = Reconciler.open({
+      orchHome: home,
+      executor: createScriptedExecutor(alwaysCompletes),
+      plans: planProvider(left, right),
+      baseline: createRecordingResetter(BASELINE),
+    });
+    toClose.push(reconciler);
+
+    const first = reconciler.acceptFeature(left);
+    const second = reconciler.acceptFeature(right);
+    reconciler.confirm(first.run);
+    reconciler.confirm(second.run);
+
+    const result = await reconciler.pass();
+    expect(result.actions).toHaveLength(1);
+    expect(result.actions[0]?.run).toBe(first.run);
+    expect(result.deferred).toHaveLength(1);
+    expect(result.deferred[0]?.overlap).toStrictEqual([shared]);
+    expect(result.deferred[0]?.reason).toContain('One worktree admits one feature at a time');
+  });
+
   it('advances two features with disjoint territories in the same pass', async () => {
-    const left = makePlan({ feature: 'alpha', territory: ['src/engine'] });
-    const right = makePlan({ feature: 'beta', territory: ['docs/specs'] });
+    const left = makePlan({ feature: 'alpha', territory: ['src/engine'], worktree: '/tmp/wt-alpha' });
+    const right = makePlan({ feature: 'beta', territory: ['docs/specs'], worktree: '/tmp/wt-beta' });
     const reconciler = Reconciler.open({
       orchHome: home,
       executor: createScriptedExecutor(alwaysCompletes),
@@ -750,6 +877,335 @@ describe('reconciliation is concurrent across features and serialised on overlap
     expect(result.actions.map((action) => action.run).sort()).toStrictEqual(
       [first.run, second.run].sort(),
     );
+  });
+});
+
+describe('a declared failure routes through the table instead of escaping the pass', () => {
+  it('routes a rejected spawn as the termination its code describes, and the pass survives', async () => {
+    /**
+     * `step.started` is already in the log when the port rejects. Letting the rejection propagate would
+     * kill the whole pass and leave the step recorded as in flight, so the next pass would adopt it as
+     * `interrupted`, re-run it and fail identically — a non-terminating loop built out of a code the AD-35
+     * table answers perfectly well.
+     */
+    expect(dispositionFor('step.spawn_failed')).toBe('retry-with-backoff');
+    const resetter = createRecordingResetter(BASELINE);
+    let attempts = 0;
+    const { reconciler, executor } = openReconciler({
+      baseline: resetter,
+      script: {
+        onStart: (request) => {
+          attempts += 1;
+          if (attempts === 1) throw new StepSpawnFailed(request.step, 'no executable on PATH');
+          return terminated(request.step, 'completed');
+        },
+      },
+    });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+
+    // The pass resolves rather than rejecting, and reports the action it took.
+    const first = await reconciler.pass();
+    expect(first.refusals).toStrictEqual([]);
+    expect(first.actions[0]?.kind).toBe('run-step');
+
+    const failed = reconciler.load(accepted.run).state.steps[0];
+    expect(failed?.disposition).toBe('failed');
+    expect(failed?.error?.code).toBe('step.spawn_failed');
+
+    // Retried through AD-26: reset to the baseline, then re-run from the typed input.
+    await reconciler.runUntilSettled();
+    expect(resetter.resets.map((reset) => reset.ref)).toContain(BASELINE);
+    expect(executor.started.length).toBeGreaterThan(1);
+    expect(reconciler.load(accepted.run).state.state).toBe('committed');
+  });
+
+  it('hands off a rejection carrying no declared code, and never retries it', async () => {
+    const resetter = createRecordingResetter(BASELINE);
+    const { reconciler, executor } = openReconciler({
+      baseline: resetter,
+      script: {
+        onStart: () => {
+          throw new Error('something the port never declared');
+        },
+      },
+    });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+    await reconciler.runUntilSettled();
+
+    const state = reconciler.load(accepted.run).state;
+    expect(state.state).toBe('handed_off');
+    expect(state.handoff?.code).toBe('internal.invariant_violated');
+    // Handed off, not retried: one attempt, no reset.
+    expect(executor.started).toHaveLength(1);
+    expect(resetter.resets).toStrictEqual([]);
+  });
+
+  it('hands off when the worktree cannot be returned to the step baseline', async () => {
+    /**
+     * AD-26 makes the reset the precondition of a re-run, and `git.baseline_reset_failed` is declared
+     * `abandon-and-hand-off` precisely so a worktree of unknown shape is never re-run into.
+     */
+    expect(dispositionFor('git.baseline_reset_failed')).toBe('abandon-and-hand-off');
+    const refusingResetter = {
+      currentRef: (): string => BASELINE,
+      resetTo: (worktree: string, ref: string): void => {
+        throw new BaselineResetError(worktree, ref, 'another process holds the index lock');
+      },
+    };
+    const { reconciler } = openReconciler({
+      baseline: refusingResetter,
+      script: {
+        onStart: (request) =>
+          terminated(request.step, 'failed', { error: makeError('step.timed_out', 'slow') }),
+      },
+    });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+
+    const taken = await reconciler.runUntilSettled();
+    expect(taken.map((action) => action.kind)).toContain('reset-and-rerun');
+
+    const state = reconciler.load(accepted.run).state;
+    expect(state.state).toBe('handed_off');
+    expect(state.handoff?.code).toBe('git.baseline_reset_failed');
+    expect(state.handoff?.reason).toContain('index lock');
+    // The re-run never happened: the step was not started a second time against a worktree of unknown shape.
+    expect(state.steps[0]?.attempts).toBe(1);
+  });
+
+  it('abandons an action whose event the redaction pass dropped, rather than performing it unrecorded', async () => {
+    /**
+     * AD-21 fails closed, so an unredactable line is replaced by `redaction.failed` — and the fold then
+     * cannot see the action at all. Proceeding would leave the loop re-deciding the same action forever
+     * against a log that never remembers it. Reached here by registering a literal that appears in the
+     * serialised `step.terminated` line, which is the one part of an engine event a caller can predict.
+     */
+    const { reconciler } = openReconciler({
+      redaction: { secrets: ['"disposition":"completed"'] },
+      script: alwaysCompletes,
+    });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+
+    const result = await reconciler.pass();
+    expect(result.actions).toStrictEqual([]);
+    expect(result.refusals).toHaveLength(1);
+    expect(result.refusals[0]?.run).toBe(accepted.run);
+    expect(result.refusals[0]?.code).toBe('redaction.failed');
+    // The step is left recorded as in flight, which the next pass adopts as an interruption — the
+    // honest outcome, and not a completion the log never recorded.
+    expect(reconciler.load(accepted.run).state.steps[0]?.disposition).toBeNull();
+  });
+
+  it('routes the earliest unrouted failure, not merely the last record', async () => {
+    /**
+     * A failed step followed in the record by a completed one. Taking the last record would leave the
+     * earlier failure unrouted, and the fall-through would then pick that same step as "the next step with
+     * no completed record" and start it again — a re-run with no baseline reset, forever.
+     */
+    const first = openReconciler({ script: alwaysCompletes });
+    const accepted = first.reconciler.acceptFeature(makePlan());
+    first.reconciler.confirm(accepted.run);
+    first.reconciler.close();
+
+    const recorder = Recorder.open({ runId: accepted.run, feature: 'engine-reconciler', orchHome: home });
+    const line = (step: string, type: string, payload: Record<string, unknown>): void => {
+      recorder.record({
+        feature: 'engine-reconciler',
+        run: accepted.run,
+        step,
+        emitter: 'engine.reconciler',
+        type,
+        payload,
+        baseline_ref: BASELINE,
+      });
+    };
+    line('implement', ENGINE_EVENT_TYPES.StepStarted, {
+      attempt: 1,
+      phase: 'implementation',
+      contract_id: 'step.output',
+      model_tier: 'claude-haiku-4-5',
+      mode: 'live',
+      input: 'steps/implement/input.json',
+    });
+    line('implement', ENGINE_EVENT_TYPES.StepTerminated, {
+      disposition: 'failed',
+      error: makeError('step.timed_out', 'slow'),
+    });
+    line('verify', ENGINE_EVENT_TYPES.StepStarted, {
+      attempt: 1,
+      phase: 'verification',
+      contract_id: 'step.output',
+      model_tier: 'claude-haiku-4-5',
+      mode: 'live',
+      input: 'steps/verify/input.json',
+    });
+    // A *second* unrouted failure, later in the record. Two are needed for this test to discriminate:
+    // with only one, "the earliest" and "the last" name the same record and the assertion proves nothing.
+    line('verify', ENGINE_EVENT_TYPES.StepTerminated, {
+      disposition: 'failed',
+      error: makeError('step.verification_failed', 'the gate failed'),
+    });
+    recorder.close();
+
+    const resetter = createRecordingResetter(BASELINE);
+    const { reconciler } = openReconciler({ baseline: resetter, script: alwaysCompletes });
+    const action = await reconciler.advance(accepted.run);
+
+    // The earliest failure is routed. `verify` fails later in the list and would win if the router took
+    // the last record — leaving `implement`'s failure never routed, and re-run without a baseline reset
+    // by the fall-through that picks the first step with no completed record.
+    expect(action.kind).toBe('reset-and-rerun');
+    expect(action.step).toBe('implement');
+    expect(action.reason).toContain('step.timed_out');
+    expect(resetter.resets).toStrictEqual([{ worktree: makePlan().worktree, ref: BASELINE }]);
+  });
+});
+
+describe('a steering command is refused once the run is past taking it', () => {
+  const settled = async (): Promise<{ readonly reconciler: Reconciler; readonly run: string }> => {
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+    await reconciler.runUntilSettled();
+    expect(reconciler.load(accepted.run).state.state).toBe('committed');
+    return { reconciler, run: accepted.run };
+  };
+
+  it('refuses to confirm a terminal run, rather than walking it back to running', async () => {
+    const { reconciler, run } = await settled();
+    expect(() => reconciler.confirm(run)).toThrowError(SteeringRefused);
+    expect(reconciler.load(run).state.state).toBe('committed');
+  });
+
+  it('refuses to approve a terminal run', async () => {
+    const { reconciler, run } = await settled();
+    expect(() => reconciler.approve(run)).toThrowError(SteeringRefused);
+    expect(reconciler.load(run).state.state).toBe('committed');
+  });
+
+  it('refuses to kill a terminal run', async () => {
+    const { reconciler, run } = await settled();
+    expect(() => reconciler.kill(run)).toThrowError(SteeringRefused);
+    expect(reconciler.load(run).state.state).toBe('committed');
+  });
+
+  it('refuses to approve a killed run, so a killed step is never resurrected', async () => {
+    const first = openReconciler({ script: alwaysCompletes });
+    const accepted = first.reconciler.acceptFeature(makePlan());
+    first.reconciler.confirm(accepted.run);
+    first.reconciler.close();
+    appendOrphanedStart(accepted.run, 'engine-reconciler', 'implement', 'sess-implement');
+
+    const { reconciler, executor } = openReconciler({ script: alwaysCompletes });
+    reconciler.kill(accepted.run);
+
+    // AD-8 twice over: the state refuses the command, and the step record is never rewritten.
+    expect(() => reconciler.approve(accepted.run)).toThrowError(SteeringRefused);
+    expect(reconciler.load(accepted.run).state.steps[0]?.disposition).toBe('killed');
+    await reconciler.pass();
+    expect(executor.started).toStrictEqual([]);
+    expect(executor.resumed).toStrictEqual([]);
+  });
+
+  it('approves without rewriting any step when nothing is blocked', async () => {
+    // `approve` finds the step whose failure blocked the run by asking the disposition table, so a run
+    // with no such step gets the state change and no `step.approved` line at all.
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+    await reconciler.pass();
+
+    reconciler.approve(accepted.run);
+    expect(eventTypes(accepted.run)).not.toContain(ENGINE_EVENT_TYPES.StepApproved);
+    expect(reconciler.load(accepted.run).state.steps[0]?.disposition).toBe('completed');
+  });
+});
+
+describe('one unreadable run does not stop every other feature', () => {
+  it('reports a refusal for a run whose checkpoint version it cannot read, and advances the rest', async () => {
+    const healthy = makePlan({ feature: 'alpha', territory: ['src/alpha'], worktree: '/tmp/wt-alpha' });
+    const broken = makePlan({ feature: 'beta', territory: ['src/beta'], worktree: '/tmp/wt-beta' });
+    const reconciler = Reconciler.open({
+      orchHome: home,
+      executor: createScriptedExecutor(alwaysCompletes),
+      plans: planProvider(healthy, broken),
+      baseline: createRecordingResetter(BASELINE),
+    });
+    toClose.push(reconciler);
+
+    const good = reconciler.acceptFeature(healthy);
+    const bad = reconciler.acceptFeature(broken);
+    reconciler.confirm(good.run);
+    reconciler.confirm(bad.run);
+
+    // A `state.json` this build does not recognise: AD-28 refuses it, per artifact.
+    const statePath = join(runPaths(bad.run, home).runDir, RUN_STATE_FILE_NAME);
+    const real = JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    writeFileSync(statePath, JSON.stringify({ ...real, schema_version: 99 }), 'utf8');
+
+    const result = await reconciler.pass();
+    expect(result.refusals).toHaveLength(1);
+    expect(result.refusals[0]?.run).toBe(bad.run);
+    expect(result.refusals[0]?.code).toBe('config.schema_version_unrecognised');
+    // The healthy feature advanced in the same pass. "Never continue a run whose log the reader
+    // refuses" is per run, not per engine.
+    expect(result.actions).toHaveLength(1);
+    expect(result.actions[0]?.run).toBe(good.run);
+    expect(reconciler.load(good.run).state.steps[0]?.disposition).toBe('completed');
+  });
+
+  it('steps over a run directory holding neither a log nor a checkpoint', async () => {
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+
+    // What a crash between creating the directory and recording run.created leaves behind. It carries no
+    // state and no feature, so a pass must step over it — for ever, not once.
+    mkdirSync(join(runsDir(home), '01K5NQ9ZJ7V3M2P9XQWRTC4BDE'), { recursive: true });
+
+    for (let index = 0; index < 3; index += 1) {
+      const result = await reconciler.pass();
+      expect(result.refusals).toStrictEqual([]);
+    }
+    expect(reconciler.load(accepted.run).state.state).toBe('committed');
+  });
+
+  it('does not let a feature awaiting confirmation hold its territory', async () => {
+    /**
+     * An inert action performs no worktree I/O, so it cannot conflict with anything. If it contended, a
+     * feature parked in `drafting` would hold its whole territory for as long as the user took to confirm
+     * and every overlapping feature would wait behind it indefinitely.
+     */
+    const waiting = makePlan({ feature: 'alpha', territory: ['src/engine'], worktree: '/tmp/wt-alpha' });
+    const working = makePlan({
+      feature: 'beta',
+      territory: ['src/engine/lock.ts'],
+      worktree: '/tmp/wt-beta',
+    });
+    const reconciler = Reconciler.open({
+      orchHome: home,
+      executor: createScriptedExecutor(alwaysCompletes),
+      plans: planProvider(waiting, working),
+      baseline: createRecordingResetter(BASELINE),
+    });
+    toClose.push(reconciler);
+
+    // The older run is left unconfirmed, so it is the one that would hold the territory.
+    const parked = reconciler.acceptFeature(waiting);
+    const active = reconciler.acceptFeature(working);
+    reconciler.confirm(active.run);
+
+    const result = await reconciler.pass();
+    expect(result.deferred).toStrictEqual([]);
+    expect(result.actions.map((action) => action.kind).sort()).toStrictEqual([
+      'await-confirmation',
+      'run-step',
+    ]);
+    expect(reconciler.load(active.run).state.steps).toHaveLength(1);
+    expect(reconciler.load(parked.run).state.state).toBe('drafting');
   });
 });
 
@@ -947,11 +1403,3 @@ describe('the dependency direction is fixed', () => {
     await expect(Promise.reject(refusal)).rejects.toBeInstanceOf(ResumeRefused);
   });
 });
-
-/** A thrown signal used to leave a step in flight without a real SIGKILL. */
-class OrphanSignal extends Error {
-  constructor(step: string) {
-    super(`the executor vanished inside step "${step}"`);
-    this.name = 'OrphanSignal';
-  }
-}

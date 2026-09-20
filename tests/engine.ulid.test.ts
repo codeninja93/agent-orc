@@ -112,12 +112,22 @@ describe('AD-29 — monotonic within a process', () => {
     expect([...ids].sort(compareUlid)).toStrictEqual(ids);
   });
 
-  it('gives two independent minters independent sequences, so monotonicity is per process', () => {
+  it('orders within one minter, which is why the engine shares the process-wide one', () => {
+    /**
+     * Monotonicity is a property of a *minter*, and AD-29 claims it per *process* — so the two only agree
+     * if one minter serves the process. Two independent minters pinned to the same millisecond order
+     * against themselves and not against each other, which is exactly why `Reconciler` defaults to
+     * `defaultUlidMinter` rather than constructing one per instance: the territory tie-break reads run-id
+     * order as "which run is older", and two engines in one process minting from separate sequences would
+     * make that answer arbitrary.
+     */
     const now = (): number => 1_770_000_000_000;
     const a = createUlidMinter({ now });
     const b = createUlidMinter({ now });
-    // Different randomness, so the two sequences differ; each is internally ordered.
+    expect([a.mint(), a.mint()].every((id, index, ids) => index === 0 || id > (ids[index - 1] ?? ''))).toBe(true);
     expect(a.mint()).not.toBe(b.mint());
+    // The shared minter is the one the engine takes, so a run id is monotonic across the whole process.
+    expect(mintRunId() < mintRunId()).toBe(true);
   });
 });
 

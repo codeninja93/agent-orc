@@ -85,10 +85,27 @@ export const ENGINE_EVENT_TYPES = {
 
 export type EngineEventType = (typeof ENGINE_EVENT_TYPES)[keyof typeof ENGINE_EVENT_TYPES];
 
-/** Every type the fold acts on. A type outside this set is ignored, per AD-5. */
-export const FOLDED_EVENT_TYPES: readonly string[] = Object.freeze(
-  Object.values(ENGINE_EVENT_TYPES),
-);
+/**
+ * Every type the fold acts on. A type outside this set is ignored, per AD-5.
+ *
+ * `step.resume_attempted` is deliberately absent. It is emitted so the timeline shows that a resume was
+ * tried, but it changes no run-state fact: what the checkpoint needs is the *outcome* — a termination, or
+ * the `step.resume_refused` that spends the session id — and folding the attempt itself would record a
+ * state the run was never in. The constant is enumerated rather than taken from `ENGINE_EVENT_TYPES` so
+ * it cannot claim to fold a type the switch below has no case for.
+ */
+export const FOLDED_EVENT_TYPES: readonly string[] = Object.freeze([
+  ENGINE_EVENT_TYPES.RunCreated,
+  ENGINE_EVENT_TYPES.FeatureStateChanged,
+  ENGINE_EVENT_TYPES.StepStarted,
+  ENGINE_EVENT_TYPES.StepSessionRecorded,
+  ENGINE_EVENT_TYPES.StepTerminated,
+  ENGINE_EVENT_TYPES.StepApproved,
+  ENGINE_EVENT_TYPES.StepResumeRefused,
+  ENGINE_EVENT_TYPES.StepBaselineReset,
+  ENGINE_EVENT_TYPES.StepTierPromoted,
+  ENGINE_EVENT_TYPES.HandoffRecorded,
+]);
 
 /** One step of a feature's declared plan: a stable name, its contract, and which phase it is in. */
 export interface PlanStep {

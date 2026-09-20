@@ -101,25 +101,31 @@ export const EVENT_ENVELOPE_REQUIRED_FIELDS = [
 ] as const;
 
 /**
- * The identifier fields a recorder restores verbatim after the AD-21 pass, by field path.
+ * The fields a recorder restores verbatim after the AD-21 pass, by field path.
  *
- * Every one of them is an identifier the system reads back: the run and feature the line belongs
- * to, the step that emitted it, the two stream-origin fields AD-5 requires unchanged, and the AD-26
- * baseline ref a re-run resets to. A ULID, a commit SHA and a `claude` session id are each one
- * unbroken high-entropy run, so the pass's entropy heuristic replaces them wherever they appear —
- * which would leave the durable truth unable to name its own run, its own step or the commit a step
- * began at, against AD-4.
+ * The list is as short as it can be, and the reason is the shape of the risk. The pass's entropy
+ * heuristic replaces any unbroken high-entropy run, so exactly two of the envelope's identifiers need
+ * rescuing from it — a run id and a baseline ref, both of which are high-entropy *by construction* and
+ * would otherwise leave the durable truth unable to name its own run or the commit a step began at,
+ * against AD-4. Two more, the AD-5 stream-origin fields, must survive verbatim because AD-5 says so.
  *
- * The allow-list is by *field path*, never by value shape: story 1-2 established that a shape
- * exemption is what let a real credential through, so a listed field is restored only when the
- * original is proven free of every credential class the pass recognises. The two stream fields are
- * dropped when that proof fails, because AD-5 requires them verbatim or not at all; the four
- * identity fields keep the redacted value instead, so a line is still written.
+ * `feature` and `step` are deliberately **not** here. Their legitimate values are punctuated and
+ * low-entropy — a kebab-case slug, a dotted declared name — so the pass leaves them untouched and there
+ * is nothing to restore. Putting them on the list would have bought nothing and cost everything: their
+ * shapes admit any alphanumeric run, so a high-entropy token with no known prefix would satisfy the
+ * shape and be written verbatim while the same value in a payload was replaced. A field is on this list
+ * only when its *legitimate* values are indistinguishable from secret material and its shape is narrow
+ * enough that no secret satisfies it.
+ *
+ * The allow-list is by *field path*, never by value shape alone: story 1-2 established that a shape
+ * exemption is what let a real credential through, so a listed field is restored only when the original
+ * is proven free of every credential class the pass recognises *and* is the identifier the field claims
+ * to hold. The two stream fields are dropped when the first proof fails, because AD-5 requires them
+ * verbatim or not at all; the two identity fields keep the redacted value instead, so a line is still
+ * written.
  */
 export const EVENT_ENVELOPE_VERBATIM_FIELDS = [
   'run',
-  'feature',
-  'step',
   'baseline_ref',
   'parent_tool_use_id',
   'session_id',
@@ -132,6 +138,39 @@ export type EventEnvelopeVerbatimField = (typeof EVENT_ENVELOPE_VERBATIM_FIELDS)
  * so the only safe alternative to keeping the value is dropping the whole artifact.
  */
 export const EVENT_ENVELOPE_STREAM_FIELDS = ['parent_tool_use_id', 'session_id'] as const;
+
+/**
+ * The two identity fields, and the shape each must have to be restored verbatim.
+ *
+ * Being proven free of every credential *class* is not sufficient on its own, and this is the gap the
+ * shapes close. The proof deliberately runs with the entropy heuristic switched off — it has to, because
+ * that heuristic is what condemns a ULID and a commit SHA in the first place — so without a shape check
+ * a high-entropy secret carrying no known prefix would be restored verbatim here while the same value in
+ * a payload was replaced.
+ *
+ * So the gate does not ask "does this look safe?" but "is this the identifier the field claims to hold?".
+ * Both shapes are a fixed length over a restricted alphabet, which no credential format satisfies. A
+ * value failing its shape keeps whatever the pass produced.
+ */
+export const EVENT_ENVELOPE_IDENTITY_SHAPES: Readonly<Record<string, RegExp>> = Object.freeze({
+  /** A ULID: 26 characters of Crockford base32, the leading one at most `7` (AD-29). */
+  run: /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/,
+  /** A full commit SHA, which is what an AD-26 baseline ref always is. */
+  baseline_ref: /^[0-9a-f]{40}$/,
+});
+
+/**
+ * Whether a value is the identifier its field claims to hold.
+ *
+ * A field with no declared shape answers `false`: the allow-list grows by declaring a narrow shape, never
+ * by a field appearing in it without one.
+ */
+export const hasEventIdentityShape = (field: string, value: string): boolean => {
+  // Own-property membership only, so a prototype key such as `constructor` cannot resolve to an
+  // `Object` member masquerading as a declared shape.
+  if (!Object.prototype.hasOwnProperty.call(EVENT_ENVELOPE_IDENTITY_SHAPES, field)) return false;
+  return EVENT_ENVELOPE_IDENTITY_SHAPES[field]?.test(value) ?? false;
+};
 
 /** Ordering is by `seq`; timestamps carry no ordering authority across processes (AD-29). */
 export const compareEventOrder = (a: EventEnvelope, b: EventEnvelope): number => a.seq - b.seq;

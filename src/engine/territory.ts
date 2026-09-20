@@ -13,6 +13,13 @@
  * on every pass and on every restart. A pass that admitted whichever feature the directory listing
  * happened to yield first would make the crash-injection suite's "converges on the same state" claim
  * depend on filesystem ordering.
+ *
+ * Oldest-first admission bounds starvation *among contending features* — a newer arrival can never
+ * overtake an older one — but it says nothing about a holder that never finishes. That is the caller's
+ * half of the contract: only a feature with real work to do may be offered as a candidate. A run parked
+ * awaiting confirmation or awaiting a person performs no worktree I/O, so it must not be presented here,
+ * or it would hold its territory for as long as it waits and every overlapping feature would be deferred
+ * behind it indefinitely. `Reconciler.pass` filters those out before calling in.
  */
 import { posix, sep } from 'node:path';
 
@@ -74,6 +81,15 @@ export interface TerritoryCandidate {
   readonly run: string;
   readonly feature: string;
   readonly territory: readonly string[];
+  /**
+   * The worktree the feature's steps run in, when it has one.
+   *
+   * Two features sharing one worktree collide however disjoint their declared *file* territories are: a
+   * re-run resets that worktree with `reset --hard` plus `clean -fd`, which discards the other feature's
+   * work wholesale. The declared territory describes which files a feature intends to change; the
+   * worktree describes what it can destroy, and only the second bounds the conflict domain of a reset.
+   */
+  readonly worktree?: string;
 }
 
 /** Why a candidate was not admitted to a pass. */
@@ -82,10 +98,16 @@ export interface TerritoryDeferral {
   readonly feature: string;
   /** The run that holds the territory this pass. */
   readonly blockedBy: string;
-  /** The paths the two features both declare. */
+  /** The paths the two features both declare, or the shared worktree, whichever collided. */
   readonly overlap: readonly string[];
   readonly reason: string;
 }
+
+/** Two candidates share a worktree when both name one and the two are the same directory. */
+export const sharesWorktree = (a: TerritoryCandidate, b: TerritoryCandidate): boolean =>
+  a.worktree !== undefined &&
+  b.worktree !== undefined &&
+  normaliseTerritoryPath(a.worktree) === normaliseTerritoryPath(b.worktree);
 
 /** Which features may act this pass, and which are serialised behind one that may. */
 export interface TerritoryAdmission {
@@ -109,21 +131,28 @@ export const admitByTerritory = (
   const deferred: TerritoryDeferral[] = [];
 
   for (const candidate of ordered) {
-    const holder = admitted.find((held) => territoriesOverlap(held.territory, candidate.territory));
+    const holder = admitted.find(
+      (held) =>
+        sharesWorktree(held, candidate) || territoriesOverlap(held.territory, candidate.territory),
+    );
     if (holder === undefined) {
       admitted.push(candidate);
       continue;
     }
-    const overlap = overlappingPaths(candidate.territory, holder.territory);
+    const contested = candidate.worktree;
+    const sharedWorktree = sharesWorktree(holder, candidate) && contested !== undefined;
+    const overlap = sharedWorktree
+      ? [normaliseTerritoryPath(contested)]
+      : overlappingPaths(candidate.territory, holder.territory);
     deferred.push({
       run: candidate.run,
       feature: candidate.feature,
       blockedBy: holder.run,
       overlap,
       reason:
-        `Feature "${candidate.feature}" declares ${overlap.join(', ')}, which run ${holder.run} ` +
-        `("${holder.feature}") holds this pass. Overlapping territories are serialised, so only one ` +
-        'holds the territory at a time.',
+        `Feature "${candidate.feature}" ${sharedWorktree ? 'runs in worktree' : 'declares'} ` +
+        `${overlap.join(', ')}, which run ${holder.run} ("${holder.feature}") holds this pass. ` +
+        `${sharedWorktree ? 'One worktree admits one feature at a time, because a baseline reset there discards every other feature\u2019s work' : 'Overlapping territories are serialised, so only one holds the territory at a time'}.`,
     });
   }
 

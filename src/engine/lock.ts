@@ -10,6 +10,7 @@
  * so a lock recording another host is never reclaimed — the recorded process may be very much alive
  * over there, and a reclaim would produce exactly the two-engine interleave AD-30 forbids.
  */
+import { execFileSync } from 'node:child_process';
 import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
@@ -29,6 +30,19 @@ export interface EngineLockClaim {
   readonly host: string;
   /** RFC3339 with milliseconds — when this engine took the lock. */
   readonly since: string;
+  /**
+   * The holder *process's* start time, as the operating system reports it.
+   *
+   * This is the field that makes a pid meaningful. A pid is a small recycled number: once the holder is
+   * gone the kernel is free to hand it to something unrelated, and a liveness probe alone then reports
+   * the lock as held by a live process forever — an `ORCH_HOME` that can never be started again, for no
+   * reason anyone can see. Comparing the recorded start time against the start time of whatever holds the
+   * pid *now* distinguishes "the engine is still running" from "a stranger inherited its number".
+   *
+   * `null` when the platform would not answer. An unknown start time is never treated as a mismatch, so
+   * the fallback is the conservative one: refuse, exactly as before this field existed.
+   */
+  readonly started_at?: string | null;
 }
 
 const isEngineLockClaim = (value: unknown): value is EngineLockClaim => {
@@ -41,6 +55,45 @@ const isEngineLockClaim = (value: unknown): value is EngineLockClaim => {
     typeof claim['host'] === 'string' &&
     typeof claim['since'] === 'string'
   );
+};
+
+/**
+ * The start time of a running process, as `ps` reports it, or `null` when it cannot be read.
+ *
+ * `ps -o lstart=` is the portable way to ask: Node exposes its *own* start time (via `process.uptime`)
+ * but nothing about another process, and reading the recorded holder's start time is the whole point.
+ * Both the recording and the checking go through this one function, so the two values are always from the
+ * same source and in the same format — comparing a `ps` string against a computed one would compare
+ * formatting, not identity.
+ *
+ * Every failure answers `null`: no `ps`, a pid that has gone, a platform that spells the flag
+ * differently. `null` never proves a mismatch, so an unreadable start time leaves the lock held.
+ */
+export const processStartedAt = (pid: number): string | null => {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const reported = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5_000,
+    }).trim();
+    return reported === '' ? null : reported;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Whether the pid a claim records now belongs to a *different* process than the one that took the lock.
+ *
+ * Both start times must be readable for this to answer `true`. A claim written before this field existed,
+ * or a platform that will not answer, leaves the question undecided — and undecided means the lock stands.
+ */
+export const pidWasRecycled = (claim: EngineLockClaim): boolean => {
+  const recorded = claim.started_at;
+  if (typeof recorded !== 'string' || recorded === '') return false;
+  const current = processStartedAt(claim.pid);
+  return current !== null && current !== recorded;
 };
 
 /**
@@ -97,7 +150,10 @@ export const readEngineLockClaim = (lockPath: string): EngineLockClaim | null =>
 export const describeEngineLockHolder = (holder: EngineLockClaim | null): string =>
   holder === null
     ? 'is held by an unreadable lock file, so no holder can be named'
-    : `is held by pid ${String(holder.pid)} on ${holder.host}, started at ${holder.since}`;
+    : `is held by pid ${String(holder.pid)} on ${holder.host}, started at ${holder.since}` +
+      (typeof holder.started_at === 'string' && holder.started_at !== ''
+        ? ` (that process started ${holder.started_at})`
+        : '');
 
 export interface EngineLockOptions {
   /** `ORCH_HOME`; defaults to the AD-9 resolution. */
@@ -159,6 +215,7 @@ export class EngineLock {
       pid: process.pid,
       host: hostname(),
       since: formatTimestamp(),
+      started_at: processStartedAt(process.pid),
     };
 
     let reclaimed = false;
@@ -170,12 +227,17 @@ export class EngineLock {
       // holder, and reporting them as a held lock would hide the real fault behind the wrong advice.
       if ((thrown as { code?: string } | null)?.code !== 'EEXIST') throw thrown;
       const existing = readEngineLockClaim(path);
+      /**
+       * Two ways a claim is stale, and the second is why the start time is recorded at all: the pid is
+       * gone, or the pid is alive but belongs to a process that started at a different time — a recycled
+       * number, which a liveness probe alone reads as a live holder for ever.
+       */
       const stale =
         (options.reclaimStale ?? true) &&
         existing !== null &&
         existing.host === claim.host &&
         existing.pid !== process.pid &&
-        !pidIsAlive(existing.pid);
+        (!pidIsAlive(existing.pid) || pidWasRecycled(existing));
       if (!stale) {
         throw new EngineLockHeldError(path, existing, describeEngineLockHolder(existing));
       }

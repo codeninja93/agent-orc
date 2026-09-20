@@ -35,6 +35,7 @@ import {
   EventEnvelopeSchema,
   dispositionFor,
   formatTimestamp,
+  hasEventIdentityShape,
 } from '../contracts/index.js';
 import type { EventEnvelope } from '../contracts/index.js';
 
@@ -79,6 +80,8 @@ export interface EventSubmission {
   readonly payload: Record<string, unknown>;
   readonly parent_tool_use_id?: string | null;
   readonly session_id?: string | null;
+  /** AD-26 — the commit the emitting step's worktree stood at. An envelope field, never a payload entry. */
+  readonly baseline_ref?: string | null;
 }
 
 /** The holder of a run's single-writer claim, as recorded in the lock file. */
@@ -520,13 +523,22 @@ export class Recorder {
       const original = candidate[field];
       if (original === undefined) continue;
       const verbatimOrDropped = (EVENT_ENVELOPE_STREAM_FIELDS as readonly string[]).includes(field);
-      if (typeof original === 'string' && !this.redactor.provesPatternFree(original)) {
-        // AD-5 leaves a stream field no third option: it is verbatim or the artifact is dropped.
-        if (verbatimOrDropped) return null;
-        // An identity field keeps what the pass produced. The fail-safe direction is a line whose
-        // `step` reads `[redacted]`, not a run with no line at all.
-        continue;
+
+      if (typeof original === 'string') {
+        if (!this.redactor.provesPatternFree(original)) {
+          // AD-5 leaves a stream field no third option: it is verbatim or the artifact is dropped.
+          if (verbatimOrDropped) return null;
+          // An identity field keeps what the pass produced. The fail-safe direction is a line whose
+          // `step` reads `[redacted]`, not a run with no line at all.
+          continue;
+        }
+        // Proven free of every *pattern* class is not enough on its own: the proof runs with the
+        // entropy heuristic off, so an unknown-format high-entropy secret would pass it. An identity
+        // field is restored only when the value is the identifier the field claims to hold, checked
+        // against a fixed-length restricted alphabet no credential format satisfies.
+        if (!verbatimOrDropped && !hasEventIdentityShape(field, original)) continue;
       }
+
       restored[field] = original;
     }
     return restored as EventEnvelope;

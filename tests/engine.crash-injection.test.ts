@@ -37,7 +37,7 @@ import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { RUN_STATE_FILE_NAME } from '../src/contracts/index.js';
+import { RUN_STATE_FILE_NAME, featureStateFingerprint } from '../src/contracts/index.js';
 import type { RunState } from '../src/contracts/index.js';
 import { readEventLog, runPaths, runsDir } from '../src/runtime/index.js';
 import { ENGINE_LOCK_FILE_NAME } from '../src/engine/index.js';
@@ -150,7 +150,10 @@ const observe = (home: string, worktree: GitWorktree, run: string): Observed => 
     readFileSync(join(runPaths(run, home).runDir, RUN_STATE_FILE_NAME), 'utf8'),
   ) as RunState;
   return {
-    fingerprint: [state.state, ...state.steps.map((step) => `${step.step}:${step.disposition ?? 'in-flight'}`)].join('|'),
+    // The exported function, not a copy of its output format. Every convergence assertion in this suite
+    // rests on this comparison, and `Reconciler.fingerprint` uses the same function — two spellings that
+    // drifted apart would leave the suite silently comparing the wrong property.
+    fingerprint: featureStateFingerprint(state),
     run: state.run,
     ledger: worktree.read(EFFECTS_LEDGER) ?? '',
     listing: worktree.listing(),

@@ -406,6 +406,135 @@ describe('AD-5 — the stream-origin fields are preserved verbatim', () => {
   });
 });
 
+describe('AD-4 — the identity fields the log must be able to name its own run by', () => {
+  /**
+   * The verbatim allow-list exists because the entropy heuristic condemns a ULID and a commit SHA, which
+   * would leave the durable truth unable to name its own run or the commit a step began at. It is a hole
+   * unless two things are both true: a credential in one of those fields must not be restored, and only a
+   * value that *is* the declared identifier may be.
+   *
+   * These cases pin both halves. Deleting either the `provesPatternFree` proof or the shape check in
+   * `preservePassthrough` fails them, which is what stops the allow-list from resting on an unasserted
+   * call.
+   */
+  const SHA = 'ddd9bed4d286ac1f8a0f4f7bfef9530046605787';
+  const TOKEN = 'sk-ant-api03-Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7Ii8Jj9Kk0Ll1Mm2';
+
+  it('restores a real ULID run id and a real commit SHA, which the entropy rule would otherwise replace', () => {
+    const recorder = recorderFor();
+    const event = recorder.record(submission({ baseline_ref: SHA }));
+
+    expect(event.run).toBe(RUN_ID);
+    expect((event as unknown as Record<string, unknown>)['baseline_ref']).toBe(SHA);
+
+    /**
+     * The same two values inside a *payload* are replaced, which is what makes the restore above a
+     * rescue rather than a no-op. A high-entropy ULID is used for the run id here rather than this
+     * suite's fixture id: the fixture is mostly zeros and so carries too little entropy to be caught,
+     * and asserting against it would have made this comparison prove nothing.
+     */
+    const payloadCopy = recorder.record(
+      submission({ payload: { a_baseline_ref: SHA, a_run_id: '01K5NQ8ZJ7V3M2P9XQWRTC4BDE' } }),
+    );
+    expect(payloadCopy.payload['a_baseline_ref']).toBe('[redacted]');
+    expect(payloadCopy.payload['a_run_id']).toBe('[redacted]');
+
+    // And the fold reads them back off the line, which is what the checkpoint rebuild depends on.
+    const [first] = readEventLog(logPathFor());
+    expect(first?.run).toBe(RUN_ID);
+    expect((first as unknown as Record<string, unknown>)['baseline_ref']).toBe(SHA);
+  });
+
+  it.each(['baseline_ref', 'step'])(
+    'appends the line with %s reading [redacted] when that field carries an sk-ant- token',
+    (field) => {
+      const recorder = recorderFor();
+      const outcome = recorder.recordResult(submission({ baseline_ref: SHA, [field]: TOKEN }));
+
+      // The line is kept, not dropped: an identity field is rewritten rather than costing the artifact.
+      expect(outcome.dropped).toBe(false);
+      expect(outcome.event.type).toBe('step.started');
+      expect((outcome.event as unknown as Record<string, unknown>)[field]).toBe('[redacted]');
+
+      // No part of the token is anywhere in the file — not in the field, not in a message, not in a
+      // fragment. AD-21 has no after-the-fact remedy, so absence is asserted over the whole file.
+      const text = readFileSync(logPathFor(), 'utf8');
+      expect(text).not.toContain(TOKEN);
+      expect(text).not.toContain('sk-ant');
+      expect(text).not.toContain('api03');
+      expect(readEventLog(logPathFor())).toStrictEqual([outcome.event]);
+    },
+  );
+
+  it('does not restore a high-entropy value that no credential class recognises but no shape admits', () => {
+    /**
+     * The gap the shape check closes. `provesPatternFree` runs with the entropy heuristic switched off —
+     * it has to, or it would condemn the ULID and the SHA this list exists to rescue — so a secret with
+     * no known prefix passes that proof. Only "is this the identifier the field claims to hold?" stops it.
+     */
+    const unknownFormatSecret = 'qT7pLx2ZfNc4Wb9JmK1sVh6Ry3Dg8Eu5';
+    const recorder = recorderFor();
+    const outcome = recorder.recordResult(submission({ baseline_ref: unknownFormatSecret }));
+
+    expect(outcome.dropped).toBe(false);
+    expect((outcome.event as unknown as Record<string, unknown>)['baseline_ref']).toBe('[redacted]');
+    expect(readFileSync(logPathFor(), 'utf8')).not.toContain(unknownFormatSecret);
+  });
+
+  it('does not restore a registered credential that happens to satisfy the shape', () => {
+    /**
+     * The case that pins the `provesPatternFree` proof rather than the shape check. A shape cannot decide
+     * this one: an injected credential is an arbitrary string, so it can perfectly well be forty lowercase
+     * hex characters, and then "is this the identifier the field claims to hold?" answers yes. Only
+     * proving the value free of every credential class stops it being written verbatim.
+     */
+    const credentialShapedLikeASha = 'c0ffee1234567890abcdef1234567890abcdef12';
+    const recorder = Recorder.open({
+      runId: RUN_ID,
+      feature: FEATURE,
+      orchHome: home,
+      fsync: false,
+      redaction: { secrets: [{ name: 'a credential shaped like a commit SHA', value: credentialShapedLikeASha }] },
+    });
+    open.push(recorder);
+
+    const outcome = recorder.recordResult(submission({ baseline_ref: credentialShapedLikeASha }));
+
+    /**
+     * Asserted as the *positive* outcome, not merely as absence. The last-resort append gate knows
+     * registered literals, so it would replace the whole line and the value would be absent from the file
+     * either way — absence alone cannot tell the proof from its backstop. What distinguishes them is that
+     * the event is still appended as itself, with the field rewritten in place: reaching the gate instead
+     * would substitute a `redaction.failed` line and report `dropped`.
+     */
+    expect(outcome.dropped).toBe(false);
+    expect(outcome.event.type).toBe('step.started');
+    expect((outcome.event as unknown as Record<string, unknown>)['baseline_ref']).toBe('[redacted]');
+    expect(readFileSync(logPathFor(), 'utf8')).not.toContain(credentialShapedLikeASha);
+  });
+
+  it.each([
+    ['too short', 'ddd9bed4d286ac1f8a0f4f7bfef95300466057'],
+    ['too long', `${'ddd9bed4d286ac1f8a0f4f7bfef9530046605787'}ab`],
+    ['upper case, so not a git object name', 'DDD9BED4D286AC1F8A0F4F7BFEF9530046605787'],
+  ])('refuses to restore a baseline_ref that is %s', (_label, notASha) => {
+    // The shape is a fixed length over a restricted alphabet precisely so near-misses do not qualify.
+    const recorder = recorderFor();
+    const event = recorder.record(submission({ baseline_ref: notASha }));
+    expect((event as unknown as Record<string, unknown>)['baseline_ref']).toBe('[redacted]');
+  });
+
+  it('keeps a legitimate step name and feature slug without needing to be restored at all', () => {
+    // Neither is on the allow-list: a dotted declared name and a kebab-case slug are punctuated and
+    // low-entropy, so the pass leaves them alone. That is why restoring them would be an unbounded hole
+    // for no benefit — there is nothing to rescue.
+    const recorder = recorderFor();
+    const event = recorder.record(submission({ step: 'write.tests', baseline_ref: SHA }));
+    expect(event.step).toBe('write.tests');
+    expect(event.feature).toBe(FEATURE);
+  });
+});
+
 describe('redaction.failed is an event type and an error code, and the two are not conflated', () => {
   it('emits the type, and reads the disposition from the AD-35 table rather than restating it', () => {
     const recorder = recorderFor();

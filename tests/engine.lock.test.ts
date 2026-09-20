@@ -24,6 +24,8 @@ import {
   acquireEngineLock,
   engineLockPath,
   pidIsAlive,
+  pidWasRecycled,
+  processStartedAt,
   readEngineLockClaim,
 } from '../src/engine/index.js';
 
@@ -218,8 +220,105 @@ describe('a stale lock is reclaimed once the recorded pid is verifiably gone', (
   });
 });
 
+describe('AD-30 — the recorded start time is what makes the pid meaningful', () => {
+  it('records the holder process\u2019s own start time, not only when the lock was taken', () => {
+    const lock = acquireEngineLock({ orchHome: home });
+    try {
+      const claim = readEngineLockClaim(lock.path);
+      // `since` is when the lock was taken; `started_at` is when the process began. They answer
+      // different questions, and only the second survives a pid being recycled.
+      expect(claim?.started_at).toBe(processStartedAt(process.pid));
+      expect(claim?.started_at).not.toBe(claim?.since);
+      expect(claim?.started_at).not.toBeNull();
+    } finally {
+      lock.release();
+    }
+  });
+
+  it('reclaims a lock whose pid is alive but belongs to a process that started at another time', async () => {
+    /**
+     * The recycled-pid case, and the reason AD-30 says "pid *and* start time". Without the second field a
+     * stranger inheriting the number makes the home permanently unstartable, for no visible reason.
+     */
+    const stranger = await spawnIdleChild();
+    writeClaim({
+      pid: stranger,
+      host: hostname(),
+      since: '2026-09-19T00:00:00.000Z',
+      started_at: 'Sat Jan  1 00:00:00 2000',
+    });
+
+    expect(pidIsAlive(stranger)).toBe(true);
+    expect(pidWasRecycled({ pid: stranger, host: hostname(), since: 'x', started_at: 'Sat Jan  1 00:00:00 2000' })).toBe(true);
+
+    const lock = acquireEngineLock({ orchHome: home });
+    try {
+      expect(lock.reclaimed).toBe(true);
+      expect(readEngineLockClaim(lock.path)?.pid).toBe(process.pid);
+    } finally {
+      lock.release();
+    }
+  }, SPAWN_TIMEOUT_MS);
+
+  it('refuses a lock whose pid is alive and whose recorded start time matches', async () => {
+    const holder = await spawnIdleChild();
+    writeClaim({
+      pid: holder,
+      host: hostname(),
+      since: '2026-09-19T00:00:00.000Z',
+      started_at: processStartedAt(holder),
+    });
+
+    expect(pidWasRecycled({ pid: holder, host: hostname(), since: 'x', started_at: processStartedAt(holder) })).toBe(false);
+    expect(() => acquireEngineLock({ orchHome: home })).toThrowError(EngineLockHeldError);
+    expect(readEngineLockClaim(engineLockPath(home))?.pid).toBe(holder);
+  }, SPAWN_TIMEOUT_MS);
+
+  it('refuses a live pid when the claim records no start time, because undecided means held', async () => {
+    // A lock written before this field existed. An unknown start time must never read as a mismatch, or
+    // an upgrade would start stealing locks from live engines.
+    const holder = await spawnIdleChild();
+    writeClaim({ pid: holder, host: hostname(), since: '2026-09-19T00:00:00.000Z' });
+    expect(pidWasRecycled({ pid: holder, host: hostname(), since: 'x' })).toBe(false);
+    expect(() => acquireEngineLock({ orchHome: home })).toThrowError(EngineLockHeldError);
+  }, SPAWN_TIMEOUT_MS);
+
+  it('names the holder\u2019s process start time in the refusal', () => {
+    const lock = acquireEngineLock({ orchHome: home });
+    try {
+      expect(() => acquireEngineLock({ orchHome: home })).toThrowError(
+        new RegExp(`that process started ${(lock.claim.started_at ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`),
+      );
+    } finally {
+      lock.release();
+    }
+  });
+});
+
+/** A child that stays alive until the suite kills it, for a pid that is genuinely running. */
+const spawnIdleChild = async (): Promise<number> => {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  children.push(child);
+  const deadline = Date.now() + 20_000;
+  while (child.pid === undefined) {
+    if (Date.now() > deadline) throw new Error('the idle child never reported a pid');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  // `ps` must be able to see it before the test compares start times.
+  while (processStartedAt(child.pid) === null) {
+    if (Date.now() > deadline) throw new Error('ps never reported the idle child');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return child.pid;
+};
+
 /** Overwrite the lock file with a hand-made claim, for the states a real process cannot produce. */
-const writeClaim = (claim: { pid: number; host: string; since: string }): void => {
+const writeClaim = (claim: {
+  pid: number;
+  host: string;
+  since: string;
+  started_at?: string | null;
+}): void => {
   mkdirSync(home, { recursive: true });
   writeFileSync(engineLockPath(home), `${JSON.stringify(claim)}\n`, 'utf8');
 };

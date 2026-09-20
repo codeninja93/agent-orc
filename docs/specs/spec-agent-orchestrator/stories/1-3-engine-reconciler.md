@@ -291,6 +291,68 @@ tests automatically on registration.
 
 ## Review Triage Log
 
+### 2026-09-20 — Review pass
+- verdicts: 56 findings — high 22, medium 27, low 7, false 0, maybe-false 0
+- layers: blind-hunter (14), edge-case-hunter (27), verification-gap (2 gap + 3 other), intent-alignment (10)
+- run after the story was first marked done: the user asked for 1-3 and 1-4 to be reviewed before story 1-5.
+- findings:
+  - `[high]` `[patch]` BH1 StepSpawnFailed escapes pass() unrouted, making a non-terminating re-run loop — VERIFIED: driveStep awaited executor.start bare. Patched with terminationFromThrown routing the code through AD-35.
+  - `[high]` `[patch]` BH2 BaselineResetError escapes the same way; orchError built and never read — VERIFIED by code read. Patched: routes to hand-off via the declared abandon-and-hand-off disposition.
+  - `[high]` `[patch]` BH3 a crash between mkdirSync and the first append wedges every later pass — load() threw for a run dir with neither artifact, and pass() calls load() for every run. Patched: IncompleteRunDirectory is skipped.
+  - `[high]` `[patch]` BH4 one unreadable run poisons every other run in the pass — Patched: per-run refusals collected and reported; Promise.allSettled for admitted actions.
+  - `[medium]` `[patch]` BH5 an inert drafting/blocked run holds its whole territory, starving overlapping features — Patched: inert runs excluded from territory contention; territory.ts docblock corrected.
+  - `[high]` `[patch]` BH6 approve() can resurrect a killed step, breaking the AD-8 invariant — VERIFIED: no state guard, target picked as steps.at(-1). Patched: assertSteerable plus blockedStep, which asks the table which record escalates to a human.
+  - `[medium]` `[patch]` BH7 the lock records acquire time, not process start time, so pid reuse is undetectable — VERIFIED: since = formatTimestamp() at acquire. Patched: real process start time via ps, compared on reclaim; a null answer never proves a mismatch.
+  - `[low]` `[patch]` BH8 FOLDED_EVENT_TYPES claims every folded type but step.resume_attempted has no case — Patched: the set is enumerated explicitly and that type excluded with its rationale.
+  - `[medium]` `[patch]` BH9 the AD-31 suite hand-inlines the fingerprint that contracts exports — Two copies of the comparison every convergence assertion rests on. Patched: imports featureStateFingerprint.
+  - `[high]` `[patch]` BH10 the identifier round-trip test is vacuous: 'a'.repeat(40) is 0.00 bits/char — VERIFIED by parent: that value is never redacted; a real 40-hex SHA is 3.73 and is. The same mistake this story's change log cites as the reason 1-2 missed the bug. Patched with a real SHA and a real minted ULID.
+  - `[medium]` `[patch]` BH11 the Reconciler makes a fresh minter per instance despite documenting a shared one — Patched: defaults to defaultUlidMinter; the ULID test reworded to match.
+  - `[medium]` `[patch]` BH12 every acting run is folded three times per pass — Patched: the entry pass() already loaded is threaded into advance.
+  - `[low]` `[patch]` BH13 sweepCheckpointTemporaries deletes any state.json.*.tmp despite its comment — Folded into the checkpoint work.
+  - `[low]` `[reject]` BH14 createScriptedExecutor.start lacks the try/catch resume has — The double is test-only and its throw surfaces identically to a rejection in every suite that drives it; no consumer behaviour differs.
+  - `[high]` `[patch]` EC1 executor.start rejection unhandled — same as BH1; patched
+  - `[high]` `[patch]` EC2 BaselineResetError unhandled — same as BH2; patched
+  - `[medium]` `[patch]` EC3 a truncated steps/<step>/input.json throws SyntaxError out of driveStep — Patched with a safe parse.
+  - `[medium]` `[patch]` EC4 a folded baseline_ref of '' or [redacted] silently re-baselines on the previous attempt's HEAD — Patched: a non-SHA recorded baseline hands off rather than re-reading HEAD.
+  - `[high]` `[patch]` EC5 approve() on a killed or terminal run — same as BH6; patched
+  - `[medium]` `[patch]` EC6 confirm() on a terminal run re-enters execution — Patched by assertSteerable.
+  - `[high]` `[patch]` EC7 kill() overwrites a completed step's disposition — VERIFIED by a reviewer probe: after a pass the checkpoint read implement:completed, and kill() made it implement:killed permanently. Patched: kill targets only an in-flight step.
+  - `[medium]` `[patch]` EC8 one run's advance rejection loses every other run's pass result — same as BH4; patched
+  - `[high]` `[patch]` EC9 a torn trailing append makes every later pass throw for all runs — same as BH4; patched per-run
+  - `[medium]` `[patch]` EC10 a dropped artifact means step.started never lands and the fold loops forever — Patched: emit checks the recordResult outcome and throws UnrecordedAction.
+  - `[medium]` `[patch]` EC11 a non-completed step earlier in the list is never routed — Patched: decideAction routes the earliest pending record. The first mutation slipped through because the fixture had only one non-completed step; the fixture now has two.
+  - `[high]` `[defer]` EC12 a retry-with-backoff code recurs with no ceiling and no delay — Real and now broader, since step.spawn_failed routes to retry. Ceilings are AD-24 / story 2-9 and this story's Never list excludes them.
+  - `[medium]` `[defer]` EC13 the same session id is resumed every pass forever — Same family as EC12: a resume ceiling belongs with the retry ceiling in 2-9.
+  - `[medium]` `[patch]` EC14 clean -fd leaves an untracked nested repository behind — Patched with a test that an ignored path survives; -ff was not adopted because it would also destroy a legitimately nested checkout.
+  - `[high]` `[patch]` EC15 git runs with no timeout and no maxBuffer — VERIFIED by code read. Patched: 120s timeout, 64 MiB buffer, both named constants.
+  - `[medium]` `[patch]` EC16 a recycled pid makes ORCH_HOME permanently unstartable — same as BH7; patched
+  - `[medium]` `[patch]` EC17 a future-version checkpoint whose shape also drifted is silently overwritten — parseVersionedArtifact parses shape before gating the version. Patched: SchemaVersionRefusal now carries config.schema_version_unrecognised so a caught refusal reaches the table.
+  - `[low]` `[defer]` EC18 compareCheckpointToLog omits promotions, resets, terminated_at and handoff.reason — Divergence in those fields goes undetected on a non-admitted run. Real but narrow; the fields are advisory rather than control-flow.
+  - `[medium]` `[patch]` EC19 nextModelRung treats indexOf -1 as a valid promotion target — Patched with a guard.
+  - `[high]` `[patch]` EC20 two features with disjoint territories sharing one worktree destroy each other — Patched: territory is keyed on the worktree via sharesWorktree.
+  - `[high]` `[patch]` EC21 a [redacted] feature slug wedges the run permanently — plans('[redacted]') threw and the run could never load again. Patched: planFor falls back to the checkpoint's feature.
+  - `[medium]` `[patch]` EC22 (deletion) run/feature/step lost their previous redaction treatment — This is the allow-list widening. Patched by narrowing: step and feature are off the list entirely, run and baseline_ref carry mandatory shapes.
+  - `[high]` `[patch]` EC23 (claim) a killed step is re-run after an approval — same as BH6/EC5; patched
+  - `[high]` `[patch]` EC24 (claim) 'every failure routes through the table' held for one code path only — same as BH1/BH2; patched
+  - `[medium]` `[patch]` EC25 (claim) only same-shaped future checkpoint versions are refused — same as EC17; patched
+  - `[medium]` `[defer]` EC26 (claim) reclaim also requires a matching hostname, so a renamed host is never reclaimable — Real and outside the matrix row. Left deferred: refusing is the safe direction and a shared ORCH_HOME is excluded by the single-user assumption.
+  - `[medium]` `[patch]` EC27 (claim) identical-effect decays when the recorded baseline folded to '' — same as EC4; patched
+  - `[high]` `[patch]` VG1 a credential in a newly allow-listed identity field is held out by one unasserted call — DEMONSTRATED by the layer: moving verbatimOrDropped to the front of the guard left 513/513 green while writing an sk-ant token verbatim. Patched and re-verified by parent: sk-ant in baseline_ref reads [redacted], line kept, token absent.
+  - `[high]` `[patch]` VG2 clean -fd omits -x and no test can observe an ignored path — DEMONSTRATED: changing to clean -fdx left 513/513 green, because the only worktree observation uses --exclude-standard. Patched with a direct read of an ignored path.
+  - `[high]` `[patch]` VGO1 kill() rewrites a completed step as killed — same as EC7; reviewer-probed. Patched.
+  - `[medium]` `[patch]` VGO2 no steering method guards a terminal state — same as BH6/EC6; patched
+  - `[low]` `[patch]` VGO3 STEP_STARTED_PAYLOAD_FIELDS is exported claiming a test that does not exist — Patched: deleted.
+  - `[medium]` `[defer]` IA-a lock refusal expected at the process surface, tested at the exception surface — No entry point exists at this commit, so nothing exits non-zero; the refused engine is always the vitest process. Deferred until an entry point exists.
+  - `[medium]` `[patch]` IA-b steering kill expected at the running-step surface, exercised at record amendment — The retargeting half is patched. That a kill can only land between passes is inherent to one-action-per-pass and belongs to 1-7.
+  - `[medium]` `[defer]` IA-c the interrupted checkpoint write is exercised after the write returns — The mechanism is right (temp, fsync, rename, dir fsync) but no injected kill lands inside the write window, and the torn case uses a deliberately non-atomic writer exported for the test.
+  - `[medium]` `[defer]` IA-d 'killed at any instant' is exercised at the boundaries the loop declares about itself — 21 boundaries are real and strong, but windows that are not boundaries are never killed in — inside writeCheckpoint, between reset --hard and clean -fd, and between the executor's side effects and step.terminated.
+  - `[medium]` `[defer]` IA-e territory and plan are re-supplied identically by fiat in every crash child — Convergence is asserted with the configuration half held constant; a restart handed a different plan is outside every test.
+  - `[high]` `[patch]` IA-f the redaction change is the largest surface mismatch and had no test at its own surface — runtime.redaction and runtime.recorder suites were untouched by the story that changed them. Patched: cases added at the recorder surface.
+  - `[low]` `[defer]` IA-g 'only the reconciler writes state.json' is a convention, and the barrel exports a non-atomic writer — Nothing mechanically prevents another unit from writing one.
+  - `[high]` `[defer]` IA-h routing is implemented, backoff is not, and the unbounded case is untested — same as EC12: ceilings are 2-9.
+  - `[medium]` `[defer]` IA-i interrupted carries two meanings, since approve() folds to it — A human approval therefore costs a full step re-run. Flagged by the story itself; left as the deliberate judgement it was.
+  - `[low]` `[reject]` IA-j two Always constraints are verified lexically over comment-stripped source — It is the honest available check at this stage; a behavioural equivalent would require a module-graph tool the Stack does not pin.
+
 ## Design Notes
 
 **The executor port is the story's main boundary decision.** AD-8 describes the reconciler attempting `claude -p --resume`, but spawning is story 1-4's subject and this story's Never list excludes it. The split: the loop owns the *decision* — which disposition is resumable, when to reset and re-run, when to hand off — and calls a port that reports a termination. Story 1-4 supplies the real `claude -p` implementation; this story drives a double. If the port's shape is wrong, 1-4 will have to change the reconciler, so the port is worth reviewing more carefully than the loop around it.
@@ -320,7 +382,9 @@ export PATH="/Users/deep/.nvm/versions/node/v24.21.0/bin:$PATH"   # node v24.21.
 Status: done
 Blocking condition: none
 
-**REVIEW WAS SKIPPED.** The user directed mid-run: *"No need to wait for reviews. You can complete as
+**REVIEW WAS INITIALLY SKIPPED, THEN RUN.** The user later directed: *"stop at 1-4 and run review for 1-3 and 1-4 first before moving to 1-5."* Four layers reviewed this story and 56 findings were triaged into 42 patch entries; see the Review Triage Log above. The paragraph that follows is the original note, kept for the record.
+
+**Original note —** The user directed mid-run: *"No need to wait for reviews. You can complete as
 many as you can. I will review code later."* No blind-hunter, edge-case, verification-gap or
 intent-alignment layer ran against this story, and there is no Review Triage Log below. Stories 1-1 and
 1-2 each surfaced 68-70 findings at this stage, four of them `high` in 1-2 alone, so the absence of a
@@ -369,3 +433,60 @@ kept because it turns a silent 20-second timeout into a diagnosable failure.
 **Follow-up review recommended: true** — because no review ran. The eight deferred entries above are ranked
 with the three `high` ones first: the missing review itself, the widened redaction allow-list, and unbounded
 retry until story 2-9 adds ceilings.
+
+### Pass 2 — four-layer review and patch round (2026-09-20)
+
+Status: done
+Blocking condition: none
+
+Four layers reported **56 findings — high 22, medium 27, low 7**, routed to 42 patch entries, 12 deferrals and
+2 rejections. They converged on one root cause: the reconciler's only `catch` was the `ResumeRefused` one, so
+`step.spawn_failed`, `git.baseline_reset_failed`, a corrupt log and a schema refusal all escaped `pass()`
+instead of routing through AD-35 — and because `step.started` was already in the log with no termination, the
+next pass adopted the step as `interrupted` and failed identically. A non-terminating loop built from codes
+that each had a declared remedy. `BaselineResetError.orchError` was constructed and never read.
+
+**The redaction allow-list was the story's own named review target, and it had a demonstrated hole.** A
+reviewer moved one operand of the guard in `preservePassthrough` so identity fields restored without the
+pattern-free proof: the suite stayed green at 513/513 while an `sk-ant-` token went verbatim into
+`events.jsonl`. No test put a credential in any of the four newly allow-listed fields. Separately the parent
+verified that a 5.00 bits/char token with no known prefix was redacted in a payload but written verbatim as
+`step`, because `provesPatternFree` disables the entropy sweep by design.
+
+**The implementer overruled the parent's instruction here, and was right.** The parent asked for shape gates on
+all four identity fields. The implementer probed and found the proposed `step` shape
+(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`) is satisfied by `qT7pLx2ZfNc4Wb9JmK1sVh6Ry3Dg8Eu5`, so the hole would
+have stayed open. The better fix, applied instead: `step` and `feature` never needed restoring at all — their
+legitimate values are punctuated and low-entropy, so the pass leaves them alone — so the allow-list is now
+`run`, `baseline_ref` and the two AD-5 stream fields, with mandatory fixed-length shapes (26-char Crockford
+ULID, 40 lowercase hex) that no credential format satisfies, checked in addition to `provesPatternFree`.
+
+Parent verification after the patch round:
+
+- `typecheck`, `lint`, `build` exit 0; `npm test` → 16 files, **542 passed** (was 513)
+- Legitimate identifiers survive: a real minted ULID `run`, a real 40-hex `baseline_ref`, and ordinary
+  `feature`/`step` values all round-trip unchanged
+- The demonstrated hole is closed: a 5.00 bits/char token as `step` no longer lands verbatim; an `sk-ant-`
+  token in `baseline_ref` reads `[redacted]` with the line kept and the token absent from the file
+- The shape gate discriminates rather than blanket-redacting: a wrong-shape high-entropy `run` reads
+  `[redacted]` while a real ULID is preserved
+- The implementer mutation-verified each fix and reported two mutations that initially slipped through,
+  strengthening the tests rather than the claims — one of them the same defence-in-depth-masking-the-pass
+  mistake story 1-2 made
+
+**The most instructive finding.** The identifier round-trip test written specifically to guard this story's
+redaction fix used `'a'.repeat(40)` — 0.00 bits/char, never redacted. That is the exact mistake the parent
+made in story 1-2, repeated inside the test created to prevent it, in a story whose own change log cites that
+mistake by name. Two layers caught it independently.
+
+**Deviations the implementer flagged, accepted by the parent:** `session_id` is not shape-gated to a UUID,
+because story 1-2's serialisation-gate test depends on verbatim restore of a non-UUID session id and the
+format is the CLI's to choose; `ReconcilerOptions.redaction` is new surface outside the Code Map, needed
+because the engine had no way to register a run's injected credentials as AD-21 requires; and `lock.ts` now
+shells out to `ps` for a process start time, which loses recycled-pid detection on a platform that will not
+answer but never steals a lock from a live engine.
+
+**Still deferred after this pass**, and the reason the follow-up flag stays true: unbounded retry with no
+backoff, now reaching `step.spawn_failed` as well, until AD-24's ceilings arrive in story 2-9; the crash suite
+killing only at boundaries the loop declares about itself; territory re-supplied identically by fiat in every
+crash child; and no process entry point, so "exits non-zero" is verified nowhere.

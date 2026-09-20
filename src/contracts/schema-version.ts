@@ -44,6 +44,15 @@ export const versioned = <Shape extends z.ZodRawShape>(
 
 /** Refusal to operate on an artifact whose `schema_version` this build does not recognise. */
 export class SchemaVersionRefusal extends Error {
+  /**
+   * The AD-35 code this refusal crosses a unit boundary as, whose declared disposition is
+   * `escalate-to-human`: nothing retries its way out of an artifact this build cannot read.
+   *
+   * Carried on the class so a caller routing a caught refusal reaches the table rather than the
+   * unknown-code fallback, which would report a precisely-diagnosed version problem as an unrecognised
+   * internal failure.
+   */
+  readonly code = 'config.schema_version_unrecognised';
   readonly artifact: string;
   readonly schemaVersion: number;
   readonly writtenBy: string | null;

@@ -41,6 +41,8 @@ import {
   formatTimestamp,
   inFlightStep,
   isTerminalFeatureState,
+  makeError,
+  renderCause,
 } from '../contracts/index.js';
 import type {
   FeatureState,
@@ -49,14 +51,21 @@ import type {
   StepInput,
   StepRecord,
 } from '../contracts/index.js';
-import { Recorder, readEventLog, resolveOrchHome, runPaths, runsDir } from '../runtime/index.js';
-import type { RunPaths } from '../runtime/index.js';
+import {
+  REDACTION_MARKER,
+  Recorder,
+  readEventLog,
+  resolveOrchHome,
+  runPaths,
+  runsDir,
+} from '../runtime/index.js';
+import type { RedactionPolicy, RunPaths } from '../runtime/index.js';
 
-import { gitBaselineResetter, resetToBaseline } from './baseline.js';
+import { BaselineResetError, gitBaselineResetter, resetToBaseline } from './baseline.js';
 import type { BaselineResetter } from './baseline.js';
 import { listRunIds, readCheckpoint, sweepCheckpointTemporaries, writeCheckpoint } from './checkpoint.js';
 import { routeRefusedResume, routeTermination } from './dispositions.js';
-import { ResumeRefused } from './executor.js';
+import { ResumeRefused, terminated } from './executor.js';
 import type { StepExecutor, StepStartRequest, StepTermination } from './executor.js';
 import {
   ENGINE_EMITTER,
@@ -66,9 +75,9 @@ import {
 } from './rebuild.js';
 import type { CheckpointDisagreement, FeaturePlan, PlanStep } from './rebuild.js';
 import { admitByTerritory } from './territory.js';
-import type { TerritoryDeferral } from './territory.js';
+import type { TerritoryCandidate, TerritoryDeferral } from './territory.js';
 import { EngineLock } from './lock.js';
-import { createUlidMinter } from './ulid.js';
+import { defaultUlidMinter } from './ulid.js';
 import type { UlidMinter } from './ulid.js';
 
 /** `runs/<run-id>/steps/` — where a step's typed input file lives. */
@@ -87,6 +96,74 @@ const SAFE_STEP_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
  * keeps that honest: when 2-9 arrives it replaces this constant, it does not discover a magic literal.
  */
 export const DECLARED_WALL_CLOCK_MS = 60 * 60 * 1000;
+
+/**
+ * A run directory holding neither an event log nor a checkpoint.
+ *
+ * `acceptFeature` creates the directory and then appends `run.created`, so a crash in between leaves one
+ * of these. It carries no run state at all — not even the feature it belongs to — so there is nothing to
+ * reconcile and nothing to act on. It is named as its own condition rather than reported as a fault,
+ * because a pass must step over it: letting it throw would stop every *other* feature from advancing for
+ * as long as the directory exists, which is permanent.
+ */
+export class IncompleteRunDirectory extends Error {
+  readonly code = 'config.invalid';
+  readonly run: string;
+
+  constructor(run: string) {
+    super(
+      `Run ${run} has a directory but neither an event log nor a checkpoint, so it carries no state ` +
+        'and no feature. A crash between creating the directory and recording run.created leaves this; ' +
+        'the run is skipped, never repaired.',
+    );
+    this.name = 'IncompleteRunDirectory';
+    this.run = run;
+  }
+}
+
+/**
+ * A steering command refused because the run is past taking it.
+ *
+ * A terminal run has reached `[*]` in the lifecycle: confirming, approving or killing it would walk a
+ * finished run backwards into `running`, and AD-8 is explicit that a `killed` step is never resumed and
+ * never re-run. The refusal is raised rather than silently ignored so story 1-7 can render *why* a
+ * control did nothing.
+ */
+export class SteeringRefused extends Error {
+  readonly code = 'internal.invariant_violated';
+  readonly run: string;
+  readonly state: FeatureState;
+
+  constructor(run: string, state: FeatureState, detail: string) {
+    super(`Refusing to steer run ${run}: it is ${state}. ${detail}`);
+    this.name = 'SteeringRefused';
+    this.run = run;
+    this.state = state;
+  }
+}
+
+/**
+ * An action whose event the redaction pass dropped.
+ *
+ * AD-21 fails closed, so a `step.started` or `step.terminated` carrying something unredactable is
+ * replaced by a `redaction.failed` line — and the fold then cannot see the action at all. Proceeding
+ * would leave the loop re-deciding the same action forever against a log that never records it, so the
+ * action is abandoned loudly instead. The code's declared disposition is `abandon-and-hand-off`.
+ */
+export class UnrecordedAction extends Error {
+  readonly code = 'redaction.failed';
+  readonly eventType: string;
+
+  constructor(eventType: string) {
+    super(
+      `The ${eventType} event was dropped by the redaction pass, so this action is not in the log. ` +
+        'AD-21 fails closed and AD-4 makes the log the only truth, so an action the log cannot record ' +
+        'is abandoned rather than performed unrecorded.',
+    );
+    this.name = 'UnrecordedAction';
+    this.eventType = eventType;
+  }
+}
 
 /** What the loop decided to do about one feature in one pass. */
 export type ReconcileAction =
@@ -159,12 +236,97 @@ export interface PassAction {
   readonly disagreements: readonly CheckpointDisagreement[];
 }
 
+/**
+ * A run this pass could not read or could not advance, reported rather than thrown.
+ *
+ * AD-28's refusal and AD-4's corrupt-log refusal are both *per artifact*: the rule is "never continue a
+ * run whose log the reader refuses", not "never continue". One unreadable run must not stop every
+ * unrelated feature, so a refusal is collected against its own run id and the pass carries on.
+ */
+export interface RunRefusal {
+  readonly run: string;
+  readonly code: string;
+  readonly reason: string;
+}
+
 export interface PassResult {
   /** One entry per feature the pass touched, each having taken at most one action. */
   readonly actions: readonly PassAction[];
   /** Features held back this pass because another holds an overlapping territory. */
   readonly deferred: readonly TerritoryDeferral[];
+  /** Runs this pass refused to read or could not advance. Every other run still advanced. */
+  readonly refusals: readonly RunRefusal[];
 }
+
+/** What one `load` established: the paths, the declared plan, and the state the log folds to. */
+export interface LoadedState {
+  readonly paths: RunPaths;
+  readonly plan: FeaturePlan;
+  readonly state: RunState;
+  readonly disagreements: readonly CheckpointDisagreement[];
+  readonly checkpointRebuilt: boolean;
+}
+
+/** One run and the state a pass loaded for it, threaded rather than folded twice. */
+interface LoadedRun {
+  readonly run: string;
+  readonly loaded: LoadedState;
+}
+
+/** Render a thrown value as a per-run refusal, taking its declared code when it has one. */
+const refusalFor = (run: string, thrown: unknown): RunRefusal => {
+  const code = (thrown as { code?: unknown } | null)?.code;
+  return {
+    run,
+    code: typeof code === 'string' ? code : 'internal.invariant_violated',
+    reason: renderCause(thrown) ?? 'the run could not be read or advanced, and said nothing about why',
+  };
+};
+
+/**
+ * A port rejection, rendered as the termination it stands in for.
+ *
+ * A thrown value carrying a declared `code` is dispositioned by that code — `step.spawn_failed` retries.
+ * Anything else gets `internal.invariant_violated`, whose declared disposition is abandon-and-hand-off:
+ * a failure the port never declared is not one to retry into.
+ */
+const terminationFromThrown = (step: string, thrown: unknown): StepTermination => {
+  const code = (thrown as { code?: unknown } | null)?.code;
+  const rendered = renderCause(thrown) ?? 'the executor rejected without a reason';
+  return terminated(step, 'failed', {
+    error: makeError(
+      typeof code === 'string' ? code : 'internal.invariant_violated',
+      `the executor rejected step "${step}": ${rendered}`,
+      rendered,
+    ),
+  });
+};
+
+/**
+ * The step whose failure blocked the run, found by the table that blocked it.
+ *
+ * Not "the last step": a completed step sitting last would be rewritten into an `interrupted` one and
+ * re-run, and a `killed` step would be resurrected — breaking the AD-8 invariant this story states twice.
+ * Asking the disposition table which record routes to `escalate-to-human` cannot pick either, because
+ * neither disposition routes there.
+ */
+const blockedStep = (state: RunState): StepRecord | null =>
+  [...state.steps]
+    .reverse()
+    .find(
+      (record) =>
+        record.disposition !== null &&
+        record.disposition !== 'completed' &&
+        record.disposition !== 'killed' &&
+        routeTermination({
+          step: record.step,
+          disposition: record.disposition,
+          sessionId: record.session_id,
+          error: record.error,
+          modelTier: record.model_tier,
+          promotions: record.promotions,
+        }).action === 'escalate-to-human',
+    ) ?? null;
 
 /** Supplies a feature's declared configuration. Re-supplied after a restart, never folded from the log. */
 export type FeaturePlanProvider = (feature: string) => FeaturePlan;
@@ -194,6 +356,14 @@ export interface ReconcilerOptions {
   readonly minter?: UlidMinter;
   /** AD-31 — where the loop's durable boundaries are, so a suite can kill at each in turn. */
   readonly onDurableBoundary?: DurableBoundaryObserver;
+  /**
+   * AD-21 — the redaction policy the run's recorder applies, including the literal values of the
+   * credentials injected into this run's tool servers.
+   *
+   * The engine is the unit that knows which credentials a run was given, so it is the unit that can
+   * register them. Passed through to the recorder rather than reimplemented: one pass, one policy.
+   */
+  readonly redaction?: RedactionPolicy;
   /** Skip the AD-30 lock. Only for a caller that already holds it; never in production. */
   readonly lock?: EngineLock | null;
 }
@@ -204,8 +374,6 @@ export interface AcceptedFeature {
   readonly run: string;
   readonly state: RunState;
 }
-
-const STEP_STARTED_PAYLOAD_KEYS = ['attempt', 'phase', 'contract_id', 'model_tier', 'mode', 'input'];
 
 /**
  * The reconciler.
@@ -223,6 +391,7 @@ export class Reconciler {
   private readonly now: () => Date;
   private readonly minter: UlidMinter;
   private readonly boundaryObserver: DurableBoundaryObserver | null;
+  private readonly redaction: RedactionPolicy;
   private readonly engineLock: EngineLock | null;
   private readonly ownsLock: boolean;
   /** Open recorders, keyed by run id. An I/O handle, not run state: nothing is read back from it. */
@@ -235,8 +404,12 @@ export class Reconciler {
     this.plans = options.plans;
     this.baseline = options.baseline ?? gitBaselineResetter;
     this.now = options.now ?? ((): Date => new Date());
-    this.minter = options.minter ?? createUlidMinter();
+    // AD-29 makes monotonicity a property *per process*, so the process-wide minter is the default:
+    // a fresh minter per reconciler could mint two ids in one millisecond that do not order against
+    // each other, and the territory tie-break reads that order as "which run is older".
+    this.minter = options.minter ?? defaultUlidMinter;
     this.boundaryObserver = options.onDurableBoundary ?? null;
+    this.redaction = options.redaction ?? {};
     this.engineLock = lock;
     this.ownsLock = ownsLock;
   }
@@ -318,10 +491,12 @@ export class Reconciler {
   approve(run: string, reason = 'a person approved the gate the feature blocked at'): RunState {
     this.assertOpen();
     const { paths, plan, state } = this.load(run);
-    const recorder = this.recorderFor(run, state.feature);
-    const blocked = state.steps.at(-1) ?? null;
+    this.assertSteerable(state, 'There is no gate left to approve.');
 
-    if (blocked !== null && blocked.disposition !== null && blocked.disposition !== 'completed') {
+    const recorder = this.recorderFor(run, state.feature);
+    const blocked = blockedStep(state);
+
+    if (blocked !== null) {
       this.emit(recorder, {
         step: blocked.step,
         type: ENGINE_EVENT_TYPES.StepApproved,
@@ -349,10 +524,21 @@ export class Reconciler {
   kill(run: string, reason = 'a steering command terminated the run (CAP-5, CAP-15)'): RunState {
     this.assertOpen();
     const { paths, plan, state } = this.load(run);
-    const recorder = this.recorderFor(run, state.feature);
-    const target = inFlightStep(state) ?? state.steps.at(-1) ?? null;
+    this.assertSteerable(state, 'There is nothing left running to kill.');
 
-    if (target !== null && target.disposition !== 'killed') {
+    const recorder = this.recorderFor(run, state.feature);
+
+    /**
+     * Only a step actually in flight is terminated.
+     *
+     * A kill normally arrives in the gap *between* passes, when no step is running — and the last record
+     * is then a step that has already finished. Rewriting that record as `killed` would put a permanent
+     * line in the log saying work that was done never happened, and because a killed step is never
+     * re-run, nothing would ever put it back. The feature still stops; no finished step is falsified.
+     */
+    const target = inFlightStep(state);
+
+    if (target !== null) {
       this.emit(recorder, {
         step: target.step,
         type: ENGINE_EVENT_TYPES.StepTerminated,
@@ -379,22 +565,16 @@ export class Reconciler {
    * The comparison's *result* never decides anything — the folded state is returned either way. It is
    * reported so a disagreement is visible, not so a caller can choose.
    */
-  load(run: string): {
-    readonly paths: RunPaths;
-    readonly plan: FeaturePlan;
-    readonly state: RunState;
-    readonly disagreements: readonly CheckpointDisagreement[];
-    readonly checkpointRebuilt: boolean;
-  } {
+  load(run: string): LoadedState {
     const paths = runPaths(run, this.orchHome);
     sweepCheckpointTemporaries(paths);
     const events = readEventLog(paths.eventLog);
-    const feature = this.featureOf(paths, events);
-    const plan = this.plans(feature);
-    const rebuilt = rebuildFromLog(events, { run, plan, now: this.now });
     // An unrecognised `schema_version` throws out of here, per AD-28: this build does not operate on a
     // state file it cannot read, and rebuilding over it would destroy the evidence of who wrote it.
+    // Read once and passed on, because a fold is already the expensive part of a pass.
     const onDisk = readCheckpoint(paths);
+    const plan = this.planFor(paths, events, onDisk.state);
+    const rebuilt = rebuildFromLog(events, { run, plan, now: this.now });
     const reconciled = reconcileCheckpointAgainstLog(onDisk.state, rebuilt);
     return {
       paths,
@@ -435,33 +615,79 @@ export class Reconciler {
    */
   async pass(): Promise<PassResult> {
     this.assertOpen();
-    const loaded = this.runIds().map((run) => ({ run, loaded: this.load(run) }));
 
-    const live = loaded.filter((entry) => !isTerminalFeatureState(entry.loaded.state.state));
+    const entries: LoadedRun[] = [];
+    const refusals: RunRefusal[] = [];
+
+    for (const run of this.runIds()) {
+      try {
+        entries.push({ run, loaded: this.load(run) });
+      } catch (thrown: unknown) {
+        // A directory with neither log nor checkpoint carries no state to reconcile and no feature to
+        // name, so it is stepped over silently rather than reported as a fault every pass forever.
+        if (thrown instanceof IncompleteRunDirectory) continue;
+        refusals.push(refusalFor(run, thrown));
+      }
+    }
+
+    /**
+     * Only a feature with real work to do contends for a territory.
+     *
+     * An inert action — awaiting confirmation, awaiting a person, or a terminal run — performs no worktree
+     * I/O, so it cannot conflict with anything. Letting it contend would mean a feature parked in
+     * `drafting` held its whole territory for as long as the user took to confirm, and every overlapping
+     * feature was deferred behind it indefinitely. Inert runs are still *reported*, so a reader can see
+     * what each is waiting for; they simply hold nothing while they wait.
+     */
+    const decided = entries
+      .filter((entry) => !isTerminalFeatureState(entry.loaded.state.state))
+      .map((entry) => ({ ...entry, action: decideAction(entry.loaded.state, entry.loaded.plan) }));
+    const inert = decided.filter((entry) => isInertAction(entry.action.kind));
+    const contending = decided.filter((entry) => !isInertAction(entry.action.kind));
+
     const { admitted, deferred } = admitByTerritory(
-      live.map((entry) => ({
-        run: entry.run,
-        feature: entry.loaded.state.feature,
-        territory: entry.loaded.state.territory,
-      })),
+      contending.map(
+        (entry): TerritoryCandidate => ({
+          run: entry.run,
+          feature: entry.loaded.state.feature,
+          territory: entry.loaded.state.territory,
+          worktree: entry.loaded.plan.worktree,
+        }),
+      ),
     );
     const admittedRuns = new Set(admitted.map((candidate) => candidate.run));
 
+    const acting = [...inert, ...contending.filter((entry) => admittedRuns.has(entry.run))];
+    const actingRuns = new Set(acting.map((entry) => entry.run));
+
     // The runs this pass will not act on: terminal ones, and ones serialised behind an overlapping
-    // territory. An admitted run's checkpoint is written by `advance`, so writing it here too would
-    // double the work and hide the rebuild from the action it is reported on.
-    for (const entry of loaded) {
-      if (!admittedRuns.has(entry.run) && entry.loaded.checkpointRebuilt) {
+    // territory. An acting run's checkpoint is written by `advance`, so writing it here too would double
+    // the work and hide the rebuild from the action it is reported on.
+    for (const entry of entries) {
+      if (!actingRuns.has(entry.run) && entry.loaded.checkpointRebuilt) {
         this.writeCheckpoint(entry.loaded.paths, entry.loaded.state);
       }
     }
 
-    const actions = await Promise.all(
-      loaded
-        .filter((entry) => admittedRuns.has(entry.run))
-        .map((entry) => this.advance(entry.run)),
+    /**
+     * `allSettled`, for the same reason the load loop catches per run: one feature whose action fails must
+     * not discard the actions of every feature that succeeded in the same pass. A rejection is reported
+     * against its own run and the rest of the pass stands.
+     */
+    const settled = await Promise.allSettled(
+      // The entry is threaded through rather than re-loaded: `advance` would otherwise fold the log a
+      // second time, and a fold is the expensive part of a pass.
+      acting.map((entry) => this.advance(entry.run, entry.loaded)),
     );
-    return { actions, deferred };
+
+    const actions: PassAction[] = [];
+    for (const [index, outcome] of settled.entries()) {
+      const run = acting[index]?.run ?? '(unknown)';
+      if (outcome.status === 'fulfilled') actions.push(outcome.value);
+      else refusals.push(refusalFor(run, outcome.reason));
+    }
+
+    return { actions, deferred, refusals };
   }
 
   /**
@@ -471,9 +697,9 @@ export class Reconciler {
    * the checkpoint has been rebuilt from that log. A crash at any point inside leaves a state the next
    * call converges from.
    */
-  async advance(run: string): Promise<PassAction> {
+  async advance(run: string, preloaded?: LoadedState): Promise<PassAction> {
     this.assertOpen();
-    const loaded = this.load(run);
+    const loaded = preloaded ?? this.load(run);
     const { paths, plan } = loaded;
     let state = loaded.state;
 
@@ -629,16 +855,7 @@ export class Reconciler {
       }
 
       case 'hand-off': {
-        this.emit(recorder, {
-          step: action.step,
-          type: ENGINE_EVENT_TYPES.HandoffRecorded,
-          payload: { code: action.code, reason: action.reason },
-        });
-        this.emit(recorder, {
-          step: action.step,
-          type: ENGINE_EVENT_TYPES.FeatureStateChanged,
-          payload: { from: state.state, to: 'handed_off', reason: action.reason },
-        });
+        this.handOff(state, action.step, action.code, action.reason);
         return action.step;
       }
 
@@ -715,7 +932,20 @@ export class Reconciler {
         : this.baseline.currentRef(plan.worktree);
 
     if (options.reset) {
-      resetToBaseline(plan.worktree, baselineRef, this.baseline);
+      try {
+        resetToBaseline(plan.worktree, baselineRef, this.baseline);
+      } catch (thrown: unknown) {
+        if (!(thrown instanceof BaselineResetError)) throw thrown;
+        /**
+         * AD-26 makes the reset the *precondition* of a re-run, and `git.baseline_reset_failed` is
+         * declared `abandon-and-hand-off` for exactly this reason: a worktree that cannot be returned to
+         * a known commit is the half-mutated state a re-run must never start from. So the failure routes
+         * through the table like any other rather than escaping the pass — which would abandon the run
+         * with no recorded reason and take every other feature's pass down with it.
+         */
+        this.handOff(state, options.step.step, thrown.orchError.code, thrown.orchError.message);
+        return;
+      }
       this.emit(recorder, {
         step: options.step.step,
         type: ENGINE_EVENT_TYPES.StepBaselineReset,
@@ -751,9 +981,38 @@ export class Reconciler {
       input.value,
     );
 
-    const termination = await this.executor.start(request);
+    /**
+     * A rejection from the port is a termination, not an escape.
+     *
+     * `step.started` is already in the log at this point. If the rejection propagated, the pass would die
+     * with the step recorded as in flight, and the next pass would adopt it as `interrupted`, re-run it
+     * and fail identically — a non-terminating loop built out of a code the AD-35 table has a perfectly
+     * good answer for. Recording the termination lets the table answer it: `step.spawn_failed` retries,
+     * an undeclared code hands off.
+     */
+    let termination: StepTermination;
+    try {
+      termination = await this.executor.start(request);
+    } catch (thrown: unknown) {
+      termination = terminationFromThrown(options.step.step, thrown);
+    }
     this.recordTermination(state, options.step, baselineRef, termination, {
       transitionTo: options.transitionTo,
+    });
+  }
+
+  /** CAP-23 — stop and explain, as its own two recorded facts, so every caller hands off identically. */
+  private handOff(state: RunState, step: string | null, code: string, reason: string): void {
+    const recorder = this.recorderFor(state.run, state.feature);
+    this.emit(recorder, {
+      step,
+      type: ENGINE_EVENT_TYPES.HandoffRecorded,
+      payload: { code, reason },
+    });
+    this.emit(recorder, {
+      step,
+      type: ENGINE_EVENT_TYPES.FeatureStateChanged,
+      payload: { from: state.state, to: 'handed_off', reason },
     });
   }
 
@@ -904,9 +1163,17 @@ export class Reconciler {
   // Plumbing
   // ---------------------------------------------------------------------------------------------
 
+  /** A terminal run takes no steering command: it has reached `[*]` and nothing walks it back. */
+  private assertSteerable(state: RunState, detail: string): void {
+    if (isTerminalFeatureState(state.state)) {
+      throw new SteeringRefused(state.run, state.state, detail);
+    }
+  }
+
   private transition(run: string, to: FeatureState, reason: string): RunState {
     this.assertOpen();
     const { paths, plan, state } = this.load(run);
+    this.assertSteerable(state, `It cannot be moved to ${to}.`);
     const recorder = this.recorderFor(run, state.feature);
     this.emit(recorder, {
       step: null,
@@ -932,7 +1199,7 @@ export class Reconciler {
       readonly baselineRef?: string | null;
     },
   ): void {
-    recorder.record({
+    const recorded = recorder.recordResult({
       feature: recorder.feature,
       run: recorder.paths.runId,
       step: event.step,
@@ -942,7 +1209,13 @@ export class Reconciler {
       ...(event.sessionId === undefined ? {} : { session_id: event.sessionId }),
       ...(event.baselineRef === undefined ? {} : { baseline_ref: event.baselineRef }),
     });
+    // A line did land — the `redaction.failed` substitute — so the boundary is real either way.
     this.boundary(`event-appended:${event.type}`);
+    if (recorded.dropped) {
+      // The log does not record this action, and AD-4 makes the log the only truth. Proceeding would
+      // leave the fold re-deciding the same action against a log that never remembers it.
+      throw new UnrecordedAction(event.type);
+    }
   }
 
   /** Fold the log and write the checkpoint from it. The only way a checkpoint is produced. */
@@ -973,27 +1246,42 @@ export class Reconciler {
       feature,
       orchHome: this.orchHome,
       now: this.now,
+      redaction: this.redaction,
     });
     this.recorders.set(run, recorder);
     return recorder;
   }
 
   /**
-   * A run's feature slug.
+   * A run's declared plan, found by the feature slug the run names.
    *
-   * Read from the log's own envelopes where there are any — the `feature` field survives the redaction
-   * pass on the verbatim allow-list — and from the checkpoint only for a run with no lines yet. The log
-   * first, in keeping with AD-4.
+   * The log is asked first, in keeping with AD-4, and the checkpoint is the fallback — not only for a run
+   * with no lines yet, but for the case where the log's own `feature` is unusable. A slug is punctuated
+   * and low-entropy so the redaction pass leaves it alone, but it is not *guaranteed* to: one that folded
+   * to the redaction marker would make the plan lookup fail, and since `load` is called for every run on
+   * every pass, that would wedge the whole loop permanently on one run's unlucky slug. Falling back costs
+   * nothing and removes a class of unrecoverable state.
    */
-  private featureOf(paths: RunPaths, events: readonly { readonly feature: string }[]): string {
-    const first = events[0];
-    if (first !== undefined) return first.feature;
-    const onDisk = readCheckpoint(paths);
-    if (onDisk.state !== null) return onDisk.state.feature;
-    throw new Error(
-      `Run ${paths.runId} has neither an event log nor a checkpoint, so its feature is unknown. ` +
-        'A run is created by acceptFeature, which records run.created before anything else.',
+  private planFor(
+    paths: RunPaths,
+    events: readonly { readonly feature: string }[],
+    checkpoint: RunState | null,
+  ): FeaturePlan {
+    const candidates = [events[0]?.feature, checkpoint?.feature].filter(
+      (feature): feature is string =>
+        typeof feature === 'string' && feature !== '' && feature !== REDACTION_MARKER,
     );
+    if (candidates.length === 0) throw new IncompleteRunDirectory(paths.runId);
+
+    let lastFailure: unknown = null;
+    for (const feature of candidates) {
+      try {
+        return this.plans(feature);
+      } catch (thrown: unknown) {
+        lastFailure = thrown;
+      }
+    }
+    throw lastFailure;
   }
 
   private planStepFor(plan: FeaturePlan, step: string): PlanStep {
@@ -1054,11 +1342,6 @@ export const stepInputPath = (paths: RunPaths, step: string): string => {
   return join(paths.runDir, STEPS_DIR_NAME, step, STEP_INPUT_FILE_NAME);
 };
 
-/** The payload keys `step.started` carries, exported so a test can assert none of them is redacted. */
-export const STEP_STARTED_PAYLOAD_FIELDS: readonly string[] = Object.freeze(
-  STEP_STARTED_PAYLOAD_KEYS,
-);
-
 /**
  * Choose the one action a pass takes for a feature.
  *
@@ -1101,19 +1384,30 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
     };
   }
 
-  const last = state.steps.at(-1) ?? null;
-  if (last !== null && last.disposition !== null && last.disposition !== 'completed') {
+  /**
+   * The *earliest* step carrying a termination that is not `completed`, not the last record.
+   *
+   * Taking the last one leaves an earlier failure unrouted: the fall-through below then picks that same
+   * step as "the next step with no completed record" and starts it again — a re-run with no baseline
+   * reset, forever, because nothing ever consults the table about it.
+   */
+  const pending =
+    state.steps.find(
+      (record) => record.disposition !== null && record.disposition !== 'completed',
+    ) ?? null;
+
+  if (pending !== null && pending.disposition !== null) {
     const routing = routeTermination({
-      step: last.step,
-      disposition: last.disposition,
-      sessionId: last.session_id,
-      error: last.error,
-      modelTier: last.model_tier,
-      promotions: last.promotions,
+      step: pending.step,
+      disposition: pending.disposition,
+      sessionId: pending.session_id,
+      error: pending.error,
+      modelTier: pending.model_tier,
+      promotions: pending.promotions,
     });
 
-    const target = targetStateFor(plan, last.step);
-    const sessionId = last.session_id;
+    const target = targetStateFor(plan, pending.step);
+    const sessionId = pending.session_id;
     switch (routing.action) {
       case 'resume':
         // `routeTermination` returns `resume` only for a step carrying a session id, so the null branch
@@ -1123,14 +1417,14 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
         return sessionId === null
           ? {
               kind: 'reset-and-rerun',
-              step: last.step,
+              step: pending.step,
               promoteTo: null,
               transitionTo: target,
               reason: routing.reason,
             }
           : {
               kind: 'resume-step',
-              step: last.step,
+              step: pending.step,
               sessionId,
               transitionTo: target,
               reason: routing.reason,
@@ -1138,7 +1432,7 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
       case 'reset-and-rerun':
         return {
           kind: 'reset-and-rerun',
-          step: last.step,
+          step: pending.step,
           promoteTo: null,
           transitionTo: target,
           reason: routing.reason,
@@ -1148,17 +1442,17 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
         // step's `failed` disposition standing, and the next pass would route it as an exhausted ladder.
         return {
           kind: 'reset-and-rerun',
-          step: last.step,
+          step: pending.step,
           promoteTo: routing.promoteTo,
           transitionTo: target,
           reason: routing.reason,
         };
       case 'escalate-to-human':
-        return { kind: 'escalate-to-human', step: last.step, reason: routing.reason };
+        return { kind: 'escalate-to-human', step: pending.step, reason: routing.reason };
       case 'hand-off':
         return {
           kind: 'hand-off',
-          step: last.step,
+          step: pending.step,
           code: routing.code ?? 'internal.invariant_violated',
           reason: routing.reason,
         };

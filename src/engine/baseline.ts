@@ -68,6 +68,26 @@ export interface BaselineResetter {
   resetTo: (worktree: string, ref: string) => void;
 }
 
+/**
+ * How long a single `git` invocation may take before it is killed.
+ *
+ * Without a bound, a `git` that hangs — an index lock another process holds, a filesystem that stops
+ * answering, a credential helper waiting on a terminal that is not there — blocks the reconcile pass
+ * forever, and AD-7's "at most one action per pass" becomes "no actions, ever". A timeout converts that
+ * into the declared `git.baseline_reset_failed`, which the AD-35 table hands off.
+ */
+export const GIT_TIMEOUT_MS = 120_000;
+
+/**
+ * How much output a single `git` invocation may produce.
+ *
+ * `clean -fd` names every path it removes, and a worktree with a large untracked tree exceeds Node's
+ * 1 MiB default — at which point `execFileSync` throws `ENOBUFS` and a *successful* clean is reported
+ * as a reset failure. The bound is generous rather than tight because the output is discarded either
+ * way; it exists so success is not mistaken for failure.
+ */
+export const GIT_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+
 const git = (worktree: string, args: readonly string[]): string => {
   try {
     return execFileSync('git', ['-C', worktree, ...args], {
@@ -75,6 +95,8 @@ const git = (worktree: string, args: readonly string[]): string => {
       // Diagnostics never go to stdout (Consistency Conventions); git's own stderr is captured into
       // the thrown error's `cause` instead of being allowed to leak to the terminal.
       stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: GIT_MAX_BUFFER_BYTES,
     }).trim();
   } catch (thrown: unknown) {
     const stderr = (thrown as { stderr?: Buffer | string } | null)?.stderr;

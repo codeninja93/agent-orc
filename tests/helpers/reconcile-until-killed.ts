@@ -41,9 +41,19 @@ const reconciler = Reconciler.open({
   orchHome,
   executor: crashFixtureExecutor(),
   plans: planProvider(plan),
-  // A pinned minter makes the run id the same in every iteration, so the parent can name the run before
-  // the child has created it and the comparison is between two runs of one identity.
-  minter: createUlidMinter({ now: () => 1_770_000_000_000, random: () => new Uint8Array(16) }),
+  /**
+   * A pinned minter makes the run id the same in every iteration, so the parent can name the run before
+   * the child has created it and the comparison is between two runs of one identity.
+   *
+   * The randomness is pinned to a fixed *high-entropy* pattern rather than to zeros. An all-zero ULID
+   * carries almost no entropy and so is never touched by the AD-21 pass — the whole restart path would
+   * have been exercised with a run id that could not have revealed the redaction problem this story
+   * exists to fix.
+   */
+  minter: createUlidMinter({
+    now: () => 1_770_000_000_000,
+    random: () => Uint8Array.from([29, 7, 23, 11, 2, 30, 17, 5, 13, 27, 3, 19, 9, 25, 15, 21]),
+  }),
   onDurableBoundary: (label: string): void => {
     crossed += 1;
     boundaries.push(label);

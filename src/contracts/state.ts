@@ -94,9 +94,18 @@ export const ModelRungSchema = z.enum(MODEL_RUNGS);
 /** AD-1 / Stack — one promotion per step per run. */
 export const MAX_PROMOTIONS_PER_STEP = 1;
 
-/** The rung above this one, or `null` at the top of the ladder. */
-export const nextModelRung = (rung: ModelRung): ModelRung | null =>
-  MODEL_RUNGS[MODEL_RUNGS.indexOf(rung) + 1] ?? null;
+/**
+ * The rung above this one, or `null` at the top of the ladder — and `null` for a rung this build does
+ * not know.
+ *
+ * The unknown case is guarded explicitly because `indexOf` answers `-1`, and `MODEL_RUNGS[-1 + 1]` is
+ * the *lowest* rung: an unrecognised tier would look like a valid promotion target and the ladder would
+ * run backwards. A rung this build cannot place is not a rung it can promote from.
+ */
+export const nextModelRung = (rung: ModelRung): ModelRung | null => {
+  const position = MODEL_RUNGS.indexOf(rung);
+  return position < 0 ? null : (MODEL_RUNGS[position + 1] ?? null);
+};
 
 /**
  * A non-negative whole count. Spelled as a refinement rather than `z.int().min(0)` so the draft-7
