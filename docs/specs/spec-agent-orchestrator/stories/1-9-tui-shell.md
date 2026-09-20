@@ -2,7 +2,7 @@
 title: 'TUI shell — event-log projection, permanent mode display, ambient status'
 type: 'feature'
 created: '2026-09-20'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
@@ -11,7 +11,36 @@ context:
   - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-7-command-transport.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-8-question-lifecycle.md'
 warnings: ['oversized'] # 12 files and 13 I/O scenarios; first UI dependencies plus a spine contradiction to settle
-deferred: []
+deferred:
+  - summary: >-
+      No review layer ran against this story; the gate plus the implementer's own probes are the only
+      scrutiny it received.
+    evidence: |-
+      typecheck, lint, 1015 tests across 37 files and build all pass, and the two verification greps
+      over `src/tui/` return no match. Read status: done as implemented and gated, not reviewed.
+    severity: high
+  - summary: >-
+      Keystrokes are not captured: the shell renders and `invokeControlByKey` exists, but no Ink
+      `useInput` handler binds one to the other.
+    evidence: |-
+      A control's whole contract — a durable intent file and nothing else — is implemented and tested
+      end to end through `invokeControl`/`invokeControlByKey`, including a real reconciler pass that a
+      written `disengage` stops. What is missing is the keyboard loop that calls it, which needs a free
+      text prompt for `answer`, `reject`, `edit_criterion` and `inject_note` — and a text prompt is
+      part of story 1-10's one-question card rather than of this shell.
+    location: 'src/tui/app.tsx'
+    severity: medium
+  - summary: >-
+      CROSS-STORY: `src/tui/mode.ts` holds the autonomy mode, and story 3-1's web renderer may not
+      import `src/tui/` any more than it may import `src/engine/`.
+    evidence: |-
+      The Code Map placed the mode's derivation in `src/tui/mode.ts` and this story followed it. The
+      spine's dependency graph gives `web -> contracts` only, so when 3-1 needs the same mode a person
+      reads in the terminal, the derivation has to move to `src/contracts/` or `src/runtime/` — the
+      same shape of move this story made for the intent writer, and cheaper to make before a second
+      renderer exists than after.
+    location: 'src/tui/mode.ts'
+    severity: medium
 baseline_revision: '6ba3c7d6cc0b486abce5d94c22a0600a82a12066'
 ---
 
@@ -132,6 +161,101 @@ Carried forward from stories 1-1 through 1-8:
 - Given `src/tui/`, when its imports are inspected, then it imports only from `src/contracts/`, `src/runtime/` and `node:` builtins, and never from `src/engine/`.
 
 ## Spec Change Log
+
+### Implementation, 2026-09-20 — the engine-import contradiction, and eight recorded deviations
+
+**1. The contradiction is settled by relocation, as the Design Note prescribed.** The spine's rule holds
+unchanged and the code moved. `src/runtime/commands.ts` now owns the intent file's *mechanics* — the
+format (`newCommandIntent`, `intentFileName`, `INTENT_FILE_EXTENSION`), the atomic write
+(`writeCommandIntent`, and the non-atomic `writeCommandIntentTruncated` a suite tears a file with), the
+id minting (`mintIntentId`) and the shape guard that keeps an id loggable (`INTENT_ID_PATTERN`,
+`MAX_INTENT_ID_TOKEN_RUN`, `isLoggableIntentId`, `UnloggableIntentId`). `src/engine/commands.ts`
+re-exports every one of those names, so **no existing caller changed**: `reconciler.ts` imports what it
+imported, and `tests/engine.commands.test.ts` passes unmodified. What stayed in the engine is what the
+engine does *with* the files — `readIntentFiles`, `orderIntents`, the refusal reasons,
+`quarantineIntent`, `retireIntent`, `appliedIntentIds`, `TORN_INTENT_GRACE_MS`,
+`REFUSAL_SIDECAR_EXTENSION` and the two `command.*` event types. `src/tui/` therefore imports
+`src/runtime/` and never `src/engine/`, which
+`tests/tui.projection.test.ts` asserts over every file in the directory rather than leaving to
+discipline.
+
+Two small consequences of the move, recorded because a reviewer would otherwise have to work out why:
+
+- **`INTENT_TEMP_SUFFIX` became an exported constant.** The writer creates `*.tmp` and the engine's
+  reader skips it; with the two in different modules, a private constant in each would have been two
+  agreements about one name.
+- **`mintRandomIntentId` was added.** `mintIntentId` takes a ULID, and AD-29 makes the ULID minter the
+  engine's. Rather than relocate the minter — which would weaken AD-29's single-owner claim for run ids —
+  a renderer mints from `node:crypto` and reuses `mintIntentId`'s grouping, so the id is still punctuated
+  into runs short enough to survive AD-21's entropy sweep in the payload that carries the exactly-once
+  key. Ordering is unaffected: an intent is ordered by its `issued_at` first and by its id only as a
+  tiebreak. `tests/tui.controls.test.ts` drives 20 minted ids through `isLoggableIntentId` and asserts
+  they are distinct.
+
+**2. `@types/react` 19.3.0 was added as an exact devDependency.** The one dependency beyond React and
+Ink, recorded here as earlier stories recorded `ajv` and `jiti`. Ink declares it as an optional peer, and
+without it a `.tsx` file cannot typecheck. Deliberately *not* added: `ink-testing-library`. The rendered
+frame is asserted by rendering through Ink into a fake `stdout` in `debug` mode, which needs no package.
+No `react-dom`: that is story 3-1's.
+
+**3. `tsconfig.json` and `tsconfig.build.json` were modified, beyond the Code Map's files.** `jsx:
+"react-jsx"` and `src/**/*.tsx` in both `include` lists. Unavoidable for a `.tsx` file to compile at all,
+and the automatic runtime keeps `app.tsx` free of an import that exists only to satisfy the compiler.
+
+**4. `tests/helpers/tui-log.ts` was added.** One file beyond the Code Map: the envelope builder four
+suites share, so a fixture log is described once. Its payload keys are the engine's own spelling, and
+`tests/tui.projection.test.ts` additionally folds a log a **real reconciler wrote**, because a builder
+that drifted from the engine would leave every hand-built test passing over an empty frame.
+
+**5. The frame-composition tests live in `tests/tui.mode.test.ts`.** The story names four test files, so
+the tests that need a composed frame — the question slot surviving later events, 40 columns, the absence
+of any colour escape, and one real Ink render — sit beside the mode enumeration rather than in a fifth
+file. The split the Design Note asks for is intact: the fold's suite is 31 pure tests, and exactly one
+test in the repository renders through Ink.
+
+**6. The compile-error criterion is checked by compiling.** "Given a `Command` member with no entry in
+the control table, when the project is typechecked, then it fails to compile" cannot be observed by a
+runtime assertion, so the test writes a `CommandMap` missing `disengage` into `.probe-control-table/`
+with a generated `tsconfig.control-table-probe.json`, spawns the project's own `tsc`, and asserts it
+fails naming that member. Both are removed in the test's teardown, and neither is inside the
+`tsconfig.json` or `eslint` file sets.
+
+**7. The autonomy mode is declared here, because nothing upstream declared one.** `interface-contract.md`
+requires "the current mode" to be permanently displayed and names `just-do-it` as first-class, but no
+contract enumerated a mode. `src/tui/mode.ts` declares five — `interactive`, `just-do-it`, `paused`,
+`taken-over`, `stopped` — derives them from the commands the log records as *applied*, and forces
+`stopped` on a terminal feature state whatever the commands said, because a mode line reading
+`just-do-it` over a killed run is precisely the false belief the contract compares to an aviation
+accident class. `AUTONOMY_MODE_TRANSITIONS` is a `CommandMap`, so a command with no decided effect on the
+mode is a compile error. AD-27's `live`/`shadow` is carried beside it rather than folded into it, and a
+shadow run says what shadow *does* rather than only its name. The cross-story consequence for story 3-1
+is recorded in `deferred`.
+
+**8. Usage and the estimate are read from the AD-24 budget events, and said to be unrecorded until they
+exist.** Nothing in this build emits a usage figure — ceilings are story 2-9 — so the fold reads
+`rate_limit_budget_consumed` from `budget.degraded` and `budget.exhausted`, and derives the estimate from
+a `wall_clock_ms_remaining` sample plus the elapsed the log had reached, or from an explicit
+`wall_clock_ms_estimate` when a later story records one. All three ambient fields are present in every
+frame regardless, reading `not yet recorded` rather than disappearing — a field that vanished when its
+value was unknown would make "always visible" untrue exactly when a person is deciding whether to wait.
+
+Three smaller decisions, recorded because a reviewer could reasonably expect the other:
+
+- **No `%` character appears anywhere in `src/tui/`, including as a remainder operator.** The story's
+  verification greps the directory for it, so `formatDuration` divides and subtracts rather than taking a
+  remainder. Keeping the character out is what leaves that grep meaning something.
+- **`idleShellView` is defined as `foldEvents([])`.** A hand-written idle view is the kind of thing that
+  stops agreeing with the fold the first time a field is added, and the suite caught exactly that
+  disagreement before the definition changed.
+- **The shell holds no state and reads no clock.** `mountShell` re-folds the log on every refresh, and
+  `now` is passed into the frame, so a frame is reproducible and elapsed still moves while the log does
+  not. Ink's `patchConsole` is off: a renderer that rewired `console` would change the behaviour of
+  whatever mounted it.
+
+**Verification.** `npm run typecheck`, `npm run lint`, `npm test` (1015 tests, 37 files) and `npm run
+build` all exit 0 on Node 24.21.0. `grep -rn "from '\.\./engine" src/tui/` and `grep -rnE "%|percent"
+src/tui/` both return no match. `npx vitest run tests/engine.crash-injection.test.ts` still converges —
+5 tests, ~25s — which is the check that the relocation changed no engine behaviour.
 
 ## Review Triage Log
 

@@ -27,10 +27,13 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "ink": "7.1.1",
+    "react": "19.3.0",
     "zod": "4.6.5"
   },
   "devDependencies": {
     "@types/node": "^22.20.4",
+    "@types/react": "19.3.0",
     "ajv": "^8.20.0",
     "eslint": "^10.11.0",
     "jiti": "^2.7.0",

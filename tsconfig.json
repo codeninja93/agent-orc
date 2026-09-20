@@ -5,6 +5,9 @@
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "moduleDetection": "force",
+    // Ink is React: the TUI shell is `.tsx`, and the automatic runtime keeps a component file free
+    // of an import that exists only to satisfy the compiler (story 1-9).
+    "jsx": "react-jsx",
     "types": ["node"],
 
     "strict": true,
@@ -23,5 +26,5 @@
 
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "vitest.config.ts", "eslint.config.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vitest.config.ts", "eslint.config.ts"]
 }
