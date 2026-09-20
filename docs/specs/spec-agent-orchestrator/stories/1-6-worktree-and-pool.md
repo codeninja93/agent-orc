@@ -13,6 +13,18 @@ context:
 warnings: ['oversized'] # 10 files and 14 I/O scenarios; spans git worktrees, leased containers and an AD-32 reconcile pass
 deferred:
   - summary: >-
+      The tier-2 execution conflict this story recorded now has a proposed resolution.
+    evidence: |-
+      RESOLUTION PROPOSED: see ADR-001-tier-2-execution.md, which moves the containment boundary from
+      the agent process to the commands the agent runs. The decisive finding is that the subscription
+      credential is in the macOS keychain rather than a file, so no mount can put it inside a
+      container — making AD-20's container and AD-1's subscription-only auth incompatible on the
+      stated primary platform. The ADR is proposed, not accepted; it awaits Deep's sign-off and amends
+      AD-1 and AD-20, which live in an adopted companion this session does not own.
+    location: >-
+      docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-001-tier-2-execution.md
+    severity: high
+  - summary: >-
       A tier-2 step still cannot reach the instance it leases: execution runs with no general network and
       a leased service is published on loopback.
     evidence: |-

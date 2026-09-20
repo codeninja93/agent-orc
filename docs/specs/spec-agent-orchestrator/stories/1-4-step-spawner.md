@@ -12,6 +12,18 @@ context:
 warnings: ['oversized'] # 9 files and 14 I/O scenarios; AD-1 is the densest single AD in the spine
 deferred:
   - summary: >-
+      The tier-2 execution conflict this story recorded now has a proposed resolution.
+    evidence: |-
+      RESOLUTION PROPOSED: see ADR-001-tier-2-execution.md, which moves the containment boundary from
+      the agent process to the commands the agent runs. The decisive finding is that the subscription
+      credential is in the macOS keychain rather than a file, so no mount can put it inside a
+      container — making AD-20's container and AD-1's subscription-only auth incompatible on the
+      stated primary platform. The ADR is proposed, not accepted; it awaits Deep's sign-off and amends
+      AD-1 and AD-20, which live in an adopted companion this session does not own.
+    location: >-
+      docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-001-tier-2-execution.md
+    severity: high
+  - summary: >-
       CONTRACT CONFLICT, UNRESOLVED AND ESCALATED: --restricted strips every code-running tool unless
       --tools names them, and no spawn passes --tools.
     evidence: |-
