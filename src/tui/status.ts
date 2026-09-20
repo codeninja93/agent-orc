@@ -19,6 +19,10 @@
  *
  * Nothing here reads a clock of its own: `now` is passed in, so a frame is reproducible.
  */
+import { hasRecordedUsage } from '../contracts/index.js';
+import type { StepUsage } from '../contracts/index.js';
+
+import { UNRECORDED_PRESENTATION } from './projection.js';
 import type { ShellView } from './projection.js';
 
 /** The label each ambient field carries, so the grammar is stable and learnable (R5). */
@@ -76,6 +80,63 @@ export const formatBudgetShare = (share: number | null): string => {
   return `${bounded.toFixed(2)} of 1.00`;
 };
 
+/**
+ * Group a count with thin separators, so five figures are readable at a glance rather than counted.
+ *
+ * Written with a plain comma rather than a locale format, because the same terminal has to show the same
+ * string on every machine: a frame whose width depends on the reader's locale is a frame whose 40-column
+ * bound is untested.
+ */
+const grouped = (count: number): string => {
+  const digits = Math.trunc(Math.abs(count)).toString();
+  const chunks: string[] = [];
+  for (let at = digits.length; at > 0; at -= 3) chunks.unshift(digits.slice(Math.max(at - 3, 0), at));
+  return `${count < 0 ? '-' : ''}${chunks.join(',')}`;
+};
+
+/**
+ * The token counts one usage record reports, or that it reports none.
+ *
+ * **This is what "cost" is on a surface, and it is deliberately not money.** R10 is explicit — "Cost is
+ * subscription usage, never currency" — and AD-24 gives a run three ceilings "and no currency dimension".
+ * Model usage is prepaid by subscription and costs nothing at the margin, so a figure with a currency mark
+ * on it would be a fiction about the thing a person is deciding with. The CLI's own `total_cost_usd` is
+ * recorded in the log because story 2-9's ceilings and story 3-3's measurement are specified to read it;
+ * The CLI's cost figure is recorded in the log but rendered nowhere, and no ambient segment
+ * does.
+ *
+ * An unrecorded field is omitted from the phrase rather than printed as `0`: a count nobody measured is not
+ * a count of nothing (R8, R12). A record with nothing in it reads `(not recorded)`.
+ */
+export const formatTokenUsage = (usage: StepUsage | null): string => {
+  if (!hasRecordedUsage(usage) || usage === null) return UNRECORDED_PRESENTATION;
+  const parts = [
+    usage.input_tokens === null ? null : `${grouped(usage.input_tokens)} in`,
+    usage.output_tokens === null ? null : `${grouped(usage.output_tokens)} out`,
+    usage.cache_read_input_tokens === null
+      ? null
+      : `${grouped(usage.cache_read_input_tokens)} cache read`,
+    usage.cache_creation_input_tokens === null
+      ? null
+      : `${grouped(usage.cache_creation_input_tokens)} cache written`,
+  ].filter((part): part is string => part !== null);
+  return parts.length === 0
+    ? // The CLI reported a cost and no token counts, which is a real shape. The cost is not rendered
+      // anywhere (R10), so this phrase is all a person gets, and it says plainly that the counts are absent.
+      'no token counts recorded'
+    : `${parts.join(' · ')} tokens`;
+};
+
+/**
+ * Why there is no cost formatter here.
+ *
+ * The CLI's `total_cost_usd` IS recorded, by story 1-11, because AD-24's ceilings and stage 3's
+ * measurement both read the log. It is deliberately never rendered. R10 is unconditional — "cost is
+ * subscription usage, never currency" — and a line reading `0.0396 usd` is a currency amount whether or
+ * not a `$` precedes it. Recording a figure and showing it are different acts, and only the second is what
+ * R10 governs. What a person sees is the consumed rate-limit budget and the token counts.
+ */
+
 /** The step count: how many have run, against the plan's total when the log recorded one. */
 export const formatStepCount = (view: ShellView): string => {
   const started = view.progress.stepsStarted;
@@ -115,12 +176,15 @@ export interface StatusFields {
   readonly steps: string;
   readonly budget: string;
   readonly elapsed: string;
+  /** The consumed token counts the log recorded, or `(not recorded)` (R10). */
+  readonly tokens: string;
 }
 
 export const statusFields = (view: ShellView, now: Date = new Date()): StatusFields => ({
   steps: formatStepCount(view),
   budget: formatBudgetShare(view.usage.rateLimitBudgetConsumed),
   elapsed: formatElapsed(view, now),
+  tokens: formatTokenUsage(view.usage.total),
 });
 
 /**

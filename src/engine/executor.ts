@@ -35,6 +35,7 @@ import type {
   StepInput,
   StepOutput,
   StepPhase,
+  StepUsage,
 } from '../contracts/index.js';
 
 /** What the loop hands the executor to start a step. */
@@ -87,6 +88,16 @@ export interface StepTermination {
   readonly sessionId: string | null;
   readonly output: StepOutput | null;
   readonly error: OrchError | null;
+  /**
+   * What the attempt cost and consumed, or `null` when the CLI reported nothing.
+   *
+   * On the termination rather than only inside the executor because the *loop* is what records events:
+   * AD-29 gives the recorder one writer and the reconciler owns `step.terminated`, so usage the spawner
+   * parsed has to travel out through the port to reach the log. It is reported for *every* disposition,
+   * not only `completed` — a step that failed after twenty turns consumed exactly as much as one that
+   * succeeded, and story 2-9's ceilings would under-count a thrashing run if a failure reported nothing.
+   */
+  readonly usage: StepUsage | null;
 }
 
 /**
@@ -144,13 +155,21 @@ export class StepSpawnFailed extends Error {
 export const terminated = (
   step: string,
   disposition: StepDisposition,
-  extra: { readonly sessionId?: string | null; readonly output?: StepOutput | null; readonly error?: OrchError | null } = {},
+  extra: {
+    readonly sessionId?: string | null;
+    readonly output?: StepOutput | null;
+    readonly error?: OrchError | null;
+    readonly usage?: StepUsage | null;
+  } = {},
 ): StepTermination => ({
   step,
   disposition,
   sessionId: extra.sessionId ?? null,
   output: extra.output ?? null,
   error: extra.error ?? null,
+  // Absent means unrecorded, never zero: a double that says nothing about usage must not have the loop
+  // record that the step was free (R8).
+  usage: extra.usage ?? null,
 });
 
 /**

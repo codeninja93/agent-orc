@@ -25,23 +25,22 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 
 import { formatTimestamp, renderCause } from '../contracts/index.js';
 import type { FeatureState, StepRecord } from '../contracts/index.js';
-import { assertSafePathSegment, redactValue } from '../runtime/index.js';
+import { redactValue, takeoverBranchFor } from '../runtime/index.js';
 import type { RedactionPolicy, RunPaths } from '../runtime/index.js';
 
 import { GIT_MAX_BUFFER_BYTES, GIT_TIMEOUT_MS } from './baseline.js';
 
 /**
- * The branch prefix the escape hatch uses.
+ * The take-over branch's name, re-exported from `src/runtime/branches.ts`.
  *
- * `orch/takeover/<run-id>`: an ordinary branch, in the run's own namespace, named from a ULID that
- * carries no product meaning. It cannot collide with, or pre-empt, the `feature/<slug>` branch the
- * committer will one day create (AD-22), and it cannot be mistaken for the worktree's own
- * `orch/run/<run-id>` branch from story 1-6.
+ * Story 1-11 moved the name, not the decision. The handoff card has to tell a person which branch their
+ * work is on and the spine forbids `src/tui/` importing the engine, so the name lives where a renderer may
+ * read it — and AD-22 still holds, because there is still exactly one function that names this branch and no
+ * unit infers it from a feature slug. Re-exported here so every existing caller, and every existing engine
+ * test, is unchanged. What did *not* move is everything below: whether a branch is created, what is
+ * committed onto it, and what the document says are still this module's.
  */
-export const TAKEOVER_BRANCH_PREFIX = 'orch/takeover/';
-
-export const takeoverBranchFor = (run: string): string =>
-  `${TAKEOVER_BRANCH_PREFIX}${assertSafePathSegment(run, 'a run id')}`;
+export { TAKEOVER_BRANCH_PREFIX, takeoverBranchFor } from '../runtime/index.js';
 
 /**
  * How many attempts at one step this build makes before it hands off.

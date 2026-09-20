@@ -28,6 +28,7 @@ import {
   KILL_CARD_COMMANDS,
   MAX_QUESTION_CARD_OPTIONS,
   UNRECORDED_PRESENTATION,
+  buildBriefCard,
   buildCompletionCard,
   buildHandoffCard,
   buildKillCard,
@@ -553,6 +554,60 @@ describe('src/tui/cards/ imports only contracts, runtime and its own siblings', 
     const source = readFileSync(new URL(file, cardsDir), 'utf8');
     for (const forbidden of ['writeFileSync', 'appendFileSync', 'renameSync', 'readFileSync']) {
       expect(source, `${file} reaches ${forbidden}`).not.toContain(forbidden);
+    }
+  });
+});
+
+/**
+ * R10 across every card, not only the ambient frame.
+ *
+ * `tests/tui.status.test.ts` has asserted since story 1-9 that the shell frame renders no currency amount,
+ * and it kept passing while story 1-11 put `0.0396 usd as the CLI reported it` on the brief and the
+ * completion notice — because a card is not the shell frame. The guard went around, not through, so it is
+ * restated here over every card a person can see. The CLI's `total_cost_usd` is still recorded in the log
+ * for AD-24's ceilings and stage 3's measurement; R10 governs what is shown, not what is kept.
+ */
+describe('no card renders a currency amount (R10)', () => {
+  /** Every spelling a currency amount arrives as. The word "cost" is a legitimate label and is not one. */
+  const CURRENCY_MARKERS = ['$', '€', '£', '¥', 'usd', 'eur', 'gbp', 'dollar', 'price'];
+
+  const withUsage = (): ShellView =>
+    foldEvents(
+      buildLog([
+        runCreated(),
+        stepStarted('implement'),
+        stepTerminated('implement', 'completed'),
+        featureStateChanged('committed'),
+      ]),
+    );
+
+  const cards: Readonly<Record<string, string>> = {
+    question: cardText(buildQuestionCard({ view: pendingQuestionView(), question: threeOptionQuestion() })),
+    'spec echo': cardText(buildSpecEchoCard({ view: withUsage() })),
+    kill: cardText(buildKillCard({ view: withUsage() })),
+    completion: cardText(buildCompletionCard({ view: withUsage() })),
+    handoff: cardText(buildHandoffCard({ view: idleShellView('checkout') })),
+    brief: cardText(
+      buildBriefCard({
+        fleet: {
+          runs: [{ runId: '01K5NQ9Z-J7V3M2P9-XQWRTC4B-DE', view: withUsage(), inFlight: true }],
+        },
+        height: 24,
+      }),
+    ),
+  };
+
+  it.each(Object.keys(cards))('renders no currency amount on the %s card', (name) => {
+    const text = (cards[name] ?? '').toLowerCase();
+    for (const marker of CURRENCY_MARKERS) {
+      expect(text, `the ${name} card rendered "${marker}"`).not.toContain(marker);
+    }
+  });
+
+  it('renders no bare decimal figure that could only be money', () => {
+    for (const [name, text] of Object.entries(cards)) {
+      // Four decimal places was the shape the cost figure used; no legitimate card value has it.
+      expect(text, name).not.toMatch(/\d+\.\d{4}\b/);
     }
   });
 });

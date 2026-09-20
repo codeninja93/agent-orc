@@ -9,13 +9,28 @@
  * where the work is, what to do next. This card is the short form that points at it: a person reading a
  * terminal needs to know that the note exists, where their work is, and that nothing was thrown away.
  *
- * **The branch and the document are given to this card, never derived by it.** AD-22 gives branch naming a
- * single owner and says no other unit may infer a branch name; the takeover branch is named by
- * `src/engine/handoff.ts` and the document's path by the AD-9 paths. Neither is recorded in the
- * `handoff.recorded` payload today, so a reader that has them passes them in and one that does not gets a
- * card that says plainly they are not recorded — which is the honest answer, and a better one than a
- * renderer guessing at a branch pattern it does not own.
+ * **The branch and the document are derived from the run id, through the units that own their names.**
+ * Story 1-10 had to be handed both, because AD-22 forbids a renderer inferring a branch name and
+ * `takeoverBranchFor` lived in `src/engine/handoff.ts`, which the spine forbids `src/tui/` importing. Story
+ * 1-11 closed that by moving the *name* to `src/runtime/branches.ts` — so this card now calls the one
+ * function that names the branch and the one module that names the path, and infers nothing. AD-22 is
+ * satisfied because there is still exactly one owner of each name, which is what the rule is about.
+ *
+ * **Nothing was added to the `handoff.recorded` payload, and that was the point.** Story 1-10 recommended
+ * adding `branch` and `document` to it. Both are pure functions of the run id, which every envelope already
+ * carries verbatim — `run` is on the AD-21 verbatim allow-list — so the facts were already reconstructable
+ * and only the functions were out of reach. Adding the fields would have put a bare 26-character ULID inside
+ * a payload string, and AD-21's entropy sweep replaces it: `orch/takeover/<ulid>` measures 5.07 bits per
+ * character against the sweep's 3.5 threshold, so the payload would have read `[redacted]` and the only
+ * escape would have been a wider allow-list, which AD-21 admits no remedy for.
+ *
+ * **The card stays pure, so the derivation takes its inputs rather than reading an environment.** The run id
+ * comes from an envelope the caller folded; `ORCH_HOME` comes from the caller too. Without the run id the
+ * card says the branch is not recorded rather than guessing; with the run id but no `ORCH_HOME` it names the
+ * branch and says the document's path is not recorded, because a path resolved against the wrong home would
+ * send a person to a file that is not there.
  */
+import { runPaths, takeoverBranchOrNull } from '../../runtime/index.js';
 import { UNRECORDED_PRESENTATION } from '../projection.js';
 import type { ShellView } from '../projection.js';
 
@@ -41,8 +56,43 @@ export interface HandoffCard extends CardBody {
 
 export interface HandoffCardInput {
   readonly view: ShellView;
+  /** An explicitly known location. Wins over the derivation, for a caller that has the escape outcome. */
   readonly location?: HandoffLocation;
+  /**
+   * The run id, read out of an event envelope.
+   *
+   * Not on `ShellView`, deliberately: R6 keeps the run id out of the view entirely so no render can require
+   * a person to know one, and `tests/tui.projection.test.ts` asserts the view never carries it. A caller
+   * that has folded a log has the envelope, so it passes the id in for the derivation and the view stays
+   * free of it.
+   */
+  readonly run?: string | null;
+  /** `ORCH_HOME`, so the document's path is resolved by the module that owns the AD-9 layout. */
+  readonly orchHome?: string;
 }
+
+/**
+ * Where the work and the note are, derived from the run id through their owners.
+ *
+ * Each half fails to `null` independently, because they need different things: the branch needs only a run
+ * id that is a safe path segment, and the document needs the home as well.
+ */
+const derivedLocation = (input: HandoffCardInput): HandoffLocation => {
+  const run = input.run ?? null;
+  const branch = takeoverBranchOrNull(run);
+  const orchHome = input.orchHome;
+  let document: string | null = null;
+  if (run !== null && branch !== null && orchHome !== undefined) {
+    try {
+      document = runPaths(run, orchHome).handoffDocument;
+    } catch {
+      // A run id no path could be built from is stated as unrecorded, never guessed at: a card must not
+      // throw at a value it read out of a log.
+      document = null;
+    }
+  }
+  return { branch, document };
+};
 
 /**
  * The fold already turned the `handoff.recorded` line into a sentence, and this is its one reader.
@@ -65,19 +115,24 @@ const whyFromNotices = (view: ShellView): string | null =>
  */
 export const buildHandoffCard = (input: HandoffCardInput): HandoffCard => {
   const view = input.view;
-  const location = input.location ?? {};
+  const given = input.location ?? {};
+  const derived = derivedLocation(input);
+  // An explicitly given location wins: a caller holding the escape hatch's own outcome knows which branch
+  // the work actually landed on, and the derivation only knows which branch it would have been named.
+  const knownBranch = given.branch ?? derived.branch ?? null;
+  const knownDocument = given.document ?? derived.document ?? null;
   const feature = view.feature ?? 'this feature';
 
   const why =
     whyFromNotices(view) ??
     `I stopped working on ${feature} and the log records no reason, so treat the work as unfinished ` +
       'rather than as abandoned for a known cause';
-  const branch = location.branch ?? UNRECORDED_PRESENTATION;
-  const document = location.document ?? UNRECORDED_PRESENTATION;
+  const branch = knownBranch ?? UNRECORDED_PRESENTATION;
+  const document = knownDocument ?? UNRECORDED_PRESENTATION;
   const nextStep =
-    location.branch === undefined || location.branch === null
+    knownBranch === null
       ? 'the work is wherever the run left it; the note names the worktree it was in'
-      : `pick the work up with: git checkout ${location.branch}`;
+      : `pick the work up with: git checkout ${knownBranch}`;
 
   const lines = [
     why,

@@ -77,6 +77,63 @@ export const stepTerminated = (step: string, disposition = 'completed'): EventSp
   payload: { disposition, reason: `the step reported ${disposition}` },
 });
 
+/**
+ * A termination that reports what the attempt cost, as story 1-11 has the engine record it.
+ *
+ * Separate from {@link stepTerminated} rather than an option on it, because "a step that recorded no usage"
+ * is the case R8 is about and it has to stay the easy one to write: a builder that defaulted to zeros would
+ * make every existing fixture claim its steps were free.
+ */
+export const stepTerminatedWithUsage = (
+  step: string,
+  usage: Record<string, number | null>,
+  disposition = 'completed',
+): EventSpec => ({
+  type: 'step.terminated',
+  step,
+  payload: {
+    disposition,
+    reason: `the step reported ${disposition}`,
+    usage: {
+      cost_usd: null,
+      input_tokens: null,
+      output_tokens: null,
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: null,
+      ...usage,
+    },
+  },
+});
+
+/** CAP-2 — the request and the ordered criteria, as `acceptFeature` records them. */
+export const specRecorded = (
+  criteria: readonly string[],
+  request = 'add a persistent question slot that does not scroll away',
+): EventSpec => ({
+  type: 'spec.recorded',
+  payload: { request, acceptance_criteria: [...criteria] },
+});
+
+/** One criterion amended. `line` is 1-based, and `null` for an amendment that named no line (Q6). */
+export const specCriterionEdited = (line: number | null, text: string): EventSpec => ({
+  type: 'spec.criterion_edited',
+  payload: { line, text },
+});
+
+/** The declared territory, as `acceptFeature` records it. */
+export const territoryDeclared = (paths: readonly string[]): EventSpec => ({
+  type: 'feature.territory_declared',
+  payload: { paths: [...paths] },
+});
+
+/**
+ * `question.asked` as an **older** engine wrote it: option ids only, no brief, no `asked_at`.
+ *
+ * Kept exactly as story 1-10 wrote it, and that is its job now. AD-5 requires a payload key added later to
+ * be non-breaking, so this builder *is* the forward-compatibility fixture: a card folded from it must state
+ * the missing facts as unrecorded and must not throw. {@link questionAskedEnriched} is the shape the engine
+ * writes today.
+ */
 export const questionAsked = (
   questionId: string,
   overrides: Record<string, unknown> = {},
@@ -91,6 +148,39 @@ export const questionAsked = (
     default_window_ms: 600_000,
     ...overrides,
   },
+});
+
+/** The three options the enriched builder offers, with the escape flagged as the engine flags it (Q1). */
+export const FIXTURE_OFFERED_OPTIONS: readonly Record<string, unknown>[] = [
+  { id: 'poll', label: 'poll', consequence: 'one read a second, and no line can be missed', escape: false },
+  { id: 'watch', label: 'watch', consequence: 'redraws instantly, and may miss a line', escape: false },
+  {
+    id: 'ask-me',
+    label: 'ask me again with more detail',
+    consequence: 'nothing changes yet and the question comes back',
+    escape: true,
+  },
+];
+
+/**
+ * `question.asked` as the engine writes it since story 1-11: each option's label and consequence, the Q3
+ * brief, and the `asked_at` a countdown is measured from.
+ *
+ * `options` keeps its older meaning — the joined ids — because AD-5 makes changing a key's meaning breaking.
+ */
+export const questionAskedEnriched = (
+  questionId: string,
+  overrides: Record<string, unknown> = {},
+): EventSpec => ({
+  ...questionAsked(questionId, {
+    options: 'poll, watch, ask-me',
+    offered_options: FIXTURE_OFFERED_OPTIONS,
+    brief:
+      'The shell re-reads the log to redraw. Polling cannot miss a line; watching is cheaper but can drop ' +
+      'a notification on some volumes.',
+    asked_at: new Date(FIXTURE_RUN_START_MS + 2_000).toISOString(),
+    ...overrides,
+  }),
 });
 
 export const questionResolved = (questionId: string, answer = 'poll, it cannot miss a line'): EventSpec => ({

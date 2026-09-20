@@ -13,8 +13,12 @@
  * in; the default wraps nothing, which is correct for a caller that has already decided its lines fit.
  *
  * **What each needs, and what it cost.** "Needs" is the next gate the projection derived — prose, never a
- * percentage (R7) — and "cost" is the ambient trio R10 and R11 require: steps, consumed rate-limit budget,
- * elapsed against estimate. No currency appears anywhere, because AD-24 admits no currency dimension.
+ * percentage (R7) — and "cost" is the ambient trio R10 and R11 require — steps, consumed rate-limit budget,
+ * elapsed against estimate — plus, since story 1-11 put them in the log, the tokens the run actually consumed
+ * and the CLI's own reported figure. No currency *mark* appears anywhere, because R10 makes cost
+ * subscription usage rather than money and AD-24 admits no currency ceiling; a run whose steps recorded no
+ * usage reads `(not recorded)` rather than zero, because CAP-22's brief is where a person decides what to
+ * abandon and an unmeasured run must not look like a free one.
  *
  * **A run whose log could not be read gets a line saying so.** That is the same choice `loadShellView`
  * already makes for a single run, applied to the list: one unreadable log costs that feature's line and
@@ -33,6 +37,8 @@ export interface FleetEntry {
   readonly needs: string;
   /** Steps, consumed rate-limit budget, elapsed against estimate (R10, R11). */
   readonly cost: string;
+  /** The tokens and the reported figure the log records, or `(not recorded)` (R10). */
+  readonly usage: string;
   /** Why this feature cannot be reported on, or `null` when it can. */
   readonly problem: string | null;
 }
@@ -74,14 +80,22 @@ export const fleetEntry = (run: FleetRun, now: Date): FleetEntry => {
     feature: view.feature ?? UNNAMED_FEATURE,
     needs: view.problem === null ? view.progress.nextGate : 'nothing can be said: its log could not be read',
     cost: `${fields.steps} · ${fields.budget} · ${fields.elapsed}`,
+    usage: fields.tokens,
     problem: view.problem,
   };
 };
 
-/** The two lines one entry occupies before wrapping: what it needs, then what it cost. */
+/**
+ * The lines one entry occupies before wrapping: what it needs, what it cost, what it consumed.
+ *
+ * Three rather than two, and the third is on its own row rather than appended to the cost row on purpose:
+ * the height bound is measured over wrapped lines, so a single long row and two short ones cost the same
+ * screen, and two labels on one row is what makes a 40-column brief unreadable.
+ */
 const entryLines = (entry: FleetEntry): readonly string[] => [
   `${entry.feature} — needs: ${entry.needs}`,
   `  cost: ${entry.cost}`,
+  `  usage: ${entry.usage}`,
 ];
 
 /**

@@ -26,8 +26,8 @@
  */
 import { REDACTION_MARKER, readEventLog } from '../runtime/index.js';
 import { EventLogCorruptError } from '../runtime/index.js';
-import type { EventEnvelope, FeatureState, RunMode, StepPhase } from '../contracts/index.js';
-import { FEATURE_STATES, compareEventOrder } from '../contracts/index.js';
+import type { EventEnvelope, FeatureState, RunMode, StepPhase, StepUsage } from '../contracts/index.js';
+import { FEATURE_STATES, addUsage, compareEventOrder, usageFromPayload } from '../contracts/index.js';
 
 import { DEFAULT_AUTONOMY_MODE, applyCommandToMode, modeForFeatureState } from './mode.js';
 import type { AutonomyMode } from './mode.js';
@@ -57,6 +57,10 @@ export const TUI_EVENT_TYPES = {
   HandoffRecorded: 'handoff.recorded',
   PermissionDenied: 'permission.denied',
   RedactionFailed: 'redaction.failed',
+  /** CAP-2 — the request and the ordered acceptance criteria, which story 1-11 put in the log. */
+  SpecRecorded: 'spec.recorded',
+  /** One criterion amended, so the card renders the current text rather than the original. */
+  SpecCriterionEdited: 'spec.criterion_edited',
 } as const;
 
 export type TuiEventType = (typeof TUI_EVENT_TYPES)[keyof typeof TUI_EVENT_TYPES];
@@ -98,6 +102,25 @@ export const TUI_PAYLOAD_KEYS = {
   WallClockMsRemaining: 'wall_clock_ms_remaining',
   WallClockMsEstimate: 'wall_clock_ms_estimate',
   Code: 'code',
+  /** CAP-2 — `spec.recorded`: the user's own words, and the criteria in their declared order. */
+  Request: 'request',
+  AcceptanceCriteria: 'acceptance_criteria',
+  /** `spec.criterion_edited`: which line, and what it now says. */
+  CriterionLine: 'line',
+  CriterionText: 'text',
+  /**
+   * `question.asked`, enriched by story 1-11.
+   *
+   * `offered_options` is a *new* key beside the older `options` string rather than a change to it: AD-5
+   * makes adding a key non-breaking and changing one's meaning breaking, so a log written by either build
+   * folds here. `Brief` and `AskedAt` are what Q3 and Q2 need from the log alone — the consequence of each
+   * option, and the instant a countdown is measured from.
+   */
+  OfferedOptions: 'offered_options',
+  Brief: 'brief',
+  AskedAt: 'asked_at',
+  /** `step.terminated`: what the attempt cost and consumed, when the CLI reported it (R10). */
+  Usage: 'usage',
 } as const;
 
 /** How a value the AD-21 pass replaced is presented: as redacted, never as a value and never as an error. */
@@ -151,6 +174,18 @@ export interface ProgressView {
  */
 export interface UsageView {
   readonly rateLimitBudgetConsumed: number | null;
+  /**
+   * The run's total, summed over every `step.terminated` that carried one, or `null`.
+   *
+   * `null` rather than a zero when nothing recorded any, and that distinction is the whole of R8 applied to
+   * a number: a step nobody measured is not a step that was free, and `$0.00` is a claim the log never
+   * made. {@link addUsage} keeps absence absent through the summation, so two unmeasured steps total to
+   * `null` rather than to zero.
+   *
+   * Every attempt counts, including a failed one and a re-run: what a feature consumed is what it
+   * consumed, and a total that only counted successes would under-report a thrashing run.
+   */
+  readonly total: StepUsage | null;
   /** The first instant the log recorded, so the shell can measure elapsed against its own clock. */
   readonly startedAt: string | null;
   /** The last instant the fold acted on, which is how far the log has got. */
@@ -166,9 +201,25 @@ export const QUESTION_SLOT_STATES = ['empty', 'pending', 'resolved', 'defaulted'
 
 export type QuestionSlotState = (typeof QUESTION_SLOT_STATES)[number];
 
+/** One option as the log records it: what it is, what it costs, and whether it is the escape (Q1). */
+export interface QuestionOptionView {
+  readonly id: string;
+  readonly label: string;
+  /** Q1 — the consequence of taking this option. Absent from a log an older build wrote. */
+  readonly consequence: string;
+  /** True for the one option that exists because the concrete ones may all be wrong. */
+  readonly escape: boolean;
+}
+
 export interface QuestionSlotView {
   readonly state: QuestionSlotState;
   readonly prompt: string | null;
+  /** Q3 — the self-contained mini-brief, which story 1-11 put in the log. */
+  readonly brief: string | null;
+  /** Q1 — every option with its consequence, the escape last and flagged. Empty for an older log. */
+  readonly options: readonly QuestionOptionView[];
+  /** Q2 — the instant the window starts from, so a card can count down from the log alone. */
+  readonly askedAt: string | null;
   readonly recommendedOptionId: string | null;
   readonly defaultAction: string | null;
   readonly defaultWindowMs: number | null;
@@ -187,6 +238,9 @@ export interface QuestionSlotView {
 const EMPTY_QUESTION_SLOT: QuestionSlotView = Object.freeze({
   state: 'empty',
   prompt: null,
+  brief: null,
+  options: Object.freeze([]),
+  askedAt: null,
   recommendedOptionId: null,
   defaultAction: null,
   defaultWindowMs: null,
@@ -210,6 +264,35 @@ export interface NoticeView {
  */
 export const MAX_NOTICES = 4;
 
+/**
+ * One acceptance criterion, as the log records it and as a person addresses it.
+ *
+ * Numbered from 1 because CAP-2 requires the criteria to be editable line by line, and "that line" is only
+ * meaningful if a person and the system agree what it names. `edited` is carried so the card can state that
+ * a criterion was amended rather than silently showing different words than the ones first recorded.
+ */
+export interface SpecCriterionView {
+  readonly line: number;
+  readonly text: string;
+  readonly edited: boolean;
+}
+
+/**
+ * CAP-2 — what this run is being built against, folded from the log.
+ *
+ * Before story 1-11 the criteria reached disk only in a step input file and `state.json`, both of which
+ * AD-4 ranks below the log — so this was the one required surface a completed run's log could not
+ * reconstruct. `recorded` is false for a log written before the type existed, and the spec echo then says
+ * so rather than offering to confirm an empty set.
+ */
+export interface SpecView {
+  /** The user's original words, or `null` when the log does not carry them. */
+  readonly request: string | null;
+  readonly criteria: readonly SpecCriterionView[];
+  /** True when a `spec.recorded` line was folded, whatever it carried. */
+  readonly recorded: boolean;
+}
+
 /** Everything one render needs, and nothing a person would have to know a run id to use. */
 export interface ShellView {
   /** The feature, by name. The only identifier a person ever needs (R6). */
@@ -219,6 +302,7 @@ export interface ShellView {
   readonly featureState: FeatureState | null;
   readonly progress: ProgressView;
   readonly usage: UsageView;
+  readonly spec: SpecView;
   readonly question: QuestionSlotView;
   readonly notices: readonly NoticeView[];
   /**
@@ -252,6 +336,44 @@ const text = (payload: Record<string, unknown>, key: string): string | null => {
 const num = (payload: Record<string, unknown>, key: string): number | null => {
   const value = payload[key];
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+};
+
+/**
+ * The options a `question.asked` payload offers, or an empty list.
+ *
+ * Read defensively, key by key, and that is not paranoia: AD-5 makes this reader responsible for surviving
+ * a payload an older build wrote without the key at all, and a newer one wrote with fields this build does
+ * not know. An entry with no id is dropped, because an option nobody can name is not one a person can
+ * choose; a missing consequence reads as unrecorded rather than as an empty promise.
+ */
+const optionList = (payload: Record<string, unknown>, key: string): readonly QuestionOptionView[] => {
+  const raw = payload[key];
+  if (!Array.isArray(raw)) return [];
+  const out: QuestionOptionView[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
+    const option = entry as Record<string, unknown>;
+    const id = option['id'];
+    if (typeof id !== 'string' || id === '') continue;
+    const label = option['label'];
+    const consequence = option['consequence'];
+    out.push({
+      id,
+      label: typeof label === 'string' && label !== '' ? label : id,
+      consequence: typeof consequence === 'string' ? consequence : UNRECORDED_PRESENTATION,
+      escape: option['escape'] === true,
+    });
+  }
+  return out;
+};
+
+/** The criteria a `spec.recorded` payload carries, numbered as a person counts them. */
+const criteriaList = (payload: Record<string, unknown>): readonly SpecCriterionView[] => {
+  const raw = payload[TUI_PAYLOAD_KEYS.AcceptanceCriteria];
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((entry): entry is string => typeof entry === 'string')
+    .map((entry, index) => ({ line: index + 1, text: entry, edited: false }));
 };
 
 /**
@@ -357,6 +479,10 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
   let lastActivityAt: string | null = null;
   let question: QuestionSlotView = EMPTY_QUESTION_SLOT;
   let pendingQuestionId: string | null = null;
+  let specRequest: string | null = null;
+  let specRecorded = false;
+  let totalUsageSoFar: StepUsage | null = null;
+  let criteria: readonly SpecCriterionView[] = [];
 
   const steps = new Map<string, MutableStep>();
   const stepOrder: string[] = [];
@@ -422,6 +548,10 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
         const record = stepOf(event.step);
         record.disposition = text(payload, TUI_PAYLOAD_KEYS.Disposition);
         record.terminatedAt = event.ts;
+        // R10 — every attempt's usage adds to the run's total, including a failure and a re-run. A
+        // termination carrying no usage key adds nothing, which is how the total stays `null` for a run
+        // nothing measured rather than becoming a zero nobody claimed.
+        totalUsageSoFar = addUsage(totalUsageSoFar, usageFromPayload(payload[TUI_PAYLOAD_KEYS.Usage]));
         break;
       }
 
@@ -466,6 +596,11 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
         question = {
           state: 'pending',
           prompt: text(payload, TUI_PAYLOAD_KEYS.Prompt),
+          // Q1–Q3 from the log alone. Each is absent from a log an older engine wrote, and each then
+          // folds to its empty value rather than throwing: the card says which part is unrecorded.
+          brief: text(payload, TUI_PAYLOAD_KEYS.Brief),
+          options: optionList(payload, TUI_PAYLOAD_KEYS.OfferedOptions),
+          askedAt: text(payload, TUI_PAYLOAD_KEYS.AskedAt),
           recommendedOptionId: text(payload, TUI_PAYLOAD_KEYS.RecommendedOptionId),
           defaultAction: text(payload, TUI_PAYLOAD_KEYS.DefaultAction),
           defaultWindowMs: num(payload, TUI_PAYLOAD_KEYS.DefaultWindowMs),
@@ -473,6 +608,38 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
           answer: null,
           outcome: null,
         };
+        break;
+      }
+
+      case TUI_EVENT_TYPES.SpecRecorded: {
+        /**
+         * The later set **replaces** the earlier one.
+         *
+         * Replacement rather than accumulation, because a second `spec.recorded` is a correction of what
+         * the feature is being built against, and a fold that concatenated would show every criterion
+         * twice and offer to confirm a set the run never had. Every `edited` flag resets with it: an
+         * amendment applies to the criteria that were current when it was made.
+         */
+        specRecorded = true;
+        specRequest = text(payload, TUI_PAYLOAD_KEYS.Request) ?? specRequest;
+        criteria = criteriaList(payload);
+        break;
+      }
+
+      case TUI_EVENT_TYPES.SpecCriterionEdited: {
+        const line = num(payload, TUI_PAYLOAD_KEYS.CriterionLine);
+        const amended = text(payload, TUI_PAYLOAD_KEYS.CriterionText);
+        if (amended === null) break;
+        const target = criteria.find((criterion) => criterion.line === line);
+        if (line === null || target === undefined) {
+          // An amendment naming no line this build can place is stated rather than discarded: Q6 admits
+          // free text, so "criterion four" against three criteria is a person's words, not a fault.
+          notice(event.ts, `a criterion was amended in words that name no numbered line: ${amended}`);
+          break;
+        }
+        criteria = criteria.map((criterion) =>
+          criterion.line === line ? { ...criterion, text: amended, edited: true } : criterion,
+        );
         break;
       }
 
@@ -592,11 +759,13 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
     },
     usage: {
       rateLimitBudgetConsumed,
+      total: totalUsageSoFar,
       startedAt,
       lastActivityAt,
       recordedElapsedMs: elapsedBetween(startedAt, lastActivityAt),
       estimateMs,
     },
+    spec: { request: specRequest, criteria, recorded: specRecorded },
     question,
     notices,
     problem: null,

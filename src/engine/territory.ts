@@ -23,6 +23,10 @@
  */
 import { posix, sep } from 'node:path';
 
+import { FeatureTerritoryDeclaredPayloadSchema } from '../contracts/index.js';
+import type { EventEnvelope } from '../contracts/index.js';
+import { REDACTION_MARKER } from '../runtime/index.js';
+
 import { compareUlid } from './ulid.js';
 
 /**
@@ -195,3 +199,126 @@ export class TerritoryLedger {
     return [...this.held.keys()].sort(compareUlid);
   }
 }
+
+// -------------------------------------------------------------------------------------------------
+// The territory as the log records it, so an overlap is recomputable by replay (AD-4)
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * The event type a declared territory is recorded as, and the key it carries its paths under.
+ *
+ * Spelled here rather than at the emitter, so the writer and the replay cannot disagree about either. The
+ * type itself is declared in `src/contracts/event.ts`, which is where a reader that is not the engine —
+ * there is none today, and story 3-1's web surface will be one — looks it up.
+ */
+export const TERRITORY_DECLARED_EVENT_TYPE = 'feature.territory_declared';
+
+export const TERRITORY_PATHS_PAYLOAD_KEY = 'paths';
+
+/** The payload of a `feature.territory_declared` line: normalised, de-duplicated, stably ordered. */
+export const territoryDeclaredPayload = (
+  declared: readonly string[],
+): Record<string, unknown> =>
+  FeatureTerritoryDeclaredPayloadSchema.parse({
+    [TERRITORY_PATHS_PAYLOAD_KEY]: [...normaliseTerritory(declared)],
+  });
+
+/**
+ * The whole repository, which {@link pathsCollide} reads as containing everything.
+ *
+ * It is the territory a replay substitutes when it cannot read what was declared, and the substitution is
+ * the fail-safe direction: a feature serialised when it need not have been costs a pass, and one admitted
+ * when it should have waited costs another feature's work in a shared worktree.
+ */
+export const WHOLE_REPOSITORY_TERRITORY: readonly string[] = Object.freeze(['.']);
+
+/** One feature's territory, as replayed out of its own event log. */
+export interface ReplayedTerritory {
+  /** From the envelope, never from a payload: AD-21 would rewrite a bare ULID in a payload. */
+  readonly run: string;
+  readonly feature: string;
+  /** The declared paths the log carries, normalised. Excludes any the AD-21 pass replaced. */
+  readonly territory: readonly string[];
+  /**
+   * How many declared entries came back as the redaction marker rather than as a path.
+   *
+   * Counted rather than named, because the marker carries nothing about what it replaced: a path long
+   * enough to reach AD-21's 24-character unbroken threshold at 3.5 bits per character is gone, and no
+   * reader can recover it. Reported so `complete` is a fact rather than an assumption.
+   */
+  readonly unreadable: number;
+  /** True when every declared entry survived the log. `false` means treat the territory as unknown. */
+  readonly complete: boolean;
+}
+
+/**
+ * The territory a run's log declares, or `null` when it declares none.
+ *
+ * The *last* `feature.territory_declared` wins, for the same reason the last `spec.recorded` does: a
+ * re-declaration is a correction, and a fold that concatenated would report a territory the feature never
+ * had. An unknown event type and a payload this build cannot read both change nothing (AD-5).
+ */
+export const territoryFromEvents = (
+  events: readonly EventEnvelope[],
+): ReplayedTerritory | null => {
+  let found: ReplayedTerritory | null = null;
+  for (const event of [...events].sort((a, b) => a.seq - b.seq)) {
+    if (event.type !== TERRITORY_DECLARED_EVENT_TYPE) continue;
+    const parsed = FeatureTerritoryDeclaredPayloadSchema.safeParse(event.payload);
+    if (!parsed.success) continue;
+    const declared = parsed.data[TERRITORY_PATHS_PAYLOAD_KEY];
+    const readable = declared.filter((path) => path !== REDACTION_MARKER);
+    found = {
+      run: event.run,
+      feature: event.feature,
+      territory: normaliseTerritory(readable),
+      unreadable: declared.length - readable.length,
+      complete: declared.length === readable.length,
+    };
+  }
+  return found;
+};
+
+/**
+ * The territory to admit a replayed feature on.
+ *
+ * An incomplete territory becomes the whole repository, which collides with every other feature. That is
+ * the substitution {@link WHOLE_REPOSITORY_TERRITORY} exists for, and it is why a redacted path does not
+ * silently shrink a conflict domain.
+ */
+export const admissionTerritoryOf = (replayed: ReplayedTerritory): readonly string[] =>
+  replayed.complete ? replayed.territory : WHOLE_REPOSITORY_TERRITORY;
+
+/** Each log's replayed territory, in the order the logs were given, skipping those that declare none. */
+export const territoriesFromLogs = (
+  logs: readonly (readonly EventEnvelope[])[],
+): readonly ReplayedTerritory[] =>
+  logs.flatMap((log) => {
+    const replayed = territoryFromEvents(log);
+    return replayed === null ? [] : [replayed];
+  });
+
+/**
+ * Which features several logs say may act together, and which are serialised behind one that may.
+ *
+ * The same decision {@link admitByTerritory} makes for a live pass, taken from the logs alone — which is
+ * what makes the serialisation AD-4 requires *reconstructable* rather than merely repeatable. It is not a
+ * second authority for the decision: a live pass still reads the plans, and this reads what those plans
+ * were recorded as.
+ */
+export const admitReplayedTerritories = (
+  logs: readonly (readonly EventEnvelope[])[],
+): TerritoryAdmission =>
+  admitByTerritory(
+    territoriesFromLogs(logs).map((replayed) => ({
+      run: replayed.run,
+      feature: replayed.feature,
+      territory: admissionTerritoryOf(replayed),
+    })),
+  );
+
+/** Every path two replayed territories both claim, for a message that names the actual conflict. */
+export const replayedOverlap = (
+  left: ReplayedTerritory,
+  right: ReplayedTerritory,
+): readonly string[] => overlappingPaths(admissionTerritoryOf(left), admissionTerritoryOf(right));

@@ -12,16 +12,16 @@
  * pass just as happily if a card quietly read one, and "reconstructable from the log" would be a claim
  * nobody had checked. With the files gone, a card that reached for one cannot silently succeed.
  *
- * Two honest gaps this suite documents rather than papers over:
+ * Story 1-11 closed the two gaps this suite used to document:
  *
- * - **The acceptance criteria are not in the log.** They live in the feature plan and reach disk in a step
- *   input file, which is not the log — so the spec echo built from the log alone states them as unrecorded
- *   rather than inventing them. Nothing here pretends otherwise; recording them is a later story's, and
- *   until then the spec echo is the one card that cannot be fully reconstructed.
- * - **The takeover branch is not in the `handoff.recorded` payload.** It *is* derivable, because every
- *   envelope carries the run id and the escape hatch names the branch from it (AD-22) — so the handoff card
- *   is given a branch derived from the log's own envelope, which is still reconstruction from the log and
- *   not from a side file.
+ * - **The acceptance criteria are in the log**, as `spec.recorded`, so the spec echo reconstructs from it
+ *   and offers the one-keystroke confirmation. The assertion that used to pin the criteria as *absent* is
+ *   inverted below, which is the gate's remaining half becoming true.
+ * - **The takeover branch and the document are derived, not recorded.** Both are pure functions of the run
+ *   id, which every envelope carries verbatim because `run` is on the AD-21 allow-list — so the card calls
+ *   `takeoverBranchFor` and the AD-9 paths rather than reading a payload field. Nothing was added to
+ *   `handoff.recorded`: a bare ULID inside a payload string is replaced by the entropy sweep, and the only
+ *   escape would have been a wider allow-list.
  */
 import { readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -146,7 +146,6 @@ const completedRunWithOnlyItsLog = async (): Promise<CompletedRun> => {
 describe('all six cards render from one completed run event log, with nothing else on disk', () => {
   it('builds every surface from the log alone', async () => {
     const completed = await completedRunWithOnlyItsLog();
-    const paths = runPaths(completed.run, home);
     const view = foldEvents(completed.events);
 
     const cards: readonly { readonly label: string; readonly card: Card }[] = [
@@ -164,11 +163,9 @@ describe('all six cards render from one completed run event log, with nothing el
       { label: 'completion', card: buildCompletionCard({ view }) },
       {
         label: 'handoff',
-        card: buildHandoffCard({
-          view,
-          // Derived from the run id the log's own envelopes carry, through the unit that owns the name.
-          location: { branch: takeoverBranchFor(completed.run), document: paths.handoffDocument },
-        }),
+        // Derived from the run id the log's own envelopes carry, by the card, through the units that own the
+        // two names. Nothing is passed in but the id and the home — no branch, no path, no payload field.
+        card: buildHandoffCard({ view, run: completed.events[0]?.run ?? null, orchHome: home }),
       },
     ];
 
@@ -231,18 +228,89 @@ describe('all six cards render from one completed run event log, with nothing el
     expect(completed.events.length).toBeGreaterThan(5);
   });
 
-  it('states the acceptance criteria as unrecorded, because the log does not carry them', async () => {
+  it('reconstructs the acceptance criteria, which the log now carries (story 1-11, matrix 14)', async () => {
     const completed = await completedRunWithOnlyItsLog();
     const card = buildSpecEchoCard({ view: foldEvents(completed.events) });
-
-    // The one card the log cannot fully reconstruct today. It says so rather than inventing criteria, and
-    // rather than offering to confirm an empty set: recording them belongs to a later story.
-    expect(card.unrecorded).toBe(true);
-    expect(cardText(card)).toContain(UNRECORDED_PRESENTATION);
     const plan = makePlan({ feature: FEATURE });
+
+    // The inversion of story 1-10's pinned gap: this assertion used to say the criteria were *absent*.
+    expect(card.unrecorded).toBe(false);
+    expect(card.criteria.map((criterion) => criterion.text)).toStrictEqual([
+      ...plan.acceptance_criteria,
+    ]);
+    expect(card.criteria.map((criterion) => criterion.line)).toStrictEqual([1, 2]);
+    // Numbered and individually addressable, and confirmable in one keystroke (CAP-2).
+    expect(cardText(card)).toContain(`press "${card.confirmKey}" to confirm all 2 as written`);
+    expect(cardText(card)).not.toContain(UNRECORDED_PRESENTATION);
+    // And it really is the log: each criterion is in the bytes on disk.
     for (const criterion of plan.acceptance_criteria) {
-      expect(JSON.stringify(completed.events), 'the log now carries the criteria').not.toContain(criterion);
+      expect(readFileSync(runPaths(completed.run, home).eventLog, 'utf8')).toContain(criterion);
     }
+  });
+
+  it('reconstructs the question’s consequences and counts down from asked_at (matrix 6)', async () => {
+    const completed = await completedRunWithOnlyItsLog();
+    const asked = completed.events.find((event) => event.type === 'question.asked');
+    const askedAt = asked?.payload['asked_at'];
+    if (typeof askedAt !== 'string') throw new Error('the log carries no asked_at');
+
+    // Rendered as if the question were still open, at a known instant inside its window, so the countdown
+    // is a number this test can name rather than one it has to trust.
+    const pending = foldEvents(completed.events.filter((event) => event.type !== 'question.resolved'));
+    const card = buildQuestionCard({
+      view: pending,
+      now: new Date(Date.parse(askedAt) + 60_000),
+    });
+
+    expect(card.brief).toBe(DRAFT.brief);
+    expect(card.options.map((option) => option.id)).toStrictEqual(['poll', 'watch', 'ask-me']);
+    for (const option of card.options) {
+      expect(option.consequence, option.id).not.toBe(UNRECORDED_PRESENTATION);
+      expect(option.consequence, option.id).not.toBe('');
+    }
+    // Every consequence the draft declared is on the card, verbatim.
+    for (const declared of [...DRAFT.options, DRAFT.escape]) {
+      expect(cardText(card)).toContain(declared.consequence);
+    }
+    // Q2 — nine minutes of a ten-minute window, counted down from the log's own instant.
+    expect(card.window).toBe('9m00s left before the default is taken');
+    expect(card.options.filter((option) => option.recommended).map((option) => option.id)).toStrictEqual([
+      'poll',
+    ]);
+  });
+
+  it('names the takeover branch and the document, derived from the envelope’s run (matrix 7)', async () => {
+    const completed = await completedRunWithOnlyItsLog();
+    const view = foldEvents(completed.events);
+    const run = completed.events[0]?.run;
+    if (run === undefined) throw new Error('the log carries no run id');
+
+    const card = buildHandoffCard({ view, run, orchHome: home });
+    // The names come from their owners: `takeoverBranchFor` and the AD-9 paths, called by the card.
+    expect(card.branch).toBe(takeoverBranchFor(run));
+    expect(card.document).toBe(runPaths(run, home).handoffDocument);
+    expect(card.nextStep).toContain(`git checkout ${takeoverBranchFor(run)}`);
+
+    // And nothing was added to the payload to make it possible: no `handoff.recorded` line carries either.
+    for (const event of completed.events) {
+      expect(Object.keys(event.payload)).not.toContain('branch');
+      expect(Object.keys(event.payload)).not.toContain('document');
+    }
+
+    // Without the run id it still says so rather than guessing at a pattern it does not own (AD-22).
+    expect(buildHandoffCard({ view }).branch).toBe(UNRECORDED_PRESENTATION);
+  });
+
+  it('reconstructs what the run consumed, or says it was not measured — never a zero (matrix 12)', async () => {
+    const completed = await completedRunWithOnlyItsLog();
+    const view = foldEvents(completed.events);
+    const card = buildCompletionCard({ view });
+
+    // The scripted executor reports no usage, which is exactly the case R8 is about.
+    expect(view.usage.total).toBeNull();
+    expect(card.tokens).toBe(UNRECORDED_PRESENTATION);
+    expect(cardText(card)).not.toContain('$0.00');
+    expect(cardText(card)).not.toContain('0.0000');
   });
 
   it('leaves no checkpoint for a card to have read', async () => {

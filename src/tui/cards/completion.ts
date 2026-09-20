@@ -19,10 +19,23 @@
  * What *is* folded from the log today is real: a verification step the log records as completed is named
  * as verified, and one that never completed is named as not verified. Those come from the steps the
  * projection already holds, so the honest half of R8 is live rather than pending.
+ *
+ * **What it cost is now one of the real facts, and `$0.00` is the failure mode it is written against.** The
+ * notice is specified to state the usage, and story 1-11 put the token counts in the log, so they are folded
+ * rather than injected. A run whose steps reported no usage states `(not recorded)`: a
+ * zero would be a claim that the work was free, which is precisely the kind of unearned reassurance R8
+ * exists to keep off this card. The CLI's own `total_cost_usd` is recorded in the log but never rendered,
+ * because R10 makes cost subscription usage and never currency — see `src/tui/status.ts`.
  */
+import { hasRecordedUsage } from '../../contracts/index.js';
 import { UNRECORDED_PRESENTATION } from '../projection.js';
 import type { ShellView } from '../projection.js';
-import { formatBudgetShare, formatElapsed, formatStepCount } from '../status.js';
+import {
+  formatBudgetShare,
+  formatElapsed,
+  formatStepCount,
+  formatTokenUsage,
+} from '../status.js';
 
 import type { CardBody } from './index.js';
 
@@ -42,6 +55,8 @@ export interface CompletionCard extends CardBody {
   readonly fileCount: string;
   readonly testStatus: string;
   readonly usage: string;
+  /** The tokens the run consumed, folded from the log, or `(not recorded)` — never a zero (R8). */
+  readonly tokens: string;
   readonly elapsed: string;
   readonly steps: string;
   /** The verification steps the log records as completed. */
@@ -80,6 +95,7 @@ export const buildCompletionCard = (input: CompletionCardInput): CompletionCard 
       : `${String(facts.fileCount)} file${facts.fileCount === 1 ? '' : 's'}`;
   const testStatus = recorded(facts.testStatus);
   const usage = formatBudgetShare(view.usage.rateLimitBudgetConsumed);
+  const tokens = formatTokenUsage(view.usage.total);
   const elapsed = formatElapsed(view, now);
   const steps = formatStepCount(view);
 
@@ -124,6 +140,18 @@ export const buildCompletionCard = (input: CompletionCardInput): CompletionCard 
     `tests: ${testStatus}`,
     `steps: ${steps}`,
     `rate-limit budget: ${usage} consumed`,
+    `usage: ${tokens}`,
+    /**
+     * Absence stated in the words it means, beside the two fields that carry it.
+     *
+     * Not in `notVerified`, and the distinction is the one R8 is actually about: a missing test result is a
+     * gap in what was *checked*, and a missing token count is a gap in what was *measured*. Putting a
+     * measurement in the verification list would make "nothing outstanding" untrue for every run at stage 1
+     * and teach a reader to skip the list — which is how the one line R8 exists for stops being read.
+     */
+    ...(hasRecordedUsage(view.usage.total)
+      ? []
+      : ['no step recorded its usage, so what this run consumed is unmeasured rather than nothing']),
     `elapsed: ${elapsed}`,
     verified.length === 0
       ? 'verified: nothing — no verification step is recorded as completed'
@@ -142,6 +170,7 @@ export const buildCompletionCard = (input: CompletionCardInput): CompletionCard 
     fileCount,
     testStatus,
     usage,
+    tokens,
     elapsed,
     steps,
     verified,

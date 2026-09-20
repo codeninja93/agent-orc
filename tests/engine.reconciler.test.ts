@@ -27,6 +27,8 @@ import {
   BaselineResetError,
   ENGINE_EMITTER,
   ENGINE_EVENT_TYPES,
+  SPEC_RECORDED_EVENT_TYPE,
+  TERRITORY_DECLARED_EVENT_TYPE,
   Reconciler,
   ResumeRefused,
   SteeringRefused,
@@ -166,7 +168,14 @@ describe('a new feature is accepted with a minted run id', () => {
     expect(accepted.state.state).toBe('drafting');
     expect(accepted.state.steps).toStrictEqual([]);
     expect(existsSync(join(runPaths(accepted.run, home).runDir, RUN_STATE_FILE_NAME))).toBe(true);
-    expect(eventTypes(accepted.run)).toStrictEqual([ENGINE_EVENT_TYPES.RunCreated]);
+    // Story 1-11 added the two run-level declarations, in this order: the run exists, then what it is
+    // being built against (CAP-2), then the territory its overlap is recomputed from. All three land
+    // before anything can read them, which is what lets the spec echo offer a confirmation at `drafting`.
+    expect(eventTypes(accepted.run)).toStrictEqual([
+      ENGINE_EVENT_TYPES.RunCreated,
+      SPEC_RECORDED_EVENT_TYPE,
+      TERRITORY_DECLARED_EVENT_TYPE,
+    ]);
   });
 
   it('mints monotonic ids, so two features accepted in one millisecond sort in acceptance order', () => {

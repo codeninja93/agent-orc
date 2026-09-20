@@ -130,11 +130,18 @@ export interface PlanStep {
  * A feature's declared configuration: everything about a run that is *not* run state.
  *
  * It is supplied to the engine rather than folded from the log, and the division is deliberate. The
- * log records what *happened*; the plan records what was *declared*. A file territory is a list of
- * repository paths, and a path long enough reads as high-entropy secret material to the AD-21 pass —
- * so putting the territory in a payload would mean reading `[redacted]` back out of the durable truth.
- * Declared configuration has a home of its own (AD-9's per-run config snapshot), and this is its
- * in-memory shape until story 1-7 sources it from the interview.
+ * log records what *happened*; the plan records what was *declared*. Declared configuration has a home of
+ * its own (AD-9's per-run config snapshot), and this is its in-memory shape until story 1-7 sources it from
+ * the interview.
+ *
+ * **Story 1-11 records the declaration in the log as well, and that is not a second authority.** A live pass
+ * still reads the plan; `spec.recorded` and `feature.territory_declared` exist so a *replay* can reconstruct
+ * what a run was built against and why two features were serialised, which AD-4 requires of everything the
+ * log is the truth about. The caveat this comment used to give as a reason not to do it is real and is
+ * handled by the reader rather than avoided: a repository path long enough with no dot and no hyphen is one
+ * unbroken high-entropy run and the AD-21 pass replaces it, so `territoryFromEvents` counts the entries it
+ * could not read and treats an incomplete territory as colliding with everything — a feature serialised
+ * unnecessarily at worst, never one admitted wrongly.
  */
 export interface FeaturePlan {
   /** The feature slug, kebab-case. */

@@ -16,13 +16,19 @@
  * **Nothing here enforces a ceiling.** AD-24's ceilings and their degradation are story 2-9's. This card
  * displays consumed budget and elapsed against estimate and offers the four gestures; what it never does
  * is act on them, because a renderer that stopped a run by itself would be a second command path (AD-19).
+ *
+ * **Usage is tokens, never money, and the omission is the contract's.** R10 says cost is subscription usage
+ * and never currency, and AD-24 gives a run three ceilings "and no currency dimension" — so this card, which
+ * is the one a person decides *against a ceiling* on, states the consumed token counts story 1-11 put in the
+ * log and states no currency figure at all. No surface renders one: the CLI's `total_cost_usd` is recorded
+ * in the log for AD-24's ceilings to read, and rendering it would make cost currency, which R10 forbids.
  */
 import { Command } from '../../contracts/index.js';
 import { commandAvailability } from '../../runtime/index.js';
 import type { CommandAvailability } from '../../runtime/index.js';
 import { CONTROLS } from '../controls.js';
 import type { ShellView } from '../projection.js';
-import { elapsedMsAt, formatBudgetShare, formatElapsed } from '../status.js';
+import { elapsedMsAt, formatBudgetShare, formatElapsed, formatTokenUsage } from '../status.js';
 
 import type { CardBody } from './index.js';
 
@@ -57,6 +63,8 @@ export interface KillCard extends CardBody {
   readonly kind: 'kill';
   /** Consumed rate-limit budget, as a share of its own ceiling. Never a currency amount (AD-24). */
   readonly usage: string;
+  /** The tokens the log records this run consuming, or `(not recorded)`. Never money (R10). */
+  readonly tokens: string;
   /** Elapsed against estimate, as one phrase (R11). */
   readonly elapsed: string;
   /** True when the run has passed the estimate the log recorded. */
@@ -124,12 +132,14 @@ export const buildKillCard = (input: KillCardInput): KillCard => {
   const view = input.view;
   const now = input.now ?? new Date();
   const usage = formatBudgetShare(view.usage.rateLimitBudgetConsumed);
+  const tokens = formatTokenUsage(view.usage.total);
   const elapsed = formatElapsed(view, now);
   const overEstimate = isOverEstimate(view, now);
   const controls = KILL_CARD_COMMANDS.map(killCardControl);
 
   const lines = [
     `rate-limit budget: ${usage} consumed`,
+    `tokens consumed: ${tokens}`,
     `elapsed: ${elapsed}`,
     overEstimate
       ? 'this run has passed the estimate it was given, which is the reason this card is in front of you'
@@ -145,6 +155,7 @@ export const buildKillCard = (input: KillCardInput): KillCard => {
     kind: 'kill',
     title: `${view.feature ?? 'this run'} — carry on, narrow it, stop it, or take it over`,
     usage,
+    tokens,
     elapsed,
     overEstimate,
     controls,

@@ -25,6 +25,8 @@
  * Nothing here spawns, reads a file or emits an event: the parser turns text into records, and the
  * spawner decides what they mean.
  */
+import { StepUsageSchema } from '../contracts/index.js';
+import type { StepUsage } from '../contracts/index.js';
 
 /** The kinds of record a stream yields. */
 export const STREAM_RECORD_KINDS = [
@@ -121,6 +123,18 @@ export interface ResultRecord {
    * own. Empty for an ordinary result.
    */
   readonly errors: readonly string[];
+  /**
+   * What the attempt cost and consumed, or `null` when the result line reported neither.
+   *
+   * Read rather than estimated: `total_cost_usd` and the `usage` block are the CLI's own numbers, and
+   * story 2-9's ceilings are specified to decide against what was actually consumed. Before story 1-11
+   * these fields were not discarded — they were never read, and `grep -rniE "total_cost_usd|input_tokens"
+   * src/` returned nothing.
+   *
+   * `null` and a record of zeros are different facts and are kept different: a result carrying no usage
+   * at all records nothing, so a surface says `(not recorded)` rather than claiming the step was free.
+   */
+  readonly usage: StepUsage | null;
 }
 
 /** A line that was not whole JSON. Carries no part of the line itself. */
@@ -171,6 +185,94 @@ export const UNREPORTED_API_KEY_SOURCE = '(unreported)';
  * parser resynchronises on the next newline.
  */
 export const MAX_STREAM_LINE_BYTES = 4 * 1024 * 1024;
+
+/** A finite number, or `null` — the shape every usage field is read through. */
+const numberOrNull = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+/**
+ * An integer count, or `null`. A fractional token count is not a count, so it is read as unreported
+ * rather than rounded: the contract declares `z.int()` and a value that would fail it must not be minted
+ * here only to be refused by the schema later.
+ */
+const countOrNull = (value: unknown): number | null => {
+  const found = numberOrNull(value);
+  return found !== null && Number.isInteger(found) ? found : null;
+};
+
+/**
+ * The usage the CLI's `modelUsage` map reports, summed across the models one attempt used.
+ *
+ * The secondary reading, kept for the same reason `permission_denials` has two: this is a shape the
+ * system depends on that lives inside a nested object, so a rename on the primary spelling would
+ * otherwise turn a cost into silence — and a silent zero cost is the one direction this must not fail in.
+ * The keys are camelCase here and snake_case on the top-level `usage` block, which is the CLI's own
+ * inconsistency, recorded off a real transcript rather than guessed.
+ */
+const usageFromModelUsage = (value: unknown): StepUsage | null => {
+  if (!isObject(value)) return null;
+  let seen = false;
+  let cost: number | null = null;
+  let input: number | null = null;
+  let output: number | null = null;
+  let cacheCreation: number | null = null;
+  let cacheRead: number | null = null;
+  const add = (carried: number | null, next: number | null): number | null => {
+    if (next === null) return carried;
+    seen = true;
+    return (carried ?? 0) + next;
+  };
+  for (const entry of Object.values(value)) {
+    if (!isObject(entry)) continue;
+    cost = add(cost, numberOrNull(entry['costUSD']));
+    input = add(input, countOrNull(entry['inputTokens']));
+    output = add(output, countOrNull(entry['outputTokens']));
+    cacheCreation = add(cacheCreation, countOrNull(entry['cacheCreationInputTokens']));
+    cacheRead = add(cacheRead, countOrNull(entry['cacheReadInputTokens']));
+  }
+  if (!seen) return null;
+  return StepUsageSchema.parse({
+    cost_usd: cost,
+    input_tokens: input,
+    output_tokens: output,
+    cache_creation_input_tokens: cacheCreation,
+    cache_read_input_tokens: cacheRead,
+  });
+};
+
+/**
+ * The usage one result line reports, or `null` when it reports none.
+ *
+ * The top-level `total_cost_usd` and `usage` block are the primary spelling, recorded off a real
+ * transcript under `tests/fixtures/stream-json/`. `modelUsage` fills a field the primary spelling did not
+ * carry, never overwrites one it did — the top-level block is the CLI's own total and a per-model sum is a
+ * reconstruction of it.
+ *
+ * Returning `null` for a line with no numbers on it at all is the whole point of the function and is what
+ * R8 requires of the surfaces downstream: absence recorded as absence.
+ */
+export const usageFromResultLine = (line: Record<string, unknown>): StepUsage | null => {
+  const block = line['usage'];
+  const declared = isObject(block) ? block : null;
+  const primary = {
+    cost_usd: numberOrNull(line['total_cost_usd']),
+    input_tokens: countOrNull(declared?.['input_tokens']),
+    output_tokens: countOrNull(declared?.['output_tokens']),
+    cache_creation_input_tokens: countOrNull(declared?.['cache_creation_input_tokens']),
+    cache_read_input_tokens: countOrNull(declared?.['cache_read_input_tokens']),
+  };
+  const fallback = usageFromModelUsage(line['modelUsage']);
+  const merged = {
+    cost_usd: primary.cost_usd ?? fallback?.cost_usd ?? null,
+    input_tokens: primary.input_tokens ?? fallback?.input_tokens ?? null,
+    output_tokens: primary.output_tokens ?? fallback?.output_tokens ?? null,
+    cache_creation_input_tokens:
+      primary.cache_creation_input_tokens ?? fallback?.cache_creation_input_tokens ?? null,
+    cache_read_input_tokens: primary.cache_read_input_tokens ?? fallback?.cache_read_input_tokens ?? null,
+  };
+  const anyReported = Object.values(merged).some((field) => field !== null);
+  return anyReported ? StepUsageSchema.parse(merged) : null;
+};
 
 /** The CLI's own `errors` array, keeping only the strings in it. */
 const errorsOf = (line: Record<string, unknown>): readonly string[] => {
@@ -327,6 +429,7 @@ export const parseStreamLine = (line: string, lineNumber = 1): readonly StreamRe
       sessionId,
       numTurns: typeof numTurns === 'number' ? numTurns : null,
       errors,
+      usage: usageFromResultLine(parsed),
     });
     return records;
   }

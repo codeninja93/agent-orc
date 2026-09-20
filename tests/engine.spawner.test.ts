@@ -395,6 +395,8 @@ describe('an output that fails its schema', () => {
         sessionId: null,
         numTurns: null,
         errors: [],
+        // Story 1-11 added the field; a result carrying no usage records none (R8).
+        usage: null,
       }),
     ).toBe('step.stream_malformed');
   });

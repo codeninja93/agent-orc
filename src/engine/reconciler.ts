@@ -35,7 +35,10 @@ import { join } from 'node:path';
 import {
   CURRENT_SCHEMA_VERSION,
   MODEL_RUNGS,
+  SpecCriterionEditedPayloadSchema,
+  SpecRecordedPayloadSchema,
   StepInputSchema,
+  USAGE_PAYLOAD_KEY,
   featureStateFingerprint,
   findStepRecord,
   formatTimestamp,
@@ -137,7 +140,11 @@ import {
   reconcileCheckpointAgainstLog,
 } from './rebuild.js';
 import type { CheckpointDisagreement, FeaturePlan, PlanStep } from './rebuild.js';
-import { admitByTerritory } from './territory.js';
+import {
+  TERRITORY_DECLARED_EVENT_TYPE,
+  admitByTerritory,
+  territoryDeclaredPayload,
+} from './territory.js';
 import type { TerritoryCandidate, TerritoryDeferral } from './territory.js';
 import { EngineLock } from './lock.js';
 import { defaultUlidMinter } from './ulid.js';
@@ -146,6 +153,62 @@ import type { UlidMinter } from './ulid.js';
 /** `runs/<run-id>/steps/` — where a step's typed input file lives. */
 export const STEPS_DIR_NAME = 'steps';
 export const STEP_INPUT_FILE_NAME = 'input.json';
+
+// -------------------------------------------------------------------------------------------------
+// CAP-2 — the acceptance criteria as lines of the durable truth
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * The two spec event types, and the payloads they carry.
+ *
+ * They live beside the loop that emits them rather than in `rebuild.ts` for one reason: the payloads are
+ * built from a {@link FeaturePlan}, which is *declared configuration* and not run state, and this is the
+ * only unit that holds both. The types themselves are declared in `src/contracts/event.ts` with their
+ * schemas, because a reader outside the engine — the renderer today, story 3-1's web surface next — must be
+ * able to look them up without importing the engine.
+ *
+ * Neither type folds into the checkpoint. `state.json` already carries the plan's criteria as declared
+ * configuration; what was missing was the *log* carrying them, so the six required surfaces are
+ * reconstructable from `events.jsonl` alone (AD-4). Recording them in both places is not a second
+ * authority: the log is authoritative and the checkpoint is discarded and rebuilt from it.
+ */
+export const SPEC_RECORDED_EVENT_TYPE = 'spec.recorded';
+export const SPEC_CRITERION_EDITED_EVENT_TYPE = 'spec.criterion_edited';
+
+/** The command whose argument is an amended criterion, spelled once (CAP-2). */
+const EDIT_CRITERION_COMMAND = 'edit_criterion';
+
+/**
+ * How the spec echo card spells an amendment's line number, read back here.
+ *
+ * `editCriterionArgument` in `src/tui/cards/spec-echo.ts` writes `criterion 3: <wording>`, and this is the
+ * other half of that one agreement. It is a *parse*, not a format: Q6 forbids imposing a format on a
+ * person, so an amendment that names no line is still recorded with the text it carried and a `null` line,
+ * and a reader states it as an edit it could not place rather than discarding what somebody wrote.
+ */
+const CRITERION_AMENDMENT = /^\s*criterion\s+(\d+)\s*[:.\-]\s*(.*)$/is;
+
+/** The payload of a `spec.recorded` line: the request, and the criteria in their declared order. */
+export const specRecordedPayload = (plan: FeaturePlan): Record<string, unknown> =>
+  SpecRecordedPayloadSchema.parse({
+    request: plan.request,
+    acceptance_criteria: [...plan.acceptance_criteria],
+  });
+
+/** The payload of a `spec.criterion_edited` line, parsed out of the intent's free text (Q6). */
+export const criterionEditedPayload = (argument: string): Record<string, unknown> => {
+  const match = CRITERION_AMENDMENT.exec(argument);
+  const line = match === null ? null : Number.parseInt(match[1] ?? '', 10);
+  const text = match === null ? argument.trim() : (match[2] ?? '').trim();
+  return SpecCriterionEditedPayloadSchema.parse({
+    // A line number that did not parse to a positive integer is no line number: better an edit recorded
+    // without one than an edit attached to criterion zero.
+    line: line === null || !Number.isInteger(line) || line < 1 ? null : line,
+    // The wording a person gave, never the wrapper the card put around it — and never empty, because an
+    // amendment with no text is still evidence that somebody edited that line.
+    text: text === '' ? argument.trim() : text,
+  });
+};
 
 /** A step id safe as a directory name. Step ids are stable declared names, never free text. */
 const SAFE_STEP_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -831,6 +894,36 @@ export class Reconciler {
       payload: { mode: plan.mode, step_count: plan.steps.length },
     });
 
+    /**
+     * CAP-2 — the criteria go in the log, at the moment the run enters `drafting`.
+     *
+     * Here and not at confirmation, because the spec echo card is what a person confirms *from*: a run in
+     * `drafting` whose criteria were not yet recorded would show `(not recorded)` and refuse to offer the
+     * confirmation, which is the gap story 1-10 pinned. Recording them before anything can read them also
+     * means the later-wins rule of `spec.recorded` has something to replace.
+     */
+    this.emit(recorder, {
+      step: null,
+      type: SPEC_RECORDED_EVENT_TYPE,
+      payload: specRecordedPayload(plan),
+    });
+
+    /**
+     * The declared territory, so a replay can recompute why two features were serialised.
+     *
+     * A path long enough reads as high-entropy secret material to the AD-21 pass, so this payload is the
+     * one place in the engine that knowingly writes something the pass may rewrite. That is handled by the
+     * *reader* rather than by an exemption: `territoryFromEvents` reports how many entries it could not
+     * read and treats an incomplete territory as colliding with everything, which serialises a feature
+     * unnecessarily at worst and never admits one wrongly. The plan remains the live authority for a
+     * running pass; this line is what makes the decision reconstructable afterwards (AD-4).
+     */
+    this.emit(recorder, {
+      step: null,
+      type: TERRITORY_DECLARED_EVENT_TYPE,
+      payload: territoryDeclaredPayload(plan.territory),
+    });
+
     return { run, state: this.checkpointFromLog(paths, plan) };
   }
 
@@ -1226,6 +1319,24 @@ export class Reconciler {
         code: effect.handoff.code,
         reason: effect.handoff.reason,
         escape,
+      });
+    }
+
+    /**
+     * CAP-2 — an amended criterion reaches the log as the amendment, not only as a command.
+     *
+     * `command.applied` records *that* `edit_criterion` was applied, with its principal and its effect,
+     * and deliberately not the argument it carried — so before this the current text of an edited
+     * criterion existed nowhere in the durable truth and the spec echo would have gone on rendering the
+     * original. The line goes before `command.applied` for the reason every other side effect does: the
+     * ledger entry is what retires the intent, so a crash in between redelivers the intent and the edit is
+     * recorded again rather than lost.
+     */
+    if (pending.intent.command === EDIT_CRITERION_COMMAND && pending.intent.argument !== null) {
+      this.emit(recorder, {
+        step: null,
+        type: SPEC_CRITERION_EDITED_EVENT_TYPE,
+        payload: criterionEditedPayload(pending.intent.argument),
       });
     }
 
@@ -1657,7 +1768,11 @@ export class Reconciler {
 
     for (const run of this.runIds()) {
       try {
-        entries.push({ run, loaded: this.load(run) });
+        const loaded = this.load(run);
+        // Re-read when a declaration was appended: the entry below is decided from this snapshot, and a
+        // snapshot whose `last_event_seq` predates the lines just written would be checkpointed as a
+        // disagreement with the log on the very next pass.
+        entries.push({ run, loaded: this.recordDeclarations(loaded) ? this.load(run) : loaded });
       } catch (thrown: unknown) {
         // A directory with neither log nor checkpoint carries no state to reconcile and no feature to
         // name, so it is stepped over silently rather than reported as a fault every pass forever. Its
@@ -2285,6 +2400,16 @@ export class Reconciler {
       payload: {
         disposition: termination.disposition,
         ...(termination.error === null ? {} : { error: termination.error }),
+        /**
+         * What the attempt cost and consumed (R10, and what story 2-9's ceilings will read).
+         *
+         * Spread rather than written unconditionally, because the key's *absence* is the record that the
+         * CLI reported nothing. Writing `usage: null`, or worse a record of zeros, would have the
+         * completion notice state `0` where R8 requires `(not recorded)` — a step nobody measured is not
+         * a step that was free. Numbers are safe in a payload: AD-21's entropy sweep only rewrites
+         * strings, which is why the usage lives here and an identifier has to live in the envelope.
+         */
+        ...(termination.usage === null ? {} : { [USAGE_PAYLOAD_KEY]: termination.usage }),
       },
       sessionId: termination.sessionId,
       baselineRef,
@@ -2425,6 +2550,44 @@ export class Reconciler {
    * The engine never opens `events.jsonl` (AD-29). Identifiers go in envelope fields — `run`, `step`,
    * `session_id`, `baseline_ref` — never in the payload, where the AD-21 pass would replace them.
    */
+  /**
+   * AD-32, AD-7 — append the run-level declarations the log still owes, on any pass.
+   *
+   * `acceptFeature` records `spec.recorded` and `feature.territory_declared` when the run is created, and
+   * that is not sufficient on its own: a kill between `run.created` and those two lines leaves a run whose
+   * criteria never reach the durable truth, so the spec echo card would read `(not recorded)` for the rest
+   * of that run's life and the stage-1 gate would hold only for runs that were never interrupted. The
+   * crash-injection suite caught exactly that, at boundaries 1 and 2.
+   *
+   * So the repair is a *reconcile* action rather than a creation-time one, which is the shape AD-32 requires
+   * of everything: guarded by what the log already carries, safe on every pass, and reached again after a
+   * restart. It changes no lifecycle state and is therefore not one of the pass's at-most-one actions —
+   * exactly like `settleQuestions`, and for the same reason.
+   *
+   * Returns true when a line was appended, so the caller re-reads the state it had loaded rather than
+   * carrying a `last_event_seq` the log has already moved past.
+   */
+  private recordDeclarations(loaded: LoadedState): boolean {
+    const carried = new Set(loaded.events.map((event) => event.type));
+    const owed: readonly { readonly type: string; readonly payload: Record<string, unknown> }[] = [
+      ...(carried.has(SPEC_RECORDED_EVENT_TYPE)
+        ? []
+        : [{ type: SPEC_RECORDED_EVENT_TYPE, payload: specRecordedPayload(loaded.plan) }]),
+      ...(carried.has(TERRITORY_DECLARED_EVENT_TYPE)
+        ? []
+        : [
+            {
+              type: TERRITORY_DECLARED_EVENT_TYPE,
+              payload: territoryDeclaredPayload(loaded.plan.territory),
+            },
+          ]),
+    ];
+    if (owed.length === 0) return false;
+    const recorder = this.recorderFor(loaded.state.run, loaded.state.feature);
+    for (const line of owed) this.emit(recorder, { step: null, ...line });
+    return true;
+  }
+
   private emit(
     recorder: Recorder,
     event: {

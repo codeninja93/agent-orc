@@ -85,12 +85,27 @@ export const cardText = (card: CardBody): string => cardLines(card).join('\n');
 export interface CardInputs {
   /** The question as `questions/<id>/state.json` holds it, when the reader has it in reach. */
   readonly question?: QuestionDetail | null;
-  /** The acceptance criteria being echoed (CAP-2). Nothing in stage 1 records them yet. */
+  /**
+   * Acceptance criteria a caller holds that the log does not carry (CAP-2).
+   *
+   * A fallback since story 1-11: `spec.recorded` puts them in the log, so the fold is the source and this is
+   * only for a log written before that type existed, or a plan not yet accepted.
+   */
   readonly criteria?: readonly string[];
   /** What a later story records about a completion: the merge, the file count, the test result. */
   readonly completion?: CompletionFacts;
   /** Where a handed-off run's work and note are, as their owners named them. */
   readonly handoff?: HandoffLocation;
+  /**
+   * The run id, from an event envelope, so the handoff card can derive the branch and the document.
+   *
+   * It is an input rather than a field of `ShellView` because R6 keeps the run id out of the view entirely:
+   * no render may require a person to know one. A caller that folded a log has the envelope, and passing the
+   * id in is what lets the derivation happen without the view carrying it.
+   */
+  readonly run?: string | null;
+  /** `ORCH_HOME`, so the handoff document's path is resolved by the module that owns the AD-9 layout. */
+  readonly orchHome?: string;
   /** Free text typed and not yet submitted, echoed by the question card rather than submitted. */
   readonly draft?: string | null;
   readonly now?: Date;
@@ -138,6 +153,8 @@ export const cardForView = (view: ShellView, inputs: CardInputs = {}): Card | nu
       return buildHandoffCard({
         view,
         ...(inputs.handoff === undefined ? {} : { location: inputs.handoff }),
+        ...(inputs.run === undefined ? {} : { run: inputs.run }),
+        ...(inputs.orchHome === undefined ? {} : { orchHome: inputs.orchHome }),
       });
     case 'degraded':
       return buildKillCard({ view, now });

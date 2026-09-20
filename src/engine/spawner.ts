@@ -1021,7 +1021,14 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
       });
     };
 
-    const withSession = { sessionId };
+    /**
+     * Every termination carries the session id and the usage, whatever the disposition.
+     *
+     * Composed once rather than at each `terminated` call, because a disposition that forgot the usage
+     * would silently under-report what a run consumed — and a missing cost reads as a free step, which is
+     * the one direction R8 forbids. A result the parser never saw contributes `null`, which is absence.
+     */
+    const withSession = { sessionId, usage: outcome.result?.usage ?? null };
 
     // AD-1's positive assertion, caught a second time on the stream. The preflight refuses an
     // API-key environment before any process exists; this catches a CLI that resolved a key some

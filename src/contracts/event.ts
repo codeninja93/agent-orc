@@ -50,6 +50,26 @@ export const EVENT_TYPES = [
   'question.resolved',
   'question.default_taken',
   'question.deflected',
+  /**
+   * The request and the ordered acceptance criteria this run is built against (CAP-2).
+   *
+   * Story 1-10 found that the criteria reached disk only in a step input file and `state.json`, both of
+   * which AD-4 ranks below the log — so the spec echo was the one required surface that could not be
+   * reconstructed from `events.jsonl` alone. This type is that gap closed. The later line wins: a second
+   * `spec.recorded` for one feature replaces the set rather than adding to it.
+   */
+  'spec.recorded',
+  /** One criterion amended through `edit_criterion`, so the current text is in the log (CAP-2). */
+  'spec.criterion_edited',
+  /**
+   * The declared file territory, so an overlap is recomputable by replay.
+   *
+   * The Consistency Conventions serialise features whose declared territories overlap, and until now the
+   * territory lived only in the in-memory plan and the AD-9 config snapshot — so a replay could not tell
+   * why two features were serialised. See {@link FeatureTerritoryDeclaredPayloadSchema} for the one thing
+   * AD-21 does to this payload that a reader has to expect.
+   */
+  'feature.territory_declared',
 ] as const;
 
 export type DeclaredEventType = (typeof EVENT_TYPES)[number];
@@ -174,3 +194,61 @@ export const hasEventIdentityShape = (field: string, value: string): boolean => 
 
 /** Ordering is by `seq`; timestamps carry no ordering authority across processes (AD-29). */
 export const compareEventOrder = (a: EventEnvelope, b: EventEnvelope): number => a.seq - b.seq;
+
+/**
+ * The payload of a `spec.recorded` line: the user's words, and the criteria in the order they were stated.
+ *
+ * Loose rather than closed, for the same reason the envelope is: AD-5 makes adding a key non-breaking, so
+ * a key a later build adds must survive this build's parse rather than being stripped by it.
+ *
+ * **What AD-21 does to this payload, stated because it is the one surprise here.** The criteria are prose
+ * and prose survives the entropy sweep — a run of punctuated words never reaches the 24-character unbroken
+ * threshold. An *identifier quoted inside* a criterion does not: a genuine ULID carries roughly 4.6 bits
+ * per character and a full commit SHA roughly 4.0, both above the sweep's 3.5, so each is replaced by the
+ * redaction marker while the sentence around it survives. That is AD-21 working as specified and there is
+ * no remedy for it that is not a wider allow-list, which AD-21 forbids: a surface therefore presents such
+ * a criterion through `presentValue`, which says `(redacted in the log)` rather than showing a marker as
+ * content. `tests/runtime.redaction-survival.test.ts` pins both halves against a real ULID.
+ */
+export const SpecRecordedPayloadSchema = z.looseObject({
+  /** The user's original words, verbatim. */
+  request: z.string(),
+  /** The criteria, in the declared order. Replaced wholesale by a later `spec.recorded`. */
+  acceptance_criteria: z.array(z.string()),
+});
+
+export type SpecRecordedPayload = z.infer<typeof SpecRecordedPayloadSchema>;
+
+/**
+ * The payload of a `spec.criterion_edited` line.
+ *
+ * `line` is 1-based, as the spec echo card numbers them, and nullable because Q6 forbids imposing a format
+ * on a person: an amendment whose wording names no line is still recorded, with the text it carried, and a
+ * reader states it as an edit it could not place rather than discarding it.
+ */
+export const SpecCriterionEditedPayloadSchema = z.looseObject({
+  line: z.int().nullable(),
+  /** The amended criterion as the person wrote it, unaltered. */
+  text: z.string(),
+});
+
+export type SpecCriterionEditedPayload = z.infer<typeof SpecCriterionEditedPayloadSchema>;
+
+/**
+ * The payload of a `feature.territory_declared` line.
+ *
+ * **A long path does not survive AD-21, and the replay must expect that.** A repository path is usually
+ * broken by a dot or a hyphen and so splits into runs far below the sweep's 24-character threshold —
+ * `src/engine`, `src/runtime/recorder.ts`. A long path with no dot and no hyphen does not: measured,
+ * `docs/planning/architecture/spine/decisions/records` is a single 50-character run at 3.78 bits per
+ * character and is replaced whole. The replay in `src/engine/territory.ts` therefore reports how many
+ * entries it could not read and treats an incomplete territory as colliding with everything, which is the
+ * fail-safe direction — a feature serialised unnecessarily costs a pass, and one admitted wrongly costs
+ * another feature's work.
+ */
+export const FeatureTerritoryDeclaredPayloadSchema = z.looseObject({
+  /** The normalised declared paths. */
+  paths: z.array(z.string()),
+});
+
+export type FeatureTerritoryDeclaredPayload = z.infer<typeof FeatureTerritoryDeclaredPayloadSchema>;

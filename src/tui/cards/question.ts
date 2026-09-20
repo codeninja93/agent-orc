@@ -19,9 +19,17 @@
  *
  * **The window is the remaining time, not the declared window, whenever that can be known.** Q2 asks for
  * "the window before that happens", and a person deciding whether to answer now needs what is left rather
- * than what it started as. That needs the instant the question was asked, which the log line does not
- * carry and the question state file does — so with the state file in reach the card counts down, and
- * without it the card states the declared window and says what it is.
+ * than what it started as. That needs the instant the question was asked — and story 1-11 put `asked_at` on
+ * the `question.asked` line, so the card now counts down from the log alone. With neither the log's instant
+ * nor a state file it states the declared window and says that is what it means, which is the case a log
+ * written before that key existed still reaches (AD-5).
+ *
+ * **The options come from the log, and the state file is the fallback.** Before story 1-11 the line carried
+ * option *ids* and nothing else, so a reconstructed card could not state a single consequence — and Q1 is a
+ * rule about what a person is shown, not about what is on disk somewhere. `offered_options` now carries each
+ * option's label, its consequence and whether it is the escape. A reader holding the question state file
+ * still wins, because the file is the question as its owner wrote it; a reader with only the log is no
+ * longer reduced to ids.
  *
  * **A settled question keeps its card.** The outcome does not vanish the moment it arrives: a person who
  * was mid-sentence when the window closed is owed the sentence `describeDefaultTaken` composes, which is
@@ -34,7 +42,7 @@
 import type { QuestionOption, QuestionState } from '../../contracts/index.js';
 import { describeDefaultTaken, questionWindowRemainingMs, recommendedOption } from '../../runtime/index.js';
 import { UNRECORDED_PRESENTATION, presentValue } from '../projection.js';
-import type { QuestionSlotState, ShellView } from '../projection.js';
+import type { QuestionOptionView, QuestionSlotState, ShellView } from '../projection.js';
 import { formatDuration } from '../status.js';
 
 import type { CardBody } from './index.js';
@@ -53,7 +61,7 @@ export const MAX_QUESTION_CARD_OPTIONS = 3;
 export interface QuestionDetail {
   readonly id?: string;
   readonly prompt?: string;
-  /** Q3 — the mini-brief. It lives in the state file and is deliberately not duplicated into the log. */
+  /** Q3 — the mini-brief. In the question state file, and since story 1-11 in the log line too. */
   readonly brief?: string;
   readonly options?: readonly QuestionOption[];
   readonly escape?: QuestionOption;
@@ -104,19 +112,81 @@ export interface QuestionCardInput {
   readonly draft?: string | null;
 }
 
-/** The three options that reach a person, then the escape, with the recommendation marked (Q1). */
-export const boundedOptions = (detail: QuestionDetail | null): readonly QuestionCardOption[] => {
-  if (detail === null) return [];
-  const recommendedId = detail.recommended_option_id ?? null;
-  const concrete = (detail.options ?? []).slice(0, MAX_QUESTION_CARD_OPTIONS).map((option) => ({
+/**
+ * The question as this card reads it, from whichever source had it.
+ *
+ * One shape rather than two code paths, because Q1's bound, the recommendation and the countdown all have to
+ * behave identically whether the reader had the state file or only the log — and two paths through the same
+ * three rules is how they stop behaving identically.
+ */
+export interface ReadQuestion {
+  /** The concrete options, unbounded: bounding them is this card's job rather than its input's. */
+  readonly concrete: readonly QuestionOption[];
+  readonly escape: QuestionOption | null;
+  readonly recommendedId: string | null;
+  readonly defaultAction: string | null;
+  readonly brief: string | null;
+  readonly askedAt: string | null;
+  readonly windowMs: number | null;
+}
+
+/** The fold's option list, split back into the concrete options and the escape it flagged. */
+const fromFold = (options: readonly QuestionOptionView[]): {
+  readonly concrete: readonly QuestionOption[];
+  readonly escape: QuestionOption | null;
+} => {
+  const plain = (option: QuestionOptionView): QuestionOption => ({
+    id: option.id,
+    label: option.label,
+    consequence: option.consequence,
+  });
+  return {
+    concrete: options.filter((option) => !option.escape).map(plain),
+    escape: options.filter((option) => option.escape).map(plain)[0] ?? null,
+  };
+};
+
+/**
+ * Read the question from the detail when the reader has it, and from the fold otherwise.
+ *
+ * Field by field rather than object by object: a reader may hold a state file that predates a field the log
+ * now carries, or the reverse, and falling back per field is what makes the card state the most the two
+ * sources together know rather than the least.
+ */
+export const readQuestion = (detail: QuestionDetail | null, view: ShellView): ReadQuestion => {
+  const slot = view.question;
+  const folded = fromFold(slot.options);
+  const declaredOptions = detail?.options;
+  const declaredEscape = detail?.escape;
+  return {
+    concrete: declaredOptions ?? folded.concrete,
+    escape: declaredEscape ?? folded.escape,
+    recommendedId: detail?.recommended_option_id ?? slot.recommendedOptionId,
+    defaultAction: detail?.default_action ?? slot.defaultAction,
+    brief: detail?.brief ?? slot.brief,
+    askedAt: detail?.asked_at ?? slot.askedAt,
+    windowMs: detail?.default_window_ms ?? slot.defaultWindowMs,
+  };
+};
+
+/**
+ * The three options that reach a person, then the escape, with the recommendation marked (Q1).
+ *
+ * Exported so a suite can assert Q1's bound without building a whole card, and taking the already-read
+ * question rather than either source: the bound is one rule, and a second entry point that read a source of
+ * its own is how a rule acquires two behaviours.
+ */
+export const boundedOptions = (read: ReadQuestion): readonly QuestionCardOption[] => {
+  const recommendedId = read.recommendedId;
+  const concrete = read.concrete.slice(0, MAX_QUESTION_CARD_OPTIONS).map((option) => ({
     id: option.id,
     label: option.label,
     consequence: option.consequence,
     recommended: option.id === recommendedId,
     escape: false,
   }));
-  const escape = detail.escape;
-  return escape === undefined
+  const escape = read.escape;
+  return escape === null
     ? concrete
     : [
         ...concrete,
@@ -138,13 +208,9 @@ export const boundedOptions = (detail: QuestionDetail | null): readonly Question
  * is. A card that guessed the start instant from the log's last line would count down from the wrong
  * moment, which is worse than saying what it knows.
  */
-const windowPhrase = (
-  detail: QuestionDetail | null,
-  view: ShellView,
-  now: Date,
-): string => {
-  const askedAt = detail?.asked_at ?? null;
-  const windowMs = detail?.default_window_ms ?? view.question.defaultWindowMs;
+const windowPhrase = (read: ReadQuestion, now: Date): string => {
+  const askedAt = read.askedAt;
+  const windowMs = read.windowMs;
   if (askedAt !== null && windowMs !== null) {
     const remaining = questionWindowRemainingMs({ asked_at: askedAt, default_window_ms: windowMs }, now);
     return remaining === 0
@@ -162,23 +228,14 @@ const windowPhrase = (
  * option's *id* and not its consequence, and a card that printed the id where a consequence belongs would
  * be answering a different question than the one Q1 asks.
  */
-const recommendationFor = (
-  detail: QuestionDetail | null,
-): { label: string; consequence: string } | null => {
-  const options = detail?.options;
-  const escape = detail?.escape;
-  const recommendedId = detail?.recommended_option_id;
-  const defaultAction = detail?.default_action;
-  if (
-    options === undefined ||
-    escape === undefined ||
-    recommendedId === undefined ||
-    defaultAction === undefined
-  ) {
-    return null;
-  }
+const recommendationFor = (read: ReadQuestion): { label: string; consequence: string } | null => {
+  const escape = read.escape;
+  const recommendedId = read.recommendedId;
+  const defaultAction = read.defaultAction;
+  if (escape === null || recommendedId === null || defaultAction === null) return null;
+  if (read.concrete.length === 0) return null;
   return recommendedOption({
-    options,
+    options: read.concrete,
     escape,
     recommended_option_id: recommendedId,
     default_action: defaultAction,
@@ -199,14 +256,16 @@ export const buildQuestionCard = (input: QuestionCardInput): QuestionCard => {
   const now = input.now ?? new Date();
   const draft = input.draft === undefined || input.draft === null || input.draft === '' ? null : input.draft;
 
+  const read = readQuestion(detail, view);
   const prompt = presentValue(detail?.prompt ?? slot.prompt);
-  const brief = presentValue(detail?.brief ?? null);
-  const options = boundedOptions(detail);
-  const offered = detail?.options?.length ?? 0;
-  const optionsNotShown = Math.max(offered - MAX_QUESTION_CARD_OPTIONS, 0);
-  const defaultAction = presentValue(detail?.default_action ?? slot.defaultAction);
-  const window = windowPhrase(detail, view, now);
-  const recommended = recommendationFor(detail);
+  const brief = presentValue(read.brief);
+  const options = boundedOptions(read);
+  // The escape is never one of the ones dropped, so only the *concrete* options are counted against Q1's
+  // bound: counting the escape in would report one fewer hidden option than there are.
+  const optionsNotShown = Math.max(read.concrete.length - MAX_QUESTION_CARD_OPTIONS, 0);
+  const defaultAction = presentValue(read.defaultAction);
+  const window = windowPhrase(read, now);
+  const recommended = recommendationFor(read);
 
   if (slot.state === 'pending') {
     const lines = [

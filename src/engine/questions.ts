@@ -70,6 +70,7 @@ import type {
   Question,
   QuestionDeflection,
   QuestionDraft,
+  QuestionOption,
   QuestionResolution,
   QuestionResolver,
   QuestionState,
@@ -894,22 +895,71 @@ const questionIdsOfTypes = (
   return ids;
 };
 
+/** The payload key the enriched option list is carried under (story 1-11). */
+export const OFFERED_OPTIONS_PAYLOAD_KEY = 'offered_options';
+
 /**
  * The payload of a `question.asked` line.
  *
  * Every value is short, punctuated prose or an enum member, because the AD-21 pass rewrites an unbroken
  * high-entropy run wherever it appears in a payload — and `question_id` is the field the idempotence of
- * every later transition depends on. The brief is deliberately *not* carried: it is on disk in the
- * question state file, and duplicating it into the log would put the same prose in two places.
+ * every later transition depends on. Labels, consequences and the brief are prose, so the sweep leaves
+ * them: a run of words is broken by its spaces long before the 24-character threshold, measured.
+ *
+ * **What story 1-11 added, and what it deliberately did not touch.** Q1 requires a person to be shown the
+ * *consequence* of each option and Q2 the window before the default is taken, and with only this line in
+ * reach the one-question card could show neither: the payload carried option *ids* and the declared window
+ * length, so a reconstructed card could not count down and could not say what any option would do. It now
+ * also carries `offered_options` with each option's label and consequence, the Q3 brief, and `asked_at`,
+ * which is the instant a countdown is measured from.
+ *
+ * `options` keeps its original meaning — the joined ids, in offer order — and that is not an oversight.
+ * AD-5 makes adding a key non-breaking and changing one's meaning breaking, so a reader written against
+ * this build goes on reading the same string it always did while a newer one reads the richer list.
+ *
+ * The brief was previously withheld on the grounds that the question state file already held it. The gate
+ * overrules that: `questions/` is not the log, and a run is required to be reconstructable from the log
+ * alone. It is one prose field duplicated into the durable truth, which is the cheaper of the two costs.
  */
 export const questionAskedPayload = (state: QuestionState): Record<string, unknown> => ({
   [QUESTION_ID_PAYLOAD_KEY]: state.question.id,
   prompt: state.question.prompt,
   options: offeredOptionIds(state.question).join(', '),
+  [OFFERED_OPTIONS_PAYLOAD_KEY]: offeredOptionsPayload(state.question),
+  brief: state.question.brief,
   recommended_option_id: state.question.recommended_option_id,
   default_action: state.question.default_action,
   default_window_ms: state.question.default_window_ms,
+  asked_at: state.question.asked_at,
 });
+
+/**
+ * Every offered option as a person is shown it: its id, its label, its consequence, and whether it is the
+ * escape.
+ *
+ * The escape is in the same list rather than beside it, and flagged, so `offered_options` and the older
+ * `options` string describe exactly the same set in the same order — two lists that could disagree about
+ * what was offered is the drift AD-25's attribution rule cannot afford. The flag is what lets the card
+ * honour Q1's "at most three concrete options plus an escape" without the escape being one of the three it
+ * drops.
+ */
+const offeredOptionsPayload = (question: {
+  readonly options: readonly QuestionOption[];
+  readonly escape: QuestionOption;
+}): readonly Record<string, unknown>[] => [
+  ...question.options.map((option) => ({
+    id: option.id,
+    label: option.label,
+    consequence: option.consequence,
+    escape: false,
+  })),
+  {
+    id: question.escape.id,
+    label: question.escape.label,
+    consequence: question.escape.consequence,
+    escape: true,
+  },
+];
 
 /**
  * The payload of a `question.resolved` or `question.default_taken` line.
