@@ -11,12 +11,13 @@ Shadow mode has no autonomy. It analyzes, proposes, and compares; it writes noth
 ## Stages
 
 **Stage 1 — Substrate, interface, containment**
-Append-only event log. Git-as-bus with notes. Runtime recorder. TUI renderer. Morning brief, one-question card with default-on-timeout, permanent mode display, escape hatch. Worktree plus least-privilege container and the leased resource pool, since containment is required from the start.
-*Gate:* a run is fully reconstructable from git and the event log alone, and the executor container is verified to hold no push credential.
+Append-only event log. Runtime recorder. TUI renderer. Morning brief, one-question card with default-on-timeout, permanent mode display, escape hatch. Worktree plus least-privilege container and the leased resource pool, since containment is required from the start.
+*Gate:* a run is fully reconstructable from the event log alone, and the executor container is verified to hold no push credential.
+*Amended 2026-09-20:* this gate read "from git and the event log alone", and the git half has moved to stage 2. AD-22 makes the committer the git note's only writer and places the note on the **merge** commit; stage 1 builds nothing that merges, so the git half was never achievable here. Stage 1 puts code in git — baseline commits and the escape-hatch takeover branch — but not the structured in-repo record. The bar is not lowered: the note still has to exist before stage 2 closes.
 
 **Stage 2 — Engine, full roster, ceilings**
 Deterministic engine with typed step contracts. The complete agent roster — analysis, planning, implementation, testing, verification, committing — plus tool servers beginning with Jira. Spec echo. Per-repo profile, hand-written at this stage. Ceilings in steps, wall-clock and rate-limit budget.
-*Gate:* a real feature completes end to end, with the user reviewing and merging a pull request authored under their own identity.
+*Gate:* a real feature completes end to end, with the user reviewing and merging a pull request authored under their own identity, **and that run is reconstructable from git alone** — the committer's note on the merge commit per AD-22, carrying the run id, the ordered step list with dispositions, the acceptance criteria, usage totals and the decisions taken.
 
 **Stage 3 — Web renderer, shadow mode, measurement**
 Local web app as a second renderer of the same event stream. Shadow mode against already-built features. Metrics: rework rate, deflection rate, interruption count, usage per feature.

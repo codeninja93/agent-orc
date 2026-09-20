@@ -112,8 +112,51 @@
     The six required terminal surfaces: the one-question card with its stated
     default and window, the line-editable spec echo card, the one-screen
     morning brief, the kill card, the completion notice stating what was not
-    verified, and the handoff document. Last story before the stage 1 gate.
+    verified, and the handoff document. Last of the six required surfaces.
+- id: "1-11"
+  title: "Event-log completeness — the facts the required surfaces are specified to show"
+  description: >-
+    Five facts stage 1's own required surfaces must display but the event log
+    does not carry: the acceptance criteria, so the spec echo card can be
+    reconstructed; option labels, consequences and asked_at on question.asked,
+    so the question card can state consequences and count down; the takeover
+    branch and document path on handoff.recorded; a feature's declared
+    territory; and per-run cost and token accounting, which nothing reads
+    today while the morning brief is specified to show what each feature cost
+    and the completion notice to show usage. This is the story that makes the
+    stage 1 gate's claim true, so the gate is assessed here.
   done_checkpoint: true
+  invoke_dev_with: >-
+    Every field added here is appended to an event payload and therefore passes
+    AD-21 redaction before it reaches the log. Verify each new field survives
+    redaction using a REAL high-entropy value — a genuine ULID at roughly 4.1
+    bits per character, never a repeated character and never a ULID of repeated
+    zeros. Both give a false pass, and this project has recorded that same false
+    pass three times. Cost and token fields are numbers, so they are not at
+    risk; the branch name, the document path and the criteria strings are.
+- id: "1-12"
+  title: "Stage-1 defect sweep — bound the retry loop, close the bypasses"
+  description: >-
+    Eight defects stage 1 owns, each recorded as a deferred entry and each
+    cheaper to fix before stage 2 builds on it: unbounded retry, recorded in
+    both 1-3 and 1-7, where a step whose disposition is retry-with-backoff
+    re-runs forever and the declared failure limit counts only the failed
+    disposition; the 'wx'-then-write torn-read window shared by the recorder's
+    writer claim and the engine lock, recorded in three stories; the
+    schema_version gate being bypassable by calling parse directly on a
+    versioned artifact; OrchError.retryable contradicting the AD-35 disposition
+    table, because the field is model-supplied and unvalidated; a command intent
+    carrying a null argument for commands meaningless without text, which story
+    1-10's cards now write; a command intent pairing source 'timeout' with
+    principal kind 'user', attributing a clock's default to a person;
+    engines.npm declared but never asserted; and no CI workflow, so the
+    four-command gate runs only when someone remembers.
+  invoke_dev_with: >-
+    Bounding the retry loop is the one item here with a cost consequence rather
+    than a correctness one — an unbounded loop spends subscription budget until
+    a person notices. Story 2-9 owns the ceilings; this story owns only a hard
+    attempt bound, so do not implement budget degradation, hibernation or
+    anything else 2-9 is named for.
 - id: "2-1"
   title: "Installer — npx init, the interview, .orch/ scaffolding"
   description: >-
