@@ -913,6 +913,57 @@ describe('an agent-reported status with no error of its own', () => {
   });
 });
 
+/**
+ * An agent whose `retryable` disagrees with the AD-35 table for the code it reported.
+ *
+ * This is a schema question answered at the spawner, because the spawner is where the cost lands. The
+ * field is a *derived* boolean on a model-facing contract, and the rule deriving it emits nothing into
+ * the exported JSON Schema — so the model is never told it and sometimes gets it wrong. While
+ * `OrchErrorSchema` *refused* the disagreement, one wrong boolean failed the whole
+ * `StepOutputSchema.parse` at AD-1's re-parse, which `reparse` answers with
+ * `step.schema_invalid_output` — `escalate-model-tier`. The agent below reports `budget.exhausted`,
+ * which is abandon-and-hand-off: its code was discarded, the loop promoted to a more expensive rung,
+ * and it re-ran a step that had just said the budget was gone.
+ *
+ * So what is asserted is that the agent's *code* survives and only the derived flag is corrected.
+ */
+describe('an agent whose retryable flag contradicts the code it reported', () => {
+  it('keeps the code and corrects the flag, rather than destroying the whole output', async () => {
+    const harness = openTracked({
+      fixturePath: withStatus('failed', {
+        code: 'budget.exhausted',
+        message: 'the step budget is gone',
+        // The contradiction: `budget.exhausted` is abandon-and-hand-off, so the table says false.
+        retryable: true,
+        cause: null,
+      }),
+    });
+    const termination = await harness.spawner.start(harness.request());
+
+    expect(termination.disposition).toBe('failed');
+    // The code the agent reported, not a schema complaint about the flag beside it.
+    expect(termination.error?.code).toBe('budget.exhausted');
+    expect(termination.error?.retryable).toBe(false);
+    // And specifically *not* the promotion trigger, which is what the refusal turned this into.
+    expect(termination.error?.code).not.toBe('step.schema_invalid_output');
+  });
+
+  it('corrects a flag that claims a retryable code is not retryable, in the other direction too', async () => {
+    const harness = openTracked({
+      fixturePath: withStatus('failed', {
+        code: 'model.rate_limited',
+        message: 'the model said to come back later',
+        retryable: false,
+        cause: null,
+      }),
+    });
+    const termination = await harness.spawner.start(harness.request());
+
+    expect(termination.error?.code).toBe('model.rate_limited');
+    expect(termination.error?.retryable).toBe(true);
+  });
+});
+
 describe('an output that is not about this attempt', () => {
   it('is rejected even though it satisfies the contract', async () => {
     const lines = readFileSync(join(FIXTURES, 'completed.jsonl'), 'utf8').trim().split('\n');

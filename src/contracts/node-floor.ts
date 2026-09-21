@@ -268,12 +268,21 @@ export const npmCeilingMessage = (running: string, ceiling: NpmCeiling = npmCeil
  * `null` is "nobody said", never "it is fine": a process started directly, not through npm, has no npm
  * to refuse. That is the same conservative shape as the engine lock's unreadable start time — an
  * undecided fact never triggers a refusal.
+ *
+ * **A version this function cannot read is also "nobody said".** pnpm, yarn Berry and bun all write an
+ * `npm/` segment into the same variable and all write `npm/?` into it, because they are not npm and have
+ * no npm version to declare. Returning `"?"` made {@link parseVersion} throw a plain `Error` inside
+ * {@link assertNodeFloorOrExit}, which re-throws anything that is neither a {@link NodeFloorError} nor an
+ * {@link NpmCeilingError} — so importing `src/contracts/index.ts` under any of those three package
+ * managers killed the whole system at import with an unhandled error, which is the opposite of the named
+ * refusal AD-28 exists to give. An unreadable statement decides nothing, exactly as an absent one does.
  */
 export const runningNpmVersion = (
   userAgent: string | undefined = process.env['npm_config_user_agent'],
 ): string | null => {
-  const declared = /(?:^|\s)npm\/(\S+)/.exec(userAgent ?? '');
-  return declared?.[1] ?? null;
+  const declared = /(?:^|\s)npm\/(\S+)/.exec(userAgent ?? '')?.[1] ?? null;
+  if (declared === null) return null;
+  return VERSION_PATTERN.test(declared) ? declared : null;
 };
 
 /**

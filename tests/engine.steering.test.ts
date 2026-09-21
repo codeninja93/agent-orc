@@ -94,6 +94,7 @@ const aStep = (overrides: Partial<StepRecord> = {}): StepRecord => ({
   model_tier: 'claude-haiku-4-5',
   promotions: 0,
   attempts: 1,
+  credited_attempts: 0,
   resets: 0,
   started_at: '2026-09-20T10:00:00.000Z',
   terminated_at: null,
@@ -642,6 +643,67 @@ describe('the loop applies what the decision decided', () => {
     reconciler.approve(accepted.run, { principal: { kind: 'user', id: 'deep' } });
     await reconciler.runUntilSettled();
     expect(reconciler.load(accepted.run).state.state).toBe('committed');
+  });
+
+  /**
+   * The three methods that carry free text, called with none of it.
+   *
+   * `answer`, `reject` and `editCriterion` all reach `steer`, which builds the intent through
+   * `CommandIntentSchema.parse`. Story 1-12 moved the "this command means nothing without text" rule
+   * into that schema, so these began throwing a bare `ZodError` out of a method whose documented refusal
+   * is a {@link SteeringRefused} carrying a sentence a person can read — and no test called any of the
+   * three with blank text, so nothing noticed. The engine-side `missing-answer` guard stays where it is:
+   * it is the *file* path's, which is the path AD-19 actually admits.
+   */
+  it.each([
+    ['answer', (reconciler: Reconciler, run: string, text: string) => reconciler.answer(run, text)],
+    ['reject', (reconciler: Reconciler, run: string, text: string) => reconciler.reject(run, text)],
+    [
+      'editCriterion',
+      (reconciler: Reconciler, run: string, text: string) => reconciler.editCriterion(run, text),
+    ],
+  ] as const)('refuses %s with blank text as a refusal, not as a crash', (name, call) => {
+    const { reconciler } = openReconciler();
+    const accepted = reconciler.acceptFeature(makePlan());
+
+    for (const blank of ['', '   ']) {
+      let thrown: unknown = null;
+      try {
+        call(reconciler, accepted.run, blank);
+      } catch (error: unknown) {
+        thrown = error;
+      }
+      expect(thrown, `${name} with ${JSON.stringify(blank)}`).toBeInstanceOf(SteeringRefused);
+      expect((thrown as Error).name).toBe('SteeringRefused');
+      // The sentence names the field, so a person knows what was missing.
+      expect((thrown as Error).message).toContain('argument');
+    }
+
+    // And nothing durable was written: an intent the contract rejects is not a file anyone must sweep.
+    expect(readIntentFiles(runPaths(accepted.run, home)).pending).toStrictEqual([]);
+    expect(
+      readEventLog(runPaths(accepted.run, home).eventLog).filter(
+        (event) =>
+          event.type === COMMAND_EVENT_TYPES.Applied ||
+          event.type === COMMAND_EVENT_TYPES.Refused,
+      ),
+    ).toStrictEqual([]);
+  });
+
+  it('still accepts the same three methods once they carry text', async () => {
+    const { reconciler } = openReconciler();
+    const accepted = reconciler.acceptFeature(makePlan());
+    // `reject` needs no open question to be *built*; what it needs text for is the ledger entry.
+    expect(() => reconciler.reject(accepted.run, 'not what I asked for')).toThrowError(
+      SteeringRefused,
+    );
+    // ...and the refusal is the engine's, about the run, rather than the contract's about the field.
+    try {
+      reconciler.reject(accepted.run, 'not what I asked for');
+    } catch (error: unknown) {
+      expect((error as Error).message).not.toContain('the declared contract accepts');
+    }
+    await Promise.resolve();
   });
 
   it('refuses a steering command on a terminal run, and the terminal state stands', async () => {

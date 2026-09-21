@@ -1,66 +1,92 @@
----
-title: 'Stage-1 defect sweep — bound the retry loop, close the bypasses'
-type: 'feature'
+---title: Stage-1 defect sweep — bound the retry loop, close the bypasses
+type: feature
 created: '2026-09-20'
-status: 'in-review'
-review_loop_iteration: 0
+status: done
+review_loop_iteration: 1
 followup_review_recommended: true
-baseline_revision: 'de025aa'
+baseline_revision: de025aa
 context:
-  - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-3-engine-reconciler.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-7-command-transport.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-8-question-lifecycle.md'
-warnings: ['oversized'] # eight independent defects across contracts, runtime, engine and the build
+- '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-3-engine-reconciler.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-7-command-transport.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-8-question-lifecycle.md'
+warnings:
+- oversized
 deferred:
-  - summary: >-
-      No review layer ran against this story; the gate, the implementer's nine mutations and my own
-      independent re-run of the decisive one are the only scrutiny it received.
-    evidence: |-
-      typecheck, lint, build and 1263 tests across 50 files all pass with zero skips. Read status: done as
-      implemented, gated and mutation-tested, not reviewed.
-    severity: high
-  - summary: >-
-      The attempt bound counts a step's own failure and the engine's crash as the same kind of engagement,
-      and 8 is the compromise that forces.
-    evidence: |-
-      One counting rule was this story's instruction, and it is what closes the unbounded resume path story
-      1-7 left open. But an interruption is the engine's fault, not the step's — a crash or a closed laptop —
-      and charging it to the same allowance is why the number had to rise from 1-7's declared 3 to 8. I
-      verified the constraint rather than accepting it: with the bound at 3, `engine.crash-injection` reports
-      "1 of 25 boundaries did not converge", i.e. a run handed off for having survived two crashes. The
-      consequence accepted is that a persistently failing step now spends 8 attempts before handing off. The
-      clean shape is two counters, or a budget-based bound, and story 2-9 owns the ceilings where that
-      belongs.
-    location: 'src/engine/dispositions.ts'
-    severity: medium
-  - summary: >-
-      Story 1-3's EC15 is only half closed: the engine can no longer create an unreadable lock, but a
-      pre-existing empty or unreadable one is still reclaimable by nothing.
-    evidence: |-
-      The atomic create removes the window in which a zero-length claim is published, so no new one can
-      arise. An existing one — however it arose — still has no reclamation path. Making an unreadable lock
-      reclaimable risks stealing a live one, which is a decision rather than a fix, and was correctly left
-      alone.
-    location: 'src/engine/lock.ts'
-    severity: medium
-  - summary: >-
-      `StepResumeRequest.attempt` carries the pre-resume count, so a resume and the start before it share an
-      attempt number, while `src/container/lifecycle.ts` documents that value as unique per attempt.
-    evidence: |-
-      Pre-existing and unchanged by this story, but newly visible now that a resume is a counted engagement.
-      It touches container naming and story 1-4's fixtures, which is why it was not changed here.
-    location: 'src/engine/reconciler.ts, src/container/lifecycle.ts'
-    severity: medium
-  - summary: >-
-      A new unswept file class: a SIGKILL between the temp write and the `link` leaves a
-      `<name>.<pid>.<n>.tmp` beside the claim, and nothing sweeps it.
-    evidence: |-
-      Harmless — nothing reads an unlinked name — and the identical shape already exists from story 1-8's
-      question outcome. It is debris rather than a defect, and it is the cost of the idiom that closed the
-      torn-read window.
-    location: 'src/runtime/exclusive-create.ts'
-    severity: low
+- summary: 'RESOLVED 2026-09-21: the four-layer review ran. See the Review Triage Log.'
+  evidence: 52 claims filed, 16 triage rows, 11 patched including four high. Suite 1542 -> 1597 tests
+    across 52 files, zero skips. Four mutations caught, including one that had passed the entire suite
+    before this round.
+  severity: high
+- summary: The attempt bound counts a step's own failure and the engine's crash as the same kind of engagement,
+    and 8 is the compromise that forces.
+  evidence: 'One counting rule was this story''s instruction, and it is what closes the unbounded resume
+    path story
+
+    1-7 left open. But an interruption is the engine''s fault, not the step''s — a crash or a closed laptop
+    —
+
+    and charging it to the same allowance is why the number had to rise from 1-7''s declared 3 to 8. I
+
+    verified the constraint rather than accepting it: with the bound at 3, `engine.crash-injection` reports
+
+    "1 of 25 boundaries did not converge", i.e. a run handed off for having survived two crashes. The
+
+    consequence accepted is that a persistently failing step now spends 8 attempts before handing off.
+    The
+
+    clean shape is two counters, or a budget-based bound, and story 2-9 owns the ceilings where that
+
+    belongs.'
+  location: src/engine/dispositions.ts
+  severity: medium
+- summary: 'Story 1-3''s EC15 is only half closed: the engine can no longer create an unreadable lock,
+    but a pre-existing empty or unreadable one is still reclaimable by nothing.'
+  evidence: 'The atomic create removes the window in which a zero-length claim is published, so no new
+    one can
+
+    arise. An existing one — however it arose — still has no reclamation path. Making an unreadable lock
+
+    reclaimable risks stealing a live one, which is a decision rather than a fix, and was correctly left
+
+    alone.'
+  location: src/engine/lock.ts
+  severity: medium
+- summary: '`StepResumeRequest.attempt` carries the pre-resume count, so a resume and the start before
+    it share an attempt number, while `src/container/lifecycle.ts` documents that value as unique per
+    attempt.'
+  evidence: 'Pre-existing and unchanged by this story, but newly visible now that a resume is a counted
+    engagement.
+
+    It touches container naming and story 1-4''s fixtures, which is why it was not changed here.'
+  location: src/engine/reconciler.ts, src/container/lifecycle.ts
+  severity: medium
+- summary: 'A new unswept file class: a SIGKILL between the temp write and the `link` leaves a `<name>.<pid>.<n>.tmp`
+    beside the claim, and nothing sweeps it.'
+  evidence: 'Harmless — nothing reads an unlinked name — and the identical shape already exists from story
+    1-8''s
+
+    question outcome. It is debris rather than a defect, and it is the cost of the idiom that closed the
+
+    torn-read window.'
+  location: src/runtime/exclusive-create.ts
+  severity: low
+- summary: 'SPEC DECISION: matrix row 9 and task 4 describe behaviour this review replaced.'
+  evidence: They say a contradictory `retryable` is "refused". It is now repaired on ingest — the schema
+    derives the flag from the code, as `orchError()` already did. The invariant is strictly stronger,
+    but the wording is wrong, and I wrote it.
+  severity: medium
+- summary: '`StepRecord` gained `credited_attempts` without a `schema_version` bump.'
+  evidence: A pre-upgrade checkpoint is discarded and rebuilt from the log, which is AD-4's declared answer
+    and the safe direction. But `run.state` is a wider artifact than this story left, and that is worth
+    acknowledging rather than discovering.
+  location: src/contracts/state.ts
+  severity: medium
+- summary: Three counts in this story's own protected sections are wrong.
+  evidence: '"Nine mutations" over a ten-row table; "Ten mutations tried" over eleven; "Five existing
+    test files changed" when six were. Story 1-7''s deferred entry also still describes a three-attempt
+    failure allowance that is now eight across every disposition — only the stale symbol name was corrected.'
+  severity: low
 ---
 
 # Story 1-12 — Stage-1 defect sweep
@@ -243,6 +269,37 @@ times a disposition that returns to a step may do so.
 
 ## Review Triage Log
 
+### 2026-09-21 — Review pass (follow-up, on a `done` spec)
+
+- claims filed: 52 across four layers — blind-hunter 13, edge-case-hunter 20, verification-gap 4 gap + 4
+  other, intent-alignment 7 divergences plus 4 enumerated readings. The edge-case layer filed an enumerated
+  list so its count is exact; the other three wrote prose, so those are my enumeration.
+- grouped into the 16 rows below. 11 patch entries applied, 3 deferred, the rest rejected. No filed claim is
+  without a row.
+- **This story was itself a defect sweep, and four of its eight fixes had made something worse.** Three of
+  those four were regressions from items I specified: the npm bound, the `retryable` refinement, and the
+  AD-19 attribution guard. A fifth row records a premise of mine that did not reproduce.
+- The worst of them was repaired by changing the shape of the fix rather than guarding on top of it: a
+  schema that derives `retryable` from the code cannot be contradicted, and does not ask a model to satisfy
+  a rule that provably is not in the schema it is given.
+
+- `[high]` `[patch]` Importing the project crashed under pnpm, yarn Berry and bun. All three set `npm_config_user_agent` to a string containing the literal `npm/?`; the regex captured `"?"`, `parseVersion` threw a plain `Error`, and `assertNodeFloorOrExit` re-threw it raw — so every module, which all import contracts, died at import instead of exiting 1 with advice. Verified before and after: all three now import cleanly. **The test covering that case passed for the wrong reason** — it asserted `null` for `'yarn/4.1.0 npmless …'`, which contains no `npm/` at all, so the regex never matched. Replaced with the three real agent shapes.
+- `[high]` `[patch]` A model's wrong boolean destroyed the whole step output and promoted the model tier. `OrchErrorSchema`'s new refinement is invisible to the model: it is embedded in `StepOutputSchema`, exported through `z.toJSONSchema`, and a Zod refinement emits nothing into draft-7 — confirmed on the real export, `retryable` is `{"type":"boolean"}`. So an agent reporting `budget.exhausted` with the flag wrong had its artifact rejected, the re-parse turned it into `step.schema_invalid_output`, whose disposition is escalate-model-tier, and the loop promoted to a costlier rung to re-run a step that said the budget was gone — consuming this same story's eight-engagement bound on the way. **Repaired rather than rejected:** the schema now derives the flag from the code, as `orchError()` already did. Verified: `budget.exhausted` with `retryable: true` keeps its code and has the flag corrected.
+- `[high]` `[patch]` The AD-19 attribution guard permitted the dangerous direction. It refused a clock's default attributed to a person and **accepted** a person's decision attributed to the clock — the direction that launders a human choice into "the system did it", which CAP-18's ledger keeps for ever. Now an equivalence; verified both directions refuse and the normal case is untouched.
+- `[high]` `[patch]` The same guard reported the wrong fault. `readIntentFiles` classifies by issue path and `onlyThePrincipal` matches anything starting with `principal`, so a person saw *"the field principal is absent or not a declared principal"* for an intent whose principal was present and valid. The cross-field rules now carry a marker in their issue params and raise `misattributed-principal` and `missing-argument`, neither of which existed — an argument-required command with a blank argument was reported as `malformed`.
+- `[medium]` `[patch]` The npm bound's wiring was unpinned: severing it — so the environment is never consulted in production — left the whole suite green, because every npm test supplied the version as an argument and the one test calling the default returned early. Now pinned end to end by real child processes importing contracts with a real `npm_config_user_agent`.
+- `[medium]` `[patch]` Existing in-flight runs would have handed off on first load, because pre-upgrade logs already hold `step.resume_attempted` lines the new bound counts retroactively. A build-boundary marker now separates them; an unmarked line folds exactly as it always did, so a pre-upgrade run gets a fresh allowance rather than an immediate hand-off.
+- `[medium]` `[patch]` An approval at the bound handed off instead of proceeding — approval sets the disposition to `interrupted`, which the new bound counts, so a person authorising a blocked step got a hand-off rather than the run they had just approved. Now credited rather than reset, because `attempts` is a total the hand-off document quotes to a person and a counter that silently restarts is a number that lies.
+- `[medium]` `[patch]` The hand-off named a retryable code for a run that must not retry: `decideAction` carried the step's own `retry-with-backoff` code while the story's prose claimed `internal.invariant_violated`. The label is now what the prose always said, with the step's real code carried as the cause. `stepPhrase` also mentioned attempts only in the `failed` branch, so a step interrupted through all eight engagements read as "interrupted part-way through" — the case the bound was widened to catch.
+- `[medium]` `[patch]` `createFileExclusively` was not the idiom its docblock claimed to copy: it fsynced the temp file but never the directory, so the `link(2)` that publishes a claim was not durable across power loss, while story 1-8's version calls `fsyncDirectory` for exactly that reason. Also fsynced by reopening read-only, hand-rolled `basename` beside an import of `node:path`, and let a `linkSync` EPERM on a filesystem without hard links escape as a raw errno. The module had **no unit test at all** — nine now.
+- `[medium]` `[patch]` The "declared in exactly one place" test read one file while its own comment stated the criterion as a grep over `src/`, and asserted a constant against its own spelling. Now walks the tree, with a guard that an empty sweep cannot pass for a clean one — verified it bites by planting a stray literal.
+- `[low]` `[patch]` Eight smaller items: `readIntentFiles` was the only versioned-artifact reader bypassing `parseVersionedArtifact`, so an intent from a future installer read as `malformed` rather than carrying the schema-version code and its "re-run the installer" advice; `FOLDED_EVENT_TYPES` had no reader, so adding a type to it was inert — now enforced against the fold's own switch; `step.resume_attempted`'s `attempt` was pre-increment while the fold and `step.started` were post-increment; `newCommandIntent` threw a raw `ZodError` out of `steer` for blank text, making the engine's own refusal unreachable; CI had no timeout and no concurrency group while this story added the suite's most expensive tests, and pinned a Node major the evidence never covered; and `.npmrc` now makes the workflow's "`npm ci` enforces engines" claim true rather than correcting it, verified both ways.
+- `[false]` `[reject]` ONE PREMISE OF MINE DID NOT REPRODUCE. I claimed `createFileExclusively`'s `mkdirSync` newly created a typo'd `ORCH_HOME` that the old `'wx'` open would have refused. `EngineLock.acquire` has called `mkdirSync(orchHome, { recursive: true })` itself since story 1-3, so a typo'd home was already being created and still is — the module's own `mkdirSync` was redundant, not the cause. Removed anyway, with a test, because a module whose subject is "who got there first" should not bring a parent into existence. Making a typo'd home refuse is a separate decision about the lock, and was correctly not taken.
+- `[medium]` `[defer]` SPEC DECISION: matrix row 9 and task 4 now describe the old behaviour. They say a contradictory `retryable` is "refused"; it is now repaired on ingest. The invariant is strictly stronger — no parsed `OrchError` can contradict its code — but the story's wording is wrong and I am the one who wrote it.
+- `[medium]` `[defer]` SPEC DECISION: `StepRecord` gained `credited_attempts`, so `run.state` is a wider artifact than this story left, and `schema_version` was not bumped. A pre-upgrade checkpoint is discarded and rebuilt from the log, which is AD-4's declared answer and the safe direction, but it is a contract widening that should be acknowledged rather than discovered.
+- `[low]` `[defer]` Three counts in this story's own protected sections are wrong and could not be corrected here: "Nine mutations" over a ten-row table, "Ten mutations tried" over eleven, and "Five existing test files changed" when six were. Story 1-7's deferred entry also still describes a three-attempt failure allowance that is now eight across every disposition; only the stale symbol name was corrected, as instructed.
+- `[low]` `[reject]` Five hardening suggestions on inputs no caller can supply, and cosmetic notes corrected elsewhere in this round. (5 findings)
+
 ## Design Notes
 
 **Task 2 is narrower than the story made it sound, and the honest version is worth recording.** Mutual
@@ -304,19 +361,44 @@ difference between a mutation table and a decoration.
 
 ## Auto Run Result
 
-**Status: done.** All eight recorded defects were present and all eight are fixed: the retry loop is bounded
-across every disposition that returns to a step, with the count folded from the log so a restart cannot reset
-it; the torn-read window is closed with the atomic-create idiom, extracted to one shared module; the
-`schema_version` and `retryable` checks moved inside their schemas; the command intent now refuses a missing
-argument and a clock's default attributed to a person; the npm bound is asserted from its single
-declaration; and CI runs the four-command gate on the pinned Node.
+**Status: done, reviewed.** The four-layer review ran on 2026-09-21 — the last of stage 1's eight. 52 claims
+filed, 16 triage rows, 11 patched, 3 deferred. Suite 1542 -> 1597 tests across 52 files, zero skips.
 
-1263 tests across 50 files, zero skips. Ten mutations tried, all caught.
+**This story was itself a defect sweep, and four of its eight fixes had made something worse.** Three of the
+four were regressions from items I specified.
 
-**Stage 1 is complete — 12 of 12 stories, and its gate is met** (assessed at story 1-11 against the gate as
-amended on 2026-09-20: containment independently verified, and all six required surfaces reconstructable
-from `events.jsonl` after every other file in the run directory is deleted).
+*The npm bound crashed the system it was meant to protect.* pnpm, yarn Berry and bun all set
+`npm_config_user_agent` to a string containing `npm/?`; the parse threw a plain `Error` that
+`assertNodeFloorOrExit` re-threw raw, so every module — all of which import contracts — died at import. And
+severing the bound's wiring entirely left the whole suite green, because every test supplied the version as
+an argument. Verified after: all three package managers import cleanly, and the mutation now fails.
 
-`followup_review_recommended: true` — the story is oversized, no review layer ran, and it changed a failure
-allowance another story declared. Five deferred entries, of which the bound's conflation of a step's failure
-with the engine's crash is the one worth revisiting when story 2-9 builds the ceilings.
+*The `retryable` refinement destroyed step outputs.* It is invisible to the model that has to satisfy it — a
+Zod refinement emits nothing into the draft-7 schema handed to `claude -p`, confirmed on the real export. So
+an agent reporting `budget.exhausted` with the derived boolean wrong had its whole artifact rejected, the
+re-parse relabelled it `step.schema_invalid_output`, and the loop promoted to a costlier model tier to re-run
+a step that had said the budget was gone — spending this story's own eight-engagement bound on the way.
+Repaired rather than rejected: the schema now derives the flag from the code, which is what `orchError()`
+always did. A contradictory flag keeps its code and has the flag corrected.
+
+*The AD-19 attribution guard pointed the wrong way and named the wrong fault.* It refused a clock's default
+attributed to a person while **accepting** a person's decision attributed to the clock — the direction that
+launders a human choice into "the system did it automatically", which CAP-18's ledger keeps for ever. And
+the refusal a person actually saw said the principal field was absent, for an intent whose principal was
+present and valid.
+
+**Also closed:** existing in-flight runs would have handed off on first load, because pre-upgrade logs hold
+resume lines the new bound counts retroactively; an approval at the bound handed off instead of running the
+attempt it authorised; the hand-off named a retryable code for a run that must not retry; and
+`createFileExclusively` omitted the directory fsync of the idiom it claimed to copy, with no unit test at
+all.
+
+**One premise of mine did not reproduce** and was reported rather than patched around: the module's
+`mkdirSync` was redundant, not the cause of a typo'd `ORCH_HOME` being created — `EngineLock.acquire` has
+done that since story 1-3.
+
+**Residual risk, and why `followup_review_recommended` is true.** Four high entries were patched. The
+specific unverified risk: `retryable` is now silently corrected rather than refused, so a step agent that is
+consistently wrong about it will never learn — the log records the corrected flag and nothing counts the
+correction. That is the right trade against destroying the artifact, but it trades a loud failure for a
+quiet one, and nothing yet measures how often it fires.

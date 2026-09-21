@@ -24,7 +24,11 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { CURRENT_SCHEMA_VERSION, formatTimestamp } from '../src/contracts/index.js';
+import {
+  CURRENT_SCHEMA_VERSION,
+  SCHEMA_VERSION_UNRECOGNISED_CODE,
+  formatTimestamp,
+} from '../src/contracts/index.js';
 import type { CommandIntent, EventEnvelope } from '../src/contracts/index.js';
 import {
   DEFAULT_HIGH_ENTROPY_MIN_LENGTH,
@@ -181,6 +185,111 @@ describe('a file the loop cannot understand is refused, and never retried for ev
     expect(read.refused).toHaveLength(1);
     expect(read.refused[0]?.reason).toBe('missing-principal');
     expect(read.refused[0]?.detail).toContain('principal');
+  });
+
+  /**
+   * The two cross-field rules have refusals of their own, rather than borrowing a field's.
+   *
+   * Both rules can only report against a field path — Zod has nowhere else — so the attribution rule
+   * reports against `principal.kind` and the argument rule against `argument`. Classifying by path then
+   * told a person the principal "is absent or not a declared principal" for an intent whose principal was
+   * present and valid, and reported an argument-required command with a blank argument as `malformed`,
+   * which is the class for a file that is nothing like an intent.
+   */
+  /**
+   * AD-28 — an intent from a future installer is refused as a version problem, not as a shape one.
+   *
+   * `readIntentFiles` was the only versioned-artifact reader that did not go through
+   * `parseVersionedArtifact`; the checkpoint, the question state and the fetch record all do. So an
+   * intent written by a newer installer came back as `malformed` — "the declared shape rejects
+   * schema_version" — which sends a person to inspect a field rather than to the installer that wrote
+   * the file.
+   */
+  it('refuses an intent from a newer installer as a version problem, with the installer advice', () => {
+    const paths = runPaths(run, home);
+    const intent = anIntent({ run });
+    writeRawIntentFile(
+      run,
+      intentFileName(intent),
+      JSON.stringify({ ...intent, schema_version: CURRENT_SCHEMA_VERSION + 1 }),
+    );
+
+    const read = readIntentFiles(paths);
+    expect(read.pending).toStrictEqual([]);
+    expect(read.refused).toHaveLength(1);
+    expect(read.refused[0]?.reason).toBe('unrecognised-schema-version');
+    expect(read.refused[0]?.reason).not.toBe('malformed');
+    // The AD-35 code and the advice, the same ones every other versioned-artifact reader produces.
+    expect(read.refused[0]?.detail).toContain(SCHEMA_VERSION_UNRECOGNISED_CODE);
+    expect(read.refused[0]?.detail).toContain('Re-run the installer');
+  });
+
+  it('refuses a misattributed principal as one, not as a missing one', () => {
+    const paths = runPaths(run, home);
+    const intent = anIntent({ run });
+    writeRawIntentFile(
+      run,
+      intentFileName(intent),
+      // Present, well-formed and disagreeing with the source: a person's decision dressed as the clock's.
+      JSON.stringify({ ...intent, source: 'tui', principal: { kind: 'timeout', id: 'question.window' } }),
+    );
+
+    const read = readIntentFiles(paths);
+    expect(read.pending).toStrictEqual([]);
+    expect(read.refused).toHaveLength(1);
+    expect(read.refused[0]?.reason).toBe('misattributed-principal');
+    expect(read.refused[0]?.reason).not.toBe('missing-principal');
+    // The sentence is about the disagreement, never about an absent field.
+    expect(read.refused[0]?.detail).not.toContain('absent');
+    expect(read.refused[0]?.detail).toContain('disagree');
+  });
+
+  it('refuses the same disagreement from the clock side, and says the same thing', () => {
+    const paths = runPaths(run, home);
+    const intent = anIntent({ run });
+    writeRawIntentFile(
+      run,
+      intentFileName(intent),
+      JSON.stringify({ ...intent, source: 'timeout', principal: { kind: 'user', id: 'deep' } }),
+    );
+
+    const read = readIntentFiles(paths);
+    expect(read.refused[0]?.reason).toBe('misattributed-principal');
+  });
+
+  it('refuses an argument-required command with no text as one, not as malformed', () => {
+    const paths = runPaths(run, home);
+    const intent = anIntent({ run });
+    writeRawIntentFile(
+      run,
+      intentFileName(intent),
+      JSON.stringify({ ...intent, command: 'narrow', argument: '   ' }),
+    );
+
+    const read = readIntentFiles(paths);
+    expect(read.pending).toStrictEqual([]);
+    expect(read.refused).toHaveLength(1);
+    expect(read.refused[0]?.reason).toBe('missing-argument');
+    expect(read.refused[0]?.reason).not.toBe('malformed');
+    // And the refusal still names the control, so a person knows which key did nothing.
+    expect(read.refused[0]?.command).toBe('narrow');
+    expect(read.refused[0]?.detail).toContain('narrow');
+  });
+
+  /**
+   * A file that is nothing like an intent is still `malformed`, cross-field marker or not.
+   *
+   * The marker is read *before* the path classification, so this is the assertion that the new reasons
+   * did not swallow the general case: a file missing half its fields fails the argument rule too, and
+   * must still be reported as the shapeless thing it is.
+   */
+  it('still reports a file that is nothing like an intent as malformed', () => {
+    const paths = runPaths(run, home);
+    writeRawIntentFile(run, 'hand-written.json', JSON.stringify({ command: 'answer' }));
+
+    const read = readIntentFiles(paths);
+    expect(read.refused).toHaveLength(1);
+    expect(read.refused[0]?.reason).toBe('malformed');
   });
 
   it('refuses an intent id the redaction pass would replace, because the key would be lost', () => {

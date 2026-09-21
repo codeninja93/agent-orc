@@ -153,6 +153,22 @@ export const StepRecordSchema = z.object({
    * disposition that returns to the same step rather than only the ones that report a failure.
    */
   attempts: countField,
+  /**
+   * Attempts a person's approval has credited back, so the bound counts *unauthorised* engagements.
+   *
+   * CAP-12 — approving a gate a step blocked at is an explicit instruction to continue, and the fold
+   * turns it into an `interrupted` step, which is a disposition that returns to the same step. Without
+   * this, a step sitting at the attempt bound when a person approved it handed off immediately rather
+   * than running the attempt they had just authorised: the bound refusing the person it exists to
+   * protect. On an approval this takes the value of `attempts`, so the difference between the two is
+   * zero and the step gets the full allowance again.
+   *
+   * Separate from `attempts` rather than resetting it, because `attempts` is a total the hand-off
+   * document quotes to a person ("failed on all N attempts") and a counter that silently restarts is a
+   * number that lies. The bound is a bound on unattended looping, and every credit here costs a human
+   * gesture, so it cannot itself become a loop.
+   */
+  credited_attempts: countField,
   /** How many times the worktree was reset to `baseline_ref` for this step. */
   resets: countField,
   started_at: TimestampSchema.nullable(),

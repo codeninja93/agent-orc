@@ -51,9 +51,11 @@ import {
   isTerminalFeatureState,
   makeError,
   renderCause,
+  renderSchemaRefusal,
 } from '../contracts/index.js';
 import type {
   Command,
+  CommandIntent,
   CommandSource,
   DeflectionSource,
   EventEnvelope,
@@ -103,6 +105,7 @@ import type { IntentRefusal, IntentRefusalReason, PendingIntent } from './comman
 import {
   DECLARED_STEP_ATTEMPT_LIMIT,
   attemptBoundReached,
+  attemptsAgainstBound,
   returnsToSameStep,
   routeRefusedResume,
   routeTermination,
@@ -153,6 +156,7 @@ import type { StepExecutor, StepStartRequest, StepTermination } from './executor
 import {
   ENGINE_EMITTER,
   ENGINE_EVENT_TYPES,
+  RESUME_COUNTS_TOWARD_BOUND_KEY,
   rebuildFromLog,
   reconcileCheckpointAgainstLog,
 } from './rebuild.js';
@@ -1076,17 +1080,41 @@ export class Reconciler {
      * to step over on every pass.
      */
     const loaded = this.load(run);
-    const intent = newCommandIntent({
-      intentId: options.intentId ?? mintIntentId(this.minter.mint()),
-      command,
-      run,
-      feature: loaded.state.feature,
-      step: options.step ?? null,
-      principal: options.principal ?? this.principal,
-      source: options.source ?? 'cli',
-      argument: options.argument ?? null,
-      issuedAt: this.now(),
-    });
+    /**
+     * A refusal by the contract is still a refusal, and is reported as one rather than as a crash.
+     *
+     * `newCommandIntent` calls `CommandIntentSchema.parse`, and story 1-12 moved two rules into that
+     * schema — an argument-required command needs text, and the `timeout` source and the `timeout`
+     * principal are one fact. So `reconciler.answer(run, '')` began throwing a bare `ZodError` out of a
+     * method whose documented refusal is {@link SteeringRefused} carrying a sentence a person can read,
+     * and the engine-side `missing-answer` guard became unreachable from the method path. The engine
+     * guard stays where it is — it is the file path's, which is the path AD-19 actually admits — and
+     * this converts the contract's refusal into the same shape the rest of this method raises. Nothing
+     * is written: an intent the contract rejects is not a durable file anybody should have to sweep.
+     */
+    let intent: CommandIntent;
+    try {
+      intent = newCommandIntent({
+        intentId: options.intentId ?? mintIntentId(this.minter.mint()),
+        command,
+        run,
+        feature: loaded.state.feature,
+        step: options.step ?? null,
+        principal: options.principal ?? this.principal,
+        source: options.source ?? 'cli',
+        argument: options.argument ?? null,
+        issuedAt: this.now(),
+      });
+    } catch (thrown: unknown) {
+      const refusedBy = renderSchemaRefusal(thrown);
+      if (refusedBy === null) throw thrown;
+      throw new SteeringRefused(
+        run,
+        loaded.state.state,
+        `the "${command}" intent is not one the declared contract accepts, so nothing was written: ` +
+          refusedBy,
+      );
+    }
 
     writeCommandIntent(loaded.paths, intent);
     this.boundary(`intent-written:${command}`);
@@ -2457,7 +2485,21 @@ export class Reconciler {
         this.emit(recorder, {
           step: action.step,
           type: ENGINE_EVENT_TYPES.StepResumeAttempted,
-          payload: { attempt: record.attempts },
+          payload: {
+            /**
+             * Post-increment, like `step.started`'s.
+             *
+             * The fold derives this resume's attempt number as `attempts + 1`, and `step.started` writes
+             * the number of the attempt it is starting — so writing `record.attempts` here numbered the
+             * resume as the attempt before it, and starts and resumes numbered themselves on two
+             * conventions in one log. `StepStartRequest.attempt` on the resume path is still the
+             * pre-resume count; that is this story's own recorded deferral, because it reaches container
+             * naming and story 1-4's fixtures.
+             */
+            attempt: record.attempts + 1,
+            // The build boundary: only a line this build wrote counts against the bound (see the fold).
+            [RESUME_COUNTS_TOWARD_BOUND_KEY]: true,
+          },
           sessionId: action.sessionId,
           baselineRef: record.baseline_ref,
         });
@@ -3373,23 +3415,37 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
      * so a user's kill still stops rather than handing off; a `blocked` step escalates to a person, which
      * is not an attempt at all; and a step that completed never reaches here.
      *
-     * The count is `attempts`, folded from the log, so a restart does not reset it (AD-4) and the resume
-     * path cannot walk around it. The code carried into the hand-off is the step's own when it reported
-     * one; with none — the interrupted-for-ever case — `internal.invariant_violated` is the honest label:
-     * the system has spent its declared attempts on one step and cannot finish it, which is an
-     * abandon-and-hand-off in the AD-35 table and so is never retried by whoever reads it.
+     * The count is `attempts` less the attempts a person's approval has credited, folded from the log,
+     * so a restart does not reset it (AD-4) and the resume path cannot walk around it — while a CAP-12
+     * approval of a step standing at the bound gets the run it authorised rather than an immediate
+     * hand-off.
+     *
+     * **The code is always `internal.invariant_violated`, and the step's own code is carried as the
+     * cause.** It used to be `pending.error?.code ?? 'internal.invariant_violated'`, which meant that in
+     * the common case — a step failing on a declared-retryable code — the hand-off went out labelled
+     * `step.timed_out`, whose AD-35 disposition is `retry-with-backoff`. A hand-off written *because*
+     * retrying has been exhausted must not be labelled as a thing to retry. What has actually been proved
+     * is that the system spent its declared attempts on one step and cannot finish it, which is an
+     * invariant it broke about itself: `abandon-and-hand-off`, never retried by whoever reads it. The
+     * condition the step reported is not lost — it is named in the reason, where a person reads it.
      */
-    if (returnsToSameStep(routing.action) && attemptBoundReached(pending.attempts)) {
+    if (returnsToSameStep(routing.action) && attemptBoundReached(attemptsAgainstBound(pending))) {
+      const spent = attemptsAgainstBound(pending);
+      const reported = pending.error?.code ?? null;
       return {
         kind: 'hand-off',
         step: pending.step,
-        code: pending.error?.code ?? 'internal.invariant_violated',
+        code: 'internal.invariant_violated',
         reason:
-          `Step "${pending.step}" has been attempted ${String(pending.attempts)} times — every start, ` +
+          `Step "${pending.step}" has been attempted ${String(spent)} times — every start, ` +
           `re-run and resume — and has still not completed, which is the declared limit of ` +
           `${String(DECLARED_STEP_ATTEMPT_LIMIT)}. The next action would be "${routing.action}", which ` +
           'returns to the same step, so the run stops and writes a hand-off document rather than ' +
-          'retrying for ever (CAP-23, AD-35).',
+          'retrying for ever (CAP-23, AD-35). ' +
+          (reported === null
+            ? 'The step reported no error code of its own; the bound is what ended it.'
+            : `The condition it last reported was "${reported}", which is carried here as the cause ` +
+              'rather than as the label: the hand-off itself is not a thing to retry.'),
       };
     }
 

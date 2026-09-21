@@ -99,7 +99,23 @@ export const schemaVersionField = z
     params: { code: SCHEMA_VERSION_UNRECOGNISED_CODE },
   });
 
-/** Wrap an object shape so the artifact carries `schema_version` as its first field. */
+/**
+ * Wrap an object shape so the artifact carries `schema_version` as its first field.
+ *
+ * **The recognition check is invisible to a model, and that is acceptable here in a way it was not for
+ * `retryable`.** {@link schemaVersionField}'s check is a Zod refinement, and a refinement emits nothing
+ * into the JSON Schema `z.toJSONSchema` exports — so a step contract wrapped in `versioned()` carries
+ * `schema_version` to `claude -p --json-schema` as a bare `{"type": "number"}` with no hint that only
+ * certain values are read. The one step contract that is wrapped is `StepInputSchema`, and it is the
+ * *engine* that writes that file and the step agent that reads it: no model is ever asked to produce a
+ * `schema_version`, so there is no model to mislead and no artifact for a model to fail at AD-1's
+ * re-parse. `StepOutputSchema` — the one a model does produce — deliberately carries no
+ * `schema_version` at all, which its own docblock says and which is the reason this stays true.
+ *
+ * A later story adding `versioned()` to a model-produced contract would change that, and would have to
+ * answer the question `src/contracts/error.ts` answers for `retryable`: a rule a model cannot see must
+ * be repaired on ingest, not used to reject the artifact carrying it.
+ */
 export const versioned = <Shape extends z.ZodRawShape>(
   shape: Shape,
 ): z.ZodObject<{ schema_version: typeof schemaVersionField } & Shape> =>

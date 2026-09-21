@@ -88,6 +88,23 @@ export const ENGINE_EVENT_TYPES = {
 export type EngineEventType = (typeof ENGINE_EVENT_TYPES)[keyof typeof ENGINE_EVENT_TYPES];
 
 /**
+ * The additive payload key that marks a `step.resume_attempted` line as counting against the bound.
+ *
+ * A build boundary, written into the log rather than inferred from it. `step.resume_attempted` predates
+ * the attempt bound — it was emitted for the record and folded for nothing — so a log written before the
+ * bound existed already holds those lines, and counting them retroactively means a run that was
+ * mid-flight when the bound landed can jump straight past its eight engagements and hand off on the
+ * first pass after the upgrade. There is nothing in an old line to tell it apart from a new one, so the
+ * new one says so.
+ *
+ * Additive and optional, so AD-5 makes it invisible to an older reader, exactly like
+ * {@link REPAIRED_PAYLOAD_KEY}. The direction of the default is the safe one: an unmarked line is
+ * *not* counted, so the worst case is a pre-upgrade run getting a fresh allowance rather than a
+ * live run being handed off for engagements it spent under different rules.
+ */
+export const RESUME_COUNTS_TOWARD_BOUND_KEY = 'counts_toward_attempt_bound';
+
+/**
  * Every type the fold acts on. A type outside this set is ignored, per AD-5.
  *
  * `step.resume_attempted` is folded for exactly one fact: the attempt count. It still changes no
@@ -297,6 +314,7 @@ export const rebuildFromLog = (
             : (existing?.model_tier ?? options.plan.starting_model_tier),
           promotions: existing?.promotions ?? 0,
           attempts: (existing?.attempts ?? 0) + 1,
+          credited_attempts: existing?.credited_attempts ?? 0,
           resets: existing?.resets ?? 0,
           started_at: event.ts,
           terminated_at: null,
@@ -341,6 +359,9 @@ export const rebuildFromLog = (
           disposition: 'interrupted',
           session_id: null,
           error: null,
+          // CAP-12 — and it credits the attempts already spent, or a step sitting at the bound would
+          // hand off instead of running the attempt the person just authorised.
+          credited_attempts: record.attempts,
         });
         break;
       }
@@ -356,7 +377,14 @@ export const rebuildFromLog = (
          * which is what AD-8 prescribes, and each of those resumes is one more line here — so the loop
          * a permanently-interrupted step used to make is now a loop that counts, and the bound in
          * `decideAction` ends it.
+         *
+         * Only a line carrying {@link RESUME_COUNTS_TOWARD_BOUND_KEY} counts. A log written before the
+         * bound existed already holds `step.resume_attempted` lines, and counting those retroactively
+         * would hand off a run that was mid-flight when the bound landed, for engagements it spent when
+         * they cost nothing. An unmarked line is still folded as it always was — which is to say it
+         * changes nothing — so this is a narrowing of what the count reads, not of what the fold sees.
          */
+        if (event.payload[RESUME_COUNTS_TOWARD_BOUND_KEY] !== true) break;
         steps.set(record.step, { ...record, attempts: record.attempts + 1 });
         break;
       }
@@ -428,6 +456,16 @@ export const rebuildFromLog = (
             session_id: spent ? null : (envelopeString(event, 'session_id') ?? record.session_id),
             terminated_at: record.terminated_at ?? event.ts,
             error: spent ? null : record.error,
+            /**
+             * CAP-12 — an approval credits the attempts already spent on the step.
+             *
+             * `clears_step_error` marks the one effect that is a person saying "continue": it turns the
+             * step's disposition to `interrupted`, which returns to the same step, so a step standing at
+             * the attempt bound when someone approved it handed off on the very next pass rather than
+             * running the attempt they had just authorised. The bound exists to stop *unattended*
+             * looping; a human gesture is the opposite of unattended, and every credit costs another one.
+             */
+            credited_attempts: spent ? record.attempts : record.credited_attempts,
           });
         }
 
@@ -544,6 +582,11 @@ export const compareCheckpointToLog = (
     compare(`steps.${record.step}.session_id`, record.session_id, logged.session_id);
     compare(`steps.${record.step}.baseline_ref`, record.baseline_ref, logged.baseline_ref);
     compare(`steps.${record.step}.attempts`, record.attempts, logged.attempts);
+    compare(
+      `steps.${record.step}.credited_attempts`,
+      record.credited_attempts,
+      logged.credited_attempts,
+    );
     compare(`steps.${record.step}.model_tier`, record.model_tier, logged.model_tier);
   }
 

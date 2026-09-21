@@ -21,7 +21,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { RUN_STATE_FILE_NAME, makeError } from '../src/contracts/index.js';
+import { RUN_STATE_FILE_NAME, dispositionFor, makeError } from '../src/contracts/index.js';
 import { readEventLog, runPaths } from '../src/runtime/index.js';
 import {
   DECLARED_STEP_ATTEMPT_LIMIT,
@@ -114,6 +114,24 @@ const alwaysInterrupted: ScriptedExecutorOptions = {
   sessionIdFor: (request) => `sess-${request.step}`,
   onStart: (request) => terminated(request.step, 'interrupted', { sessionId: `sess-${request.step}` }),
   onResume: (request) => terminated(request.step, 'interrupted', { sessionId: request.sessionId }),
+};
+
+/**
+ * Retryable until the last permitted attempt, then a gate only a person can pass.
+ *
+ * The step reaches the bound and then stops at something `escalate-to-human` answers — which is not one
+ * of the actions that return to the step, so the bound has nothing to say about it.
+ */
+const blocksAtTheBound: ScriptedExecutorOptions = {
+  sessionIdFor: () => null,
+  onStart: (request, attempt) => {
+    if (request.step !== 'implement') return terminated(request.step, 'completed');
+    return attempt < DECLARED_STEP_ATTEMPT_LIMIT
+      ? terminated(request.step, 'failed', { error: makeError('step.timed_out', 'slow') })
+      : terminated(request.step, 'blocked', {
+          error: makeError('permission.denied', 'this needs a person'),
+        });
+  },
 };
 
 describe('the bound covers every disposition that returns to the same step', () => {
@@ -212,6 +230,179 @@ describe('a step that keeps being interrupted and resumed', () => {
     expect(
       log.filter((event) => event.payload['disposition'] === 'failed'),
     ).toStrictEqual([]);
+  });
+});
+
+/**
+ * The bound's label, and the three actions it is asked about.
+ *
+ * `returnsToSameStep` names three actions, and only two of them were ever driven through a real run.
+ * The two that are *not* in the set matter just as much: a `blocked` step at the bound waits for a
+ * person and a `killed` one stops, and neither is a hand-off — the bound must not turn either into one.
+ */
+describe('the hand-off the bound writes', () => {
+  it('is labelled with a code that is never retried, carrying the real one as the cause', async () => {
+    const reconciler = openReconciler(alwaysRetryable);
+    const run = startRun(reconciler);
+
+    await reconciler.runUntilSettled();
+
+    const handoff = reconciler.load(run).state.handoff;
+    /**
+     * `step.timed_out` is declared `retry-with-backoff`, and it is the code every attempt above
+     * reported. Labelling the hand-off with it would put a retryable code on the one document written
+     * *because* retrying is exhausted — so the label is the invariant the system broke about itself,
+     * which the AD-35 table declares `abandon-and-hand-off`.
+     */
+    expect(handoff?.code).toBe('internal.invariant_violated');
+    expect(handoff?.code).not.toBe('step.timed_out');
+    expect(dispositionFor(handoff?.code ?? '')).toBe('abandon-and-hand-off');
+    // And the condition the step reported is not lost: it is named where a person reads it.
+    expect(handoff?.reason).toContain('step.timed_out');
+    expect(handoff?.reason).toContain('cause');
+  });
+
+  it('says so in prose when the step was interrupted rather than failed', async () => {
+    const reconciler = openReconciler(alwaysInterrupted);
+    const run = startRun(reconciler);
+
+    await reconciler.runUntilSettled();
+
+    const document = readFileSync(runPaths(run, home).handoffDocument, 'utf8');
+    /**
+     * The case the bound was widened to catch. `stepPhrase` mentioned the attempt count only on the
+     * `failed` branch, so a step picked up eight times and interrupted every time read as "was
+     * interrupted part-way through" — a document that cannot explain why the run stopped.
+     */
+    expect(document).toContain(`${String(DECLARED_STEP_ATTEMPT_LIMIT)} attempts`);
+    expect(document).toContain('interrupted');
+  });
+
+  it('applies to a promotion too, which is the third action that returns to the step', async () => {
+    const reconciler = openReconciler({
+      sessionIdFor: () => null,
+      onStart: (request, attempt) => {
+        if (request.step !== 'implement') return terminated(request.step, 'completed');
+        // Retryable until the last permitted attempt, then a code the ladder would promote for.
+        return attempt < DECLARED_STEP_ATTEMPT_LIMIT
+          ? terminated(request.step, 'failed', { error: makeError('step.timed_out', 'slow') })
+          : terminated(request.step, 'failed', {
+              error: makeError('step.verification_failed', 'the checks did not pass'),
+            });
+      },
+    });
+    const run = startRun(reconciler);
+
+    await reconciler.runUntilSettled();
+
+    const state = reconciler.load(run).state;
+    expect(stepRecord(reconciler, run).attempts).toBe(DECLARED_STEP_ATTEMPT_LIMIT);
+    expect(state.state).toBe('handed_off');
+    // The next action would have been a promotion, which spends a model call on the same step.
+    expect(state.handoff?.reason).toContain('promote-model-tier');
+    expect(state.handoff?.code).toBe('internal.invariant_violated');
+    // The promotion was not spent: the bound stopped it before the rung moved.
+    expect(state.steps[0]?.promotions).toBe(0);
+  });
+
+  it('does not hand off a step that is blocked at the bound, because a person decides that', async () => {
+    const reconciler = openReconciler(blocksAtTheBound);
+    const run = startRun(reconciler);
+
+    await reconciler.runUntilSettled();
+
+    const state = reconciler.load(run).state;
+    expect(stepRecord(reconciler, run).attempts).toBe(DECLARED_STEP_ATTEMPT_LIMIT);
+    // `escalate-to-human` does not return to the step, so the bound has nothing to say about it.
+    expect(state.state).toBe('blocked');
+    expect(state.handoff).toBeNull();
+  });
+
+  it('does not hand off a step stopped by a steering command at the bound', async () => {
+    const reconciler = openReconciler(blocksAtTheBound);
+    const run = startRun(reconciler);
+    await reconciler.runUntilSettled();
+    expect(reconciler.load(run).state.state).toBe('blocked');
+
+    reconciler.kill(run);
+
+    const state = reconciler.load(run).state;
+    // A user's kill outranks the bound: the run is `killed`, not handed off (AD-8).
+    expect(state.state).toBe('killed');
+    expect(state.handoff).toBeNull();
+    expect((await reconciler.pass()).actions).toStrictEqual([]);
+  });
+});
+
+/**
+ * CAP-12 — a person approving the gate a step blocked at gets the run they authorised.
+ *
+ * The approval folds the step to `interrupted`, which is one of the three dispositions that return to
+ * the same step — so a step standing at the bound when someone approved it was answered with an
+ * immediate hand-off. The bound exists to stop an *unattended* loop spending a subscription budget; a
+ * person pressing approve is the opposite of unattended, and every credit costs another gesture.
+ */
+describe('an approval at the bound', () => {
+  it('proceeds rather than handing off, and credits the attempts already spent', async () => {
+    const reconciler = openReconciler({
+      sessionIdFor: () => null,
+      onStart: (request, attempt) => {
+        if (request.step !== 'implement') return terminated(request.step, 'completed');
+        if (attempt < DECLARED_STEP_ATTEMPT_LIMIT) {
+          return terminated(request.step, 'failed', { error: makeError('step.timed_out', 'slow') });
+        }
+        // The last permitted attempt blocks at a gate, so there is something to approve.
+        if (attempt === DECLARED_STEP_ATTEMPT_LIMIT) {
+          return terminated(request.step, 'blocked', {
+            error: makeError('permission.denied', 'this needs a person'),
+          });
+        }
+        return terminated(request.step, 'completed');
+      },
+    });
+    const run = startRun(reconciler);
+
+    await reconciler.runUntilSettled();
+    expect(reconciler.load(run).state.state).toBe('blocked');
+    expect(stepRecord(reconciler, run).attempts).toBe(DECLARED_STEP_ATTEMPT_LIMIT);
+
+    reconciler.approve(run);
+    await reconciler.runUntilSettled();
+
+    const state = reconciler.load(run).state;
+    // The attempt the person authorised ran, and it succeeded.
+    expect(state.state).toBe('committed');
+    expect(state.handoff).toBeNull();
+    expect(stepRecord(reconciler, run).disposition).toBe('completed');
+    // `attempts` stays the honest total — the hand-off document quotes it — and the credit is beside it.
+    expect(stepRecord(reconciler, run).attempts).toBeGreaterThan(DECLARED_STEP_ATTEMPT_LIMIT);
+    const record = reconciler.load(run).state.steps[0];
+    expect(record?.credited_attempts).toBe(DECLARED_STEP_ATTEMPT_LIMIT);
+  });
+
+  it('gives a full allowance again and no more, so the credit is not a way around the bound', async () => {
+    const reconciler = openReconciler({
+      sessionIdFor: () => null,
+      onStart: (request, attempt) => {
+        if (request.step !== 'implement') return terminated(request.step, 'completed');
+        return attempt === DECLARED_STEP_ATTEMPT_LIMIT
+          ? terminated(request.step, 'blocked', {
+              error: makeError('permission.denied', 'this needs a person'),
+            })
+          : terminated(request.step, 'failed', { error: makeError('step.timed_out', 'slow') });
+      },
+    });
+    const run = startRun(reconciler);
+
+    await reconciler.runUntilSettled();
+    reconciler.approve(run);
+    await reconciler.runUntilSettled();
+
+    const state = reconciler.load(run).state;
+    // Eight more engagements after the approval, and then the bound ends it again.
+    expect(state.state).toBe('handed_off');
+    expect(stepRecord(reconciler, run).attempts).toBe(2 * DECLARED_STEP_ATTEMPT_LIMIT);
+    expect(state.steps[0]?.credited_attempts).toBe(DECLARED_STEP_ATTEMPT_LIMIT);
   });
 });
 

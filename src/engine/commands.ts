@@ -52,9 +52,14 @@ import {
   COMMANDS,
   CommandIntentSchema,
   CURRENT_SCHEMA_VERSION,
+  INTENT_RULES,
+  SCHEMA_VERSION_UNRECOGNISED_CODE,
   formatTimestamp,
+  intentRuleOfIssue,
+  isRecognisedSchemaVersion,
+  schemaVersionRefusalMessage,
 } from '../contracts/index.js';
-import type { Command, CommandIntent, EventEnvelope } from '../contracts/index.js';
+import type { Command, CommandIntent, EventEnvelope, IntentRule } from '../contracts/index.js';
 import {
   INTENT_FILE_EXTENSION,
   INTENT_ID_PATTERN,
@@ -161,10 +166,37 @@ export const INTENT_REFUSAL_REASONS = [
   'unrecognised-command',
   /** No principal, so the command is unattributable (AD-19). */
   'missing-principal',
+  /**
+   * The principal is present and well-formed, and disagrees with the source that wrote the file.
+   *
+   * Its own reason rather than `missing-principal`, because the two send a person to different places.
+   * A cross-field rule can only report against one of the fields it relates, so this one reports against
+   * `principal.kind` — and the path-based classification then told a person the field was "absent or not
+   * a declared principal" for an intent whose principal was both present and valid. AD-19's attribution
+   * is the subject; the field is fine.
+   */
+  'misattributed-principal',
+  /**
+   * An argument-required command carrying no usable text.
+   *
+   * Distinct from `missing-answer`, which is the same absence found later and against an open question:
+   * this one is the contract refusing the file, before any run state is consulted, and it covers `narrow`
+   * and `inject_note` as well — commands that have nothing to do with a question.
+   */
+  'missing-argument',
   /** An id that could not be carried into the log, so exactly-once could not be guaranteed. */
   'unloggable-intent-id',
   /** An intent naming a different run than the directory it sits in. */
   'misaddressed',
+  /**
+   * A `schema_version` this build does not recognise (AD-28).
+   *
+   * Its own reason, and reported before any shape complaint, because it is not one: an intent written by
+   * a newer installer used to come back as `malformed`, which sends a person to inspect a field instead
+   * of to the installer that wrote the file. The detail carries `config.schema_version_unrecognised` and
+   * the same "re-run the installer" sentence every other versioned-artifact reader produces.
+   */
+  'unrecognised-schema-version',
   /** A run with no state at all: nothing to steer. */
   'unknown-run',
   /** The run has reached a terminal state, which nothing walks back. */
@@ -477,6 +509,40 @@ export const readIntentFiles = (
       const issues = result.error.issues;
       const paths_ = new Set(issues.map((issue) => issue.path.map(String).join('.')));
 
+      /**
+       * AD-28 before anything else: a version this build does not recognise is not a shape complaint.
+       *
+       * Every other reader of a versioned artifact goes through `parseVersionedArtifact` — the
+       * checkpoint, the question state, the fetch record — and gets the named refusal carrying
+       * `config.schema_version_unrecognised` and "re-run the installer". This reader classifies Zod
+       * issues by path instead, so an intent written by a *newer* installer came back as `malformed`,
+       * "the declared shape rejects schema_version" — which sends a person to inspect a field rather
+       * than to the installer that wrote the file. The refusal is raised from the contracts' own
+       * helpers, so the sentence is the same one every other reader produces.
+       *
+       * First, because a file from a future installer may well also fail the command enum or the
+       * principal shape — those are this build's reading of a format it has already said it cannot read.
+       */
+      const declaredVersion = record['schema_version'];
+      if (
+        typeof declaredVersion === 'number' &&
+        Number.isInteger(declaredVersion) &&
+        !isRecognisedSchemaVersion(declaredVersion)
+      ) {
+        refused.push(
+          refusal(
+            fileName,
+            'unrecognised-schema-version',
+            `${SCHEMA_VERSION_UNRECOGNISED_CODE}: ${schemaVersionRefusalMessage(
+              `the intent file "${fileName}"`,
+              declaredVersion,
+            )}`,
+            { intentId: declaredId },
+          ),
+        );
+        continue;
+      }
+
       if (typeof declaredCommand === 'string' && !(COMMANDS as readonly string[]).includes(declaredCommand)) {
         refused.push(
           refusal(
@@ -490,6 +556,53 @@ export const readIntentFiles = (
         );
         continue;
       }
+      /**
+       * The two cross-field rules report first, and by their own marker rather than by their path.
+       *
+       * Both borrow a field path because Zod has nowhere else to report — the argument rule takes
+       * `argument`, the attribution rule takes `principal.kind` — so classifying by path called an
+       * attribution failure a missing principal, and told a person the field "is absent or not a declared
+       * principal" for an intent whose principal was present and valid. The marker says which rule fired,
+       * so the sentence a person reads is about the rule rather than about one of the fields it relates.
+       */
+      const ruleFired = (rule: IntentRule): boolean =>
+        issues.some((issue) => intentRuleOfIssue(issue) === rule);
+
+      if (ruleFired(INTENT_RULES.PrincipalAttribution)) {
+        refused.push(
+          refusal(
+            fileName,
+            'misattributed-principal',
+            'the principal and the source disagree about who acted. AD-19 makes "timeout" both a ' +
+              'source and a principal kind, and they are one fact: a clock-sourced intent is always ' +
+              'attributed to the clock, and an intent attributed to the clock always comes from it. ' +
+              'Recording a person\'s decision as the clock\'s would put "the system did it ' +
+              'automatically" in the decision ledger for ever (CAP-18).',
+            { intentId: declaredId },
+          ),
+        );
+        continue;
+      }
+      if (ruleFired(INTENT_RULES.ArgumentRequired)) {
+        refused.push(
+          refusal(
+            fileName,
+            'missing-argument',
+            `"${typeof declaredCommand === 'string' ? declaredCommand : 'this command'}" carries no ` +
+              'text, and it is one of the commands that mean nothing without it. Accepting it would ' +
+              'leave a person believing they had steered the run while the consumer silently did ' +
+              'nothing — so it is refused instead, naming the field.',
+            {
+              intentId: declaredId,
+              command: (COMMANDS as readonly string[]).includes(declaredCommand as string)
+                ? (declaredCommand as Command)
+                : null,
+            },
+          ),
+        );
+        continue;
+      }
+
       /**
        * Reported as a missing principal only when the principal is the *only* thing wrong.
        *

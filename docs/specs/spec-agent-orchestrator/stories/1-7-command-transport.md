@@ -74,7 +74,7 @@ deferred:
   severity: medium
 - summary: The declared failure limit counts only the `failed` disposition, so story 1-3's unbounded resume
     loop is still unbounded.
-  evidence: 'DECLARED_FAILURE_ATTEMPT_LIMIT hands off after three `failed` attempts, which closes the
+  evidence: 'DECLARED_STEP_ATTEMPT_LIMIT hands off after three `failed` attempts, which closes the
     matrix''s
 
     repeated-failure row and the retry half of 1-3''s EC12. `interrupted` is deliberately excluded: an

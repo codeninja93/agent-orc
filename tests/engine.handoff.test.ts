@@ -275,6 +275,7 @@ const aStep = (overrides: Partial<StepRecord> = {}): StepRecord => ({
   model_tier: 'claude-haiku-4-5',
   promotions: 0,
   attempts: 3,
+  credited_attempts: 0,
   resets: 2,
   started_at: '2026-09-20T10:00:00.000Z',
   terminated_at: '2026-09-20T10:05:00.000Z',

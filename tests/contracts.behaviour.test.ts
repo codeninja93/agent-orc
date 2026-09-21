@@ -44,6 +44,7 @@ import {
   renderCause,
   resolveQuestion,
   schemaVersionRefusalMessage,
+  toJsonSchema,
   writesToDecisionLedger,
 } from '../src/contracts/index.js';
 import type { CommandMap, QuestionState, StepDisposition } from '../src/contracts/index.js';
@@ -206,20 +207,31 @@ describe('AD-35 — every failure code carries a declared disposition', () => {
   });
 
   /**
-   * The table is the authority, and the field is on the wire.
+   * The table is the authority, and the field is on the wire — so the parse *derives* it.
    *
    * `retryable` reaches the system inside a step agent's structured output, where a model writes whatever
    * it believes. A payload whose flag disagrees with the code used to parse cleanly, leaving two answers
    * to one question and a later consumer free to trust the wrong one — which is the drift AD-35 exists to
    * prevent. Asserted across every declared code rather than for a sample, so a code added to the table
    * with the wrong disposition cannot slip through with it.
+   *
+   * It is *repaired*, not refused, and the difference is the whole point. A refusal here fails the entire
+   * `StepOutputSchema.parse` at AD-1's re-parse, which the spawner turns into `step.schema_invalid_output`
+   * — `escalate-model-tier` — so one wrong boolean discarded the agent's real code and promoted the model
+   * ladder. And the rule could not be *told* to the model: a Zod refinement emits nothing into the
+   * exported JSON Schema, which is asserted directly below. The agent's code survives; the one field the
+   * table already knows the answer to is overwritten with that answer.
    */
-  it('refuses an error whose retryable contradicts the table for its code', () => {
+  it('derives retryable from the table when the payload contradicts it, keeping the code', () => {
     for (const code of ERROR_CODES) {
       const contradicting = { ...makeError(code, 'm'), retryable: !isRetryable(code) };
       const result = OrchErrorSchema.safeParse(contradicting);
-      expect(result.success, code).toBe(false);
-      expect(result.error?.issues.map((issue) => issue.path.join('.')), code).toContain('retryable');
+      expect(result.success, code).toBe(true);
+      // The flag is the table's answer, not the payload's...
+      expect(result.data?.retryable, code).toBe(isRetryable(code));
+      // ...and the code — the part only the agent knows — is untouched.
+      expect(result.data?.code, code).toBe(code);
+      expect(result.data?.message, code).toBe('m');
     }
   });
 
@@ -230,14 +242,34 @@ describe('AD-35 — every failure code carries a declared disposition', () => {
     }
   });
 
-  it('refuses an unknown code claiming to be retryable, because unknown is never retried', () => {
-    const result = OrchErrorSchema.safeParse({
+  it('derives false for an unknown code claiming to be retryable, because unknown is never retried', () => {
+    const parsed = OrchErrorSchema.parse({
       code: 'gremlin.unheard_of',
       message: 'x',
       retryable: true,
       cause: null,
     });
-    expect(result.success).toBe(false);
+    expect(parsed.retryable).toBe(false);
+    expect(parsed.code).toBe('gremlin.unheard_of');
+  });
+
+  /**
+   * The exported contract still says only `{"type": "boolean"}`, and that is the deliberate choice.
+   *
+   * Asserted rather than assumed, because the whole defect was a rule the model was never told. Draft-7
+   * *could* carry it as a `oneOf` of a `const` per declared code, but that would close `code` — which is
+   * an open string on purpose, so an unrecognised failure is dispositioned rather than throwing a second
+   * failure while handling the first. So the export stays honest about what it is: a boolean the engine
+   * decides. If a later story enumerates it, this assertion is what will make that a decision rather than
+   * an accident.
+   */
+  it('exports retryable as a plain boolean, because the engine derives it rather than the model', () => {
+    const exported = toJsonSchema(OrchErrorSchema) as {
+      properties: { retryable: Record<string, unknown> };
+    };
+    expect(exported.properties.retryable).toStrictEqual({ type: 'boolean' });
+    // The rule is nowhere in the exported text, which is exactly why it may not be a refusal.
+    expect(JSON.stringify(exported)).not.toContain('disposition');
   });
 });
 
@@ -505,6 +537,51 @@ describe('AD-3 — one Command enum covering every steering control', () => {
         ).toBe(true);
       }
     });
+
+    /**
+     * The inverse, which is the dangerous direction and was the one that was accepted.
+     *
+     * The rule used to be an implication — refuse `source: 'timeout'` with a `user` principal — so it
+     * guarded a clock's default wearing a person's name and accepted a person's decision wearing the
+     * clock's. That is the harmful one: a human choice laundered into "the system did it automatically",
+     * kept for ever by the CAP-18 ledger. The rule is now an equivalence, so both directions are refused.
+     */
+    it.each(['tui', 'web', 'cli'] as const)(
+      'refuses a %s-sourced intent claiming a timeout principal, so a person cannot hide behind the clock',
+      (source) => {
+        const result = CommandIntentSchema.safeParse(
+          anIntent({ source, principal: { kind: 'timeout', id: 'question.window' } }),
+        );
+        expect(result.success, source).toBe(false);
+        expect(result.error?.issues.map((issue) => issue.path.join('.')), source).toContain(
+          'principal.kind',
+        );
+      },
+    );
+
+    it.each(['user', 'agent'] as const)(
+      'refuses a timeout-sourced intent attributed to a %s principal',
+      (kind) => {
+        expect(
+          CommandIntentSchema.safeParse(
+            anIntent({ source: 'timeout', principal: { kind, id: 'whoever' } }),
+          ).success,
+          kind,
+        ).toBe(false);
+      },
+    );
+
+    it.each(['tui', 'web', 'cli'] as const)(
+      'leaves an agent principal free on %s, because only the clock pairing is fixed',
+      (source) => {
+        expect(
+          CommandIntentSchema.safeParse(
+            anIntent({ source, principal: { kind: 'agent', id: 'interviewer' } }),
+          ).success,
+          source,
+        ).toBe(true);
+      },
+    );
   });
 });
 

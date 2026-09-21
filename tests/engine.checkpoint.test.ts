@@ -30,7 +30,10 @@ import { runPaths } from '../src/runtime/index.js';
 import type { RunPaths } from '../src/runtime/index.js';
 import {
   ENGINE_EMITTER,
+  COMMAND_EVENT_TYPES,
   ENGINE_EVENT_TYPES,
+  FOLDED_EVENT_TYPES,
+  RESUME_COUNTS_TOWARD_BOUND_KEY,
   checkpointPath,
   compareCheckpointToLog,
   emptyRunState,
@@ -200,6 +203,89 @@ describe('AD-4 — the checkpoint is rebuilt from the log', () => {
     expect(record?.model_tier).toBe('claude-sonnet-5');
   });
 
+  /**
+   * A resume counts against the bound only when the line says it does.
+   *
+   * `step.resume_attempted` predates the attempt bound: it was written for the record and folded for
+   * nothing. So a log written before the bound existed already holds those lines, and counting them
+   * retroactively means a run that was mid-flight when the bound landed jumps straight past its eight
+   * engagements and hands off on the first pass after the upgrade — punished for engagements it spent
+   * when they cost nothing. The marker is the build boundary, written into the line rather than inferred.
+   */
+  it('does not count a pre-existing resume line, which was written before the bound existed', () => {
+    const events = [
+      ...completedImplementLog().slice(0, 4),
+      event(ENGINE_EVENT_TYPES.StepTerminated, {
+        step: 'implement',
+        session_id: 'sess-implement-1',
+        payload: { disposition: 'interrupted' },
+      }),
+      // Exactly the shape a pre-upgrade build wrote: the attempt number, and nothing else.
+      ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((attempt) =>
+        event(ENGINE_EVENT_TYPES.StepResumeAttempted, {
+          step: 'implement',
+          session_id: 'sess-implement-1',
+          payload: { attempt },
+        }),
+      ),
+    ];
+    const record = rebuild(events).steps[0];
+    // One start, nine unmarked resumes: the count is the start alone, so the run keeps its allowance.
+    expect(record?.attempts).toBe(1);
+    expect(record?.disposition).toBe('interrupted');
+  });
+
+  it('counts a resume line this build wrote, which carries the marker', () => {
+    const events = [
+      ...completedImplementLog().slice(0, 4),
+      event(ENGINE_EVENT_TYPES.StepTerminated, {
+        step: 'implement',
+        session_id: 'sess-implement-1',
+        payload: { disposition: 'interrupted' },
+      }),
+      event(ENGINE_EVENT_TYPES.StepResumeAttempted, {
+        step: 'implement',
+        session_id: 'sess-implement-1',
+        payload: { attempt: 2, [RESUME_COUNTS_TOWARD_BOUND_KEY]: true },
+      }),
+    ];
+    const record = rebuild(events).steps[0];
+    expect(record?.attempts).toBe(2);
+  });
+
+  /**
+   * An error already in a log, whose `retryable` disagrees with the AD-35 table.
+   *
+   * The table's answer is derived at parse rather than demanded of the payload, and this is where that
+   * matters most: a log line is already written and cannot be re-negotiated. While the schema *refused*
+   * the disagreement, `payloadError` answered `null` and the step record lost its error entirely — so
+   * `decideAction` substituted `internal.invariant_violated` for a code the log plainly holds, and the
+   * hand-off named the wrong condition. Replay is not a place to be strict about a field the reader can
+   * work out for itself.
+   */
+  it('keeps an error from an existing log whose retryable disagrees with the table', () => {
+    const events = [
+      ...completedImplementLog().slice(0, 4),
+      event(ENGINE_EVENT_TYPES.StepTerminated, {
+        step: 'implement',
+        payload: {
+          disposition: 'failed',
+          error: {
+            code: 'budget.exhausted',
+            message: 'the budget is gone',
+            // Written by a build whose schema did not derive the flag; the table says false.
+            retryable: true,
+            cause: null,
+          },
+        },
+      }),
+    ];
+    const record = rebuild(events).steps[0];
+    expect(record?.error?.code).toBe('budget.exhausted');
+    expect(record?.error?.retryable).toBe(false);
+    expect(record?.error).not.toBeNull();
+  });
+
   it('clears the session id when a resume is refused, so the next routing re-runs', () => {
     const events = [
       ...completedImplementLog().slice(0, 4),
@@ -260,6 +346,48 @@ describe('AD-4 — the checkpoint is rebuilt from the log', () => {
   });
 });
 
+/**
+ * `FOLDED_EVENT_TYPES` had no reader at all.
+ *
+ * Its docblock says the constant is enumerated by hand rather than derived "so it cannot claim to fold a
+ * type the switch below has no case for" — and nothing enforced that, so adding `step.resume_attempted`
+ * to it was inert and the claim was true only by the author's care. A declaration nothing reads is
+ * documentation wearing a constant's clothes. This is the reader: the list and the switch, compared.
+ */
+describe('the folded-type list is the switch, not a claim about it', () => {
+  const foldSource = readFileSync(new URL('../src/engine/rebuild.ts', import.meta.url), 'utf8');
+
+  /** The `case` labels of the fold's own switch, resolved through the two vocabularies they name. */
+  const casesOfTheFold = (): string[] => {
+    const vocabularies: Record<string, Record<string, string>> = {
+      ENGINE_EVENT_TYPES,
+      COMMAND_EVENT_TYPES,
+    };
+    const found: string[] = [];
+    for (const match of foldSource.matchAll(/^ {6}case (\w+)\.(\w+):/gm)) {
+      const table = vocabularies[match[1] ?? ''];
+      const value = table?.[match[2] ?? ''];
+      expect(value, `${String(match[1])}.${String(match[2])} is not a declared event type`).toBeDefined();
+      if (value !== undefined) found.push(value);
+    }
+    return found;
+  };
+
+  it('reads the switch at all, so an empty comparison cannot pass', () => {
+    expect(casesOfTheFold().length).toBeGreaterThan(5);
+    expect(casesOfTheFold()).toContain(ENGINE_EVENT_TYPES.StepResumeAttempted);
+  });
+
+  it('declares exactly the types the switch has a case for, in both directions', () => {
+    const cases = new Set(casesOfTheFold());
+    const declared = new Set(FOLDED_EVENT_TYPES);
+    // A type claimed as folded that the switch ignores: the claim the docblock makes.
+    expect([...declared].filter((type) => !cases.has(type))).toStrictEqual([]);
+    // And the inverse, which is the one that bites a reader: a type the fold acts on and does not declare.
+    expect([...cases].filter((type) => !declared.has(type))).toStrictEqual([]);
+  });
+});
+
 describe('AD-4 — where they disagree, the log wins', () => {
   it('detects a checkpoint naming a step the log never started', () => {
     const rebuilt = rebuild(completedImplementLog());
@@ -277,6 +405,7 @@ describe('AD-4 — where they disagree, the log wins', () => {
           model_tier: 'claude-haiku-4-5',
           promotions: 0,
           attempts: 1,
+          credited_attempts: 0,
           resets: 0,
           started_at: rebuilt.updated_at,
           terminated_at: rebuilt.updated_at,

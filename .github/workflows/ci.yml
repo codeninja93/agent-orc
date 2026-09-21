@@ -19,16 +19,31 @@ on:
 permissions:
   contents: read
 
+# One run per ref, and the newest wins.
+#
+# The suite now spawns real child processes — seven jiti-compiling children per cross-process race, three
+# races — so three pushes in a minute would otherwise have three copies of that contending for the same
+# runners while two of them are already answering a question nobody is asking any more. A pull request is
+# deliberately *not* cancelled by its own merge queue: the group keys on the ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # The pinned Node: the floor as `.nvmrc` declares it, which is what the Stack table promises.
   gate:
     name: typecheck, lint, build, test
     runs-on: ubuntu-latest
+    # A hang must fail rather than run for six hours. The cross-process races carry their own 180s bound
+    # inside Vitest; this is the outer one, for a wedged child that never reaches an assertion at all.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
       # The Node version is read from `.nvmrc`, never written here. AD-28 declares the floor in exactly
       # two places — `.nvmrc` and `package.json` `engines.node` — and a literal in this file would be a
-      # third, free to drift from both. `npm ci` then enforces `engines` against it.
+      # third, free to drift from both. `.npmrc` sets `engine-strict=true`, so `npm ci` then enforces
+      # `engines` against it rather than warning and installing anyway.
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
@@ -36,6 +51,31 @@ jobs:
 
       # `ci`, not `install`: it installs the lockfile exactly and fails if the lockfile and the manifest
       # disagree, so the gate runs against the declared dependency tree rather than a resolved-today one.
+      - run: npm ci
+
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test
+
+  # The newest Node, which is where every story's evidence has actually been gathered.
+  #
+  # `engines.node` is a floor — `>=22.22` — so the build claims to work on everything above it, and CI
+  # was checking exactly one point of that range while all the local verification happened on 24.x. A
+  # floor nothing tests above is a floor, not a range. `current` is an alias rather than a literal, so
+  # this row cannot become a third declaration of the version the other row pins.
+  gate-current:
+    name: typecheck, lint, build, test (current Node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: current
+          cache: npm
+
       - run: npm ci
 
       - run: npm run typecheck

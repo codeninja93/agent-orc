@@ -24,7 +24,13 @@ import {
   isResumable,
   nextModelRung,
 } from '../contracts/index.js';
-import type { Disposition, ModelRung, OrchError, StepDisposition } from '../contracts/index.js';
+import type {
+  Disposition,
+  ModelRung,
+  OrchError,
+  StepDisposition,
+  StepRecord,
+} from '../contracts/index.js';
 
 /**
  * What the loop does next about a step. One member per outcome the story names, plus the two that
@@ -281,3 +287,19 @@ export const DECLARED_STEP_ATTEMPT_LIMIT = 8;
  */
 export const attemptBoundReached = (attempts: number): boolean =>
   attempts >= DECLARED_STEP_ATTEMPT_LIMIT;
+
+/**
+ * The engagements the bound counts: every one the step has had, less the ones a person has authorised.
+ *
+ * CAP-12 — approving the gate a step blocked at turns it into an `interrupted` step, which is one of
+ * the three actions that return to the same step, so an approval of a step standing at the bound was
+ * answered with an immediate hand-off: the run a person had just authorised, refused by the guard that
+ * exists to protect them from an unattended loop. `credited_attempts` takes the value of `attempts` at
+ * each approval, so the difference is the engagements spent since the last human gesture.
+ *
+ * Clamped at zero because the two numbers are folded from different lines and a truncated or reordered
+ * log must not produce a negative allowance, which would read as "never reaches the bound".
+ */
+export const attemptsAgainstBound = (
+  record: Pick<StepRecord, 'attempts' | 'credited_attempts'>,
+): number => Math.max(0, record.attempts - record.credited_attempts);

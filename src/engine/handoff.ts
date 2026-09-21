@@ -301,19 +301,29 @@ export interface HandoffBrief {
   readonly writtenAt: string;
 }
 
-/** How a step's record reads in prose, in the second person's terms rather than the enum's. */
+/**
+ * How a step's record reads in prose, in the second person's terms rather than the enum's.
+ *
+ * The attempt count appears wherever there was more than one, not only on the `failed` branch. The
+ * bound was widened to cover every disposition that returns to the same step — a resume by session id
+ * as much as a re-run — so the case it exists to catch is a step interrupted and resumed until the
+ * allowance ran out, and that step rendered as "was interrupted part-way through" with no hint that it
+ * had been picked up seven more times. A document that does not say how much was spent cannot explain
+ * why the run stopped.
+ */
 const stepPhrase = (record: StepRecord): string => {
+  const overAttempts = ` on all ${String(record.attempts)} attempts`;
   switch (record.disposition) {
     case 'completed':
       return 'finished';
     case 'failed':
-      return record.attempts > 1
-        ? `failed on all ${String(record.attempts)} attempts`
-        : 'failed on its first attempt';
+      return record.attempts > 1 ? `failed${overAttempts}` : 'failed on its first attempt';
     case 'blocked':
       return 'stopped at a gate it was not allowed to pass on its own';
     case 'interrupted':
-      return 'was interrupted part-way through';
+      return record.attempts > 1
+        ? `was interrupted part-way through${overAttempts}`
+        : 'was interrupted part-way through';
     case 'killed':
       return 'was stopped by a steering command, and is never re-run';
     case null:

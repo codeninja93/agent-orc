@@ -123,13 +123,33 @@ export const isRetryable = (code: string): boolean =>
  * `cause` is a rendered string rather than a nested error, because AD-2 forbids recursive schemas
  * and this shape appears inside step contracts.
  *
- * **`retryable` may not disagree with the table.** The field is on the wire — a step agent's
- * structured output carries it, and a model will write whatever it believes — while AD-35 makes the
- * table the one authority on what a code means. A payload claiming `budget.exhausted` is retryable
- * parses into a value whose own flag argues for the retry the table forbids, and the next reader has
- * two answers to one question. So the agreement is checked inside the schema: `makeError` derives the
- * flag from the table and therefore always passes, and there is no parsed `OrchError` anywhere in the
- * system whose flag contradicts its code.
+ * **`retryable` may not disagree with the table, and it is *derived* rather than checked.** The field
+ * is on the wire — a step agent's structured output carries it, and a model will write whatever it
+ * believes — while AD-35 makes the table the one authority on what a code means. So the parse
+ * overwrites the flag with what the table says for the code, and no parsed `OrchError` anywhere in the
+ * system can contradict its own code.
+ *
+ * **Why derive and not refuse.** A refinement rejecting the disagreement was tried and was strictly
+ * worse than the free `z.boolean()` it replaced. This schema is embedded in `StepOutputSchema`, which is
+ * exported through `z.toJSONSchema` and handed to `claude -p --json-schema` — and a Zod refinement emits
+ * *nothing* into JSON Schema, as `step.ts` says of its own budget bounds. The model was therefore never
+ * told the rule, and a model that got the derived boolean wrong failed the whole artifact at AD-1's
+ * re-parse: `src/engine/spawner.ts` turns that into `step.schema_invalid_output`, whose AD-35
+ * disposition is `escalate-model-tier`. An agent reporting `budget.exhausted` — abandon-and-hand-off —
+ * had its code discarded, the loop promoted to a more expensive rung, and it re-ran a step that had just
+ * said the budget was gone. Repairing the one derivable field keeps the agent's real code, which is the
+ * part of the payload a model actually knows and the engine cannot recompute.
+ *
+ * **And why the exported schema still says only `{"type": "boolean"}`.** Telling the model the rule in
+ * draft-7 would mean a `oneOf` of a `const` per declared code — around forty branches on a field the
+ * engine overwrites anyway — and it would close `code`, which is deliberately an open string so an
+ * unrecognised failure can be dispositioned rather than throw a second failure while handling the first.
+ * The honest export is "a boolean the engine decides", so the field stays a plain boolean and the value
+ * the model sends is replaced rather than judged.
+ *
+ * `.overwrite` rather than `.transform`: it is a same-type check, so the schema stays a `ZodObject`,
+ * `z.toJSONSchema` still represents it, and `OrchErrorSchema.nullable()` inside a step contract is
+ * unchanged.
  */
 export const OrchErrorSchema = z
   .object({
@@ -138,12 +158,7 @@ export const OrchErrorSchema = z
     retryable: z.boolean(),
     cause: z.string().nullable(),
   })
-  .refine((error) => error.retryable === isRetryable(error.code), {
-    message:
-      'retryable must equal what the AD-35 disposition table says for this code — the table is the ' +
-      'authority and the field may not disagree with it (an unknown code is never retryable)',
-    path: ['retryable'],
-  });
+  .overwrite((error) => ({ ...error, retryable: isRetryable(error.code) }));
 
 export type OrchError = z.infer<typeof OrchErrorSchema>;
 
@@ -159,6 +174,25 @@ export const makeError = (code: string, message: string, cause: string | null = 
   retryable: isRetryable(code),
   cause,
 });
+
+/**
+ * Render a thrown value as the schema refusal it is, or `null` when it is not one.
+ *
+ * Here rather than at the caller so `zod` stays inside `src/contracts/`, which is the only directory
+ * that imports it — every other unit holds schemas, never the library. A caller that has just called
+ * `Schema.parse` on a caller's behalf needs to tell "the contract said no" from "something broke", and
+ * `instanceof ZodError` is that question; answering it elsewhere would spread the dependency for one
+ * predicate.
+ */
+export const renderSchemaRefusal = (thrown: unknown): string | null =>
+  thrown instanceof z.ZodError
+    ? thrown.issues
+        .map(
+          (issue) =>
+            `${issue.path.map((part) => String(part)).join('.') || '(root)'}: ${issue.message}`,
+        )
+        .join('; ')
+    : null;
 
 /** Render an unknown thrown value as the `cause` string. */
 export const renderCause = (thrown: unknown): string | null => {
