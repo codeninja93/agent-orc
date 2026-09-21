@@ -13,7 +13,7 @@
  */
 import { z } from 'zod';
 
-import { PrincipalSchema } from './command.js';
+import { CommandIntentSchema, PrincipalSchema } from './command.js';
 import { TimestampSchema } from './event.js';
 import { versioned } from './schema-version.js';
 
@@ -137,6 +137,42 @@ export const QuestionStateSchema = versioned({
   });
 
 export type QuestionState = z.infer<typeof QuestionStateSchema>;
+
+/**
+ * The contended artifact: `questions/<id>/outcome.json`, whose *creation* decides which resolver won
+ * (AD-25 as amended by ADR-002).
+ *
+ * **It lives in `contracts/` because it is the load-bearing half of the question type.** AD-25 already
+ * says a question is a contract type here, and ADR-002 moved this schema out of `src/engine/questions.ts`
+ * for the reason the ADR was written at all: story 3-1 is a *second process* holding the other half of the
+ * compare-and-set, and an implementer reading AD-25's original wording would contend on `state.json` —
+ * the file this arrangement treats as derived output. Two resolvers arbitrating on different objects
+ * would both win, which is precisely the race the decision exists to make impossible. So the shape of the
+ * file that decides is declared at the contracts surface, not behind a doc comment in the engine.
+ *
+ * It carries the whole transition — which resolver, which principal, what they answered — so `state.json`
+ * and the events are both *derivable* from it and neither is a second authority. `intent_id` is here for
+ * the redelivery AD-19 makes ordinary: the same gesture arriving twice must be told it won, not told it
+ * lost to itself.
+ *
+ * `intent_id` is validated by the **command contract's own** id rules rather than the question's. It holds
+ * a `CommandIntent.intent_id`, and borrowing `QuestionSchema.shape.id` for it coupled the validity of an
+ * intent id to whatever rule a question id happens to carry — so tightening one would make the other throw
+ * from inside `outcomeRecord`, on a value the command contract had already accepted.
+ */
+export const QuestionOutcomeSchema = versioned({
+  question_id: QuestionSchema.shape.id,
+  resolution: QuestionResolutionSchema.nullable(),
+  deflection: QuestionDeflectionSchema.nullable(),
+  /** The steering intent that claimed this outcome, or `null` for the timeout resolver. */
+  intent_id: CommandIntentSchema.shape.intent_id.nullable(),
+  claimed_at: QuestionSchema.shape.asked_at,
+}).refine((outcome) => (outcome.resolution === null) !== (outcome.deflection === null), {
+  message: 'an outcome records exactly one of a resolution and a deflection',
+  path: ['resolution'],
+});
+
+export type QuestionOutcome = z.infer<typeof QuestionOutcomeSchema>;
 
 /** The outcome of an attempted transition. A losing resolver is told, not thrown at. */
 export interface QuestionTransition {

@@ -119,6 +119,7 @@ import type { IntentEffect, QuestionSteering } from './steering.js';
 import { DECISION_EVENT_TYPE, decidedQuestionIds, decisionFor, decisionPayload } from './decision.js';
 import {
   QUESTION_EVENT_TYPES,
+  UnloggableQuestionId,
   activeQuestion,
   askQuestion,
   askedQuestionIds,
@@ -131,8 +132,10 @@ import {
   questionAskedPayload,
   questionEventPayload,
   questionResolution,
+  readQuestionDirectory,
   settleQuestion,
   settledQuestionIds,
+  sweepQuestionTemporaries,
 } from './questions.js';
 import type { QuestionClaim, SettledQuestion } from './questions.js';
 import {
@@ -413,7 +416,21 @@ export interface QuestionPassOutcome {
   readonly settled: readonly QuestionPassAction[];
   /** Questions still `asked` whose window has not yet passed. Nothing is owed for them. */
   readonly open: readonly string[];
-  /** Questions this pass could not read — a torn state file, an unrecognised version. */
+  /**
+   * Questions still `asked` that nothing will ever resolve, because their run has reached `[*]`.
+   *
+   * A bucket of their own, and the distinction is a renderer's whole problem. AD-8 keeps a default from
+   * being taken against a terminal run — a decision about work that has stopped — so such a question keeps
+   * its `asked` state for ever, which is the honest record. It was nevertheless counted among {@link open},
+   * whose own docblock says "whose window has not yet passed", so story 1-10's card said `N question(s)
+   * open, none due` about a question nobody is waiting on and no window will close. Separating them is what
+   * lets a surface say "abandoned unanswered" instead of "still waiting".
+   */
+  readonly abandoned: readonly string[];
+  /**
+   * Questions this pass could not act on — a torn state file, an unrecognised version, a read that failed,
+   * or a directory name that is not a loggable question id.
+   */
   readonly refused: readonly QuestionRefusal[];
 }
 
@@ -429,13 +446,21 @@ interface QuestionLedger {
   readonly decided: Set<string>;
 }
 
-/** One line naming what a pass did to a run's questions, for a reader. */
+/**
+ * One line naming what a pass did to a run's questions, for a reader.
+ *
+ * An abandoned question is named as abandoned rather than counted as open, because those are two different
+ * things to tell a person: one is a question still waiting for them, the other is one their run ended
+ * without.
+ */
 export const describeQuestions = (outcome: QuestionPassOutcome): string => {
   const parts = outcome.settled.map((entry) => `${entry.questionId} ${entry.kind}`);
   for (const entry of outcome.refused) parts.push(`${entry.questionId} refused: ${entry.code}`);
-  return parts.length === 0
-    ? `${String(outcome.open.length)} question(s) open, none due.`
-    : `Questions settled: ${parts.join('; ')}.`;
+  if (parts.length > 0) return `Questions settled: ${parts.join('; ')}.`;
+  const waiting = `${String(outcome.open.length)} question(s) open, none due.`;
+  return outcome.abandoned.length === 0
+    ? waiting
+    : `${waiting} ${String(outcome.abandoned.length)} abandoned unanswered on a terminal run.`;
 };
 
 /** One line naming what a pass did to a run's intents, for the action it is reported as. */
@@ -1649,7 +1674,7 @@ export class Reconciler {
       this.emit(recorder, {
         step: state.question.step,
         type: QUESTION_EVENT_TYPES.Asked,
-        payload: questionAskedPayload(state),
+        payload: questionAskedPayload(state, this.redaction),
       });
       ledger.asked.add(questionId);
       kind = 'asked';
@@ -1659,7 +1684,7 @@ export class Reconciler {
       this.emit(recorder, {
         step: state.question.step,
         type: settled.eventType,
-        payload: questionEventPayload(state),
+        payload: questionEventPayload(state, this.redaction),
       });
       ledger.settled.add(questionId);
       kind =
@@ -1676,7 +1701,7 @@ export class Reconciler {
       this.emit(recorder, {
         step: state.question.step,
         type: DECISION_EVENT_TYPE,
-        payload: decisionPayload(decision),
+        payload: decisionPayload(decision, this.redaction),
       });
       ledger.decided.add(questionId);
       decisionRecorded = true;
@@ -1713,8 +1738,8 @@ export class Reconciler {
    */
   private settleQuestions(loaded: LoadedState): QuestionPassOutcome | null {
     const { paths } = loaded;
-    const questionIds = listQuestionIds(paths);
-    if (questionIds.length === 0) return null;
+    const listing = readQuestionDirectory(paths);
+    if (listing.ids.length === 0 && listing.unloggable.length === 0) return null;
 
     /**
      * The log is re-read rather than taken from the loaded state, and it has to be: consuming an intent
@@ -1722,13 +1747,43 @@ export class Reconciler {
      * state the pass *opened* with would append them a second time. The read costs nothing for a run with
      * no questions, because it is guarded above.
      */
-    const ledger = this.questionLedger(readEventLog(paths.eventLog));
-    const terminal = isTerminalFeatureState(loaded.state.state);
+    const events = readEventLog(paths.eventLog);
+    const ledger = this.questionLedger(events);
+    /**
+     * The *feature state* is re-read from those same lines, for exactly the reason the ledger is.
+     *
+     * `pass` consumes intents before it settles questions, so a `kill` sitting in `commands/` has already
+     * been applied by the time this runs — and reading `loaded.state`, which is the state the pass *opened*
+     * with, said the run was still live. The consequence was not cosmetic: an overdue question on a run this
+     * very pass had killed had its default taken, `question.default_taken` appended and a decision recorded
+     * against work that had already stopped, which is the one thing the terminal guard below exists to
+     * prevent. AD-4 makes the log the authority, so the state is folded from the lines as they stand now.
+     */
+    const current = rebuildFromLog(events, {
+      run: paths.runId,
+      plan: loaded.plan,
+      now: this.now,
+    });
+    const terminal = isTerminalFeatureState(current.state);
     const settledActions: QuestionPassAction[] = [];
     const open: string[] = [];
+    const abandoned: string[] = [];
     const refused: QuestionRefusal[] = [];
 
-    for (const questionId of questionIds) {
+    /**
+     * A directory name this build cannot carry into a payload is refused, not skipped.
+     *
+     * Skipping it — which is what filtering the listing amounted to — made the question invisible to every
+     * pass: no window taken, no line appended, no refusal, and nobody told that a question existed at all.
+     * An id from an older build, or one story 3-1's web resolver minted differently, would have vanished
+     * without trace, while a torn state file beside it was reported. Same class of fault, same treatment.
+     */
+    for (const name of listing.unloggable) {
+      const unusable = new UnloggableQuestionId(name);
+      refused.push({ questionId: name, code: unusable.code, reason: unusable.message });
+    }
+
+    for (const questionId of listing.ids) {
       try {
         let settled = settleQuestion(paths, questionId);
 
@@ -1745,9 +1800,11 @@ export class Reconciler {
           settled = settleQuestion(paths, questionId);
         }
 
-        const acted = this.recordQuestion(paths, loaded.state.feature, settled, ledger);
+        const acted = this.recordQuestion(paths, current.feature, settled, ledger);
         if (acted !== null) settledActions.push(acted);
-        if (settled.outcome === null) open.push(questionId);
+        // Still `asked`, and told apart by whether anything can still resolve it: a live run's question is
+        // waiting for a person, a terminal run's is one the run ended without.
+        if (settled.outcome === null) (terminal ? abandoned : open).push(questionId);
       } catch (thrown: unknown) {
         /**
          * One unreadable question does not stop the others, for the same reason one unreadable run does not
@@ -1764,7 +1821,7 @@ export class Reconciler {
       }
     }
 
-    return { run: paths.runId, settled: settledActions, open, refused };
+    return { run: paths.runId, settled: settledActions, open, abandoned, refused };
   }
 
   /**
@@ -1798,13 +1855,34 @@ export class Reconciler {
 
     const target = activeQuestion(paths) ?? lastSettledQuestion(paths);
     if (target === null) {
+      /**
+       * No question exists, so the refusal has to say what *is* true rather than describe a question the
+       * person never saw.
+       *
+       * `reject` is the case that forced this sentence to be written carefully. Its own note cites CAP-18 —
+       * rejection at an approval gate — and that is exactly the case it cannot serve: `approve` is an
+       * `effect` command that acts on a `blocked` run, while `reject` is a `question` command, so a person
+       * looking at a gate who presses reject reaches this branch. Telling them their rejection "has nothing
+       * to resolve" under `questions/` describes machinery they were never shown. So a blocked run is named
+       * as a blocked run, and the refusal states plainly that this build's rejection answers a question
+       * rather than a gate. Giving `reject` a non-question path means declaring a lifecycle transition for a
+       * rejected gate, which nothing in the spine or the lifecycle declares — so it is a spec decision, not
+       * a patch, and is reported rather than guessed at.
+       */
+      const atAGate = state.state === 'blocked';
       return {
         reason: '',
         refusal: refusal(
           'no-open-question',
-          `Run ${paths.runId} has no question under questions/, so "${intent.command}" has nothing to ` +
-            'resolve. The answer is quarantined rather than met by every later pass, and nothing was ' +
-            'recorded: an answer to no question is not a decision.',
+          atAGate
+            ? `Run ${paths.runId} is blocked at a gate, and "${intent.command}" is a question command in ` +
+              'this build: it resolves an open question through the AD-25 compare-and-set, and this run ' +
+              'has none. So nothing was recorded, and the gate still stands exactly as it did — it was ' +
+              'not rejected, and nothing about the run changed. Approving the gate is "approve"; what a ' +
+              'rejection at a gate should do to the run is not a transition this build declares (CAP-18).'
+            : `Run ${paths.runId} has no question under questions/, so "${intent.command}" has nothing ` +
+              'to resolve. The answer is quarantined rather than met by every later pass, and nothing ' +
+              'was recorded: an answer to no question is not a decision.',
         ),
       };
     }
@@ -1907,6 +1985,16 @@ export class Reconciler {
      * checkpoint's sweep, because `load` is the one place every path through the loop passes through.
      */
     sweepCommandTemporaries(paths, { now: this.now });
+    /**
+     * And the same sweep for `questions/`, which had none either.
+     *
+     * A resolver killed between its `write` and its `link` or `rename` leaves a `.tmp` beside the outcome —
+     * debris, never a decision, because nothing reads a name that was never published. Bounded here beside
+     * the other two for the same reason: `load` is the one place every path through the loop passes
+     * through, and a directory that only ever grows is a slower version of the same fault. It also keeps
+     * the AD-25 directory listing to the two files ADR-002 says it holds, which the race suite asserts.
+     */
+    sweepQuestionTemporaries(paths, { now: this.now });
     pruneRetiredIntents(paths);
     const events = readEventLog(paths.eventLog);
     // An unrecognised `schema_version` throws out of here, per AD-28: this build does not operate on a

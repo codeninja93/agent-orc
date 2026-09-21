@@ -17,7 +17,7 @@ import { rmSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { QuestionDraft } from '../src/contracts/index.js';
-import { readEventLog, runPaths } from '../src/runtime/index.js';
+import { describeDefaultTaken, readEventLog, runPaths } from '../src/runtime/index.js';
 import {
   DECISION_EVENT_TYPE,
   QUESTION_EVENT_TYPES,
@@ -212,15 +212,75 @@ describe('the window expires: the default is taken, and it is a decision like an
   it('does not take a default against a terminal run, which nothing walks backwards', async () => {
     const reconciler = openReconciler();
     const run = reconciler.acceptFeature(makePlan()).run;
-    reconciler.ask(run, aDraft());
+    const asked = reconciler.ask(run, aDraft());
     reconciler.disengage(run);
     advance(WINDOW_MS * 5);
 
-    await reconciler.pass();
+    const result = await reconciler.pass();
 
     // The question keeps its `asked` state, which is the honest record: it was asked and never answered.
     expect(typesOf(run)).not.toContain(QUESTION_EVENT_TYPES.DefaultTaken);
     expect(reconciler.questions(run)[0]?.state.status).toBe('asked');
+    expect(decisionsInLog(readEventLog(runPaths(run, home).eventLog))).toStrictEqual([]);
+
+    /**
+     * And it is reported as *abandoned*, not as open.
+     *
+     * `open`'s own docblock says "whose window has not yet passed", and this question's window passed long
+     * ago and nothing will ever close it — so counting it there made story 1-10's card say `N question(s)
+     * open, none due` about a question nobody is waiting on. Two different things to tell a person.
+     */
+    const outcome = result.questions.find((entry) => entry.run === run);
+    expect(outcome?.open).toStrictEqual([]);
+    expect(outcome?.abandoned).toStrictEqual([asked.question.id]);
+    expect(describeQuestions(outcome ?? (null as never))).toContain('abandoned unanswered');
+  });
+
+  it('does not take a due default against a run the same pass has just killed', async () => {
+    /**
+     * The live defect this covers. `pass` consumes intents and *then* settles questions, and
+     * `settleQuestions` deliberately re-reads the log for its ledger — with the comment saying why —
+     * while still reading the *feature state* the pass opened with. So a run with an overdue question and
+     * a `kill` waiting in `commands/` came out of one pass killed **and** carrying
+     * `question.default_taken` plus a `decision.recorded` line: a durable decision about work that had
+     * already stopped, which is the one thing the terminal guard exists to prevent (AD-8).
+     */
+    const reconciler = openReconciler();
+    const run = reconciler.acceptFeature(makePlan()).run;
+    const asked = reconciler.ask(run, aDraft());
+    writeCommandIntent(
+      runPaths(run, home),
+      newCommandIntent({
+        intentId: mintIntentId(mintRunId()),
+        command: 'kill',
+        run,
+        feature: 'engine-reconciler',
+        principal: { kind: 'user', id: 'deep' },
+        source: 'tui',
+        issuedAt: clock,
+      }),
+    );
+    advance(WINDOW_MS);
+
+    const result = await reconciler.pass();
+
+    // One pass: the kill is applied...
+    expect(
+      result.steering.find((entry) => entry.run === run)?.applied.map((entry) => entry.kind),
+    ).toStrictEqual(['applied']);
+    expect(reconciler.load(run).state.state).toBe('killed');
+
+    // ...and no default is taken against the run it just killed, in that same pass.
+    const outcome = result.questions.find((entry) => entry.run === run);
+    expect(outcome?.settled).toStrictEqual([]);
+    expect(outcome?.abandoned).toStrictEqual([asked.question.id]);
+    expect(typesOf(run)).not.toContain(QUESTION_EVENT_TYPES.DefaultTaken);
+    expect(decisionsInLog(readEventLog(runPaths(run, home).eventLog))).toStrictEqual([]);
+    expect(reconciler.questions(run)[0]?.state.status).toBe('asked');
+
+    // Nor on any later pass, for the same reason.
+    await reconciler.pass();
+    expect(typesOf(run)).not.toContain(QUESTION_EVENT_TYPES.DefaultTaken);
     expect(decisionsInLog(readEventLog(runPaths(run, home).eventLog))).toStrictEqual([]);
   });
 });
@@ -336,5 +396,96 @@ describe('the window beats the answer: the human is told it timed out', () => {
     expect(claim.created).toBe(false);
     expect(claim.refusal).toContain('already');
     expect(claim.state.resolution?.resolver).toBe('tui');
+  });
+});
+
+describe('losing to something other than the clock is never reported as a timeout', () => {
+  it('tells a loser who answered first, naming the resolver and the principal', () => {
+    /**
+     * `describeDefaultTaken`'s non-timeout branch could be neutralised — returning the timeout sentence for
+     * every loser — and all 794 tests stayed green: the one test covering it matched `/already|stands/i`,
+     * and the timeout sentence contains "stands" too. So a person who lost to a colleague's answer was told
+     * the window had expired and a default had been taken, when no window expired and no default exists.
+     * This module's own comment says the message is what stops "a user who believes their answer landed and
+     * a system that took the default" from diverging; naming the wrong cause is a different divergence.
+     */
+    const reconciler = openReconciler();
+    const run = reconciler.acceptFeature(makePlan()).run;
+    const asked = reconciler.ask(run, aDraft());
+
+    // Well inside the window: nothing about this is a timeout.
+    advance(60_000);
+    reconciler.answer(run, 'squash', { principal: { kind: 'user', id: 'nadia' }, source: 'web' });
+
+    let raised: SteeringRefused | null = null;
+    try {
+      reconciler.answer(run, 'keep', { principal: { kind: 'user', id: 'deep' }, source: 'tui' });
+    } catch (thrown: unknown) {
+      raised = thrown as SteeringRefused;
+    }
+
+    expect(raised).toBeInstanceOf(SteeringRefused);
+    // Who got there first, and on whose behalf: a decision nobody is named for is what AD-25 forbids.
+    expect(raised?.message).toContain('web');
+    expect(raised?.message).toContain('nadia');
+    expect(raised?.message).toContain('squash');
+    expect(raised?.message).toContain('wrote nothing');
+    // And emphatically not the clock's sentence: no window expired and no default was taken.
+    expect(raised?.message).not.toContain('timed out');
+    expect(raised?.message).toContain('no default was taken');
+
+    const settled = settleQuestion(runPaths(run, home), asked.question.id);
+    expect(settled.state.resolution?.resolver).toBe('web');
+    expect(describeDefaultTaken(settled.state)).not.toContain('timed out');
+  });
+
+  it('tells a loser that the question was deflected, naming the source and the anchor', () => {
+    /**
+     * The deflection case asserted only the error class, so it too was handed the timeout sentence: a
+     * person whose question was answered from the ledger before it ever reached them was told a window had
+     * expired. Nobody was asked at all (Q4), and there is no rival answer to point at either.
+     */
+    const reconciler = openReconciler();
+    const run = reconciler.acceptFeature(makePlan()).run;
+    const asked = reconciler.ask(run, aDraft());
+    reconciler.deflect(run, asked.question.id, {
+      source: 'decision_ledger',
+      answer: 'the step commits were kept for this area last week',
+      anchor: 'decision:squash-policy',
+    });
+
+    let raised: SteeringRefused | null = null;
+    try {
+      reconciler.answer(run, 'squash', { principal: { kind: 'user', id: 'deep' } });
+    } catch (thrown: unknown) {
+      raised = thrown as SteeringRefused;
+    }
+
+    expect(raised).toBeInstanceOf(SteeringRefused);
+    expect(raised?.message).toContain('decision ledger');
+    expect(raised?.message).toContain('decision:squash-policy');
+    expect(raised?.message).not.toContain('timed out');
+    expect(raised?.message).toContain('no default was taken');
+    // No decision was recorded for it either, because nobody was asked (AD-25).
+    expect(decisionsInLog(readEventLog(runPaths(run, home).eventLog))).toStrictEqual([]);
+  });
+
+  it('still tells the clock’s loser that it timed out, which is the case that must not change', () => {
+    const reconciler = openReconciler();
+    const run = reconciler.acceptFeature(makePlan()).run;
+    reconciler.ask(run, aDraft());
+    advance(WINDOW_MS);
+    const settled = reconciler.questions(run)[0];
+    expect(settled?.state.status).toBe('asked');
+
+    // Taken by the clock, so the sentence is the clock's.
+    takeQuestionDefault(
+      runPaths(run, home),
+      settled?.state.question.id ?? '',
+      settled?.state.question ?? (null as never),
+      clock,
+    );
+    const defaulted = reconciler.questions(run)[0];
+    expect(describeDefaultTaken(defaulted?.state ?? (null as never))).toContain('timed out');
   });
 });

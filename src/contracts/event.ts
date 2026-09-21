@@ -32,6 +32,20 @@ export const TimestampSchema = z.string().refine(isRfc3339Millis, {
 export const formatTimestamp = (at: Date = new Date()): string => at.toISOString();
 
 /**
+ * The ledger line a resolved question writes (AD-25, amended by ADR-002).
+ *
+ * Declared here, as a named constant, for the reason ADR-002 gives: AD-25 *requires* a decision ledger
+ * and says only a resolved question writes to it, so the type carrying that record has to be declarable.
+ * AD-5's open vocabulary makes an undeclared type legal to *read*, which is not a reason for this
+ * project's own writer to emit one — and `isDeclaredEventType('decision.recorded')` answered `false`
+ * while `isDeclaredEventType('question.resolved')` answered `true`.
+ *
+ * `src/engine/decision.ts` points its `DECISION_EVENT_TYPE` at this constant rather than spelling the
+ * string a second time, so there is one spelling of the type in the codebase.
+ */
+export const DECISION_RECORDED_EVENT_TYPE = 'decision.recorded';
+
+/**
  * The declared event vocabulary. Dot-namespaced and past-tense. The vocabulary is open by
  * design: a reader meeting a type absent from this list accepts the envelope and ignores the
  * event, so later stories add types without a breaking change.
@@ -50,6 +64,14 @@ export const EVENT_TYPES = [
   'question.resolved',
   'question.default_taken',
   'question.deflected',
+  /**
+   * The decision a resolved question left (AD-25, ADR-002 decision 4).
+   *
+   * Separate from `question.resolved` on purpose: the first says a transition happened, this says a
+   * decision was recorded — which is what makes "only a resolved question writes to the decision ledger"
+   * observable rather than inferred, because a deflection emits the first kind of line and never this one.
+   */
+  DECISION_RECORDED_EVENT_TYPE,
   /**
    * The request and the ordered acceptance criteria this run is built against (CAP-2).
    *

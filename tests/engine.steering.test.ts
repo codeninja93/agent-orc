@@ -25,6 +25,7 @@ import {
   COMMAND_EVENT_TYPES,
   COMMAND_HANDLING,
   HONOURED_COMMANDS,
+  QUESTION_COMMANDS,
   Reconciler,
   SteeringRefused,
   TAKE_OVER_HANDOFF_CODE,
@@ -292,6 +293,32 @@ describe('a terminal run refuses every command', () => {
       if (decision.kind !== 'refuse') continue;
       expect(decision.reason).toBe('terminal-run');
       expect(decision.detail).toContain('committed');
+    }
+  });
+
+  it('refuses each of the three question commands on a terminal run, with real text in hand', () => {
+    /**
+     * The three question commands, named one at a time with a non-empty argument, because that is the only
+     * shape in which the guard can fail. Moving the `handling.kind === 'question'` block above the terminal
+     * check returns `resolve-question` here — a durable decision written about stopped work — and a fixture
+     * whose `argument` was `null` would not notice: `missing-answer` is a refusal too, so an assertion on
+     * `kind` alone stays green. The refusal *reason* is therefore what is asserted.
+     */
+    // Driven from the exported list rather than from a literal of its own, so the table that decides
+    // which commands are question commands is the table this guard is asserted over.
+    expect([...QUESTION_COMMANDS].sort()).toStrictEqual(['answer', 'edit_criterion', 'reject']);
+    for (const command of QUESTION_COMMANDS) {
+      expect(COMMAND_HANDLING[command].kind, command).toBe('question');
+      const intent = anIntent(command, null, 'the second option, and log it either way');
+      expect(intent.argument).not.toBeNull();
+      for (const state of ['committed', 'killed', 'handed_off', 'hibernated'] as const) {
+        const decision = decideSteering(intent, aState({ state }), noneApplied);
+        expect(decision.kind, `${command} on ${state}`).toBe('refuse');
+        if (decision.kind !== 'refuse') continue;
+        // `terminal-run`, not `missing-answer`: the guard held for the reason it exists.
+        expect(decision.reason, `${command} on ${state}`).toBe('terminal-run');
+        expect(decision.detail, `${command} on ${state}`).toContain(state);
+      }
     }
   });
 

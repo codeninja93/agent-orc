@@ -80,19 +80,49 @@ export const recommendedOption = (
 };
 
 /**
- * What a person is told when the clock beat them.
+ * What a person is told when somebody — or something — else got there first.
  *
  * Plain, and naming the decision that stands rather than only the failure: the losing path's message is
  * the only thing standing between "my answer landed" and a durable decision that says otherwise. The
  * one-question card renders this verbatim rather than paraphrasing it, so the terminal and the engine's
  * refusal say the same thing about the same decision.
+ *
+ * **Three outcomes, and each is named as what it is.** Two of them used to fall into one branch that said
+ * "the answer that got there first stands", and the branch above it was reached by *resolver* rather than
+ * by the shape of the loss — so a person who lost to a colleague's answer, and a person whose question was
+ * deflected from the ledger, were both handed a sentence about a window that had expired and a default
+ * that did not exist. Neutralising this function's non-timeout branch left the whole suite green, which is
+ * how the divergence stayed invisible: the one test covering it matched `/already|stands/i`, and the
+ * timeout sentence contains "stands" too.
+ *
+ * So: the clock is told as a window that passed and a default that was taken; another resolver is told as
+ * *who* answered, because a decision nobody is named for is the one thing AD-25 will not have; and a
+ * deflection is told as the source and anchor it was answered from, because nobody was asked at all (Q4)
+ * and there is no rival answer to point at.
  */
 export const describeDefaultTaken = (state: QuestionState): string => {
   const resolution = state.resolution;
-  if (resolution?.resolver !== 'timeout_default') {
+  const deflection = state.deflection;
+  if (deflection !== null) {
     return (
-      `Question ${state.question.id} was already ${state.status} when this answer arrived, so the ` +
-      'answer that got there first stands and nothing was written.'
+      `Question ${state.question.id} was answered from the ${deflection.source.replace(/_/g, ' ')} ` +
+      `before it reached anybody, so it was never put to a person and this answer wrote nothing. The ` +
+      `answer on record is "${deflection.answer}" (anchor: ${deflection.anchor}). No window expired and ` +
+      'no default was taken.'
+    );
+  }
+  if (resolution !== null && resolution.resolver !== 'timeout_default') {
+    return (
+      `Question ${state.question.id} was already resolved when this answer arrived: the ` +
+      `${resolution.resolver} resolver got there first, on behalf of ${resolution.principal.kind} ` +
+      `"${resolution.principal.id}", and answered "${resolution.answer}". That decision stands and is ` +
+      'recorded; this answer wrote nothing. No window expired and no default was taken.'
+    );
+  }
+  if (resolution === null) {
+    return (
+      `Question ${state.question.id} is ${state.status}, so no decision stands for it yet and nothing ` +
+      'was written. No window expired and no default was taken.'
     );
   }
   return (

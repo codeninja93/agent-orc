@@ -15,14 +15,23 @@
  *
  * **Every value is short and punctuated.** The payload is subject to AD-21's pass like any other, and the
  * one field a reader keys on — the question id — is punctuated by `mintQuestionId` for exactly that
- * reason. A rejection's reason travels here as prose, which the pass leaves alone, and it is never
- * discarded: "rejection is one keystroke plus a reason, and the reason becomes a ledger entry" is a line
- * of the interface contract, so the reason *is* the decision when a rejection is what resolved the
- * question.
+ * reason. A rejection's reason travels here as prose, which the pass leaves alone in the ordinary case,
+ * and it is never discarded: "rejection is one keystroke plus a reason, and the reason becomes a ledger
+ * entry" is a line of the interface contract, so the reason *is* the decision when a rejection is what
+ * resolved the question.
+ *
+ * **Where that claim needed qualifying.** Q6 imposes no format on a human, so a reason may contain an
+ * unbroken high-entropy run — a SHA, a token, a long path — and AD-21 rewrites one wherever it appears in
+ * a payload. The verbatim reason survives in `questions/<id>/state.json`, which is why the decision is not
+ * lost; what used to be lost was any *record* that the two disagreed. The payload now names the fields the
+ * pass rewrote, so the ledger says so rather than presenting a marker as the words a person wrote. The
+ * remedy is never a wider allow-list: AD-21 is a write-path invariant with no after-the-fact remedy.
  */
+import { DECISION_RECORDED_EVENT_TYPE } from '../contracts/index.js';
 import type { EventEnvelope, QuestionState } from '../contracts/index.js';
+import type { RedactionPolicy } from '../runtime/index.js';
 
-import { QUESTION_ID_PAYLOAD_KEY } from './questions.js';
+import { QUESTION_ID_PAYLOAD_KEY, notingRedactedFields } from './questions.js';
 
 /**
  * The event type a decision is recorded as.
@@ -30,10 +39,14 @@ import { QUESTION_ID_PAYLOAD_KEY } from './questions.js';
  * Not one of the four AD-25 names, and separate from them on purpose: `question.resolved` says a
  * transition happened, and this says a decision was recorded. Keeping them apart is what makes "only a
  * resolved question writes to the decision ledger" observable — a deflection emits the first kind of line
- * and never the second, which a reader can check rather than infer. AD-5 makes adding a type safe: a
- * reader that does not know it ignores it.
+ * and never the second, which a reader can check rather than infer.
+ *
+ * **Declared in `src/contracts/event.ts`, and pointed at here** (ADR-002 decision 4). AD-5's open
+ * vocabulary makes an undeclared type legal to *read*, which is not a reason for this project's own writer
+ * to emit one — and `isDeclaredEventType('decision.recorded')` answered `false` while the type was spelled
+ * only in this module. One spelling, in the contract, so the ledger AD-25 requires is declarable.
  */
-export const DECISION_EVENT_TYPE = 'decision.recorded';
+export const DECISION_EVENT_TYPE = DECISION_RECORDED_EVENT_TYPE;
 
 /** What one decision records. Flat, prose-and-enum, and readable back out of the log unchanged. */
 export interface DecisionRecord {
@@ -81,17 +94,41 @@ export const decisionFor = (state: QuestionState): DecisionRecord | null => {
   };
 };
 
-/** The payload of a `decision.recorded` line. */
-export const decisionPayload = (record: DecisionRecord): Record<string, unknown> => ({
-  [QUESTION_ID_PAYLOAD_KEY]: record.questionId,
-  question: record.question,
-  answer: record.answer,
-  option_id: record.optionId,
-  resolver: record.resolver,
-  principal_kind: record.principalKind,
-  principal_id: record.principalId,
-  resolved_at: record.resolvedAt,
-});
+/**
+ * The payload of a `decision.recorded` line.
+ *
+ * Eight fields, and story 5-3 indexes every one of them, which is why none is decorative: `option_id` is
+ * what a later run reads back to avoid asking the same question twice (Q7), `resolved_at` is what orders
+ * two decisions about one area, and the question text is what makes the entry legible without reopening a
+ * question file that a consolidation pass may have swept.
+ *
+ * `policy` is the active AD-21 policy, so the line can name the free-text fields the pass is about to
+ * rewrite in it. See {@link REDACTED_FIELDS_PAYLOAD_KEY}: without it, a rejection whose reason contained a
+ * SHA reached the log as `[redacted]` while the question's state file kept the reason verbatim, and this
+ * module's claim that the reason is never discarded was true of `questions/` and quietly false of the
+ * ledger.
+ */
+export const decisionPayload = (
+  record: DecisionRecord,
+  policy: RedactionPolicy = {},
+): Record<string, unknown> =>
+  notingRedactedFields(
+    {
+      [QUESTION_ID_PAYLOAD_KEY]: record.questionId,
+      question: record.question,
+      answer: record.answer,
+      option_id: record.optionId,
+      resolver: record.resolver,
+      principal_kind: record.principalKind,
+      principal_id: record.principalId,
+      resolved_at: record.resolvedAt,
+    },
+    [
+      ['answer', record.answer],
+      ['question', record.question],
+    ],
+    policy,
+  );
 
 /**
  * The question ids the log already carries a decision for.

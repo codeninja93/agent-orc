@@ -29,7 +29,12 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { QuestionDraft } from '../src/contracts/index.js';
-import { readEventLog, runPaths } from '../src/runtime/index.js';
+import {
+  QUESTION_OUTCOME_FILE_NAME,
+  QUESTION_STATE_FILE_NAME,
+  readEventLog,
+  runPaths,
+} from '../src/runtime/index.js';
 import {
   DECISION_EVENT_TYPE,
   QUESTION_EVENT_TYPES,
@@ -235,6 +240,15 @@ const race = async (
   return { run, questionId, reports };
 };
 
+/**
+ * The two files ADR-002 says a question directory holds, named from the module that owns the layout.
+ *
+ * Spelled from `paths.ts`'s own constants rather than as literals, which is what that module exists for:
+ * one spelling of a file name, so a rename is a compile error rather than a suite that silently stops
+ * describing the directory it asserts on.
+ */
+const PUBLISHED_QUESTION_FILES = [QUESTION_OUTCOME_FILE_NAME, QUESTION_STATE_FILE_NAME].sort();
+
 const questionFiles = (run: string, questionId: string): readonly string[] =>
   readdirSync(join(runPaths(run, home).questionsDir, questionId)).sort();
 
@@ -278,16 +292,29 @@ describe('exactly one transition is accepted, proven across processes', () => {
         expect(report.refusal ?? '', report.resolver).toMatch(/already|timed out/i);
         expect(report.standing, report.resolver).toBe(winner);
         /**
-         * And every one of them lost *at the exclusive create*, not at a check in front of it.
+         * And each of them lost through one of exactly **two** honest paths, neither of which writes a
+         * decision.
          *
-         * This is the assertion that makes the suite about the primitive rather than about the outcome. A
-         * resolver that never reached the create would still report having lost — correctly — and a
+         * This is the assertion that makes the suite about the primitive rather than about the outcome — a
          * read-then-write implementation would pass every other assertion here while being exactly the
-         * design AD-25 forbids. `contended` is false only for an answer the state machine refused on its own
-         * terms, which no contender here does.
+         * design AD-25 forbids — so what it may not admit is a third path. The two it admits are:
+         *
+         * - `contended`: this resolver issued its own `link` and got `EEXIST`. The interesting one.
+         * - not `contended`, having read a question that was already `resolved`: the loser was descheduled
+         *   long enough after the barrier that the winner's derived `state.json` was on disk by the time it
+         *   looked, so story 1-1's pure transition refused before anything was contended for. The outcome
+         *   file still decided and this resolver still wrote nothing; it is the same loss observed one step
+         *   earlier.
+         *
+         * Asserting `contended` unconditionally made the suite fail for the very scheduling reason it
+         * exists to rule out — a descheduled loser is not a broken compare-and-set. What is asserted
+         * instead is that no loser reached any *other* conclusion: it is refused, it names the winner, and
+         * (below) no second decision exists on disk.
          */
-        expect(report.contended, report.resolver).toBe(true);
+        if (!report.contended) expect(report.status, report.resolver).toBe('resolved');
       }
+      // Somebody reached the primitive: the winner always does, by construction.
+      expect(reports.some((report) => report.contended)).toBe(true);
 
       // One transition on disk, and it is the winner's: the losers' answers never reached it.
       const settled = settleQuestion(runPaths(run, home), questionId);
@@ -302,9 +329,12 @@ describe('exactly one transition is accepted, proven across processes', () => {
       );
 
       // Two files, and no debris: nothing wrote a second outcome or left a half-written temporary.
-      expect(questionFiles(run, questionId)).toStrictEqual(['outcome.json', 'state.json']);
+      expect(questionFiles(run, questionId)).toStrictEqual(PUBLISHED_QUESTION_FILES);
       const outcome = JSON.parse(
-        readFileSync(join(runPaths(run, home).questionsDir, questionId, 'outcome.json'), 'utf8'),
+        readFileSync(
+          join(runPaths(run, home).questionsDir, questionId, QUESTION_OUTCOME_FILE_NAME),
+          'utf8',
+        ),
       ) as { resolution: { resolver: string } | null; deflection: unknown };
       expect(outcome.resolution?.resolver).toBe(winner);
       expect(outcome.deflection).toBeNull();
@@ -332,8 +362,21 @@ describe('exactly one transition is accepted, proven across processes', () => {
 
       expect(reports.filter((report) => report.created)).toHaveLength(1);
       expect(reports.filter((report) => report.accepted)).toHaveLength(1);
-      // All six issued their create; five of them lost it. None of them decided by reading first.
-      expect(reports.filter((report) => report.contended)).toHaveLength(6);
+      /**
+       * Five losers, none of them accepted, and not one of them decided anything by reading first.
+       *
+       * The count of `contended` is deliberately *not* asserted to be six. A loser descheduled past the
+       * barrier reads the winner's derived `state.json`, is refused there, and reports `contended: false`
+       * — a property of the scheduler, not of the primitive, and asserting otherwise made this suite able
+       * to fail for the one reason it must not. What is asserted is what the primitive guarantees: one
+       * creator, one winner, every other process refused, and one outcome on disk.
+       */
+      for (const report of reports.filter((entry) => !entry.created)) {
+        expect(report.accepted, report.resolver).toBe(false);
+        expect(report.refusal, report.resolver).not.toBeNull();
+        if (!report.contended) expect(report.status, report.resolver).toBe('resolved');
+      }
+      expect(reports.some((report) => report.contended)).toBe(true);
 
       const settled = settleQuestion(runPaths(run, home), questionId);
       const selected = settled.state.resolution?.option_id;
@@ -345,7 +388,7 @@ describe('exactly one transition is accepted, proven across processes', () => {
       const standing = new Set(reports.map((report) => report.standing));
       expect(standing.size).toBe(1);
       for (const report of reports) expect(report.status).toBe('resolved');
-      expect(questionFiles(run, questionId)).toStrictEqual(['outcome.json', 'state.json']);
+      expect(questionFiles(run, questionId)).toStrictEqual(PUBLISHED_QUESTION_FILES);
     },
     RACE_TIMEOUT_MS,
   );

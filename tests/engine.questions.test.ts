@@ -18,18 +18,35 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { writesToDecisionLedger } from '../src/contracts/index.js';
-import type { QuestionDraft, QuestionState } from '../src/contracts/index.js';
-import { REDACTION_MARKER, readEventLog, runPaths } from '../src/runtime/index.js';
+import { COMMAND_SOURCES, isDeclaredEventType, makeError, writesToDecisionLedger } from '../src/contracts/index.js';
+import type { CommandSource, QuestionDraft, QuestionState } from '../src/contracts/index.js';
+import {
+  DEFAULT_HIGH_ENTROPY_MIN_LENGTH,
+  QUESTION_OUTCOME_FILE_NAME,
+  QUESTION_STATE_FILE_NAME,
+  REDACTION_MARKER,
+  questionPaths,
+  readEventLog,
+  runPaths,
+} from '../src/runtime/index.js';
 import {
   DECISION_EVENT_TYPE,
   MAX_QUESTION_ID_TOKEN_RUN,
+  MAX_QUESTION_WINDOW_MS,
+  QUESTION_DRAFT_FIELDS,
   QUESTION_EVENT_TYPES,
+  QUESTION_RESOLVER_NAMES,
+  QUESTION_SEED_PATTERN,
   QuestionDraftRefused,
+  QuestionFileUnreadable,
+  QuestionOutcomeSchema,
+  REDACTED_FIELDS_PAYLOAD_KEY,
   Reconciler,
   SteeringRefused,
   TornQuestionState,
+  UnknownQuestion,
   UnloggableQuestionId,
+  UnusableQuestionSeed,
   askQuestion,
   attemptQuestionResolution,
   createRecordingResetter,
@@ -38,14 +55,24 @@ import {
   decisionFor,
   decisionsInLog,
   isLoggableQuestionId,
+  listQuestionIds,
+  mintIntentId,
   mintQuestionId,
   mintRunId,
   parseOptionSelection,
+  questionDefaultDueAt,
   questionResolution,
+  readQuestionDirectory,
+  readQuestionOutcome,
+  readQuestionState,
+  resolverForSource,
   settleQuestion,
   settledQuestionIds,
+  survivesRedaction,
+  sweepQuestionTemporaries,
   terminated,
 } from '../src/engine/index.js';
+import type { ScriptedExecutorOptions } from '../src/engine/index.js';
 
 import { makeHome, makePlan, planProvider } from './helpers/engine-fixture.js';
 
@@ -221,7 +248,10 @@ describe('asking a question makes it durable before it makes it visible', () => 
     expect(questionDirs(run)).toStrictEqual([asked.question.id]);
 
     const onDisk = JSON.parse(
-      readFileSync(join(runPaths(run, home).questionsDir, asked.question.id, 'state.json'), 'utf8'),
+      readFileSync(
+        join(runPaths(run, home).questionsDir, asked.question.id, QUESTION_STATE_FILE_NAME),
+        'utf8',
+      ),
     ) as QuestionState;
     expect(onDisk.question.id).toBe(asked.question.id);
     expect(onDisk.question.step).toBe('implement');
@@ -528,14 +558,18 @@ describe('a torn question state file is refused, and no transition is attempted'
     const tornId = mintQuestionId(mintRunId());
     const tornDir = join(runPaths(run, home).questionsDir, tornId);
     mkdirSync(tornDir, { recursive: true });
-    writeFileSync(join(tornDir, 'state.json'), '{"schema_version": 1, "question": {"id": "q-', 'utf8');
+    writeFileSync(
+      join(tornDir, QUESTION_STATE_FILE_NAME),
+      '{"schema_version": 1, "question": {"id": "q-',
+      'utf8',
+    );
 
     const result = await reconciler.pass();
     const questions = result.questions.find((entry) => entry.run === run);
     expect(questions?.refused.map((entry) => entry.questionId)).toStrictEqual([tornId]);
     expect(questions?.refused[0]?.code).toBe('internal.invariant_violated');
     // No transition against the torn question, and no outcome file invented for it.
-    expect(existsSync(join(tornDir, 'outcome.json'))).toBe(false);
+    expect(existsSync(join(tornDir, QUESTION_OUTCOME_FILE_NAME))).toBe(false);
     // The healthy question is untouched and still open.
     expect(questions?.open).toContain(healthy.question.id);
   });
@@ -546,7 +580,7 @@ describe('a torn question state file is refused, and no transition is attempted'
     const questionId = mintQuestionId(mintRunId());
     const dir = join(runPaths(run, home).questionsDir, questionId);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'state.json'), '{"schema_version": 1, "stat', 'utf8');
+    writeFileSync(join(dir, QUESTION_STATE_FILE_NAME), '{"schema_version": 1, "stat', 'utf8');
     expect(() => settleQuestion(runPaths(run, home), questionId)).toThrowError(TornQuestionState);
   });
 });
@@ -607,5 +641,618 @@ describe('a crash between the durable claim and its effect produces exactly one 
     await reconciler.pass();
     expect(typesOf(run).filter((type) => type === QUESTION_EVENT_TYPES.Asked)).toHaveLength(1);
     expect(questionDirs(run)).toStrictEqual([asked.state.question.id]);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Which question an answer resolves, and what each durable line carries
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * Two seeds whose minted ids sort in a known order, so a test can say *which* question it means.
+ *
+ * Explicit rather than minted from the clock: the property under test is that targeting is decided by the
+ * declared rule — the earliest question id — and a fixture whose ids happened to be in creation order
+ * could not tell that apart from "whatever `readdir` returned first".
+ */
+const SEEDS = [
+  '01K5NQ9ZJ7V3M2P9XQWRTC4BDA',
+  '01K5NQ9ZJ7V3M2P9XQWRTC4BDB',
+  '01K5NQ9ZJ7V3M2P9XQWRTC4BDC',
+  '01K5NQ9ZJ7V3M2P9XQWRTC4BDD',
+] as const;
+
+const questionIdOf = (index: number): string => mintQuestionId(SEEDS[index] ?? SEEDS[0]);
+
+describe('two questions open at once: an answer resolves one of them, by rule', () => {
+  it('resolves the earliest still-asked question and leaves the other asked', () => {
+    /**
+     * No test anywhere had two questions open on one run, and two mutations survived because of it:
+     * dropping `.sort()` from `listQuestionIds`, and flipping `activeQuestion` from earliest to latest.
+     * Either one attaches a person's answer, principal and decision record to a question they were never
+     * shown, while the one they answered stays open until its window defaults.
+     */
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const first = questionIdOf(0);
+    const second = questionIdOf(1);
+    // Asked in *reverse* id order, so creation order and id order disagree and the assertion is about
+    // the rule rather than about the directory.
+    reconciler.ask(run, aDraft({ prompt: 'the later id, asked first' }), { questionId: second });
+    reconciler.ask(run, aDraft({ prompt: 'the earlier id, asked second' }), { questionId: first });
+    expect(questionDirs(run)).toStrictEqual([first, second]);
+
+    reconciler.answer(run, 'ignore', { principal: { kind: 'user', id: 'deep' } });
+
+    const earliest = settleQuestion(runPaths(run, home), first);
+    const latest = settleQuestion(runPaths(run, home), second);
+    expect(earliest.state.status).toBe('resolved');
+    expect(earliest.state.resolution?.answer).toBe('ignore');
+    // The other question is untouched: no outcome, no resolution, still waiting for somebody.
+    expect(latest.state.status).toBe('asked');
+    expect(latest.outcome).toBeNull();
+
+    // And the durable record names the question that was resolved, not merely "a question".
+    const decisions = decisionsInLog(readEventLog(runPaths(run, home).eventLog));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.['question_id']).toBe(first);
+    const resolved = eventsOf(run).filter((event) => event.type === QUESTION_EVENT_TYPES.Resolved);
+    expect(resolved.map((event) => event.payload['question_id'])).toStrictEqual([first]);
+  });
+
+  it('lists question ids in minted order however the directory was created', () => {
+    // The ordering `activeQuestion` rests on. Created in descending id order, so an unsorted listing
+    // would have to be wrong about at least one of them.
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const ids = [0, 1, 2, 3].map(questionIdOf);
+    for (const questionId of [...ids].reverse()) reconciler.ask(run, aDraft(), { questionId });
+    expect(listQuestionIds(runPaths(run, home))).toStrictEqual(ids);
+  });
+
+  it('answers the second question once the first is resolved, never re-resolving the first', () => {
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const first = questionIdOf(0);
+    const second = questionIdOf(1);
+    reconciler.ask(run, aDraft(), { questionId: first });
+    reconciler.ask(run, aDraft(), { questionId: second });
+
+    reconciler.answer(run, 'reject', { principal: { kind: 'user', id: 'first-answer' } });
+    reconciler.answer(run, 'ignore', { principal: { kind: 'user', id: 'second-answer' } });
+
+    expect(settleQuestion(runPaths(run, home), first).state.resolution?.principal.id).toBe('first-answer');
+    expect(settleQuestion(runPaths(run, home), second).state.resolution?.principal.id).toBe(
+      'second-answer',
+    );
+    expect(decisionsInLog(readEventLog(runPaths(run, home).eventLog))).toHaveLength(2);
+  });
+});
+
+describe('the four durable payloads carry what story 5-3 will index', () => {
+  /**
+   * Four mutations each left the suite green: deleting `option_id` from the decision payload, deleting
+   * `question` and `resolved_at` from it, deleting `resolver`/`principal_kind`/`principal_id` from the
+   * resolved payload, and deleting `source`/`anchor` from the deflected one. They survived because every
+   * test asserting a resolver, a principal or an option read the *derived* `state.json` through
+   * `settleQuestion` — and AD-4 makes the log the only authority, with story 5-3 indexing exactly these
+   * lines. So these assertions are on the payloads as the log holds them.
+   */
+  const lineOf = (run: string, type: string): Record<string, unknown> => {
+    const found = eventsOf(run).find((event) => event.type === type);
+    expect(found, `no ${type} line in the log`).toBeDefined();
+    return found?.payload ?? {};
+  };
+
+  it('names the resolver, the principal, the option and the instant on question.resolved', () => {
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const asked = reconciler.ask(run, aDraft());
+    reconciler.answer(run, 'ignore', { principal: { kind: 'user', id: 'deep' }, source: 'tui' });
+
+    const payload = lineOf(run, QUESTION_EVENT_TYPES.Resolved);
+    expect(payload['question_id']).toBe(asked.question.id);
+    // AD-25 — the winning transition records its resolver *and* its principal, in the log.
+    expect(payload['resolver']).toBe('tui');
+    expect(payload['principal_kind']).toBe('user');
+    expect(payload['principal_id']).toBe('deep');
+    expect(payload['option_id']).toBe('ignore');
+    expect(payload['answer']).toBe('ignore');
+    expect(payload['resolved_at']).toBe(
+      settleQuestion(runPaths(run, home), asked.question.id).state.resolution?.resolved_at,
+    );
+  });
+
+  it('names the option and the instant on the decision record, and the question as it was put', () => {
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const asked = reconciler.ask(run, aDraft());
+    reconciler.answer(run, 'reject', { principal: { kind: 'user', id: 'deep' } });
+
+    const decision = lineOf(run, DECISION_EVENT_TYPE);
+    expect(decision['question_id']).toBe(asked.question.id);
+    // Q7 — a later run reads the option back to avoid asking the same question twice, so it is the field
+    // whose absence would be invisible and expensive.
+    expect(decision['option_id']).toBe('reject');
+    expect(decision['answer']).toBe('reject');
+    expect(decision['resolver']).toBe('tui');
+    expect(decision['principal_kind']).toBe('user');
+    expect(decision['principal_id']).toBe('deep');
+    expect(String(decision['question'])).toContain('unknown field');
+    expect(decision['resolved_at']).toBe(
+      settleQuestion(runPaths(run, home), asked.question.id).state.resolution?.resolved_at,
+    );
+    // The type is declared, so the ledger AD-25 requires is not written under a name no contract knows.
+    expect(isDeclaredEventType(DECISION_EVENT_TYPE)).toBe(true);
+  });
+
+  it('names the source and the anchor on question.deflected, and no resolver at all', () => {
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const asked = reconciler.ask(run, aDraft());
+    reconciler.deflect(run, asked.question.id, {
+      source: 'git_history',
+      answer: 'the convention has been "reject" since the contracts landed',
+      anchor: 'src/contracts/step.ts',
+    });
+
+    const payload = lineOf(run, QUESTION_EVENT_TYPES.Deflected);
+    expect(payload['question_id']).toBe(asked.question.id);
+    // Where the answer came from, and the durable anchor a reader follows back to the evidence (Q4).
+    expect(payload['source']).toBe('git_history');
+    expect(payload['anchor']).toBe('src/contracts/step.ts');
+    expect(String(payload['answer'])).toContain('since the contracts landed');
+    expect(payload['deflected_at']).toBe(
+      settleQuestion(runPaths(run, home), asked.question.id).state.deflection?.deflected_at,
+    );
+    // Nobody was asked, so nothing is attributed and nothing is recorded as a decision (AD-25).
+    expect(payload['resolver']).toBeUndefined();
+    expect(payload['principal_id']).toBeUndefined();
+  });
+
+  it('names the resolver and the timeout principal on question.default_taken', async () => {
+    /**
+     * Driven through a real pass rather than through the payload builder, because the assertion is about
+     * the line the log holds: the claim lands first and the pass reports it, which is also the crash
+     * ordering. The window suite covers expiry; what is covered here is the payload's own shape.
+     */
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const asked = reconciler.ask(run, aDraft());
+    const claim = attemptQuestionResolution(
+      runPaths(run, home),
+      asked.question.id,
+      questionResolution({
+        resolver: 'timeout_default',
+        principal: { kind: 'timeout', id: 'question.window' },
+        answer: 'the window passed and the recommended default was taken',
+        optionId: 'reject',
+      }),
+    );
+    expect(claim.created).toBe(true);
+    await reconciler.pass();
+
+    const payload = lineOf(run, QUESTION_EVENT_TYPES.DefaultTaken);
+    expect(payload['question_id']).toBe(asked.question.id);
+    // `timeout` is a declared principal kind precisely so a default has an honest one: nobody decided
+    // this, the window did, and the log says so rather than naming the user who did not answer (AD-19).
+    expect(payload['resolver']).toBe('timeout_default');
+    expect(payload['principal_kind']).toBe('timeout');
+    expect(payload['principal_id']).toBe('question.window');
+    expect(payload['option_id']).toBe('reject');
+    expect(payload['resolved_at']).toBe(claim.outcome?.resolution?.resolved_at);
+    // And the decision carries the same option, which is what Q7's "asked once becomes a rule" reads back.
+    expect(lineOf(run, DECISION_EVENT_TYPE)['option_id']).toBe('reject');
+  });
+});
+
+describe('a command source maps to a resolver exhaustively, so a new source is a compile error', () => {
+  it('counts a cli answer as the tui resolver rather than falling through to it', () => {
+    /**
+     * `resolverForSource` was `source === 'web' ? 'web' : source === 'timeout' ? 'timeout_default' :
+     * 'tui'`, while `COMMAND_SOURCES` is four long. So a CLI-issued answer recorded a durable decision
+     * naming a resolver that did not make it, and a fifth source would have joined the same bucket in
+     * silence — the non-exhaustive default `steering.ts` forbids in its own comment.
+     */
+    expect(resolverForSource('cli')).toBe('tui');
+    expect(resolverForSource('tui')).toBe('tui');
+    expect(resolverForSource('web')).toBe('web');
+    expect(resolverForSource('timeout')).toBe('timeout_default');
+  });
+
+  it('maps every declared source to a declared resolver, with nothing undefined', () => {
+    /**
+     * The *exhaustiveness* is enforced by the type system rather than here — the map is a total
+     * `Record<CommandSource, QuestionResolver>`, so adding a fifth source to `COMMAND_SOURCES` is a
+     * compile error at the map rather than a silent extra member of the `tui` bucket. What this asserts is
+     * the other half: every declared source reaches a resolver AD-25 declares, with no hole a `??` or a
+     * trailing ternary could fill in for it.
+     */
+    const sources: readonly CommandSource[] = COMMAND_SOURCES;
+    for (const source of sources) {
+      expect(QUESTION_RESOLVER_NAMES, source).toContain(resolverForSource(source));
+    }
+  });
+});
+
+describe('a minted question id is checked at both ends, as story 1-7’s intent id is', () => {
+  it('refuses a degenerate seed rather than returning the bare prefix', () => {
+    // `mintQuestionId('')` returned the literal "q-", which is a loggable id — so two questions minted
+    // that way shared one directory and one idempotence key, and the second was read as the first.
+    expect(() => mintQuestionId('')).toThrowError(UnusableQuestionSeed);
+    expect(() => mintQuestionId('short')).toThrowError(UnusableQuestionSeed);
+    expect(() => mintQuestionId('lower-case-not-a-ulid-at-all')).toThrowError(UnusableQuestionSeed);
+    expect(QUESTION_SEED_PATTERN.test(mintRunId())).toBe(true);
+  });
+
+  it('asserts its own output against the policy that will redact it', () => {
+    const ulid = mintRunId();
+    const minted = mintQuestionId(ulid);
+    expect(isLoggableQuestionId(minted)).toBe(true);
+    /**
+     * The *active* policy decides, not a constant copied at some past moment. A build that lowered
+     * `highEntropyMinLength` would otherwise keep minting ids this module called loggable while the
+     * recorder replaced them with the marker, and the ledger every question append is keyed on would hold
+     * `[redacted]` instead of a key.
+     */
+    expect(isLoggableQuestionId(minted, { highEntropyMinLength: 4 })).toBe(false);
+    expect(() => mintQuestionId(ulid, { highEntropyMinLength: 4 })).toThrowError(UnloggableQuestionId);
+    // One number, derived rather than copied: 23 written out here would drift from the pass's threshold.
+    expect(MAX_QUESTION_ID_TOKEN_RUN).toBe(DEFAULT_HIGH_ENTROPY_MIN_LENGTH - 1);
+  });
+});
+
+describe('an intent id in an outcome is validated by the command contract, not by the question’s rules', () => {
+  it('claims an outcome under a real minted intent id and recognises its redelivery', () => {
+    /**
+     * `QuestionOutcomeSchema.intent_id` borrowed `QuestionSchema.shape.id`, coupling the validity of an
+     * intent id to whatever rule a question id carries — and every existing test put a hand-made `'cmd-1'`
+     * through it, so no test ever passed a real one. A real minted id is 30-odd characters of punctuated
+     * ULID, which is what the transport actually writes.
+     */
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const asked = reconciler.ask(run, aDraft());
+    const intentId = mintIntentId(mintRunId());
+    const resolution = questionResolution({
+      resolver: 'tui',
+      principal: { kind: 'user', id: 'deep' },
+      answer: 'reject',
+      optionId: 'reject',
+    });
+
+    const first = attemptQuestionResolution(runPaths(run, home), asked.question.id, resolution, {
+      intentId,
+    });
+    expect(first.accepted).toBe(true);
+    expect(first.outcome?.intent_id).toBe(intentId);
+
+    // The same gesture arriving twice is the winner, which is the whole point of recording the id.
+    const redelivered = attemptQuestionResolution(runPaths(run, home), asked.question.id, resolution, {
+      intentId,
+    });
+    expect(redelivered.accepted).toBe(true);
+    expect(redelivered.created).toBe(false);
+
+    // And the outcome file on disk round-trips through the contract that now declares its shape.
+    const onDisk = readQuestionOutcome(questionPaths(runPaths(run, home), asked.question.id));
+    expect(onDisk?.intent_id).toBe(intentId);
+    expect(onDisk?.resolution?.resolver).toBe('tui');
+  });
+
+  it('accepts a minted intent id in the declared outcome shape', () => {
+    const parsed = QuestionOutcomeSchema.safeParse({
+      schema_version: 1,
+      question_id: mintQuestionId(mintRunId()),
+      resolution: null,
+      deflection: {
+        source: 'repository',
+        answer: 'the convention is already in the tree',
+        anchor: 'src/contracts/question.ts',
+        deflected_at: '2026-09-20T10:00:00.000Z',
+      },
+      intent_id: mintIntentId(mintRunId()),
+      claimed_at: '2026-09-20T10:00:00.000Z',
+    });
+    expect(parsed.success).toBe(true);
+  });
+});
+
+describe('a free-text answer AD-21 rewrites is a divergence the record names', () => {
+  it('keeps the answer verbatim in the question file, redacts it in the log, and says so', () => {
+    /**
+     * Q6 imposes no format on a human, so an answer may contain anything — and an answer carrying a SHA, a
+     * token or a bare identifier is an unbroken high-entropy run, which AD-21 replaces on the way into the
+     * log. That is the pass working as specified and there is no remedy for it that is not a wider
+     * allow-list, which AD-21 forbids. What was wrong was the silence: `state.json` kept the answer
+     * verbatim while the log kept the marker, with nothing recording that the two disagreed.
+     *
+     * Driven with a real ULID at ~4 bits per character, because `'a'.repeat(n)` carries no entropy and
+     * would pass this test while the real thing was being rewritten — the false pass this project has
+     * recorded three times.
+     */
+    const identifier = mintRunId();
+    expect(survivesRedaction(identifier)).toBe(false);
+
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const asked = reconciler.ask(run, aDraft());
+    const answer = `reject, and keep the behaviour introduced in ${identifier}`;
+    reconciler.answer(run, answer, { principal: { kind: 'user', id: 'deep' } });
+
+    // The question file holds what the person wrote, in full. The decision is not lost.
+    const settled = settleQuestion(runPaths(run, home), asked.question.id);
+    expect(settled.state.resolution?.answer).toBe(answer);
+    expect(settled.state.resolution?.answer).toContain(identifier);
+
+    for (const type of [QUESTION_EVENT_TYPES.Resolved, DECISION_EVENT_TYPE]) {
+      const payload = eventsOf(run).find((event) => event.type === type)?.payload ?? {};
+      // The log holds the marker, not the identifier: AD-21 is a write-path invariant.
+      expect(String(payload['answer']), type).toContain(REDACTION_MARKER);
+      expect(String(payload['answer']), type).not.toContain(identifier);
+      // And the line says which of its own fields was rewritten, so a reader knows the marker is a
+      // rewritten value rather than the words a person typed, and knows the answer survives in questions/.
+      expect(payload[REDACTED_FIELDS_PAYLOAD_KEY], type).toBe('answer');
+      // The question id is untouched, which is what the punctuation is for.
+      expect(payload['question_id'], type).toBe(asked.question.id);
+    }
+  });
+
+  it('says nothing about redaction when nothing was redacted', () => {
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    reconciler.ask(run, aDraft());
+    reconciler.answer(run, 'ignore');
+    for (const event of eventsOf(run)) {
+      expect(event.payload[REDACTED_FIELDS_PAYLOAD_KEY], event.type).toBeUndefined();
+    }
+  });
+});
+
+describe('a question directory a pass cannot use is reported, never hidden', () => {
+  it('refuses a directory name that is not a loggable question id', async () => {
+    /**
+     * `listQuestionIds` filtered such a name away, which made the question invisible to every pass: no
+     * window taken, no event, no refusal, nobody told. An id from an older build — or one story 3-1's web
+     * resolver minted differently — would have vanished without trace, while a torn state file beside it
+     * was reported.
+     */
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const healthy = reconciler.ask(run, aDraft());
+    const bareUlid = mintRunId();
+    mkdirSync(join(runPaths(run, home).questionsDir, bareUlid), { recursive: true });
+
+    const listing = readQuestionDirectory(runPaths(run, home));
+    expect(listing.ids).toStrictEqual([healthy.question.id]);
+    expect(listing.unloggable).toStrictEqual([bareUlid]);
+
+    const result = await reconciler.pass();
+    const questions = result.questions.find((entry) => entry.run === run);
+    expect(questions?.refused.map((entry) => entry.questionId)).toStrictEqual([bareUlid]);
+    expect(questions?.refused[0]?.code).toBe('config.invalid');
+    expect(questions?.refused[0]?.reason).toContain('cannot be logged');
+    // The healthy question is untouched and still open.
+    expect(questions?.open).toStrictEqual([healthy.question.id]);
+  });
+});
+
+describe('a read that failed is not absence', () => {
+  it('refuses an unreadable state file rather than reporting the question as unknown', () => {
+    /**
+     * `catch { throw new UnknownQuestion }` treated EACCES, EIO and EISDIR as "there is no such question".
+     * A directory where the state file belongs is the deterministic form of the same fault — EISDIR for
+     * every user, no privileges involved — and the distinction is what keeps a pass from taking a second
+     * default over a decision it merely could not read.
+     */
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const questionId = mintQuestionId(mintRunId());
+    const dir = join(runPaths(run, home).questionsDir, questionId);
+    mkdirSync(join(dir, QUESTION_STATE_FILE_NAME), { recursive: true });
+
+    const paths = questionPaths(runPaths(run, home), questionId);
+    let raised: unknown = null;
+    try {
+      readQuestionState(paths);
+    } catch (thrown: unknown) {
+      raised = thrown;
+    }
+    expect(raised).toBeInstanceOf(QuestionFileUnreadable);
+    expect(raised).not.toBeInstanceOf(UnknownQuestion);
+    expect((raised as QuestionFileUnreadable).file).toBe(QUESTION_STATE_FILE_NAME);
+  });
+
+  it('refuses an unreadable outcome file rather than reporting the question as unclaimed', async () => {
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const asked = reconciler.ask(run, aDraft());
+    const paths = questionPaths(runPaths(run, home), asked.question.id);
+    mkdirSync(paths.outcome, { recursive: true });
+
+    // Never `null`: a claimed question reading as unclaimed is what lets a second default be taken over a
+    // decision that is already durable.
+    expect(() => readQuestionOutcome(paths)).toThrowError(QuestionFileUnreadable);
+
+    const result = await reconciler.pass();
+    const questions = result.questions.find((entry) => entry.run === run);
+    expect(questions?.refused.map((entry) => entry.questionId)).toStrictEqual([asked.question.id]);
+    // And no transition was attempted against it.
+    expect(typesOf(run)).not.toContain(QUESTION_EVENT_TYPES.DefaultTaken);
+    expect(typesOf(run)).not.toContain(QUESTION_EVENT_TYPES.Resolved);
+  });
+
+  it('still reports a genuinely absent question as unknown', () => {
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    expect(() =>
+      readQuestionState(questionPaths(runPaths(run, home), mintQuestionId(mintRunId()))),
+    ).toThrowError(UnknownQuestion);
+  });
+});
+
+describe('an outcome that disagrees with its question is refused, not half-reported', () => {
+  it('refuses a question whose outcome names an option it never offered', async () => {
+    /**
+     * `deriveState` returned the *unchanged* state when the pure transition refused, so `settleQuestion`
+     * handed back an `asked` state while still reporting the event type the outcome called for — and the
+     * pass then tried to emit `question.resolved` for a question carrying no resolution, throwing from
+     * inside the append. The disagreement is named at the one place that can see both halves of it.
+     */
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const asked = reconciler.ask(run, aDraft());
+    const paths = questionPaths(runPaths(run, home), asked.question.id);
+    writeFileSync(
+      paths.outcome,
+      `${JSON.stringify({
+        schema_version: 1,
+        question_id: asked.question.id,
+        resolution: {
+          resolver: 'tui',
+          principal: { kind: 'user', id: 'deep' },
+          answer: 'an option from another build',
+          option_id: 'never-offered',
+          resolved_at: '2026-09-20T10:00:00.000Z',
+        },
+        deflection: null,
+        intent_id: null,
+        claimed_at: '2026-09-20T10:00:00.000Z',
+      })}\n`,
+      'utf8',
+    );
+
+    expect(() => settleQuestion(runPaths(run, home), asked.question.id)).toThrowError(TornQuestionState);
+    const result = await reconciler.pass();
+    const questions = result.questions.find((entry) => entry.run === run);
+    expect(questions?.refused.map((entry) => entry.questionId)).toStrictEqual([asked.question.id]);
+    expect(typesOf(run)).not.toContain(QUESTION_EVENT_TYPES.Resolved);
+  });
+});
+
+describe('every required draft field is refused by name, from the table that names them', () => {
+  /** One unaskable value per required field, so the table and the checks cannot drift apart. */
+  const brokenDraft: Readonly<Record<string, Partial<QuestionDraft>>> = {
+    prompt: { prompt: '   ' },
+    brief: { brief: '' },
+    options: { options: [] },
+    escape: { escape: { id: 'esc', label: '  ', consequence: 'nothing happens' } },
+    recommended_option_id: { recommended_option_id: '' },
+    default_action: { default_action: '' },
+    default_window_ms: { default_window_ms: 0 },
+  };
+
+  it('covers every field of QUESTION_DRAFT_FIELDS', () => {
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    for (const field of QUESTION_DRAFT_FIELDS) {
+      let raised: QuestionDraftRefused | null = null;
+      try {
+        reconciler.ask(run, aDraft(brokenDraft[field]));
+      } catch (thrown: unknown) {
+        raised = thrown as QuestionDraftRefused;
+      }
+      expect(raised, field).toBeInstanceOf(QuestionDraftRefused);
+      expect(raised?.field, field).toBe(field);
+    }
+    expect(questionDirs(run)).toStrictEqual([]);
+  });
+
+  it('refuses a fractional window and one whose due instant no timestamp can express', () => {
+    /**
+     * `Number.isFinite(w) && w > 0` accepted `0.5`, which is not a count of milliseconds, and accepted a
+     * window large enough that `asked_at + window` is not a representable instant — so CAP-4's own "when
+     * does this default" threw a `RangeError` out of a renderer's countdown rather than answering.
+     */
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    for (const window of [0.5, -1, MAX_QUESTION_WINDOW_MS + 1, Number.MAX_SAFE_INTEGER]) {
+      let raised: QuestionDraftRefused | null = null;
+      try {
+        reconciler.ask(run, aDraft({ default_window_ms: window }));
+      } catch (thrown: unknown) {
+        raised = thrown as QuestionDraftRefused;
+      }
+      expect(raised?.field, String(window)).toBe('default_window_ms');
+    }
+    expect(questionDirs(run)).toStrictEqual([]);
+    // The bound is not decorative: this is the failure it prevents.
+    expect(() =>
+      questionDefaultDueAt({
+        asked_at: '2026-09-20T10:00:00.000Z',
+        default_window_ms: Number.MAX_SAFE_INTEGER,
+      }),
+    ).toThrowError(RangeError);
+  });
+});
+
+describe('a resolver’s temporary file is swept rather than left to accumulate', () => {
+  it('removes an abandoned temporary and leaves the two published files alone', () => {
+    const reconciler = openReconciler();
+    const run = aRun(reconciler);
+    const asked = reconciler.ask(run, aDraft());
+    reconciler.answer(run, 'reject');
+    const dir = join(runPaths(run, home).questionsDir, asked.question.id);
+    // Exactly what a resolver killed between its write and its link leaves behind.
+    writeFileSync(join(dir, `${QUESTION_OUTCOME_FILE_NAME}.99999.1.tmp`), '{"partial":', 'utf8');
+
+    // A live writer's temporary is left alone: the engine is not the only writer in questions/.
+    expect(sweepQuestionTemporaries(runPaths(run, home))).toBe(0);
+    expect(readdirSync(dir).sort()).toHaveLength(3);
+
+    // Past the grace, it is debris and nothing reads it.
+    expect(sweepQuestionTemporaries(runPaths(run, home), { graceMs: 0 })).toBe(1);
+    expect(readdirSync(dir).sort()).toStrictEqual([
+      QUESTION_OUTCOME_FILE_NAME,
+      QUESTION_STATE_FILE_NAME,
+    ]);
+  });
+});
+
+describe('a rejection at an approval gate is refused without describing a question nobody saw', () => {
+  it('names the gate, says the gate still stands, and records nothing', async () => {
+    /**
+     * `approve` is an `effect` command that acts on a blocked run; `reject` is a `question` command, so it
+     * only works when a question happens to be open. Its own note cites CAP-18 — rejection at an approval
+     * gate — which is exactly the case it cannot serve. What a rejection at a gate should *do* to the run
+     * is not a transition this build declares, so the fix here is the refusal's honesty: a person looking
+     * at a gate is told about the gate rather than about machinery under `questions/` they never saw.
+     */
+    const blocking: ScriptedExecutorOptions = {
+      onStart: (request) =>
+        request.step === 'implement'
+          ? terminated(request.step, 'completed', { sessionId: 'sess-implement' })
+          : terminated(request.step, 'blocked', {
+              sessionId: 'sess-verify',
+              error: makeError('permission.denied', 'an irreversible gate needs a person'),
+            }),
+    };
+    const reconciler = Reconciler.open({
+      orchHome: home,
+      executor: createScriptedExecutor(blocking),
+      plans: planProvider(makePlan()),
+      baseline: createRecordingResetter(BASELINE),
+    });
+    toClose.push(reconciler);
+    const run = reconciler.acceptFeature(makePlan()).run;
+    reconciler.confirm(run);
+    await reconciler.runUntilSettled();
+    expect(reconciler.load(run).state.state).toBe('blocked');
+
+    let raised: SteeringRefused | null = null;
+    try {
+      reconciler.reject(run, 'this migration is not reversible; do not run it');
+    } catch (thrown: unknown) {
+      raised = thrown as SteeringRefused;
+    }
+
+    expect(raised).toBeInstanceOf(SteeringRefused);
+    expect(raised?.message).toContain('blocked at a gate');
+    expect(raised?.message).toContain('the gate still stands');
+    // Never a sentence about a question the person never saw.
+    expect(raised?.message).not.toContain('under questions/');
+    // And nothing durable happened: no decision, and the run is still blocked for a person.
+    expect(decisionsInLog(readEventLog(runPaths(run, home).eventLog))).toStrictEqual([]);
+    expect(reconciler.load(run).state.state).toBe('blocked');
   });
 });

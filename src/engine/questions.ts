@@ -17,9 +17,12 @@
  *
  * Three consequences follow, and each is load-bearing:
  *
- * - **A losing resolver writes nothing.** Its `open` fails, it reads the outcome that stands, and it is
- *   handed story 1-1's already-resolved refusal to render. Refusing *after* writing would not be a
- *   compare-and-set, however carefully the write were ordered.
+ * - **No losing resolver's *decision* is ever accepted.** Its `link` fails, it reads the outcome that
+ *   stands, and it is handed story 1-1's already-resolved refusal to render. Refusing *after* writing a
+ *   decision would not be a compare-and-set, however carefully the write were ordered. Stated at the
+ *   decision level because that is what is true and what the invariant is for (AD-25 as amended by
+ *   ADR-002): a loser may still write the *derived* `state.json`, but only by converging it to the
+ *   winner's content, and it skips even that when the winner got there first.
  * - **The durable write precedes the effect, and the effect is idempotent on the question id.** The
  *   outcome file lands before any event does, so a crash in between leaves the decision made and the
  *   log silent — which a later pass finishes, because the state file and the events are both derived
@@ -31,17 +34,22 @@
  * A question id travels in an event payload, and story 1-7 paid for that lesson already: AD-21's pass
  * replaces an unbroken high-entropy run wherever it appears, so a bare ULID is redacted out of the one
  * field the idempotence rests on. {@link mintQuestionId} punctuates for exactly that reason.
+ *
+ * **What the outcome file *is* now lives in `src/contracts/question.ts`** (ADR-002 decision 3): the
+ * contended artifact is the load-bearing half of the question type, and story 3-1 is a second process
+ * that has to read its shape without reading this module. The names are re-exported below, so no caller
+ * of this module changed.
  */
 import {
   closeSync,
   existsSync,
   fsyncSync,
-  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -52,6 +60,7 @@ import {
   QUESTION_RESOLVERS,
   QuestionDeflectionSchema,
   QuestionDraftSchema,
+  QuestionOutcomeSchema,
   QuestionResolutionSchema,
   QuestionSchema,
   QuestionStateSchema,
@@ -61,7 +70,6 @@ import {
   offeredOptionIds,
   parseVersionedArtifact,
   resolveQuestion,
-  versioned,
 } from '../contracts/index.js';
 import type {
   CommandSource,
@@ -71,12 +79,33 @@ import type {
   QuestionDeflection,
   QuestionDraft,
   QuestionOption,
+  QuestionOutcome,
   QuestionResolution,
   QuestionResolver,
   QuestionState,
 } from '../contracts/index.js';
-import { QUESTION_OUTCOME_FILE_NAME, questionPaths } from '../runtime/index.js';
-import type { QuestionPaths, RunPaths } from '../runtime/index.js';
+import {
+  ABANDONED_TEMPORARY_GRACE_MS,
+  CLOCK_SKEW_TOLERANCE_MS,
+  DEFAULT_HIGH_ENTROPY_MIN_LENGTH,
+  QUESTION_OUTCOME_FILE_NAME,
+  QUESTION_STATE_FILE_NAME,
+  createFileExclusively,
+  fsyncDirectory,
+  questionPaths,
+  redactValue,
+} from '../runtime/index.js';
+import type { QuestionPaths, RedactionPolicy, RunPaths } from '../runtime/index.js';
+
+/**
+ * The contended artifact's schema, re-exported from `contracts/` where ADR-002 put it.
+ *
+ * Re-exported rather than moved out of reach: every existing caller — the reconciler, the race helper,
+ * the suites — asks this module for it, and ADR-002's decision was about where the shape is *declared*,
+ * not about who may ask for it.
+ */
+export { QuestionOutcomeSchema };
+export type { QuestionOutcome };
 
 /**
  * The four event types AD-25 names, already declared in the shared vocabulary.
@@ -109,14 +138,20 @@ export const QUESTION_OUTCOME_EVENT_TYPES: readonly string[] = Object.freeze([
 export const QUESTION_ID_PAYLOAD_KEY = 'question_id';
 
 /**
- * The longest unbroken alphanumeric run a question id may contain.
+ * The longest unbroken alphanumeric run a question id may contain under the default policy.
  *
  * The same bound, for the same reason, as story 1-7's intent id: AD-21's high-entropy rule considers
- * runs of `[A-Za-z0-9+/=]` at least 24 characters long, so an id whose runs all stay under that cannot be
- * reached by the rule whatever its entropy. The guard is on *shape*, which is checkable here, rather
- * than on entropy, which depends on a policy this module does not own.
+ * runs of `[A-Za-z0-9+/=]` at least {@link DEFAULT_HIGH_ENTROPY_MIN_LENGTH} characters long, so an id
+ * whose runs all stay under that cannot be reached by the rule whatever its entropy. The guard is on
+ * *shape*, which is checkable here, rather than on entropy, which depends on a policy this module does
+ * not own.
+ *
+ * Derived from the redaction module's own threshold rather than written out as `23` — the parity story
+ * 1-7 made real after the same claim was made here in prose. The two numbers have to move together: an id
+ * declared loggable against a stale threshold is an id whose idempotence key is silently replaced by the
+ * marker in the only payloads that carry it.
  */
-export const MAX_QUESTION_ID_TOKEN_RUN = 23;
+export const MAX_QUESTION_ID_TOKEN_RUN = DEFAULT_HIGH_ENTROPY_MIN_LENGTH - 1;
 
 /** The shape a question id must take: a safe path segment whose runs survive the log. */
 export const QUESTION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -130,28 +165,19 @@ const LONGEST_TOKEN_RUN = /[A-Za-z0-9+/=]+/g;
  * idempotent by recognising the question id already in the log, so an id the log replaces with the
  * redaction marker is an id whose event would be emitted again on every later pass.
  */
-export const isLoggableQuestionId = (id: string): boolean => {
+export const isLoggableQuestionId = (id: string, policy: RedactionPolicy = {}): boolean => {
   if (!QUESTION_ID_PATTERN.test(id)) return false;
+  /**
+   * The threshold is read from the *active* policy when one is given, exactly as `isLoggableIntentId`
+   * does. A build that lowered `highEntropyMinLength` would otherwise keep calling ids loggable here
+   * while the recorder replaced them, and the ledger every question append is keyed on would quietly
+   * hold the redaction marker instead of a key.
+   */
+  const longestAllowed = (policy.highEntropyMinLength ?? DEFAULT_HIGH_ENTROPY_MIN_LENGTH) - 1;
   for (const run of id.match(LONGEST_TOKEN_RUN) ?? []) {
-    if (run.length > MAX_QUESTION_ID_TOKEN_RUN) return false;
+    if (run.length > longestAllowed) return false;
   }
   return true;
-};
-
-/** The prefix every minted question id carries, so a directory under `questions/` reads at a glance. */
-export const QUESTION_ID_PREFIX = 'q';
-
-/**
- * Mint a question id from a ULID, punctuated into groups.
- *
- * Story 1-7's `mintIntentId` in one sentence: the same 26 characters unbroken carry 4.1 bits each and are
- * exactly what AD-21's sweep exists to catch, so the id that keys the idempotence would be redacted out
- * of the payload that carries it. Uniqueness and ordering come from the ULID underneath; the hyphens are
- * the only thing this adds, and they are what makes the id readable back.
- */
-export const mintQuestionId = (ulid: string): string => {
-  const groups = (ulid.match(/.{1,8}/g) ?? [ulid]).join('-');
-  return `${QUESTION_ID_PREFIX}-${groups}`;
 };
 
 /** A question id this build cannot carry into the log, refused rather than written. */
@@ -171,6 +197,65 @@ export class UnloggableQuestionId extends Error {
     this.questionId = questionId;
   }
 }
+
+/** The prefix every minted question id carries, so a directory under `questions/` reads at a glance. */
+export const QUESTION_ID_PREFIX = 'q';
+
+/**
+ * The shape a seed must have before a question id is built from it.
+ *
+ * The same rule as story 1-7's `INTENT_SEED_PATTERN`, and the parity is the point: this module claimed
+ * "the same bound, for the same reason, as story 1-7's intent id" while `mintQuestionId('')` still
+ * returned the literal `"q-"`, which passes {@link isLoggableQuestionId}. Two questions minted from a
+ * degenerate seed would then share one directory and one idempotence key, so the second would be read as
+ * the first: its window never taken, its `question.asked` line never appended, and an answer attributed to
+ * a question nobody was shown. A caller's degenerate seed is refused at the mint, where the cause is
+ * visible, rather than at the ledger, where the symptom is a question that vanished.
+ *
+ * Upper-case alphanumerics of at least 26 characters: the 26 Crockford base32 characters of an AD-29 ULID,
+ * or the 32 hex characters a renderer's `randomUUID` yields. The length floor is the *uniqueness* floor.
+ */
+export const QUESTION_SEED_PATTERN = /^[0-9A-Z]{26,64}$/;
+
+/** A seed with too little in it to key a question. Refused rather than punctuated. */
+export class UnusableQuestionSeed extends Error {
+  readonly code = 'internal.invariant_violated';
+  readonly seed: string;
+
+  constructor(seed: string) {
+    super(
+      `Refusing to mint a question id from "${seed}": a seed must match ` +
+        `${String(QUESTION_SEED_PATTERN)} — the 26 Crockford base32 characters of a ULID, or the 32 hex ` +
+        'characters of a UUID. The minted id names the question directory and keys every append the ' +
+        'transition makes, so a seed carrying no uniqueness produces two questions that share one key ' +
+        'and the second is read as the first (AD-25).',
+    );
+    this.name = 'UnusableQuestionSeed';
+    this.seed = seed;
+  }
+}
+
+/**
+ * Mint a question id from a ULID, punctuated into groups.
+ *
+ * Story 1-7's `mintIntentId` in one sentence: the same 26 characters unbroken carry 4.1 bits each and are
+ * exactly what AD-21's sweep exists to catch, so the id that keys the idempotence would be redacted out
+ * of the payload that carries it. Uniqueness and ordering come from the ULID underneath; the hyphens are
+ * the only thing this adds, and they are what makes the id readable back.
+ *
+ * Both ends are checked, which is what makes the claimed parity with story 1-7 real. The seed has to be
+ * able to carry uniqueness ({@link QUESTION_SEED_PATTERN}), and the id this produces has to survive the
+ * log ({@link isLoggableQuestionId}) — asserted rather than assumed, because the punctuation that makes it
+ * survive is computed right here, and a change to the grouping would otherwise fail silently in the one
+ * payload nothing else can reconstruct.
+ */
+export const mintQuestionId = (ulid: string, policy: RedactionPolicy = {}): string => {
+  if (!QUESTION_SEED_PATTERN.test(ulid)) throw new UnusableQuestionSeed(ulid);
+  const groups = (ulid.match(/.{1,8}/g) ?? [ulid]).join('-');
+  const id = `${QUESTION_ID_PREFIX}-${groups}`;
+  if (!isLoggableQuestionId(id, policy)) throw new UnloggableQuestionId(id);
+  return id;
+};
 
 /**
  * The fields of a draft the interface contract requires, named so a refusal points at one of them.
@@ -210,13 +295,87 @@ const issueField = (path: readonly PropertyKey[]): string =>
   path.length === 0 ? '(draft)' : path.map(String).join('.');
 
 /**
+ * The longest window a question may declare.
+ *
+ * A *representability* bound, not a product policy. `questionDefaultDueAt` formats `asked_at + window`,
+ * and `Date` refuses an instant beyond ±8.64e15 ms — so a window large enough turned CAP-4's "when does
+ * this default" into a `RangeError` thrown out of a renderer's countdown. The bound is the whole span the
+ * RFC3339 timestamp contract can express, which leaves the due instant of *any* askable question
+ * formattable whatever `asked_at` is, and is still orders of magnitude above any window a person waits
+ * out.
+ */
+export const MAX_QUESTION_WINDOW_MS = 253_402_300_799_999;
+
+/** One field's rule: whether a parsed draft satisfies it, and the sentence a refusal carries. */
+interface QuestionDraftRule {
+  readonly satisfied: (draft: QuestionDraft) => boolean;
+  readonly detail: string;
+}
+
+/**
+ * The checks {@link assertAskableDraft} applies, one per required field.
+ *
+ * A total record over {@link QUESTION_DRAFT_FIELDS} rather than a run of `if` statements, because that
+ * list is the table this function should be driven from: a field added to it without a rule here is a
+ * compile error, where before it was a field nothing checked. The order the fields are checked in is the
+ * list's own order, so the field a refusal names is stable.
+ */
+const QUESTION_DRAFT_RULES: Readonly<Record<QuestionDraftField, QuestionDraftRule>> = {
+  prompt: {
+    satisfied: (draft) => draft.prompt.trim() !== '',
+    detail: 'a question with no prompt asks nothing',
+  },
+  brief: {
+    satisfied: (draft) => draft.brief.trim() !== '',
+    detail:
+      'Q3 requires a self-contained mini-brief, so the question is answerable without reloading the ' +
+      'feature into the user’s head',
+  },
+  options: {
+    satisfied: (draft) => draft.options.length > 0,
+    detail: 'Q1 requires at least one concrete option, because an open-ended question is not a card',
+  },
+  escape: {
+    satisfied: (draft) => draft.escape.label.trim() !== '',
+    detail: 'Q1 requires an escape alongside the concrete options',
+  },
+  recommended_option_id: {
+    satisfied: (draft) => draft.recommended_option_id.trim() !== '',
+    detail:
+      'Q1 requires a recommended default, and CAP-4 has nothing to take when the window expires without one',
+  },
+  default_action: {
+    satisfied: (draft) => draft.default_action.trim() !== '',
+    detail: 'Q2 requires the question to state what happens if it is ignored',
+  },
+  default_window_ms: {
+    /**
+     * A positive, whole count of milliseconds, no longer than the timestamp contract can express.
+     *
+     * Three failures rather than one, and each was reachable: zero or less takes the default in the same
+     * instant the question is asked; a fraction such as `0.5` is not a count of milliseconds at all and
+     * makes the due instant depend on floating-point rounding; and a window past
+     * {@link MAX_QUESTION_WINDOW_MS} makes the due instant unformattable, so CAP-4's own "when" throws.
+     */
+    satisfied: (draft) =>
+      Number.isSafeInteger(draft.default_window_ms) &&
+      draft.default_window_ms > 0 &&
+      draft.default_window_ms <= MAX_QUESTION_WINDOW_MS,
+    detail:
+      'Q2 requires the window before the default is taken, as a whole number of milliseconds greater ' +
+      `than zero and no greater than ${String(MAX_QUESTION_WINDOW_MS)} — a window of zero or less takes ` +
+      'the default in the same instant the question is asked, a fractional one is not a count of ' +
+      'milliseconds, and a larger one has a due instant no timestamp can express',
+  },
+};
+
+/**
  * Check a draft against Q1, Q2 and Q3, naming the first field at fault.
  *
  * The declared schema covers the structural half — at most three options, a recommended id that names
- * one of them — and the checks added here cover the half a schema cannot express without forbidding a
+ * one of them — and the rules above cover the half a schema cannot express without forbidding a
  * legitimate value elsewhere: a blank brief is a valid string, and a zero window is a valid number, but
- * neither is a question anybody can answer. Q2's window in particular must be positive: a window of zero
- * takes the default in the same instant the question is asked, which is not a question.
+ * neither is a question anybody can answer.
  */
 export const assertAskableDraft = (draft: unknown): QuestionDraft => {
   const parsed = QuestionDraftSchema.safeParse(draft);
@@ -228,67 +387,32 @@ export const assertAskableDraft = (draft: unknown): QuestionDraft => {
     );
   }
   const question = parsed.data;
-
-  if (question.prompt.trim() === '') {
-    throw new QuestionDraftRefused('prompt', 'a question with no prompt asks nothing');
-  }
-  if (question.brief.trim() === '') {
-    throw new QuestionDraftRefused(
-      'brief',
-      'Q3 requires a self-contained mini-brief, so the question is answerable without reloading the ' +
-        'feature into the user’s head',
-    );
-  }
-  if (question.escape.label.trim() === '') {
-    throw new QuestionDraftRefused('escape', 'Q1 requires an escape alongside the concrete options');
-  }
-  if (question.recommended_option_id.trim() === '') {
-    throw new QuestionDraftRefused(
-      'recommended_option_id',
-      'Q1 requires a recommended default, and CAP-4 has nothing to take when the window expires without one',
-    );
-  }
-  if (question.default_action.trim() === '') {
-    throw new QuestionDraftRefused(
-      'default_action',
-      'Q2 requires the question to state what happens if it is ignored',
-    );
-  }
-  if (!Number.isFinite(question.default_window_ms) || question.default_window_ms <= 0) {
-    throw new QuestionDraftRefused(
-      'default_window_ms',
-      'Q2 requires the window before the default is taken, and a window of zero or less takes the ' +
-        'default in the same instant the question is asked',
-    );
+  for (const field of QUESTION_DRAFT_FIELDS) {
+    const rule = QUESTION_DRAFT_RULES[field];
+    if (!rule.satisfied(question)) throw new QuestionDraftRefused(field, rule.detail);
   }
   return question;
 };
 
-/** Which of the three AD-25 resolvers a command source counts as. */
-export const resolverForSource = (source: CommandSource): QuestionResolver =>
-  source === 'web' ? 'web' : source === 'timeout' ? 'timeout_default' : 'tui';
-
 /**
- * The exclusively created claim: the record whose *creation* decided which resolver won.
+ * Which of the three AD-25 resolvers a command source counts as.
  *
- * It carries the transition's whole payload — which resolver, which principal, what they answered — so
- * the state file and the events are both derivable from it and neither is a second authority. `intent_id`
- * is here for the redelivery case AD-19 makes ordinary: the same gesture arriving twice must be told it
- * won, not told it lost to itself.
+ * Exhaustive over `COMMAND_SOURCES` rather than defaulting, which is the rule `steering.ts` states for
+ * itself two functions away: "enumerated rather than defaulted so adding a command with an effect is a
+ * compile error here". The ternary chain this replaces sent `cli` — a declared source — into the `tui`
+ * bucket, so a CLI-issued answer recorded a durable decision naming a resolver that did not make it, and
+ * a fifth source would have joined the same bucket in silence. A `cli` answer is a person at a terminal,
+ * so it is the `tui` resolver *by decision* rather than by falling through.
  */
-export const QuestionOutcomeSchema = versioned({
-  question_id: QuestionSchema.shape.id,
-  resolution: QuestionResolutionSchema.nullable(),
-  deflection: QuestionDeflectionSchema.nullable(),
-  /** The steering intent that claimed this outcome, or `null` for the timeout resolver. */
-  intent_id: QuestionSchema.shape.id.nullable(),
-  claimed_at: QuestionSchema.shape.asked_at,
-}).refine((outcome) => (outcome.resolution === null) !== (outcome.deflection === null), {
-  message: 'an outcome records exactly one of a resolution and a deflection',
-  path: ['resolution'],
-});
+const RESOLVER_BY_COMMAND_SOURCE: Readonly<Record<CommandSource, QuestionResolver>> = {
+  tui: 'tui',
+  cli: 'tui',
+  web: 'web',
+  timeout: 'timeout_default',
+};
 
-export type QuestionOutcome = ReturnType<typeof QuestionOutcomeSchema.parse>;
+export const resolverForSource = (source: CommandSource): QuestionResolver =>
+  RESOLVER_BY_COMMAND_SOURCE[source];
 
 /** A question state file that is not whole. Refused rather than read partially (AD-4's rule for state). */
 export class TornQuestionState extends Error {
@@ -321,16 +445,61 @@ export class UnknownQuestion extends Error {
   }
 }
 
+/**
+ * A question file that exists but could not be read. Never reported as absence.
+ *
+ * `EACCES`, `EIO` and `EISDIR` say nothing about whether a question was asked or claimed, and the old
+ * `catch`-everything read said the opposite of what it knew: a claimed question read as *unclaimed*, so a
+ * pass could take a second default over a decision a person had already made, and an asked question read
+ * as never asked. Only `ENOENT` means absence. Everything else is refused, which carries the
+ * `abandon-and-hand-off` disposition of `internal.invariant_violated` — the fail-safe direction, and the
+ * same one a torn file takes.
+ */
+export class QuestionFileUnreadable extends Error {
+  readonly code = 'internal.invariant_violated';
+  readonly questionId: string;
+  readonly file: string;
+
+  constructor(questionId: string, file: string, cause: string) {
+    super(
+      `Refusing question ${questionId}: its ${file} exists but could not be read (${cause}). A read ` +
+        'fault is not absence — reporting it as one would let a pass take a second default over a ' +
+        'decision that is already durable, so the question is refused instead (AD-25).',
+    );
+    this.name = 'QuestionFileUnreadable';
+    this.questionId = questionId;
+    this.file = file;
+  }
+}
+
+/** The errno a failed `fs` call reports, or `null` when it reported none. */
+const errnoOf = (thrown: unknown): string | null => {
+  const code = (thrown as { code?: unknown } | null)?.code;
+  return typeof code === 'string' ? code : null;
+};
+
+/** True only for "there is no such file", which is the one failure that means absence. */
+const isAbsence = (thrown: unknown): boolean => {
+  const code = errnoOf(thrown);
+  return code === 'ENOENT' || code === 'ENOTDIR';
+};
+
 const TEMP_SUFFIX = '.tmp';
 
 let tempCounter = 0;
 
 /**
- * Write a question state file atomically: temporary file in the same directory, fsync, rename.
+ * Write a question state file atomically: temporary file in the same directory, fsync, rename, then
+ * fsync the directory.
  *
  * Atomic because a reader arrives unannounced — two other resolvers are looking at this directory — and
  * because the matrix requires a torn file to be *refused*: a writer that could leave one would make that
  * refusal a permanent state rather than a transient one.
+ *
+ * The file's own `fsync` makes its contents survive a crash; only the *directory's* makes the new name
+ * survive one, which is why `fsyncDirectory` is called here as well and is the same call story 1-9 made
+ * for the intent file. Without it a power loss after the rename can leave the question with the state it
+ * had before, while the outcome file that decided the transition is already on disk.
  */
 export const writeQuestionState = (paths: QuestionPaths, state: QuestionState): QuestionState => {
   const validated = QuestionStateSchema.parse(state);
@@ -349,18 +518,26 @@ export const writeQuestionState = (paths: QuestionPaths, state: QuestionState): 
   }
   closeSync(fd);
   renameSync(temp, paths.state);
+  fsyncDirectory(paths.dir);
   return validated;
 };
 
 const questionArtifact = (paths: QuestionPaths): string =>
-  `runs/${paths.runId}/questions/${paths.questionId}/state.json`;
+  `runs/${paths.runId}/questions/${paths.questionId}/${QUESTION_STATE_FILE_NAME}`;
 
 /** Read a question's state, refusing a file that is not whole rather than reading part of it. */
 export const readQuestionState = (paths: QuestionPaths): QuestionState => {
   let raw: string;
   try {
     raw = readFileSync(paths.state, 'utf8');
-  } catch {
+  } catch (thrown: unknown) {
+    if (!isAbsence(thrown)) {
+      throw new QuestionFileUnreadable(
+        paths.questionId,
+        QUESTION_STATE_FILE_NAME,
+        errnoOf(thrown) ?? 'the read failed and said nothing about why',
+      );
+    }
     throw new UnknownQuestion(paths.runId, paths.questionId);
   }
   let parsed: unknown;
@@ -382,12 +559,25 @@ export const readQuestionState = (paths: QuestionPaths): QuestionState => {
   }
 };
 
-/** The outcome that stands, or `null` when no resolver has claimed this question yet. */
+/**
+ * The outcome that stands, or `null` when no resolver has claimed this question yet.
+ *
+ * `null` means *there is no outcome file*, and nothing else. A read that failed for any other reason is
+ * refused: reporting `EACCES` as "unclaimed" is what would let a pass take a second default over a
+ * decision already on disk, which is the one thing this compare-and-set exists to make impossible.
+ */
 export const readQuestionOutcome = (paths: QuestionPaths): QuestionOutcome | null => {
   let raw: string;
   try {
     raw = readFileSync(paths.outcome, 'utf8');
-  } catch {
+  } catch (thrown: unknown) {
+    if (!isAbsence(thrown)) {
+      throw new QuestionFileUnreadable(
+        paths.questionId,
+        QUESTION_OUTCOME_FILE_NAME,
+        errnoOf(thrown) ?? 'the read failed and said nothing about why',
+      );
+    }
     return null;
   }
   let parsed: unknown;
@@ -399,7 +589,7 @@ export const readQuestionOutcome = (paths: QuestionPaths): QuestionOutcome | nul
   return parseVersionedArtifact(
     QuestionOutcomeSchema,
     parsed,
-    `runs/${paths.runId}/questions/${paths.questionId}/outcome.json`,
+    `runs/${paths.runId}/questions/${paths.questionId}/${QUESTION_OUTCOME_FILE_NAME}`,
   );
 };
 
@@ -517,45 +707,29 @@ export interface QuestionClaim {
  * `EEXIST` is the only failure that means "another resolver won". `EACCES`, `ENOSPC` and `EROFS` say
  * nothing about a winner, and reporting one of them as a lost race would tell the user a disk fault was
  * somebody else's answer.
+ *
+ * **The idiom itself is `src/runtime/exclusive-create.ts`'s**, and this no longer keeps its own copy of
+ * it. Story 1-12 extracted it from here after three other stories recorded the same `'wx'` trap, and the
+ * extracted version is identical in shape down to the errno handling — so two copies were two places a
+ * fix would have to land, in the one primitive AD-25 rests on. What stays here is the record's
+ * serialisation and the directory `fsync`, which the outcome needs and the shared helper leaves to the
+ * caller only because the recorder's claim and the engine lock reach it by other paths.
  */
 const createOutcomeExclusively = (paths: QuestionPaths, outcome: QuestionOutcome): boolean => {
-  mkdirSync(paths.dir, { recursive: true });
-  tempCounter += 1;
-  const temp = join(
-    paths.dir,
-    `${QUESTION_OUTCOME_FILE_NAME}.${String(process.pid)}.${String(tempCounter)}${TEMP_SUFFIX}`,
-  );
-  writeFileSync(temp, `${JSON.stringify(outcome, null, 2)}\n`, 'utf8');
-  const fd = openSync(temp, 'r');
-  try {
-    fsyncSync(fd);
-  } catch {
-    // Unsynced contents are a durability weakness, not a partial read: the link is still atomic.
-  }
-  closeSync(fd);
-
-  try {
-    linkSync(temp, paths.outcome);
-  } catch (thrown: unknown) {
-    const code = (thrown as { code?: string } | null)?.code;
-    // The temporary is debris either way: unlinked here so a lost race leaves the directory as it found it.
-    try {
-      unlinkSync(temp);
-    } catch {
-      // A temporary that cannot be removed is inert — nothing reads it — and never a second outcome.
-    }
-    if (code === 'EEXIST') return false;
-    throw thrown;
-  }
-  try {
-    unlinkSync(temp);
-  } catch {
-    // The link is what decided the race; the temporary's removal is tidiness and never affects the result.
-  }
-  return true;
+  const created = createFileExclusively(paths.outcome, `${JSON.stringify(outcome, null, 2)}\n`);
+  // Only the winner's name is new, so only the winner has a directory entry to make durable. The loser's
+  // `link` published nothing.
+  if (created) fsyncDirectory(paths.dir);
+  return created;
 };
 
-/** Derive the state file from the outcome that stands. Idempotent, and safe for a loser to do. */
+/**
+ * Derive the state file from the outcome that stands (ADR-002 decision 2).
+ *
+ * Idempotent, and safe for a *loser* to do: converging `state.json` to the winner's content is the one
+ * write a losing resolver may make, and it skips even that when the winner got there first. What it never
+ * does is write a decision — that is the invariant, and it belongs to the `link` above.
+ */
 const deriveState = (
   paths: QuestionPaths,
   asked: QuestionState,
@@ -569,10 +743,24 @@ const deriveState = (
           // The schema's refinement guarantees exactly one of the two is non-null.
           outcome.deflection ?? { source: 'repository', answer: '', anchor: '', deflected_at: outcome.claimed_at },
         );
-  // The pure transition cannot refuse here: the state it is handed is `asked` by construction, and the
-  // option was checked before the claim was created. Writing the unchanged state would be worse than
-  // writing nothing, so a refusal leaves the file alone.
-  if (!transition.accepted) return readQuestionState(paths);
+  /**
+   * The pure transition cannot refuse here — and if it ever does, that is refused rather than papered over.
+   *
+   * The state it is handed is `asked` by construction and the option was checked before the claim was
+   * created, so a refusal means the outcome on disk disagrees with the question on disk: an option the
+   * question does not offer, most plausibly from a build whose options changed. Returning the *unchanged*
+   * state, which is what stood here, handed the caller an `asked` state while `settleQuestion` went on
+   * reporting the event type the outcome called for — so a pass would try to emit `question.resolved` for a
+   * question carrying no resolution, and the payload builder would throw from deep inside the append.
+   * Refusing names the disagreement at the one place that can see both halves of it.
+   */
+  if (!transition.accepted) {
+    throw new TornQuestionState(
+      paths.questionId,
+      'disagrees with the outcome that claimed it, so no state can be derived from it: ' +
+        (transition.refusal ?? 'the transition was refused and said nothing about why'),
+    );
+  }
   const current = existsSync(paths.state) ? readQuestionState(paths) : null;
   if (current !== null && current.status === transition.state.status) return current;
   return writeQuestionState(paths, transition.state);
@@ -693,8 +881,13 @@ export const attemptQuestionResolution = (
    *
    * Deliberately *not* preceded by a read of the outcome file. A read-then-create would be a check before a
    * write — the very shape AD-25 exists to rule out — and although the create would still be the arbiter, the
-   * short-circuit would mean a losing resolver sometimes never reached the primitive at all. Every loss
-   * arriving through one branch is what makes the cross-process suite able to prove the branch works.
+   * short-circuit would mean a losing resolver *never* reached the primitive.
+   *
+   * A loss can still arrive by two paths, and the cross-process suite has to tolerate both: through this
+   * `link` failing, which is the interesting one and the reason `contended` is reported; or through step 3
+   * above, when this resolver was descheduled long enough that the winner's derived `state.json` was already
+   * on disk by the time it read the question. The second is not a weaker guarantee — the outcome file still
+   * decided, and nothing was written — it is the same loss observed one step earlier.
    */
   if (!createOutcomeExclusively(question, claim)) {
     // Somebody else's link landed first. The loser reads what stands and writes nothing of its own.
@@ -820,14 +1013,31 @@ export const settleQuestion = (paths: RunPaths, questionId: string): SettledQues
   };
 };
 
+/** What a run's `questions/` directory holds: the questions a pass can act on, and the names it cannot. */
+export interface QuestionDirectoryListing {
+  /** Every usable question id, in minted order. */
+  readonly ids: readonly string[];
+  /**
+   * Directory names that are not loggable question ids, so no transition can be made against them.
+   *
+   * Reported rather than dropped. A name this build cannot carry into a payload — an id from an older
+   * build, or one a story 3-1 web resolver minted differently — used to be filtered away by
+   * {@link listQuestionIds}, which made the question invisible to every pass: no window taken, no event,
+   * no refusal, and nobody told. A torn state file is reported; an unusable *name* is the same class of
+   * fault and is now reported the same way.
+   */
+  readonly unloggable: readonly string[];
+}
+
 /**
- * Every question id with a directory under `runs/<run-id>/questions/`, in minted order.
+ * Every question directory under `runs/<run-id>/questions/`, split into what can be acted on and what
+ * cannot.
  *
  * Minted order because a question id carries a ULID, so sorting the directory names sorts the questions
  * chronologically — which is what makes "the active question" a deterministic choice rather than
  * whatever `readdir` happened to return first.
  */
-export const listQuestionIds = (paths: RunPaths): readonly string[] => {
+export const readQuestionDirectory = (paths: RunPaths): QuestionDirectoryListing => {
   let entries: string[];
   try {
     entries = readdirSync(paths.questionsDir, { withFileTypes: true })
@@ -835,9 +1045,77 @@ export const listQuestionIds = (paths: RunPaths): readonly string[] => {
       .map((entry) => entry.name);
   } catch {
     // No questions directory is the ordinary case: a run nothing has asked about.
-    return [];
+    return { ids: [], unloggable: [] };
   }
-  return entries.filter(isLoggableQuestionId).sort();
+  const ids: string[] = [];
+  const unloggable: string[] = [];
+  for (const name of entries) (isLoggableQuestionId(name) ? ids : unloggable).push(name);
+  return { ids: ids.sort(), unloggable: unloggable.sort() };
+};
+
+/**
+ * Every question id a transition can be made against, in minted order.
+ *
+ * The narrower half of {@link readQuestionDirectory}, kept because every resolver wants exactly this: a
+ * name it cannot log is a name it cannot make idempotent, so there is nothing for a resolver to do with
+ * one. The *pass* asks for the whole listing, so the name it skips is refused rather than hidden.
+ */
+export const listQuestionIds = (paths: RunPaths): readonly string[] =>
+  readQuestionDirectory(paths).ids;
+
+/**
+ * Remove temporaries a writer died between writing and publishing.
+ *
+ * A `link` or a `rename` either happened or did not, so a surviving `<name>.<pid>.<n>.tmp` is always
+ * debris: nothing reads a name that was never published, and the outcome that decided the race is the
+ * published one. They are not poison files, they are an unbounded leak in a directory three resolvers
+ * write to — and the race suite asserts the directory holds exactly `['outcome.json', 'state.json']`, so
+ * any crash in there would have made an unrelated suite fail for a reason it has nothing to do with.
+ *
+ * Only a temporary older than {@link ABANDONED_TEMPORARY_GRACE_MS} is touched, for the reason story 1-9's
+ * sweep gives: the engine is not the only writer here — AD-25's other two resolvers may be other
+ * processes — so a sweep that deleted on sight would race a live writer between its `write` and its
+ * `link` and destroy the very outcome it was publishing.
+ */
+export const sweepQuestionTemporaries = (
+  paths: RunPaths,
+  options: { readonly now?: () => Date; readonly graceMs?: number } = {},
+): number => {
+  const now = (options.now ?? ((): Date => new Date()))().getTime();
+  const grace = options.graceMs ?? ABANDONED_TEMPORARY_GRACE_MS;
+  const listing = readQuestionDirectory(paths);
+  let removed = 0;
+  for (const questionId of [...listing.ids, ...listing.unloggable]) {
+    const dir = join(paths.questionsDir, questionId);
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (!name.endsWith(TEMP_SUFFIX)) continue;
+      const path = join(dir, name);
+      let age: number;
+      try {
+        age = now - statSync(path).mtimeMs;
+      } catch {
+        continue;
+      }
+      // Sub-millisecond jitter is a brand-new file, not an old one: the filesystem records mtime below
+      // the millisecond while `Date.now()` truncates. A mtime a second or more ahead is a clock that
+      // disagrees, which no amount of waiting resolves, so it counts as age.
+      const settled = age < 0 && age > -CLOCK_SKEW_TOLERANCE_MS ? 0 : age;
+      if (settled >= 0 && settled < grace) continue;
+      try {
+        unlinkSync(path);
+        removed += 1;
+      } catch {
+        // Another writer's live temporary, or a permission fault. Neither is this sweep's business.
+      }
+    }
+  }
+  return removed;
 };
 
 /** One question a pass looked at, and what it found. */
@@ -899,6 +1177,59 @@ const questionIdsOfTypes = (
 export const OFFERED_OPTIONS_PAYLOAD_KEY = 'offered_options';
 
 /**
+ * The payload key naming the free-text fields the AD-21 pass will rewrite in this very line.
+ *
+ * **Why a line has to say this about itself.** Q6 imposes no format on a human, so an answer may contain
+ * any text at all — and an answer carrying a SHA, a token or a long path is an unbroken high-entropy run,
+ * which AD-21 replaces with the marker on the way into the log. That is AD-21 working exactly as
+ * specified, and there is no remedy for it that is not a wider allow-list, which AD-21 forbids: the pass
+ * is a write-path invariant with no after-the-fact remedy. What there *was* no remedy for was the
+ * silence: `questions/<id>/state.json` kept the answer verbatim while the log kept `[redacted]`, so the
+ * two durable records disagreed with nothing saying so, and `decision.ts`'s claim that a rejection's
+ * reason "is never discarded" quietly stopped being true of the ledger.
+ *
+ * So the emitter names the fields, using the same policy the recorder is about to apply. A reader of the
+ * log then knows the marker is a rewritten value rather than what the person typed, and knows which
+ * durable record still holds it. AD-5 makes adding a key non-breaking, and the key is present only when
+ * something was in fact rewritten.
+ */
+export const REDACTED_FIELDS_PAYLOAD_KEY = 'redacted_fields';
+
+/**
+ * True when this value reaches the log unchanged under the given policy.
+ *
+ * Runs the *real* pass rather than a re-implementation of its heuristic: a second copy of "what counts as
+ * high entropy" would drift from `redactValue`, and a flag that said a field survived when it did not
+ * would be worse than no flag. A pass that *fails* — a value no JSON can carry — is reported as not
+ * surviving, because the whole artifact is dropped in that case.
+ */
+export const survivesRedaction = (value: string, policy: RedactionPolicy = {}): boolean => {
+  const pass = redactValue(value, policy);
+  return pass.ok && pass.value === value;
+};
+
+/**
+ * Add {@link REDACTED_FIELDS_PAYLOAD_KEY} when any of the named free-text fields will be rewritten.
+ *
+ * Exported because `decision.ts` builds the fourth payload of the same transition and must say the same
+ * thing about it in the same words: the decision record carries the question *and* the answer, so it is the
+ * line where a rewritten value is most consequential and the one place a second spelling would show up as
+ * two records disagreeing about which fields are trustworthy.
+ */
+export const notingRedactedFields = (
+  payload: Record<string, unknown>,
+  freeText: readonly (readonly [string, string])[],
+  policy: RedactionPolicy,
+): Record<string, unknown> => {
+  const rewritten = freeText
+    .filter(([, value]) => !survivesRedaction(value, policy))
+    .map(([field]) => field);
+  return rewritten.length === 0
+    ? payload
+    : { ...payload, [REDACTED_FIELDS_PAYLOAD_KEY]: rewritten.join(', ') };
+};
+
+/**
  * The payload of a `question.asked` line.
  *
  * Every value is short, punctuated prose or an enum member, because the AD-21 pass rewrites an unbroken
@@ -921,17 +1252,28 @@ export const OFFERED_OPTIONS_PAYLOAD_KEY = 'offered_options';
  * overrules that: `questions/` is not the log, and a run is required to be reconstructable from the log
  * alone. It is one prose field duplicated into the durable truth, which is the cheaper of the two costs.
  */
-export const questionAskedPayload = (state: QuestionState): Record<string, unknown> => ({
-  [QUESTION_ID_PAYLOAD_KEY]: state.question.id,
-  prompt: state.question.prompt,
-  options: offeredOptionIds(state.question).join(', '),
-  [OFFERED_OPTIONS_PAYLOAD_KEY]: offeredOptionsPayload(state.question),
-  brief: state.question.brief,
-  recommended_option_id: state.question.recommended_option_id,
-  default_action: state.question.default_action,
-  default_window_ms: state.question.default_window_ms,
-  asked_at: state.question.asked_at,
-});
+export const questionAskedPayload = (
+  state: QuestionState,
+  policy: RedactionPolicy = {},
+): Record<string, unknown> =>
+  notingRedactedFields(
+    {
+      [QUESTION_ID_PAYLOAD_KEY]: state.question.id,
+      prompt: state.question.prompt,
+      options: offeredOptionIds(state.question).join(', '),
+      [OFFERED_OPTIONS_PAYLOAD_KEY]: offeredOptionsPayload(state.question),
+      brief: state.question.brief,
+      recommended_option_id: state.question.recommended_option_id,
+      default_action: state.question.default_action,
+      default_window_ms: state.question.default_window_ms,
+      asked_at: state.question.asked_at,
+    },
+    [
+      ['prompt', state.question.prompt],
+      ['brief', state.question.brief],
+    ],
+    policy,
+  );
 
 /**
  * Every offered option as a person is shown it: its id, its label, its consequence, and whether it is the
@@ -967,7 +1309,10 @@ const offeredOptionsPayload = (question: {
  * It names the resolver and the principal because AD-25 requires the winning transition to record both:
  * a decision nobody is attributable for is the one thing a durable decision must not be (AD-19).
  */
-export const questionResolvedPayload = (state: QuestionState): Record<string, unknown> => {
+export const questionResolvedPayload = (
+  state: QuestionState,
+  policy: RedactionPolicy = {},
+): Record<string, unknown> => {
   const resolution = state.resolution;
   if (resolution === null) {
     throw new Error(
@@ -975,37 +1320,59 @@ export const questionResolvedPayload = (state: QuestionState): Record<string, un
         'resolved question emits question.resolved or question.default_taken (AD-25).',
     );
   }
-  return {
-    [QUESTION_ID_PAYLOAD_KEY]: state.question.id,
-    resolver: resolution.resolver,
-    principal_kind: resolution.principal.kind,
-    principal_id: resolution.principal.id,
-    option_id: resolution.option_id,
-    answer: resolution.answer,
-    resolved_at: resolution.resolved_at,
-  };
+  return notingRedactedFields(
+    {
+      [QUESTION_ID_PAYLOAD_KEY]: state.question.id,
+      resolver: resolution.resolver,
+      principal_kind: resolution.principal.kind,
+      principal_id: resolution.principal.id,
+      option_id: resolution.option_id,
+      answer: resolution.answer,
+      resolved_at: resolution.resolved_at,
+    },
+    [['answer', resolution.answer]],
+    policy,
+  );
 };
 
 /** The payload of a `question.deflected` line: where the answer came from, and never a resolver. */
-export const questionDeflectedPayload = (state: QuestionState): Record<string, unknown> => {
+export const questionDeflectedPayload = (
+  state: QuestionState,
+  policy: RedactionPolicy = {},
+): Record<string, unknown> => {
   const deflection = state.deflection;
   if (deflection === null) {
     throw new Error(
       `Question ${state.question.id} is ${state.status}, so it has no deflection to report.`,
     );
   }
-  return {
-    [QUESTION_ID_PAYLOAD_KEY]: state.question.id,
-    source: deflection.source,
-    anchor: deflection.anchor,
-    answer: deflection.answer,
-    deflected_at: deflection.deflected_at,
-  };
+  return notingRedactedFields(
+    {
+      [QUESTION_ID_PAYLOAD_KEY]: state.question.id,
+      source: deflection.source,
+      anchor: deflection.anchor,
+      answer: deflection.answer,
+      deflected_at: deflection.deflected_at,
+    },
+    [
+      ['answer', deflection.answer],
+      // The anchor is a test name, an API symbol or a module name — prose-shaped, and the one field a
+      // later reader follows back to the evidence. An anchor the pass rewrote is an anchor nobody can
+      // follow, so it is named too rather than left to read as if it were the real one.
+      ['anchor', deflection.anchor],
+    ],
+    policy,
+  );
 };
 
 /** The payload the event type calls for, so no caller pairs a type with the wrong payload. */
-export const questionEventPayload = (state: QuestionState): Record<string, unknown> =>
-  state.status === 'deflected' ? questionDeflectedPayload(state) : questionResolvedPayload(state);
+export const questionEventPayload = (
+  state: QuestionState,
+  policy: RedactionPolicy = {},
+): Record<string, unknown> =>
+  state.status === 'deflected'
+    ? questionDeflectedPayload(state, policy)
+    : questionResolvedPayload(state, policy);
 
 /** Build a resolution, filling in the fields every resolver supplies the same way. */
 export const questionResolution = (declared: {
