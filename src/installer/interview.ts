@@ -213,9 +213,14 @@ export const BUILT_IN_AGENTS: readonly AgentDeclarationInput[] = Object.freeze([
   },
   {
     id: 'committing',
-    purpose: 'Open the pull request under the user’s identity and write the AD-22 merge note.',
+    // AD-15 names the committer while forbidding exactly this: pull request creation, `git push`, notes
+    // and tags are engine-executed write intents that no agent may perform. So this agent reads the diff
+    // and composes the intent; the engine executes it once against an idempotency key. It holds no `Bash`,
+    // because that is the one tool that would let the roster's only irreversible agent do the write itself
+    // (ADR-003).
+    purpose: 'Read the change and compose the write intent the engine executes to open the pull request and record the AD-22 note.',
     contract: 'step.output',
-    tools: ['Read', 'Bash'],
+    tools: ['Read', 'Grep', 'Glob'],
     mcp_domains: [],
     reversibility: 'irreversible',
     model: { start_tier: 'claude-sonnet-5', promotion_policy: 'never' },

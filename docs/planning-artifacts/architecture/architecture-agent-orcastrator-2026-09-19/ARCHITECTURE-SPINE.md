@@ -37,6 +37,7 @@ sources:
 companions:
   - ./ADR-001-tier-2-execution.md
   - ./ADR-002-question-compare-and-set-artifact.md
+  - ./ADR-003-built-in-agent-tool-grants.md
   - ../../../specs/spec-agent-orchestrator/architecture.md
   - ../../../specs/spec-agent-orchestrator/interface-contract.md
   - ../../../specs/spec-agent-orchestrator/memory-design.md
@@ -180,7 +181,7 @@ flowchart TD
 
 - **Binds:** the engine, the installer, every step agent, CAP-20
 - **Prevents:** one unit hardcoding the built-in roster while another reads it from config, making a user-defined agent invisible to half the system
-- **Rule:** every agent, built-in or user-defined, is declared by one TOML file in `<target-repo>/.orch/agents/` specifying its id, a reference to a registered contract id — never inline schemas, since AD-2 requires every schema to be a Zod schema in code — its granted tools and MCP domains, its reversibility class, and a `model` field declaring a starting tier and a promotion policy, never a fixed assignment. The engine discovers agents only by reading that directory and holds no compiled-in list. Adding an agent that reuses an existing contract requires no engine change; a genuinely new contract shape does.
+- **Rule:** every agent, built-in or user-defined, is declared by one TOML file in `<target-repo>/.orch/agents/` specifying its id, a reference to a registered contract id — never inline schemas, since AD-2 requires every schema to be a Zod schema in code — its granted tools and MCP domains, its reversibility class, and a `model` field declaring a starting tier and a promotion policy, never a fixed assignment. The engine discovers agents only by reading that directory and holds no compiled-in list. Adding an agent that reuses an existing contract requires no engine change; a genuinely new contract shape does. **Amended by ADR-003:** the built-in roster's grants are fixed — `analysis` and `planning` get `Read`/`Grep`/`Glob`; `implementation` and `testing` add `Write`/`Edit`/`Bash`; `verification` gets `Bash` without the edit tools, because it must not be able to change what it judges; and `committing` gets no `Bash` at all, because AD-15 makes pull-request creation, `git push`, notes and tags engine-executed write intents that no agent may perform. No built-in is granted `Task`, `WebFetch` or `WebSearch`. A granted tool name must be a name declared in `src/contracts/`, because ADR-001 made this field security configuration and an undeclared name changes a grant silently.
 
 ### AD-18 — No BMad dependency and no BMad files in a target project
 

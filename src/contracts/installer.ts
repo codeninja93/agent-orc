@@ -134,11 +134,30 @@ export type AgentModel = z.infer<typeof AgentModelSchema>;
  * id. Checking it in the schema would make `src/contracts/registry.ts` and this file import each
  * other, and the registry is what registers this shape — so the check goes where the cycle does not.
  */
+/**
+ * The tool names a roster entry may grant (ADR-003).
+ *
+ * ADR-001 made `--tools` load-bearing security configuration rather than a convenience field, and this was
+ * `z.array(z.string())` — so `Bsah` granted nothing while reading as though it granted something, and the
+ * reverse mistake was worse. A declared vocabulary makes an unknown name a refusal at parse, which is the
+ * treatment every other load-bearing vocabulary in this codebase gets.
+ *
+ * `Task` is absent deliberately: a step that could spawn its own subagents is an unbounded tree. `WebFetch`
+ * and `WebSearch` are absent because AD-13/AD-14 route every external read through the engine's fetch
+ * record, and a step reaching the network directly would leave that record incomplete. Adding a name here is
+ * a decision; finding one in a TOML is not.
+ */
+export const GRANTABLE_TOOLS = ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'] as const;
+
+export type GrantableTool = (typeof GRANTABLE_TOOLS)[number];
+
+export const GrantableToolSchema = z.enum(GRANTABLE_TOOLS);
+
 export const AgentDeclarationSchema = versioned({
   id: z.string(),
   purpose: z.string(),
   contract: z.string(),
-  tools: z.array(z.string()),
+  tools: z.array(GrantableToolSchema),
   mcp_domains: z.array(z.string()),
   reversibility: z.enum(REVERSIBILITY_CLASSES),
   model: AgentModelSchema,
