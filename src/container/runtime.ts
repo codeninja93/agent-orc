@@ -127,6 +127,15 @@ export const CONTAINER_SUBCOMMANDS = {
   versionFlag: ['--version'] as const,
   inspectImage: ['image', 'inspect'] as const,
   inspectContainer: ['container', 'inspect'] as const,
+  /**
+   * `ps` exists so the reclamation sweep can find a leased instance by its label (`service.ts`).
+   *
+   * AD-32 requires every container to be reclaimable by a pass, and a pass that can only read its own
+   * durable records cannot see a container whose record was lost. The labels are the answer, and asking
+   * for them needs a listing subcommand — spelled here, because this is the one file AD-20 allows to name
+   * the runtime's vocabulary.
+   */
+  list: ['ps'] as const,
   info: ['info'] as const,
   version: ['version'] as const,
 } as const;

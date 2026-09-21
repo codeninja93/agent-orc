@@ -26,10 +26,15 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { CURRENT_SCHEMA_VERSION, RUN_STATE_FILE_NAME } from '../src/contracts/index.js';
 import { AD20_REQUIRED_FLAGS, SERVICE_REQUIRED_FLAGS } from '../src/container/index.js';
 import type { FeatureState } from '../src/contracts/index.js';
-import { runPaths, worktreeDir } from '../src/runtime/index.js';
+import { UnsafePathSegmentError, assertSafePathSegment, runPaths, worktreeDir } from '../src/runtime/index.js';
 import { Reconciler } from '../src/engine/index.js';
-import type { StepExecutor } from '../src/engine/index.js';
+import type {
+  ReclaimedResource as EngineReclaimedResource,
+  ReclamationSummary as EngineReclamationSummary,
+  StepExecutor,
+} from '../src/engine/index.js';
 import {
+  WARM_IDLE_TTL_MS,
   createWorktree,
   decideReclamation,
   enumerateLiveResources,
@@ -37,10 +42,19 @@ import {
   leasesDir,
   listWorktreeRuns,
   performReclamation,
+  quarantineDir,
   reconcilerReclamation,
   runReclamationPass,
+  warmDir,
 } from '../src/pool/index.js';
-import type { LeaseRecord, LiveResource, ReclaimDecision, RunStateView } from '../src/pool/index.js';
+import type {
+  LeaseRecord,
+  LiveResource,
+  ReclaimDecision,
+  ReclaimedResource as PoolReclaimedResource,
+  ReclamationSummary as PoolReclamationSummary,
+  RunStateView,
+} from '../src/pool/index.js';
 
 import { makeGitWorktree, makeHome, makePlan, planProvider } from './helpers/engine-fixture.js';
 import type { GitWorktree } from './helpers/engine-fixture.js';
@@ -301,6 +315,219 @@ describe('the pass: enumerate, compare, act', () => {
     expect(existsSync(join(leasesDir(home), 'lease-kept.json'))).toBe(true);
   });
 
+  it('keeps going past a stray directory under worktrees/, rather than aborting the whole pass', () => {
+    // `worktreeDir` refuses any segment that is not ULID-shaped, and it refuses by *throwing* — so one
+    // `.staging/` beside the real worktrees aborted the enumeration before a single resource was looked at,
+    // the reconciler caught it, recorded one refusal and reported `reclaimed: null`. On every pass, for
+    // ever. That is the invisible-leak state AD-32 exists to prevent.
+    const { home, repo } = world('stray');
+    writeRunState(home, TERMINAL_RUN, 'committed');
+    const doomed = createWorktree({ run: TERMINAL_RUN, repository: repo.dir, orchHome: home });
+    mkdirSync(join(home, 'worktrees', '.staging'), { recursive: true });
+
+    const summary = runReclamationPass({ orchHome: home });
+
+    // The valid resource was still decided and still reclaimed.
+    expect(summary.reclaimed.map((entry) => entry.id)).toStrictEqual([TERMINAL_RUN]);
+    expect(existsSync(doomed.path)).toBe(false);
+    // And the stray is reported rather than dropped, or deleted (AD-33).
+    expect(summary.failed.map((entry) => entry.id)).toStrictEqual(['.staging']);
+    expect(summary.failed[0]?.reason).toContain('not a usable run id');
+    expect(summary.failed[0]?.run).toBe('');
+    expect(existsSync(join(home, 'worktrees', '.staging'))).toBe(true);
+    // The enumeration itself no longer throws, which is the property the reconciler depends on.
+    expect(() => enumerateLiveResources({ orchHome: home })).not.toThrow();
+  });
+
+  it('reclaims no quarantined instance, even when its lease record is still there too', () => {
+    // The dirty return writes the quarantine record and *then* removes the lease record, so a crash between
+    // those two lines leaves both present. A pass that enumerated `leases/` alone then destroyed the very
+    // container a person was being asked to look at — contradicting `deferred[4]`, whose whole purpose is
+    // preserving the evidence the `escalate-to-human` disposition is about.
+    const { home } = world('quarantine');
+    const record = writeLeaseRecord(home, 'lease-dirty', TERMINAL_RUN);
+    mkdirSync(quarantineDir(home), { recursive: true });
+    writeFileSync(
+      join(quarantineDir(home), 'lease-dirty.json'),
+      JSON.stringify({ ...record, residue: ['the key orders survived the wipe'] }),
+      'utf8',
+    );
+
+    expect(enumerateLiveResources({ orchHome: home })).toStrictEqual([]);
+
+    const destroyed: string[] = [];
+    const summary = runReclamationPass({
+      orchHome: home,
+      pool: {
+        orchHome: home,
+        acquire: () => {
+          throw new Error('the sweep never acquires');
+        },
+        release: () => {
+          throw new Error('the sweep never releases');
+        },
+        leases: () => [],
+        warm: () => [],
+        quarantined: () => [],
+        idle: () => [],
+        unrecorded: () => ({ ok: true, containerNames: [], detail: 'no runtime in this fixture' }),
+        reclaimIdle: () => ({ reclaimed: false, reason: 'unused' }),
+        reclaim: (candidate: LeaseRecord) => {
+          destroyed.push(candidate.container_name);
+          return { reclaimed: true, reason: 'destroyed in this fixture' };
+        },
+      },
+    });
+
+    expect(destroyed).toStrictEqual([]);
+    expect(summary.reclaimed).toStrictEqual([]);
+    // Both records stand: the evidence a person was escalated to is intact.
+    expect(existsSync(join(quarantineDir(home), 'lease-dirty.json'))).toBe(true);
+    expect(existsSync(join(leasesDir(home), 'lease-dirty.json'))).toBe(true);
+  });
+
+  it('excludes a quarantined instance by container name as well as by lease id', () => {
+    // A second lease of the same container is the other half of the same hazard: the ids differ, the
+    // container does not, and destroying it destroys the same evidence.
+    const { home } = world('quarantine-by-name');
+    const record = writeLeaseRecord(home, 'lease-other-id', TERMINAL_RUN);
+    mkdirSync(quarantineDir(home), { recursive: true });
+    writeFileSync(
+      join(quarantineDir(home), 'lease-original.json'),
+      JSON.stringify({ ...record, lease: 'lease-original', residue: ['3 key(s) survived the wipe'] }),
+      'utf8',
+    );
+    expect(enumerateLiveResources({ orchHome: home })).toStrictEqual([]);
+  });
+
+  it('reclaims a warm instance whose idle TTL has run out, and keeps one inside it', () => {
+    // `pool/warm/` records belong to no run and `decideReclamation` needs a run, so before this a returned
+    // instance ran for ever across restarts — holding a port and its memory limit, and handed to the next
+    // run with no liveness or emptiness re-check.
+    const { home } = world('warm-ttl');
+    mkdirSync(warmDir(home), { recursive: true });
+    const warmRecord = (name: string, returnedAt: string): void => {
+      writeFileSync(
+        join(warmDir(home), `${name}.json`),
+        JSON.stringify({
+          schema_version: CURRENT_SCHEMA_VERSION,
+          kind: 'redis',
+          container_name: name,
+          host_port: 55_410,
+          image: 'redis:7.4-alpine',
+          returned_at: returnedAt,
+        }),
+        'utf8',
+      );
+    };
+    const at = new Date('2026-09-21T12:00:00.000Z');
+    warmRecord('orch-pool-redis-stale', new Date(at.getTime() - WARM_IDLE_TTL_MS - 1).toISOString());
+    warmRecord('orch-pool-redis-fresh', new Date(at.getTime() - 1_000).toISOString());
+
+    const destroyed: string[] = [];
+    const summary = runReclamationPass({
+      orchHome: home,
+      now: () => at,
+      pool: {
+        orchHome: home,
+        acquire: () => {
+          throw new Error('the sweep never acquires');
+        },
+        release: () => {
+          throw new Error('the sweep never releases');
+        },
+        leases: () => [],
+        warm: () => [],
+        quarantined: () => [],
+        idle: () => [],
+        unrecorded: () => ({ ok: true, containerNames: [], detail: 'no runtime in this fixture' }),
+        reclaim: () => ({ reclaimed: false, reason: 'no lease record in this fixture' }),
+        reclaimIdle: (entry) => {
+          destroyed.push(entry.record.container_name);
+          rmSync(entry.path, { force: true });
+          return { reclaimed: true, reason: 'destroyed in this fixture' };
+        },
+      },
+    });
+
+    expect(destroyed).toStrictEqual(['orch-pool-redis-stale']);
+    expect(summary.reclaimed.map((entry) => `${entry.kind}:${entry.id}`)).toStrictEqual([
+      'warm:orch-pool-redis-stale',
+    ]);
+    expect(summary.retained.map((entry) => entry.id)).toStrictEqual(['orch-pool-redis-fresh']);
+    expect(existsSync(join(warmDir(home), 'orch-pool-redis-fresh.json'))).toBe(true);
+    expect(existsSync(join(warmDir(home), 'orch-pool-redis-stale.json'))).toBe(false);
+  });
+
+  it('reports an expired warm instance it has no pool to act through, rather than forgetting it', () => {
+    const { home } = world('warm-no-pool');
+    mkdirSync(warmDir(home), { recursive: true });
+    writeFileSync(
+      join(warmDir(home), 'orch-pool-redis-orphan.json'),
+      JSON.stringify({
+        schema_version: CURRENT_SCHEMA_VERSION,
+        kind: 'redis',
+        container_name: 'orch-pool-redis-orphan',
+        host_port: 55_411,
+        image: 'redis:7.4-alpine',
+        returned_at: '2020-01-01T00:00:00.000Z',
+      }),
+      'utf8',
+    );
+    const summary = runReclamationPass({ orchHome: home });
+    expect(summary.reclaimed).toStrictEqual([]);
+    expect(summary.failed).toHaveLength(1);
+    expect(summary.failed[0]?.kind).toBe('warm');
+    expect(summary.failed[0]?.reason).toContain('no lease pool is configured');
+    expect(existsSync(join(warmDir(home), 'orch-pool-redis-orphan.json'))).toBe(true);
+  });
+
+  it('names a pooled container no record accounts for, in the summary the loop surfaces', () => {
+    const { home } = world('unrecorded-pass');
+    const summary = runReclamationPass({
+      orchHome: home,
+      pool: {
+        orchHome: home,
+        acquire: () => {
+          throw new Error('the sweep never acquires');
+        },
+        release: () => {
+          throw new Error('the sweep never releases');
+        },
+        leases: () => [],
+        warm: () => [],
+        quarantined: () => [],
+        idle: () => [],
+        reclaim: () => ({ reclaimed: false, reason: 'unused' }),
+        reclaimIdle: () => ({ reclaimed: false, reason: 'unused' }),
+        unrecorded: () => ({
+          ok: true,
+          containerNames: ['orch-pool-redis-lost-record'],
+          detail: '1 of 1 pooled container(s) are named by no record of this pool',
+        }),
+      },
+    });
+    expect(summary.reclaimed).toStrictEqual([]);
+    expect(summary.failed).toHaveLength(1);
+    expect(summary.failed[0]?.id).toBe('orch-pool-redis-lost-record');
+    expect(summary.failed[0]?.reason).toContain('named by no lease, warm, claim or quarantine record');
+    // Reported rather than destroyed, and the reason is in the reason.
+    expect(summary.failed[0]?.reason).toContain('ORCH_HOME');
+  });
+
+  it('surfaces a record it had to skip, so the resource it named is not silently invisible', () => {
+    const { home } = world('skip-surfaced');
+    mkdirSync(leasesDir(home), { recursive: true });
+    writeFileSync(join(leasesDir(home), 'half-written.json'), '{"schema_version": 1, "lea', 'utf8');
+
+    const summary = runReclamationPass({ orchHome: home });
+    // Skipping keeps the pass alive; reporting is what keeps the skip from being a hole.
+    expect(summary.reclaimed).toStrictEqual([]);
+    expect(summary.failed).toHaveLength(1);
+    expect(summary.failed[0]?.id).toBe('half-written.json');
+    expect(summary.failed[0]?.reason).toContain('skipped');
+  });
+
   it('reports one resource’s failure against that resource and acts on the rest', () => {
     const decisions: readonly ReclaimDecision[] = [
       {
@@ -366,6 +593,15 @@ describe('a kill leaves everything reclaimable on the next pass', () => {
         leases: () => [],
         warm: () => [],
         quarantined: () => [],
+        // FIXTURE EXTENDED: `LeasePool` gained `idle` and `reclaimIdle` so that a warm instance — which
+        // belongs to no run, and was therefore reclaimable by nothing at all — is answerable to a pass.
+        // The intent of this case is unchanged: it still models a kill by putting resources on disk and
+        // building a pass with nothing in memory.
+        idle: () => [],
+        unrecorded: () => ({ ok: true, containerNames: [], detail: 'no runtime in this fixture' }),
+        reclaimIdle: () => {
+          throw new Error('this fixture holds no idle instance');
+        },
         reclaim: (record: LeaseRecord) => {
           released.push(record.lease);
           rmSync(join(leasesDir(home), `${record.lease}.json`), { force: true });
@@ -554,6 +790,70 @@ describe('the reconciler drives the pass', () => {
     }
   });
 
+  it('surfaces a resource the sweep could not release, rather than reporting it into nothing', async () => {
+    // `summary.failed` was reported into `PassResult` and read by nothing, so a resource failing reclamation
+    // on every pass leaked with no signal at all — through the pass that exists to prevent exactly that.
+    const { home } = world('engine-failed');
+    const reconciler = Reconciler.open({
+      orchHome: home,
+      executor: refusingExecutor,
+      plans: planProvider(makePlan()),
+      reclamation: () => ({
+        reclaimed: [],
+        retained: [],
+        failed: [
+          {
+            kind: 'lease',
+            id: 'lease-stuck',
+            run: TERMINAL_RUN,
+            reason: 'the instance would not stop',
+            code: 'resource.lease_timed_out',
+          },
+        ],
+      }),
+    });
+    try {
+      const result = await reconciler.pass();
+      expect(result.reclaimed?.failed).toHaveLength(1);
+      expect(result.refusals).toHaveLength(1);
+      expect(result.refusals[0]?.code).toBe('resource.lease_timed_out');
+      expect(result.refusals[0]?.reason).toContain('lease-stuck');
+      // Pass-scoped, with an empty run: the field holds run ids, and `(reclamation)` read like one.
+      expect(result.refusals[0]?.scope).toBe('pass');
+      expect(result.refusals[0]?.run).toBe('');
+      // Every feature in the pass still advanced, which is the per-artifact rule this channel already holds.
+      expect(result.actions).toStrictEqual([]);
+    } finally {
+      reconciler.close();
+    }
+  });
+
+  it('names no run id for a pass-wide refusal, so nothing can build a path from one', async () => {
+    const { home } = world('engine-refusal-run');
+    const reconciler = Reconciler.open({
+      orchHome: home,
+      executor: refusingExecutor,
+      plans: planProvider(makePlan()),
+      reclamation: () => {
+        throw new Error('the sweep could not read a record');
+      },
+    });
+    try {
+      const result = await reconciler.pass();
+      expect(result.refusals).toHaveLength(1);
+      expect(result.refusals[0]?.run).toBe('');
+      expect(result.refusals[0]?.scope).toBe('pass');
+      // The literal that used to stand here would have been refused by the path guard, but only after
+      // reading as though it were a real id.
+      expect(result.refusals[0]?.run).not.toContain('reclamation');
+      expect(() => assertSafePathSegment(result.refusals[0]?.run ?? '', 'a run id')).toThrow(
+        UnsafePathSegmentError,
+      );
+    } finally {
+      reconciler.close();
+    }
+  });
+
   it('reports a sweep that threw as a refusal, and still completes the pass', async () => {
     const { home } = world('engine-throws');
     const reconciler = Reconciler.open({
@@ -606,6 +906,59 @@ describe('the reconciler drives the pass', () => {
     expect(existsSync(worktree.path)).toBe(false);
     // The evidence outlives the worktree, including for the run the pass just reclaimed.
     expect(existsSync(runPaths(TERMINAL_RUN, home).runDir)).toBe(true);
+  });
+});
+
+/**
+ * The seam, asserted by the compiler rather than by a runtime hope.
+ *
+ * `ReclamationSummary` and `ReclaimedResource` are declared twice on purpose — the engine may not import
+ * `src/pool/`, so the port is satisfied structurally — and nothing asserted that the two declarations still
+ * described the same thing. Two hand-kept copies of a shape drift, and the first symptom would be a field
+ * one side writes and the other silently drops. These four lines fail the *build* instead.
+ *
+ * Assignability is asserted one way only where the types differ deliberately: the engine's `kind` is an open
+ * `string` because the unit that owns resources declares what kinds exist, so the pool's narrower
+ * `ResourceKind` flows into it and not back.
+ */
+type Assignable<Narrow extends Wide, Wide> = readonly [Narrow, Wide];
+type SameKeys<Left, Right> = [keyof Left] extends [keyof Right]
+  ? [keyof Right] extends [keyof Left]
+    ? true
+    : never
+  : never;
+
+const poolSummaryFitsTheEnginePort: Assignable<PoolReclamationSummary, EngineReclamationSummary> | null =
+  null;
+const poolResourceFitsTheEnginePort: Assignable<PoolReclaimedResource, EngineReclaimedResource> | null =
+  null;
+const summaryKeysAgree: SameKeys<PoolReclamationSummary, EngineReclamationSummary> = true;
+const resourceKeysAgree: SameKeys<PoolReclaimedResource, EngineReclaimedResource> = true;
+
+describe('the engine seam and the pool agree on one shape', () => {
+  it('is asserted at compile time, so drift fails the build rather than a pass', () => {
+    expect(poolSummaryFitsTheEnginePort).toBe(null);
+    expect(poolResourceFitsTheEnginePort).toBe(null);
+    expect(summaryKeysAgree).toBe(true);
+    expect(resourceKeysAgree).toBe(true);
+  });
+
+  it('carries the same fields at runtime, for the reader the compiler cannot reach', () => {
+    const fromThePool: PoolReclaimedResource = {
+      kind: 'lease',
+      id: 'lease-x',
+      run: TERMINAL_RUN,
+      reason: 'terminal',
+      code: 'resource.lease_timed_out',
+    };
+    const asTheEngineSeesIt: EngineReclaimedResource = fromThePool;
+    expect(Object.keys(asTheEngineSeesIt).sort()).toStrictEqual([
+      'code',
+      'id',
+      'kind',
+      'reason',
+      'run',
+    ]);
   });
 });
 

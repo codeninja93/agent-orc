@@ -582,6 +582,16 @@ export interface RunRefusal {
   readonly run: string;
   readonly code: string;
   readonly reason: string;
+  /**
+   * What the refusal is about, when it is not one run.
+   *
+   * `run` is documented as holding a run id, and a consumer that builds `runs/<run>/` from it is entitled
+   * to. A pass-wide refusal — the reclamation sweep throwing, a resource it could not release — has no run
+   * id to give, so it carries `scope: 'pass'` and an *empty* `run` rather than a readable placeholder: an
+   * empty segment is refused by `assertSafePathSegment`, where a placeholder like `(reclamation)` would be
+   * refused too but only after reading as though it were a real id.
+   */
+  readonly scope?: 'run' | 'pass';
 }
 
 /**
@@ -595,6 +605,14 @@ export interface ReclaimedResource {
   readonly id: string;
   readonly run: string;
   readonly reason: string;
+  /**
+   * The AD-35 code a failed reclamation carries, when the pass declared one.
+   *
+   * Reported, not acted on, like every other field here: the loop's job is to make a failure visible and the
+   * next pass's job is to try again. `tests/pool.reclaim.test.ts` asserts at compile time that this shape and
+   * `src/pool/reclaim.ts`'s stay identical, because two hand-kept copies of a seam drift silently.
+   */
+  readonly code?: string;
 }
 
 /** What one reclamation pass decided and did. Reported by the pass that invoked it, never acted on here. */
@@ -661,8 +679,17 @@ const refusalFor = (run: string, thrown: unknown): RunRefusal => {
     run,
     code: typeof code === 'string' ? code : 'internal.invariant_violated',
     reason: renderCause(thrown) ?? 'the run could not be read or advanced, and said nothing about why',
+    scope: 'run',
   };
 };
+
+/** The same, for something that belongs to the pass rather than to any one run. */
+const passRefusal = (code: string, reason: string): RunRefusal => ({
+  run: '',
+  code,
+  reason,
+  scope: 'pass',
+});
 
 /**
  * A port rejection, rendered as the termination it stands in for.
@@ -1950,9 +1977,30 @@ export class Reconciler {
       for (const resource of summary.reclaimed) {
         this.boundary(`resource-reclaimed:${resource.kind}`);
       }
+      // A resource the sweep could not release is surfaced here or nowhere. `summary.failed` was reported
+      // into `PassResult` and read by nothing, so a resource failing reclamation on every pass leaked with
+      // no signal at all — the invisible state AD-32 exists to prevent, arrived at through the pass that was
+      // supposed to prevent it. The refusal channel is where this loop already says "something did not
+      // happen", so that is where a failed reclamation says it too.
+      for (const resource of summary.failed) {
+        refusals.push(
+          passRefusal(
+            resource.code ?? 'internal.invariant_violated',
+            `the reclamation pass could not release the ${resource.kind} ${resource.id}: ${resource.reason}`,
+          ),
+        );
+      }
       return summary;
     } catch (thrown: unknown) {
-      refusals.push(refusalFor('(reclamation)', thrown));
+      // `run: ''` rather than a `(reclamation)` placeholder: the field holds run ids, and a literal that
+      // reads like one is a literal a consumer will try to build a path from.
+      const code = (thrown as { code?: unknown } | null)?.code;
+      refusals.push(
+        passRefusal(
+          typeof code === 'string' ? code : 'internal.invariant_violated',
+          renderCause(thrown) ?? 'the reclamation pass threw and said nothing about why',
+        ),
+      );
       return null;
     }
   }

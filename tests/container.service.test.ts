@@ -12,10 +12,14 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  CONTAINER_CONTROL_TIMEOUT_MS,
   DEFAULT_SERVICE_MEMORY_LIMIT,
   DEFAULT_SERVICE_PIDS_LIMIT,
   FORBIDDEN_SERVICE_FLAGS,
+  FORBIDDEN_SERVICE_FLAG_REASONS,
   REFUSED_SECCOMP_PROFILE,
+  SERVICE_START_TIMEOUT_MS,
+  firstForbiddenFlag,
   SERVICE_DEFINITIONS,
   SERVICE_ENV_SHAPE_EXCEPTIONS,
   SERVICE_KINDS,
@@ -67,6 +71,21 @@ const recordingInvoker = (
       argv: ['<runtime>', ...invocation.subcommand, ...invocation.args],
     };
   };
+};
+
+/**
+ * What each kind's emptiness probe prints when the instance is empty, and when it is not.
+ *
+ * Per kind because the probes are not the same shape: postgres sums its surviving objects to one integer,
+ * and redis reports a keyspace section — which is what makes its answer cover all sixteen databases rather
+ * than only the selected one.
+ */
+const EMPTY_PROBE_OUTPUT: Readonly<Record<ServiceKind, { readonly empty: string; readonly dirty: string }>> = {
+  postgres: { empty: '0\n', dirty: '3\n' },
+  redis: {
+    empty: '# Keyspace\r\n\r\n',
+    dirty: '# Keyspace\r\ndb0:keys=3,expires=0,avg_ttl=0\r\n\r\n',
+  },
 };
 
 describe.each(SERVICE_KINDS)('the composed argv for a leased %s', (kind) => {
@@ -159,10 +178,41 @@ describe.each(SERVICE_KINDS)('the composed argv for a leased %s', (kind) => {
   });
 
   it('reads an emptiness probe that counts nothing as empty and anything as residue', () => {
-    expect(definition.residueOf('0\n')).toStrictEqual([]);
-    expect(definition.residueOf('3\n')).toHaveLength(1);
+    // FIXTURE CHANGED: the samples are now per kind. Redis's probe is `info keyspace` rather than `dbsize`,
+    // because `flushall` clears all sixteen databases and `dbsize` reported only the selected one — so the
+    // check verified a sixteenth of what the wipe cleared. The intent of this case is unchanged: empty reads
+    // as empty, anything reads as residue, and unreadable fails closed.
+    expect(definition.residueOf(EMPTY_PROBE_OUTPUT[kind].empty)).toStrictEqual([]);
+    expect(definition.residueOf(EMPTY_PROBE_OUTPUT[kind].dirty)).toHaveLength(1);
     // Unreadable fails closed: an answer nobody can parse has not established emptiness.
     expect(definition.residueOf('could not connect')).toHaveLength(1);
+  });
+
+  it('carries no forbidden flag in either spelling the runtime accepts', () => {
+    // The check here used to be a local `includes` loop, which repeated `flags.ts`'s own `=`-form blind
+    // spot: `--cap-add=SYS_ADMIN` walked straight past it, and every value-bearing entry it inherited
+    // (`--pid=host`, `--network=host`) could never fire at all. `firstForbiddenFlag` is the one matcher.
+    for (const vector of [
+      ['--cap-add', 'SYS_ADMIN'],
+      ['--cap-add=SYS_ADMIN'],
+      ['--privileged'],
+      ['--pid', 'host'],
+      ['--pid=host'],
+      ['--network', 'host'],
+      ['--network=host'],
+      ['--volume', '/etc:/etc'],
+      ['--volume=/etc:/etc'],
+      ['--mount', 'type=bind,src=/etc,dst=/etc'],
+    ]) {
+      const hit = firstForbiddenFlag(vector, FORBIDDEN_SERVICE_FLAG_REASONS);
+      expect(hit, vector.join(' ')).not.toBe(null);
+      expect(hit?.reason.length, vector.join(' ')).toBeGreaterThan(10);
+    }
+    // And the flags a service legitimately carries are not caught by it.
+    expect(firstForbiddenFlag([...args], FORBIDDEN_SERVICE_FLAG_REASONS)).toBe(null);
+    // `--detach` is required of a service and forbidden of a step: the two tables differ on purpose.
+    expect(firstForbiddenFlag(['--detach'], FORBIDDEN_SERVICE_FLAG_REASONS)).toBe(null);
+    expect(firstForbiddenFlag(['--detach'])).not.toBe(null);
   });
 });
 
@@ -237,10 +287,14 @@ describe('the operator: five operations, every one an invocation through the sin
   });
 
   it('wipes, then reports residue, and treats an unreadable probe as residue', () => {
+    // FIXTURE CHANGED: the probe's answer is now a keyspace section rather than a bare count, for the reason
+    // the emptiness-probe case above records. The intent is unchanged.
     const seen: ContainerInvocation[] = [];
     const operator = createServiceOperator(
       recordingInvoker(seen, (invocation) =>
-        invocation.args.includes('dbsize') ? { status: 0, stdout: '0\n' } : { status: 0, stdout: '' },
+        invocation.args.includes('keyspace')
+          ? { status: 0, stdout: EMPTY_PROBE_OUTPUT.redis.empty }
+          : { status: 0, stdout: '' },
       ),
     );
     expect(operator.wipe(instance).ok).toBe(true);
@@ -255,11 +309,129 @@ describe('the operator: five operations, every one an invocation through the sin
     expect(refused.residue.length).toBeGreaterThan(0);
   });
 
-  it('reports residue when the instance still holds data', () => {
-    const operator = createServiceOperator(recordingInvoker([], () => ({ status: 0, stdout: '7\n' })));
+  it('reports residue when the instance still holds data, in any database', () => {
+    const operator = createServiceOperator(
+      recordingInvoker([], () => ({
+        status: 0,
+        // Two databases, which is precisely what `dbsize` could not see: it read the selected one only,
+        // while `flushall` clears all sixteen.
+        stdout: '# Keyspace\r\ndb0:keys=4,expires=0,avg_ttl=0\r\ndb3:keys=3,expires=0,avg_ttl=0\r\n',
+      })),
+    );
     const residue = operator.residue(instance);
     expect(residue.ok).toBe(false);
     expect(residue.residue.join(' ')).toContain('7');
+    expect(residue.residue.join(' ')).toContain('db3');
+  });
+
+  it('asks whether a container exists, separately from whether it is ready', () => {
+    // Two different remedies: a container that exists and is not serving is worth waiting for; one that is
+    // gone — the state a reboot leaves, since records are durable and containers are not — never will be.
+    const seen: ContainerInvocation[] = [];
+    const present = createServiceOperator(
+      recordingInvoker(seen, () => ({ status: 0, stdout: 'running\n' })),
+    ).exists(instance);
+    expect(present.ok).toBe(true);
+    expect(seen[0]?.subcommand).toStrictEqual([...CONTAINER_SUBCOMMANDS.inspectContainer]);
+    expect(seen[0]?.args.at(-1)).toBe(instance.containerName);
+
+    const gone = createServiceOperator((invocation) => ({
+      status: 1,
+      stdout: '',
+      stderr: 'Error: No such object: orch-pool-redis-lease-9f1c',
+      argv: [...invocation.subcommand],
+    })).exists(instance);
+    expect(gone.ok).toBe(false);
+  });
+
+  it('forces the removal, because a container that ignored stop is still running', () => {
+    // Without `--force` a plain `rm` refuses a running container, so an instance whose process ignores
+    // SIGTERM was destroyed by nothing at all — on this pass or any later one. AD-32 makes the pass the only
+    // thing that removes a container, so the pass has to be able to.
+    const seen: ContainerInvocation[] = [];
+    createServiceOperator(recordingInvoker(seen)).destroy(instance);
+    const removal = seen.find(
+      (invocation) => invocation.subcommand.join(' ') === CONTAINER_SUBCOMMANDS.remove.join(' '),
+    );
+    expect(removal?.args).toContain('--force');
+    expect(removal?.args).toContain('--volumes');
+    expect(removal?.args.at(-1)).toBe(instance.containerName);
+  });
+
+  it('sweeps pooled containers by the one label that stays true for a container’s whole life', () => {
+    // `SERVICE_LABEL_KEYS` was documented as the sweep's discovery mechanism and nothing swept by it, so a
+    // container whose durable record was lost was reclaimable by no pass. The sweep keys on `orch.pool`
+    // alone: a warm instance leased a second time is never restarted, so its `orch.run` and `orch.lease`
+    // labels still name the *first* lease and are evidence for a person rather than a fact to act on.
+    const seen: ContainerInvocation[] = [];
+    const swept = createServiceOperator(
+      recordingInvoker(seen, () => ({
+        status: 0,
+        stdout: 'orch-pool-redis-a\tredis\tredis:7.4-alpine\norch-pool-postgres-b\t\tpostgres:17.2-alpine\n',
+      })),
+    ).sweep();
+
+    expect(seen[0]?.subcommand).toStrictEqual([...CONTAINER_SUBCOMMANDS.list]);
+    expect(seen[0]?.args).toContain(`label=${SERVICE_LABEL_KEYS.pool}=1`);
+    expect(seen[0]?.args).toContain('--all');
+    expect(seen[0]?.args.join(' ')).not.toContain(SERVICE_LABEL_KEYS.run);
+    expect(swept.ok).toBe(true);
+    expect(swept.instances.map((one) => one.containerName)).toStrictEqual([
+      'orch-pool-redis-a',
+      'orch-pool-postgres-b',
+    ]);
+    expect(swept.instances[0]?.kind).toBe('redis');
+    // An unlabelled or unrecognised kind is `null`, never guessed from the container's name.
+    expect(swept.instances[1]?.kind).toBe(null);
+  });
+
+  it('never reads a sweep that could not run as “no containers”', () => {
+    const failed = createServiceOperator((invocation) => ({
+      status: 1,
+      stdout: '',
+      stderr: 'Cannot connect to the container runtime',
+      argv: [...invocation.subcommand],
+    })).sweep();
+    expect(failed.ok).toBe(false);
+    expect(failed.instances).toStrictEqual([]);
+  });
+
+  it('gives the start invocation a ceiling a cold image pull can fit inside', () => {
+    const seen: ContainerInvocation[] = [];
+    createServiceOperator(recordingInvoker(seen)).start(request('postgres'));
+    expect(seen[0]?.timeoutMs).toBe(SERVICE_START_TIMEOUT_MS);
+    expect(SERVICE_START_TIMEOUT_MS).toBeGreaterThan(CONTAINER_CONTROL_TIMEOUT_MS);
+
+    // And a caller with a declared bound gets its own number, so the bound it promised is the one that holds.
+    const bounded: ContainerInvocation[] = [];
+    createServiceOperator(recordingInvoker(bounded)).start({ ...request('redis'), timeoutMs: 9_000 });
+    expect(bounded[0]?.timeoutMs).toBe(9_000);
+  });
+
+  it('asks readiness with a positive match rather than the absence of a complaint', () => {
+    // `pg_isready -q` prints nothing on success, and the rule was a *negative* match — so the empty string
+    // `-q` guarantees read as ready, and so did every unreadable answer. The claim is now the phrase itself.
+    expect(serviceDefinition('postgres').readiness).not.toContain('-q');
+    expect(serviceDefinition('postgres').readyWhen('')).toBe(false);
+    expect(serviceDefinition('postgres').readyWhen('some unrelated output')).toBe(false);
+    expect(serviceDefinition('postgres').readyWhen('/tmp:5432 - accepting connections')).toBe(true);
+    // Redis was already positive; both kinds now read the same way.
+    expect(serviceDefinition('redis').readyWhen('')).toBe(false);
+    expect(serviceDefinition('redis').readyWhen('PONG')).toBe(true);
+  });
+
+  it('wipes every non-system schema, not only public, and reports what the wipe cannot reach', () => {
+    const definition = serviceDefinition('postgres');
+    const wipe = definition.wipe.join(' ');
+    expect(wipe).toContain('DROP SCHEMA');
+    // A feature may `CREATE SCHEMA`; a wipe that knew only about `public` left its tables standing.
+    expect(wipe).toContain('pg_namespace');
+    const probe = definition.emptyProbe.join(' ');
+    // Cluster-wide objects the wipe cannot reach are *reported*, so the instance is quarantined for a person
+    // rather than handed on — the fail-closed direction CAP-11 asks for.
+    expect(probe).toContain('pg_database');
+    expect(probe).toContain('pg_roles');
+    expect(probe).toContain('pg_namespace');
   });
 
   it('destroys an instance by stopping then removing it, and treats already-gone as done', () => {

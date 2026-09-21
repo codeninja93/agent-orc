@@ -34,15 +34,33 @@ import { join } from 'node:path';
 import { FEATURE_STATES, isTerminalFeatureState, isRecognisedSchemaVersion } from '../contracts/index.js';
 import type { FeatureState } from '../contracts/index.js';
 import { RUN_STATE_FILE_NAME } from '../contracts/index.js';
-import { EVENT_LOG_FILE_NAME, resolveOrchHome, runPaths, worktreeDir } from '../runtime/index.js';
+import {
+  EVENT_LOG_FILE_NAME,
+  resolveOrchHome,
+  runPaths,
+  worktreeDir,
+  worktreesDir,
+} from '../runtime/index.js';
 
-import { listLeaseRecords } from './lease.js';
-import type { LeaseRecord, LeasePool } from './lease.js';
-import { listWorktreeRuns, removeWorktree } from './worktree.js';
+import {
+  decideWarmExpiry,
+  listIdleInstances,
+  listLeaseRecords,
+  listQuarantinedRecords,
+} from './lease.js';
+import type { LeaseRecord, LeasePool, RecordSkip } from './lease.js';
+import { listUnusableWorktreeEntries, listWorktreeRuns, removeWorktree } from './worktree.js';
 import type { GitRunner, WorktreeRemoval } from './worktree.js';
 
-/** The two kinds of resource a run holds. Both are reclaimed by the same comparison. */
-export const RESOURCE_KINDS = ['worktree', 'lease'] as const;
+/**
+ * The kinds of resource a pass acts on.
+ *
+ * `worktree` and `lease` belong to a run and are decided by the run-state comparison. `warm` belongs to no
+ * run at all — that is what it means for an instance to be back in the inventory — so it is decided by the
+ * idle TTL in `lease.ts` instead. It is a kind here because a pass that could not name it was a pass that
+ * reclaimed warm instances never, and a resource no pass can reclaim is the AD-32 leak.
+ */
+export const RESOURCE_KINDS = ['worktree', 'lease', 'warm'] as const;
 
 export type ResourceKind = (typeof RESOURCE_KINDS)[number];
 
@@ -207,6 +225,15 @@ export const decideReclamation = (
 
 export interface EnumerateOptions {
   readonly orchHome?: string;
+  /**
+   * Called once per thing this enumeration found and could not use.
+   *
+   * A stray directory under `worktrees/`, a half-written record, a record of a shape this build does not
+   * recognise. Each is *skipped* so the pass stays alive — one unreadable file must not stop every other
+   * resource being reclaimed — and each is reported, because a resource nothing can name is a resource no
+   * pass can reclaim, and silence there is the invisible leak AD-32 exists to prevent.
+   */
+  readonly onUnusable?: (entry: ReclaimedResource) => void;
 }
 
 /**
@@ -214,9 +241,46 @@ export interface EnumerateOptions {
  *
  * Enumeration is by what is *there*, never by what a run says it has. A run that recorded a lease it
  * never got is not a resource; a lease record no run mentions is.
+ *
+ * Two exclusions, each for its own reason:
+ *
+ * **A stray directory under `worktrees/` is reported, never thrown.** `worktreeDir` refuses any name that is
+ * not ULID-shaped, so one `.staging/` beside the real worktrees aborted the whole enumeration before a
+ * single resource was looked at — and the pass then reclaimed nothing, on every pass, for ever.
+ *
+ * **A quarantined instance is not a live resource.** `resource.return_dirty` is `escalate-to-human` and
+ * `deferred[4]` says in so many words that a quarantined instance is reclaimed by no pass, by design: the
+ * record under `pool/quarantine/` is the evidence the escalation is about. But the dirty return writes the
+ * quarantine record and *then* removes the lease record, so a crash between those two lines leaves both
+ * present — and a pass that read only `leases/` then destroyed the very container a person was being asked
+ * to look at, leaving a quarantine record naming nothing.
  */
 export const enumerateLiveResources = (options: EnumerateOptions = {}): readonly LiveResource[] => {
   const orchHome = options.orchHome ?? resolveOrchHome();
+  const report = options.onUnusable;
+  const skipSink = (kind: ResourceKind) => (skip: RecordSkip): void => {
+    report?.({
+      kind,
+      id: skip.file,
+      // Empty rather than a placeholder: a placeholder reads as a run id, and a consumer building
+      // `runs/<run>/` from it would resolve a path this pass never meant to name.
+      run: '',
+      reason: `${skip.path} was skipped: ${skip.reason}`,
+    });
+  };
+
+  for (const stray of listUnusableWorktreeEntries(orchHome)) {
+    report?.({
+      kind: 'worktree',
+      id: stray,
+      run: '',
+      reason:
+        `${worktreesDir(orchHome)}/${stray} is a directory whose name is not a usable run id, so no run ` +
+        'state can be read for it and this pass cannot decide anything about it. It is reported rather ' +
+        'than allowed to stop the pass (AD-32), and reported rather than deleted (AD-33)',
+    });
+  }
+
   const worktrees = listWorktreeRuns(orchHome).map(
     (run): LiveResource => ({
       kind: 'worktree',
@@ -225,15 +289,23 @@ export const enumerateLiveResources = (options: EnumerateOptions = {}): readonly
       handle: worktreeDir(run, orchHome),
     }),
   );
-  const leases = listLeaseRecords(orchHome).map(
-    (record): LiveResource => ({
-      kind: 'lease',
-      id: record.lease,
-      run: record.run,
-      handle: record.container_name,
-      lease: record,
-    }),
-  );
+  const quarantined = listQuarantinedRecords(orchHome, skipSink('lease'));
+  const quarantinedLeases = new Set(quarantined.map((record) => record.lease));
+  const quarantinedInstances = new Set(quarantined.map((record) => record.container_name));
+  const leases = listLeaseRecords(orchHome, skipSink('lease'))
+    .filter(
+      (record) =>
+        !quarantinedLeases.has(record.lease) && !quarantinedInstances.has(record.container_name),
+    )
+    .map(
+      (record): LiveResource => ({
+        kind: 'lease',
+        id: record.lease,
+        run: record.run,
+        handle: record.container_name,
+        lease: record,
+      }),
+    );
   return [...worktrees, ...leases];
 };
 
@@ -243,6 +315,13 @@ export interface ReclaimedResource {
   readonly id: string;
   readonly run: string;
   readonly reason: string;
+  /**
+   * The AD-35 code a failure carries, so a caller can dispose of it rather than only print it.
+   *
+   * Set on the `failed` entries alone. A reclamation that could not complete is retried by the next pass and
+   * by nothing else, which is why the codes here are the retry-with-backoff ones.
+   */
+  readonly code?: string;
 }
 
 /**
@@ -297,24 +376,31 @@ export const performReclamation = (
         if (removal.removed) {
           reclaimed.push({ ...entry, reason: `${decision.reason}; ${removal.reason}` });
         } else {
-          failed.push({ ...entry, reason: removal.reason });
+          // Retry-with-backoff, and the retry is the next pass: nothing here holds state between them.
+          failed.push({ ...entry, reason: removal.reason, code: 'git.worktree_unavailable' });
         }
         continue;
       }
       const record = decision.resource.lease;
       if (record === undefined) {
-        failed.push({ ...entry, reason: 'the lease decision carried no lease record to act on' });
+        failed.push({
+          ...entry,
+          reason: 'the lease decision carried no lease record to act on',
+          code: 'internal.invariant_violated',
+        });
         continue;
       }
       const released = actions.releaseLease(record);
       if (released.reclaimed) reclaimed.push({ ...entry, reason: `${decision.reason}; ${released.reason}` });
-      else failed.push({ ...entry, reason: released.reason });
+      else failed.push({ ...entry, reason: released.reason, code: 'resource.lease_timed_out' });
     } catch (thrown: unknown) {
       // A thrown release is one resource's problem. Reported against that resource so every other one
       // in the same pass is still acted on, exactly as the reconciler treats one unreadable run.
+      const code = (thrown as { code?: unknown } | null)?.code;
       failed.push({
         ...entry,
         reason: thrown instanceof Error ? `${thrown.name}: ${thrown.message}` : String(thrown),
+        code: typeof code === 'string' ? code : 'internal.invariant_violated',
       });
     }
   }
@@ -328,6 +414,10 @@ export interface ReclamationPassOptions {
   readonly pool?: LeasePool;
   readonly readRunState?: RunStateReader;
   readonly git?: GitRunner;
+  /** The clock the idle TTL is measured against. Injectable so the TTL is assertable without waiting. */
+  readonly now?: () => Date;
+  /** Overrides the declared warm idle TTL for this pass. */
+  readonly warmTtlMs?: number;
 }
 
 /**
@@ -340,11 +430,20 @@ export interface ReclamationPassOptions {
 export const runReclamationPass = (options: ReclamationPassOptions = {}): ReclamationSummary => {
   const orchHome = options.orchHome ?? resolveOrchHome();
   const readRunState = options.readRunState ?? fileRunStateReader(orchHome);
-  const resources = enumerateLiveResources({ orchHome });
-  const decisions = decideReclamation(resources, readRunState);
   const pool = options.pool;
+  const now = options.now ?? ((): Date => new Date());
 
-  return performReclamation(decisions, {
+  // Everything the enumeration could not use, collected rather than dropped: see `EnumerateOptions`.
+  const unusable: ReclaimedResource[] = [];
+  const resources = enumerateLiveResources({
+    orchHome,
+    onUnusable: (entry: ReclaimedResource): void => {
+      unusable.push({ ...entry, code: entry.code ?? 'internal.invariant_violated' });
+    },
+  });
+  const decisions = decideReclamation(resources, readRunState);
+
+  const summary = performReclamation(decisions, {
     removeWorktree: (resource: LiveResource, decision: ReclaimDecision): WorktreeRemoval =>
       removeWorktree({
         run: resource.run,
@@ -366,6 +465,83 @@ export const runReclamationPass = (options: ReclamationPassOptions = {}): Reclam
           }
         : pool.reclaim(record),
   });
+
+  // The idle-TTL half. Warm records belong to no run, so the run-state comparison above cannot speak about
+  // them — which is how a returned instance came to be reclaimable by nothing at all, holding a port and its
+  // memory limit across restarts and then being handed to the next run unchecked.
+  const idleReclaimed: ReclaimedResource[] = [];
+  const idleRetained: ReclaimedResource[] = [];
+  const idleFailed: ReclaimedResource[] = [];
+  const idleEntries = listIdleInstances(orchHome, (skip) => {
+    unusable.push({
+      kind: 'warm',
+      id: skip.file,
+      run: '',
+      reason: `${skip.path} was skipped: ${skip.reason}`,
+      code: 'internal.invariant_violated',
+    });
+  });
+  for (const expiry of decideWarmExpiry(idleEntries, now(), options.warmTtlMs)) {
+    const entry = {
+      kind: 'warm' as const,
+      id: expiry.entry.record.container_name,
+      // A warm instance belongs to no run: that is what being warm means. Empty rather than a placeholder,
+      // for the reason `EnumerateOptions.onUnusable` gives.
+      run: '',
+    };
+    if (!expiry.expired) {
+      idleRetained.push({ ...entry, reason: expiry.reason });
+      continue;
+    }
+    if (pool === undefined) {
+      idleFailed.push({
+        ...entry,
+        reason:
+          `${expiry.reason}, but no lease pool is configured for this pass, so its instance is reported ` +
+          'rather than destroyed',
+        code: 'resource.lease_timed_out',
+      });
+      continue;
+    }
+    const released = pool.reclaimIdle(expiry.entry);
+    if (released.reclaimed) idleReclaimed.push({ ...entry, reason: `${expiry.reason}; ${released.reason}` });
+    else idleFailed.push({ ...entry, reason: released.reason, code: 'resource.lease_timed_out' });
+  }
+
+  // The label sweep: the one thing that can see a container whose durable record was lost, which before this
+  // was reclaimable by nothing and mentioned by nothing. Reported rather than destroyed — `UnrecordedSweep`
+  // records why — so the leak is at least visible on every pass instead of never.
+  if (pool !== undefined) {
+    const swept = pool.unrecorded();
+    if (!swept.ok) {
+      unusable.push({
+        kind: 'warm',
+        id: '',
+        run: '',
+        reason: swept.detail,
+        code: 'resource.lease_timed_out',
+      });
+    }
+    for (const containerName of swept.containerNames) {
+      unusable.push({
+        kind: 'warm',
+        id: containerName,
+        run: '',
+        reason:
+          `the container ${containerName} carries this pool's label and is named by no lease, warm, claim ` +
+          'or quarantine record, so no pass can decide anything about it. It is reported rather than ' +
+          'destroyed because the label set carries no ORCH_HOME and so cannot tell this home\'s containers ' +
+          "from another home's on the same machine",
+        code: 'resource.lease_timed_out',
+      });
+    }
+  }
+
+  return {
+    reclaimed: [...summary.reclaimed, ...idleReclaimed],
+    retained: [...summary.retained, ...idleRetained],
+    failed: [...summary.failed, ...idleFailed, ...unusable],
+  };
 };
 
 /**

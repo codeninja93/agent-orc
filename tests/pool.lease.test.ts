@@ -19,7 +19,10 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { dispositionFor } from '../src/contracts/index.js';
 import {
+  CONTAINER_SUBCOMMANDS,
   CONTAINMENT_SKIP_MARKER,
+  ServiceOperationError,
+  composeServiceExecArgs,
   createContainerInvoker,
   createServiceOperator,
   instanceFor,
@@ -30,18 +33,26 @@ import type { ServiceInstance, ServiceOperator, ServiceStartRequest } from '../s
 import { poolDir } from '../src/runtime/index.js';
 import {
   LEASE_TIME_BOUND_MS,
+  LeaseNotHeldError,
   LeaseReturnDirtyError,
   LeaseTimedOutError,
+  MAX_WARM_PER_KIND,
   POOL_PORT_BASE,
+  POOL_PORT_COUNT,
+  PoolPortsExhaustedError,
+  WARM_IDLE_TTL_MS,
   createLeasePool,
+  decideWarmExpiry,
   instanceNameFor,
   leasesDir,
+  listIdleInstances,
   listLeaseRecords,
   listQuarantinedRecords,
   listWarmRecords,
   quarantineDir,
   warmDir,
 } from '../src/pool/index.js';
+import type { RecordSkip } from '../src/pool/index.js';
 
 import { makeHome } from './helpers/engine-fixture.js';
 
@@ -75,6 +86,8 @@ interface FakeService {
   readonly probes: string[];
   put: (instance: ServiceInstance, key: string) => void;
   keys: (instance: ServiceInstance) => readonly string[];
+  /** The container disappears while its record survives: the state a reboot leaves behind. */
+  vanish: (instance: ServiceInstance) => void;
 }
 
 interface FakeOptions {
@@ -82,6 +95,13 @@ interface FakeOptions {
   readonly readyAfter?: number;
   /** Never ready: the case the declared bound exists for. */
   readonly neverReady?: boolean;
+  /** Full control of the readiness answer, for a case that depends on which instance is asked. */
+  readonly readyWhen?: (
+    instance: ServiceInstance,
+    calls: number,
+  ) => { readonly ok: boolean; readonly detail: string };
+  /** Called with the request at the moment `start` is invoked, before it answers. */
+  readonly onStarting?: (request: ServiceStartRequest) => void;
   /** The start invocation fails, so nothing will ever become ready. */
   readonly startFails?: boolean;
   /** The wipe does nothing, which is exactly how residue survives one. */
@@ -102,6 +122,7 @@ const fakeService = (options: FakeOptions = {}): FakeService => {
 
   const operator: ServiceOperator = {
     start: (request: ServiceStartRequest) => {
+      options.onStarting?.(request);
       options.onStart?.(request);
       started.push(request.containerName);
       data.set(request.containerName, new Set<string>());
@@ -112,12 +133,24 @@ const fakeService = (options: FakeOptions = {}): FakeService => {
         argv: [],
       };
     },
+    exists: (instance: ServiceInstance) => {
+      // The fixture's `data` map is the container's existence: `start` creates the entry, `destroy` and
+      // `vanish` remove it. So "the record survived a reboot and the container did not" is expressible.
+      const alive = data.has(instance.containerName);
+      return { ok: alive, detail: alive ? 'running' : 'no such container in this fixture' };
+    },
     ready: (instance: ServiceInstance) => {
       const seen = (readinessCalls.get(instance.containerName) ?? 0) + 1;
       readinessCalls.set(instance.containerName, seen);
+      if (options.readyWhen !== undefined) return options.readyWhen(instance, seen);
       if (options.neverReady === true) return { ok: false, detail: 'still starting in this fixture' };
       return { ok: seen > (options.readyAfter ?? 0), detail: `probe ${String(seen)}` };
     },
+    sweep: () => ({
+      ok: true,
+      instances: [...data.keys()].map((containerName) => ({ containerName, kind: null, image: '' })),
+      detail: `${String(data.size)} pooled container(s) in this fixture`,
+    }),
     wipe: (instance: ServiceInstance) => {
       wipes.push(instance.containerName);
       if (options.wipeDoesNothing === true) return { ok: false, detail: 'the wipe did nothing' };
@@ -156,12 +189,24 @@ const fakeService = (options: FakeOptions = {}): FakeService => {
     keys: (instance: ServiceInstance): readonly string[] => [
       ...(data.get(instance.containerName) ?? new Set<string>()),
     ],
+    vanish: (instance: ServiceInstance): void => {
+      data.delete(instance.containerName);
+    },
   };
 };
 
-/** A clock the injected sleep advances, so the bound is exercised without waiting for it. */
+/**
+ * A clock the injected sleep advances, so the bound is exercised without waiting for it.
+ *
+ * `monotonicNow` reads the same counter as `now`, which is what lets a test see time spent *outside* the
+ * sleep: `advance` is the hook a fixture uses to burn time inside `start`, where the bound used not to
+ * reach. The pool takes the two separately because only the deadline may be monotonic — a durable record's
+ * timestamp has to name a real instant.
+ */
 const fakeClock = (): {
   readonly now: () => Date;
+  readonly monotonicNow: () => number;
+  readonly advance: (ms: number) => void;
   readonly sleep: (ms: number) => Promise<void>;
   readonly elapsed: () => number;
 } => {
@@ -169,6 +214,10 @@ const fakeClock = (): {
   const start = millis;
   return {
     now: (): Date => new Date(millis),
+    monotonicNow: (): number => millis,
+    advance: (ms: number): void => {
+      millis += ms;
+    },
     sleep: (ms: number): Promise<void> => {
       millis += ms;
       return Promise.resolve();
@@ -186,6 +235,7 @@ describe('acquiring a lease', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
       mintLeaseId: () => 'lease-one',
     });
@@ -223,6 +273,7 @@ describe('acquiring a lease', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
     });
 
@@ -238,6 +289,7 @@ describe('acquiring a lease', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
     });
 
@@ -256,6 +308,7 @@ describe('acquiring a lease', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
     });
 
@@ -275,7 +328,12 @@ describe('acquiring a lease', () => {
     expect(service.destroyed).toHaveLength(1);
   });
 
-  it('reports a start that failed as the bound’s failure, not as a wait for nothing', async () => {
+  it('reports a start that failed as container.start_failed, never as the bound expiring', async () => {
+    // FIXTURE CHANGED: this case asserted `LeaseTimedOutError`. A bad image pin, a name collision and a
+    // busy port are permanent for this request, and `resource.lease_timed_out` is retry-with-backoff — so
+    // the old code sent a caller into a retry loop over something no wait fixes. The intent survives
+    // intact: the case is still "a start that failed does not wait the bound out", now asserted as
+    // `clock.elapsed() === 0` plus the code that actually describes what happened.
     const orchHome = home('start-fails');
     const service = fakeService({ startFails: true });
     const clock = fakeClock();
@@ -283,10 +341,91 @@ describe('acquiring a lease', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
     });
-    await expect(pool.acquire({ run: RUN_A, kind: 'redis' })).rejects.toBeInstanceOf(LeaseTimedOutError);
+    try {
+      await pool.acquire({ run: RUN_A, kind: 'redis' });
+      expect.unreachable('a start that failed must be reported, not waited out');
+    } catch (thrown: unknown) {
+      expect(thrown).toBeInstanceOf(ServiceOperationError);
+      expect(thrown).not.toBeInstanceOf(LeaseTimedOutError);
+      const failure = thrown as ServiceOperationError;
+      expect(failure.code).toBe('container.start_failed');
+      expect(dispositionFor(failure.code)).toBe('retry-with-backoff');
+      expect(failure.orchError.code).toBe('container.start_failed');
+    }
     expect(clock.elapsed()).toBe(0);
+  });
+
+  it('counts the time spent inside start against the declared bound', async () => {
+    // The bound is declared on "a feature receives a ready instance". A clock that started after
+    // `operator.start` returned left the start's own time outside it entirely, so a 30s redis bound could
+    // legitimately take 60s — which is the hang CAP-11 forbids, arrived at one layer down.
+    const orchHome = home('bound-covers-start');
+    const clock = fakeClock();
+    const service = fakeService({
+      // The start itself burns more than the whole bound, without any sleep being involved.
+      onStarting: () => clock.advance(LEASE_TIME_BOUND_MS.redis + 1_000),
+    });
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+    });
+
+    await expect(pool.acquire({ run: RUN_A, kind: 'redis' })).rejects.toBeInstanceOf(LeaseTimedOutError);
+    // No sleeping happened at all: every millisecond of the bound was spent in `start`.
+    expect(clock.elapsed()).toBe(LEASE_TIME_BOUND_MS.redis + 1_000);
+  });
+
+  it('hands the start invocation what is left of the bound, so a cold pull cannot outrun it', async () => {
+    const orchHome = home('start-timeout');
+    const clock = fakeClock();
+    let declared: number | undefined;
+    const service = fakeService({
+      onStarting: (request) => {
+        declared = request.timeoutMs;
+      },
+    });
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+    });
+    await pool.acquire({ run: RUN_A, kind: 'redis', timeoutMs: 7_500 });
+    expect(declared).toBe(7_500);
+  });
+
+  it('refuses a lease when every port in the declared range is held, with a dispositioned code', async () => {
+    const orchHome = home('ports');
+    const service = fakeService();
+    const clock = fakeClock();
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+      allocatePort: () => {
+        throw new PoolPortsExhaustedError(POOL_PORT_COUNT);
+      },
+    });
+    try {
+      await pool.acquire({ run: RUN_A, kind: 'redis' });
+      expect.unreachable('a pool with no free port must refuse');
+    } catch (thrown: unknown) {
+      expect(thrown).toBeInstanceOf(PoolPortsExhaustedError);
+      const failure = thrown as PoolPortsExhaustedError;
+      // A bare `Error` stood here, carrying no AD-35 code at all — so it would have been handed off
+      // rather than retried, though a port frees the moment another lease is released.
+      expect(failure.code).toBe('resource.lease_timed_out');
+      expect(dispositionFor(failure.code)).toBe('retry-with-backoff');
+    }
   });
 
   it('keeps the record when the instance could not be destroyed, so the next pass reclaims it', async () => {
@@ -297,6 +436,7 @@ describe('acquiring a lease', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
     });
     await expect(
@@ -315,6 +455,7 @@ describe('returning a lease', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
       mintLeaseId: () => 'lease-clean',
     });
@@ -348,6 +489,7 @@ describe('returning a lease', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
       mintLeaseId: () => {
         minted += 1;
@@ -368,6 +510,293 @@ describe('returning a lease', () => {
     expect(listLeaseRecords(orchHome)).toHaveLength(1);
   });
 
+  it('never lets two concurrent claims of one warm record both win', async () => {
+    // The old claim was `rmSync(..., { force: true })`, and `force` swallows ENOENT — so two acquires both
+    // listed the record, both "succeeded", and both wrote a lease naming one container. That is this
+    // story's own "two runs, one kind → neither sees the other's data" criterion failing outright.
+    const orchHome = home('claim-race');
+    const service = fakeService();
+    const clock = fakeClock();
+    let minted = 0;
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+      mintLeaseId: () => {
+        minted += 1;
+        return `lease-${String(minted)}`;
+      },
+    });
+
+    const first = await pool.acquire({ run: RUN_A, kind: 'redis' });
+    pool.release(first);
+    expect(listWarmRecords(orchHome)).toHaveLength(1);
+
+    const [left, right] = await Promise.all([
+      pool.acquire({ run: RUN_A, kind: 'redis' }),
+      pool.acquire({ run: RUN_B, kind: 'redis' }),
+    ]);
+
+    // Exactly one of the two reused the warm instance; the other started its own.
+    expect([left.reused, right.reused].filter((reused) => reused)).toHaveLength(1);
+    expect(left.instance.containerName).not.toBe(right.instance.containerName);
+    const records = listLeaseRecords(orchHome);
+    expect(records).toHaveLength(2);
+    expect(new Set(records.map((record) => record.container_name)).size).toBe(2);
+    expect(listWarmRecords(orchHome)).toStrictEqual([]);
+    // And nothing was left mid-claim: the hand-over completed for both.
+    expect(listIdleInstances(orchHome)).toStrictEqual([]);
+  });
+
+  it('records the warm instance somewhere durable at every instant of the hand-over', async () => {
+    // `release()` deliberately writes the warm record before dropping the lease record, so no window exists
+    // in which the instance is recorded nowhere. `claimWarm` used to do the exact opposite — delete the warm
+    // record, *then* write the lease record — so a crash between them left a running container mentioned by
+    // neither directory, which nothing enumerates and no pass can ever see.
+    const orchHome = home('warm-ordering');
+    const service = fakeService();
+    const clock = fakeClock();
+    let minted = 0;
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+      mintLeaseId: () => {
+        minted += 1;
+        return `lease-${String(minted)}`;
+      },
+    });
+
+    const first = await pool.acquire({ run: RUN_A, kind: 'redis' });
+    pool.release(first);
+    const container = first.instance.containerName;
+
+    // Every observation the fixture can make during the second acquire: the container is named by a warm
+    // record, by a claim record or by a lease record — never by none of them.
+    const sightings: string[] = [];
+    const observe = (): void => {
+      const named =
+        listWarmRecords(orchHome).some((record) => record.container_name === container) ||
+        listIdleInstances(orchHome).some((entry) => entry.record.container_name === container) ||
+        listLeaseRecords(orchHome).some((record) => record.container_name === container);
+      sightings.push(named ? 'recorded' : 'invisible');
+    };
+    const watched = fakeService({ readyWhen: () => (observe(), { ok: true, detail: 'ready' }) });
+    const secondPool = createLeasePool({
+      orchHome,
+      operator: {
+        ...watched.operator,
+        exists: () => (observe(), { ok: true, detail: 'running' }),
+      },
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+      mintLeaseId: () => 'lease-second',
+    });
+
+    const second = await secondPool.acquire({ run: RUN_B, kind: 'redis' });
+    expect(second.instance.containerName).toBe(container);
+    expect(sightings.length).toBeGreaterThan(0);
+    expect(sightings).not.toContain('invisible');
+  });
+
+  it('starts fresh rather than burning the bound on a warm record whose container is gone', async () => {
+    // Records are durable and containers are not, so this is the state every reboot leaves. Polling a
+    // container that no longer exists for the whole declared bound and then failing is a lease that should
+    // simply have started a new instance.
+    const orchHome = home('stale-warm');
+    const service = fakeService();
+    const clock = fakeClock();
+    let minted = 0;
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+      mintLeaseId: () => {
+        minted += 1;
+        return `lease-${String(minted)}`;
+      },
+    });
+
+    const first = await pool.acquire({ run: RUN_A, kind: 'redis' });
+    pool.release(first);
+    service.vanish(first.instance); // the reboot: the record survives, the container does not
+
+    const second = await pool.acquire({ run: RUN_B, kind: 'redis' });
+    expect(second.reused).toBe(false);
+    expect(second.instance.containerName).not.toBe(first.instance.containerName);
+    expect(clock.elapsed()).toBe(0);
+    // The dead record is gone, not left to be claimed again on the next acquire.
+    expect(listWarmRecords(orchHome)).toStrictEqual([]);
+    expect(listIdleInstances(orchHome)).toStrictEqual([]);
+  });
+
+  it('holds a reused instance to the same readiness bound, and hands back no endpoint when it fails', async () => {
+    // Removing the readiness wait for a reused instance kept every other test green: the warm case's double
+    // reports ready on its first call. So the wait was asserted by nothing at all.
+    const orchHome = home('warm-not-ready');
+    const clock = fakeClock();
+    let serving = true;
+    const service = fakeService({
+      readyWhen: () => ({ ok: serving, detail: serving ? 'ready' : 'not serving in this fixture' }),
+    });
+    let minted = 0;
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+      mintLeaseId: () => {
+        minted += 1;
+        return `lease-${String(minted)}`;
+      },
+    });
+
+    const first = await pool.acquire({ run: RUN_A, kind: 'redis' });
+    pool.release(first);
+    serving = false; // the container is still there; it has stopped answering
+
+    let endpoint: string | null = null;
+    try {
+      const second = await pool.acquire({ run: RUN_B, kind: 'redis', timeoutMs: 2_000 });
+      endpoint = second.endpoint;
+      expect.unreachable('a reused instance that does not serve must not be handed to a run');
+    } catch (thrown: unknown) {
+      expect(thrown).toBeInstanceOf(LeaseTimedOutError);
+      expect((thrown as LeaseTimedOutError).boundMs).toBe(2_000);
+    }
+    expect(endpoint).toBe(null);
+    expect(clock.elapsed()).toBeGreaterThanOrEqual(2_000);
+    // Nothing is left leased and nothing rejoined the inventory: the instance was destroyed.
+    expect(listLeaseRecords(orchHome)).toStrictEqual([]);
+    expect(listWarmRecords(orchHome)).toStrictEqual([]);
+  });
+
+  it('refuses to release a lease this pool no longer records as held', async () => {
+    // A stale `Lease` released twice, or released after a pass reclaimed it, would wipe whatever
+    // `lease.instance` names — and by then that container can belong to another run which acquired it out
+    // of the warm inventory. The durable record is the only authority on who holds an instance.
+    const orchHome = home('stale-release');
+    const service = fakeService();
+    const clock = fakeClock();
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+      mintLeaseId: () => 'lease-once',
+    });
+
+    const lease = await pool.acquire({ run: RUN_A, kind: 'redis' });
+    pool.release(lease);
+    const wipesAfterFirst = service.wipes.length;
+
+    // The second release names a lease record that no longer exists.
+    try {
+      pool.release(lease);
+      expect.unreachable('a lease released twice must be refused');
+    } catch (thrown: unknown) {
+      expect(thrown).toBeInstanceOf(LeaseNotHeldError);
+      const refusal = thrown as LeaseNotHeldError;
+      expect(refusal.code).toBe('internal.invariant_violated');
+      expect(refusal.message).toContain('lease-once');
+    }
+    // Nothing was wiped the second time round, so a warm instance another run now holds is untouched.
+    expect(service.wipes).toHaveLength(wipesAfterFirst);
+  });
+
+  it('refuses to release a lease whose record names a different container', async () => {
+    const orchHome = home('mismatched-release');
+    const service = fakeService();
+    const clock = fakeClock();
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+      mintLeaseId: () => 'lease-mismatch',
+    });
+    const lease = await pool.acquire({ run: RUN_A, kind: 'redis' });
+    const impostor = {
+      ...lease,
+      instance: { ...lease.instance, containerName: 'orch-pool-redis-somebody-else' },
+    };
+    expect(() => pool.release(impostor)).toThrow(LeaseNotHeldError);
+    expect(service.wipes).toStrictEqual([]);
+  });
+
+  it('quarantines an instance whose wipe failed, even when the probe happened to read clean', async () => {
+    // `wiped` was recorded and acted on by nothing, so an instance whose wipe errored rejoined the pool on
+    // the strength of one probe — and a probe only verifies what it knows how to look at. CAP-11 claims
+    // "wiped, then verified empty"; half of that failing is not a clean return.
+    const orchHome = home('wipe-failed');
+    const service = fakeService({ wipeDoesNothing: true });
+    const clock = fakeClock();
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+      mintLeaseId: () => 'lease-wipe-failed',
+    });
+
+    // Nothing is put in it, so the emptiness probe reads clean: the wipe's own failure is the only signal.
+    const lease = await pool.acquire({ run: RUN_A, kind: 'redis' });
+    expect(service.keys(lease.instance)).toStrictEqual([]);
+
+    try {
+      pool.release(lease);
+      expect.unreachable('a failed wipe must not return an instance to the pool');
+    } catch (thrown: unknown) {
+      expect(thrown).toBeInstanceOf(LeaseReturnDirtyError);
+      expect((thrown as LeaseReturnDirtyError).residue.join(' ')).toContain('the wipe itself failed');
+    }
+    expect(listWarmRecords(orchHome)).toStrictEqual([]);
+    expect(listQuarantinedRecords(orchHome)).toHaveLength(1);
+  });
+
+  it('destroys a returned instance rather than keeping it past the warm ceiling', async () => {
+    const orchHome = home('warm-ceiling');
+    const service = fakeService();
+    const clock = fakeClock();
+    let minted = 0;
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+      mintLeaseId: () => {
+        minted += 1;
+        return `lease-${String(minted)}`;
+      },
+    });
+
+    // One more than the ceiling, all held at once, then all returned.
+    const leases = [];
+    for (let index = 0; index <= MAX_WARM_PER_KIND; index += 1) {
+      leases.push(await pool.acquire({ run: RUN_A, kind: 'redis' }));
+    }
+    const returns = leases.map((lease) => pool.release(lease));
+
+    expect(returns.filter((returned) => returned.available)).toHaveLength(MAX_WARM_PER_KIND);
+    const destroyed = returns.filter((returned) => !returned.available);
+    expect(destroyed).toHaveLength(1);
+    expect(destroyed[0]?.verifiedEmpty).toBe(true);
+    expect(destroyed[0]?.reason).toContain('ceiling');
+    expect(listWarmRecords(orchHome)).toHaveLength(MAX_WARM_PER_KIND);
+  });
+
   it('refuses a dirty resource with resource.return_dirty and never reissues it', async () => {
     const orchHome = home('dirty');
     const service = fakeService({ wipeDoesNothing: true });
@@ -377,6 +806,7 @@ describe('returning a lease', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
       mintLeaseId: () => {
         minted += 1;
@@ -421,6 +851,7 @@ describe('returning a lease', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
     });
     const lease = await pool.acquire({ run: RUN_A, kind: 'redis' });
@@ -439,6 +870,7 @@ describe('two runs, one kind', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
       mintLeaseId: () => {
         minted += 1;
@@ -487,11 +919,141 @@ describe('the pool’s durable records', () => {
     expect(() => listLeaseRecords(orchHome)).toThrow(/schema_version 99/);
   });
 
-  it('skips a corrupt record rather than letting it stop the pass', () => {
+  it('skips a corrupt record rather than letting it stop the pass, and says which one', () => {
+    // FIXTURE EXTENDED: this case asserted only the silent skip. Skipping is still right — one half-written
+    // file must not stop the pass reclaiming every other resource — but a *silent* skip makes the resource
+    // that record named invisible, which is the same failure shape AD-32 exists to prevent. The intent
+    // survives: the skip is still asserted, and now so is the report that goes with it.
     const orchHome = home('corrupt');
     mkdirSync(leasesDir(orchHome), { recursive: true });
     writeFileSync(join(leasesDir(orchHome), 'half-written.json'), '{"schema_version": 1, "lea', 'utf8');
-    expect(listLeaseRecords(orchHome)).toStrictEqual([]);
+
+    const skips: RecordSkip[] = [];
+    expect(listLeaseRecords(orchHome, (skip) => skips.push(skip))).toStrictEqual([]);
+    expect(skips).toHaveLength(1);
+    expect(skips[0]?.file).toBe('half-written.json');
+    expect(skips[0]?.path).toBe(join(leasesDir(orchHome), 'half-written.json'));
+    expect(skips[0]?.reason.length).toBeGreaterThan(10);
+  });
+
+  it('reports a record of a shape this build does not recognise, rather than dropping it', () => {
+    const orchHome = home('wrong-shape');
+    mkdirSync(leasesDir(orchHome), { recursive: true });
+    // Valid JSON, valid schema_version, and no `container_name`: nothing can act on the resource it names.
+    writeFileSync(
+      join(leasesDir(orchHome), 'shapeless.json'),
+      JSON.stringify({ schema_version: 1, lease: 'shapeless', run: RUN_A, kind: 'redis' }),
+      'utf8',
+    );
+    const skips: RecordSkip[] = [];
+    expect(listLeaseRecords(orchHome, (skip) => skips.push(skip))).toStrictEqual([]);
+    expect(skips.map((skip) => skip.file)).toStrictEqual(['shapeless.json']);
+  });
+
+  it('gives a warm instance an idle TTL, because no run holds one for a pass to compare against', async () => {
+    const orchHome = home('warm-ttl');
+    const service = fakeService();
+    const clock = fakeClock();
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+      mintLeaseId: () => 'lease-ttl',
+    });
+
+    const lease = await pool.acquire({ run: RUN_A, kind: 'redis' });
+    pool.release(lease);
+    const idle = listIdleInstances(orchHome);
+    expect(idle).toHaveLength(1);
+    expect(idle[0]?.origin).toBe('warm');
+
+    // Inside the TTL it is retained; past it, it is expired. The comparison is pure: it writes nothing.
+    const fresh = decideWarmExpiry(idle, new Date(clock.now().getTime() + WARM_IDLE_TTL_MS - 1));
+    expect(fresh[0]?.expired).toBe(false);
+    const stale = decideWarmExpiry(idle, new Date(clock.now().getTime() + WARM_IDLE_TTL_MS));
+    expect(stale[0]?.expired).toBe(true);
+    expect(stale[0]?.reason).toContain('past the declared TTL');
+    expect(listIdleInstances(orchHome)).toHaveLength(1);
+
+    // Acting on it destroys the container and forgets exactly the file the enumeration read.
+    const released = pool.reclaimIdle(idle[0]!);
+    expect(released.reclaimed).toBe(true);
+    expect(service.destroyed).toStrictEqual([lease.instance.containerName]);
+    expect(listIdleInstances(orchHome)).toStrictEqual([]);
+  });
+
+  it('names a pooled container no record accounts for, so a lost record is not a silent leak', async () => {
+    // `SERVICE_LABEL_KEYS` was documented as the sweep's discovery mechanism and nothing swept by it, so a
+    // container whose durable record was lost was reclaimable by no pass and mentioned by nothing at all.
+    const orchHome = home('unrecorded');
+    const service = fakeService();
+    const clock = fakeClock();
+    const pool = createLeasePool({
+      orchHome,
+      operator: service.operator,
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+      mintLeaseId: () => 'lease-recorded',
+    });
+
+    const lease = await pool.acquire({ run: RUN_A, kind: 'redis' });
+    // While the record is there, the container is accounted for.
+    expect(pool.unrecorded()).toStrictEqual({
+      ok: true,
+      containerNames: [],
+      detail: '0 of 1 pooled container(s) are named by no record of this pool',
+    });
+
+    // The record is lost — a truncated write, a deleted file — and the container stays up.
+    rmSync(join(leasesDir(orchHome), 'lease-recorded.json'), { force: true });
+    const swept = pool.unrecorded();
+    expect(swept.ok).toBe(true);
+    expect(swept.containerNames).toStrictEqual([lease.instance.containerName]);
+    // Reported, never destroyed: the label set carries no ORCH_HOME, so it cannot tell this home's
+    // containers from another home's on the same machine.
+    expect(service.destroyed).toStrictEqual([]);
+  });
+
+  it('never reads a sweep that could not run as “every container is accounted for”', async () => {
+    const orchHome = home('unrecorded-fails');
+    const service = fakeService();
+    const clock = fakeClock();
+    const pool = createLeasePool({
+      orchHome,
+      operator: {
+        ...service.operator,
+        sweep: () => ({ ok: false, instances: [], detail: 'the runtime did not answer' }),
+      },
+      now: clock.now,
+      monotonicNow: clock.monotonicNow,
+      sleep: clock.sleep,
+    });
+    await pool.acquire({ run: RUN_A, kind: 'redis' });
+    const swept = pool.unrecorded();
+    expect(swept.ok).toBe(false);
+    expect(swept.detail).toContain('could not run');
+  });
+
+  it('never expires an idle record whose returned_at this build cannot read', () => {
+    const orchHome = home('warm-unreadable');
+    const entry = {
+      record: {
+        schema_version: 1,
+        kind: 'redis' as const,
+        container_name: 'orch-pool-redis-unreadable',
+        host_port: 55_499,
+        image: 'redis:7.4-alpine',
+        returned_at: 'not a timestamp',
+      },
+      path: join(warmDir(orchHome), 'orch-pool-redis-unreadable.json'),
+      origin: 'warm' as const,
+    };
+    const [decision] = decideWarmExpiry([entry], new Date());
+    expect(decision?.expired).toBe(false);
+    expect(decision?.reason).toContain('unreadable returned_at');
   });
 
   it('reclaims a recorded lease by destroying its instance and forgetting the record', async () => {
@@ -502,6 +1064,7 @@ describe('the pool’s durable records', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
       mintLeaseId: () => 'lease-reclaim',
     });
@@ -523,6 +1086,7 @@ describe('the pool’s durable records', () => {
       orchHome,
       operator: service.operator,
       now: clock.now,
+      monotonicNow: clock.monotonicNow,
       sleep: clock.sleep,
     });
     await pool.acquire({ run: RUN_A, kind: 'redis' });
@@ -545,19 +1109,51 @@ describe.skipIf(!runtime.reachable)(liveSuiteName, () => {
     'starts, becomes ready, wipes clean and is destroyed',
     async () => {
       const orchHome = home('live');
-      const operator = createServiceOperator(createContainerInvoker());
+      const invoke = createContainerInvoker();
+      const operator = createServiceOperator(invoke);
       const pool = createLeasePool({ orchHome, operator });
 
       const lease = await pool.acquire({ run: RUN_A, kind: 'redis' });
       try {
         expect(lease.endpoint.startsWith('127.0.0.1:')).toBe(true);
         expect(operator.ready(lease.instance).ok).toBe(true);
+        expect(operator.exists(lease.instance).ok).toBe(true);
 
-        // Put something in it, so "verified empty" is a claim about an instance that held data.
+        // FIXTURE FIXED: this case asserted `definition.wipe.length > 0` under a comment claiming data had
+        // been put in the instance. Nothing ever wrote any, so CAP-11's central claim would have passed
+        // against an instance that was empty the whole time. Real keys, in two different databases, because
+        // `flushall` clears all sixteen and the old `dbsize` probe read only the selected one.
         const definition = serviceDefinition('redis');
         expect(definition.wipe.length).toBeGreaterThan(0);
+        for (const [database, key] of [
+          ['0', 'orch:probe:zero'],
+          ['3', 'orch:probe:three'],
+        ]) {
+          const written = invoke({
+            subcommand: CONTAINER_SUBCOMMANDS.exec,
+            args: composeServiceExecArgs(lease.instance, [
+              'redis-cli',
+              '-n',
+              database ?? '0',
+              'set',
+              key ?? '',
+              'a feature wrote this',
+            ]),
+          });
+          expect(written.status, written.stderr).toBe(0);
+        }
+
+        // The instance really is dirty now, and the probe really sees it: without this the next assertion
+        // would be a claim about nothing.
+        const dirty = operator.residue(lease.instance);
+        expect(dirty.ok).toBe(false);
+        expect(dirty.residue.join(' ')).toContain('survived the wipe');
+
         const returned = pool.release(lease);
+        expect(returned.wiped).toBe(true);
         expect(returned.verifiedEmpty).toBe(true);
+        // And asked again, directly: the wipe emptied every database, not only the selected one.
+        expect(operator.residue(lease.instance).residue).toStrictEqual([]);
       } finally {
         // Test hygiene, not the system's reclamation path: the pass in reclaim.ts is what a run relies
         // on, and this line exists so a skipped daemon does not leave a container on a dev machine.

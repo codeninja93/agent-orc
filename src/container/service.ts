@@ -42,6 +42,7 @@ import {
   DEFAULT_SECCOMP_PROFILE,
   ForbiddenFlagError,
   FORBIDDEN_RUN_FLAG_REASONS,
+  firstForbiddenFlag,
   isCredentialEnvName,
   REFUSED_SECCOMP_PROFILE,
 } from './flags.js';
@@ -53,7 +54,15 @@ export const SERVICE_KINDS = ['postgres', 'redis'] as const;
 
 export type ServiceKind = (typeof SERVICE_KINDS)[number];
 
-/** The label keys a reclamation sweep finds a leased instance by, without parsing a name. */
+/**
+ * The label keys a reclamation sweep finds a leased instance by, without parsing a name.
+ *
+ * `pool` is the one the sweep in {@link ServiceOperator.sweep} actually keys on, and the distinction
+ * matters: a warm instance leased a second time is never restarted, so its `run` and `lease` labels still
+ * name the *first* lease for the rest of its life. Acting on those would attribute a live instance to a
+ * finished run. `pool` and `resource` are properties of the container itself and stay true; `run` and
+ * `lease` are evidence about its first lease and are read by a person, never by a pass.
+ */
 export const SERVICE_LABEL_KEYS = {
   run: 'orch.run',
   lease: 'orch.lease',
@@ -76,6 +85,16 @@ export const DEFAULT_SERVICE_PIDS_LIMIT = 256;
 
 /** The loopback address a leased instance is published on, and nowhere else. */
 export const SERVICE_PUBLISH_ADDRESS = '127.0.0.1';
+
+/**
+ * The ceiling on a start invocation when the caller declares no bound of its own.
+ *
+ * Longer than {@link CONTAINER_CONTROL_TIMEOUT_MS} on purpose: the first start of a kind pulls its image,
+ * and a 30s control-plane timeout killed that pull and handed the caller a failure that read as a lease
+ * timeout. A caller with a declared bound passes it through `ServiceStartRequest.timeoutMs` instead, so the
+ * bound it promised is the one that applies.
+ */
+export const SERVICE_START_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * Everything that differs between one leasable service and the next.
@@ -129,6 +148,28 @@ const countedResidue = (stdout: string, noun: string): readonly string[] => {
   return count === 0 ? [] : [`${String(count)} ${noun}(s) survived the wipe`];
 };
 
+/**
+ * What redis's `INFO keyspace` section says survived, across every database rather than one.
+ *
+ * An empty instance prints the section header and no `dbN:` line, which is why the header is what marks
+ * the output as readable: without it, the answer is a connection error or a truncated read, and an
+ * unreadable answer has not established emptiness. Fails closed, like {@link countedResidue}.
+ */
+const keyspaceResidue = (stdout: string): readonly string[] => {
+  if (!/#\s*keyspace/i.test(stdout)) {
+    return [
+      `the emptiness probe printed ${JSON.stringify(stdout.trim())}, which carries no keyspace section`,
+    ];
+  }
+  const databases = [...stdout.matchAll(/^db(\d+):keys=(\d+)/gm)];
+  const keys = databases.reduce((total, match) => total + Number.parseInt(match[2] ?? '0', 10), 0);
+  if (keys === 0) return [];
+  return [
+    `${String(keys)} key(s) survived the wipe, across ${String(databases.length)} database(s): ` +
+      databases.map((match) => `db${match[1] ?? '?'}`).join(', '),
+  ];
+};
+
 /** The in-container user the postgres image's own tools expect. */
 const POSTGRES_ROLE = 'orch';
 const POSTGRES_DATABASE = 'orch';
@@ -157,9 +198,14 @@ export const SERVICE_DEFINITIONS: Readonly<Record<ServiceKind, ServiceDefinition
       POSTGRES_HOST_AUTH_METHOD: 'trust',
       PGDATA: '/var/lib/postgresql/data/pgdata',
     },
-    readiness: ['pg_isready', '-q', '-U', POSTGRES_ROLE, '-d', POSTGRES_DATABASE],
+    // No `-q`: with it, `pg_isready` prints nothing on success, and a readiness rule can then only be a
+    // *negative* match on the empty string — which is true of every unreadable answer as well. The
+    // positive phrase is the claim, the same shape redis's `/pong/i` has.
+    readiness: ['pg_isready', '-U', POSTGRES_ROLE, '-d', POSTGRES_DATABASE],
     // Dropping and recreating the schema removes tables, sequences, views and types in one statement,
-    // which a `TRUNCATE` sweep over the tables it happened to find does not.
+    // which a `TRUNCATE` sweep over the tables it happened to find does not. Every *other* non-system
+    // schema goes with it: a feature may `CREATE SCHEMA`, and a wipe that only knew about `public` left
+    // one feature's tables standing where the emptiness probe never looked.
     wipe: [
       'psql',
       '-U',
@@ -169,10 +215,17 @@ export const SERVICE_DEFINITIONS: Readonly<Record<ServiceKind, ServiceDefinition
       '-v',
       'ON_ERROR_STOP=1',
       '-c',
-      'DROP SCHEMA IF EXISTS public CASCADE',
+      "DO $$DECLARE s text; BEGIN FOR s IN SELECT nspname FROM pg_namespace WHERE nspname NOT IN " +
+        "('pg_catalog','information_schema','pg_toast') AND nspname NOT LIKE 'pg\\_%' LOOP " +
+        'EXECUTE format(\'DROP SCHEMA IF EXISTS %I CASCADE\', s); END LOOP; END$$',
       '-c',
       'CREATE SCHEMA public',
     ],
+    // Counts everything a feature could have left anywhere in the cluster, summed to one integer:
+    // relations in any non-system schema, extra schemas, extra databases and extra roles. `CREATE
+    // DATABASE` and `CREATE ROLE` are cluster-wide and the wipe above cannot reach them, so they are
+    // *reported* — an instance carrying one is quarantined for a person rather than handed on, which is
+    // the fail-closed direction CAP-11 asks for.
     emptyProbe: [
       'psql',
       '-U',
@@ -181,10 +234,15 @@ export const SERVICE_DEFINITIONS: Readonly<Record<ServiceKind, ServiceDefinition
       POSTGRES_DATABASE,
       '-At',
       '-c',
-      "SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace",
+      'SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE ' +
+        "n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') AND n.nspname NOT LIKE 'pg\\_%') " +
+        '+ (SELECT count(*) FROM pg_namespace WHERE nspname NOT IN ' +
+        "('pg_catalog','information_schema','pg_toast','public') AND nspname NOT LIKE 'pg\\_%') " +
+        `+ (SELECT count(*) FROM pg_database WHERE datname NOT IN ('postgres','template0','template1','${POSTGRES_DATABASE}')) ` +
+        `+ (SELECT count(*) FROM pg_roles WHERE rolname <> '${POSTGRES_ROLE}' AND rolname NOT LIKE 'pg\\_%')`,
     ],
-    readyWhen: (stdout: string): boolean => !/no response|not accepting/i.test(stdout),
-    residueOf: (stdout: string): readonly string[] => countedResidue(stdout, 'relation'),
+    readyWhen: (stdout: string): boolean => /accepting connections/i.test(stdout),
+    residueOf: (stdout: string): readonly string[] => countedResidue(stdout, 'surviving object'),
   },
   redis: {
     kind: 'redis',
@@ -194,9 +252,12 @@ export const SERVICE_DEFINITIONS: Readonly<Record<ServiceKind, ServiceDefinition
     env: { REDIS_ARGS: '--save "" --appendonly no' },
     readiness: ['redis-cli', 'ping'],
     wipe: ['redis-cli', 'flushall'],
-    emptyProbe: ['redis-cli', 'dbsize'],
+    // `info keyspace`, not `dbsize`: `flushall` clears all sixteen databases and `dbsize` reports only the
+    // selected one, so the probe verified a sixteenth of what the wipe cleared. The keyspace section names
+    // every database that holds a key, which is exactly the set the wipe is claiming to have emptied.
+    emptyProbe: ['redis-cli', 'info', 'keyspace'],
     readyWhen: (stdout: string): boolean => /pong/i.test(stdout),
-    residueOf: (stdout: string): readonly string[] => countedResidue(stdout, 'key'),
+    residueOf: (stdout: string): readonly string[] => keyspaceResidue(stdout),
   },
 };
 
@@ -270,6 +331,15 @@ export interface ServiceStartRequest {
   readonly memoryLimit?: string;
   readonly pidsLimit?: number;
   readonly seccompProfile?: string;
+  /**
+   * How long the start invocation itself may take. The caller's declared bound, when it has one.
+   *
+   * Without it the invocation took the 30s control-plane default, which is shorter than a cold image pull
+   * and longer than the caller's own bound — so a lease could both be killed mid-pull *and* spend 60s
+   * inside a 30s bound. The lease passes its remaining bound here so the declared number covers the whole
+   * acquire rather than only the readiness wait (CAP-11).
+   */
+  readonly timeoutMs?: number;
 }
 
 /**
@@ -351,11 +421,13 @@ export const composeServiceRunArgs = (request: ServiceStartRequest): readonly st
   ];
 
   const runtimeFlags = args.slice(0, args.indexOf(definition.image));
-  for (const flag of FORBIDDEN_SERVICE_FLAGS) {
-    if (runtimeFlags.includes(flag)) {
-      throw new ForbiddenFlagError(flag, FORBIDDEN_SERVICE_FLAG_REASONS[flag] ?? 'it is not permitted');
-    }
-  }
+  // `firstForbiddenFlag`, not a local `includes` loop. The loop that stood here repeated `flags.ts`'s own
+  // `=`-form blind spot on a table derived from the same source: `--cap-add=SYS_ADMIN` passed it, and
+  // every value-bearing entry it inherited (`--pid=host`, `--network=host`) could never fire at all,
+  // because no argv contains that joined string as one token unless somebody wrote it that way. One
+  // matcher over both tables is one place the spelling can be forgotten.
+  const forbidden = firstForbiddenFlag(runtimeFlags, FORBIDDEN_SERVICE_FLAG_REASONS);
+  if (forbidden !== null) throw new ForbiddenFlagError(forbidden.flag, forbidden.reason);
   return args;
 };
 
@@ -412,10 +484,43 @@ export interface ServiceResidueResult extends ServiceOperationResult {
  */
 export interface ServiceOperator {
   readonly start: (request: ServiceStartRequest) => ServiceStartOutcome;
+  /**
+   * Whether the container an instance names is still there at all.
+   *
+   * Separate from `ready` because the two answers have different remedies. A container that exists and is
+   * not yet serving is worth waiting for, up to the declared bound. A container that is *gone* — the state
+   * after a reboot, since the pool's records are durable and containers are not — will never become ready,
+   * and polling it for the full bound instead of starting a fresh instance is a lease that fails for no
+   * reason.
+   */
+  readonly exists: (instance: ServiceInstance) => ServiceOperationResult;
   readonly ready: (instance: ServiceInstance) => ServiceOperationResult;
   readonly wipe: (instance: ServiceInstance) => ServiceOperationResult;
   readonly residue: (instance: ServiceInstance) => ServiceResidueResult;
   readonly destroy: (instance: ServiceInstance) => ServiceOperationResult;
+  /**
+   * Every pooled container the runtime holds, found by label rather than by a durable record.
+   *
+   * This is what {@link SERVICE_LABEL_KEYS} is *for*, and until now nothing swept by it: a pass could only
+   * see containers its own records named, so a container whose record was lost was reclaimable by nothing —
+   * the exact invisible leak AD-32 exists to prevent. The sweep keys on `orch.pool` alone, deliberately:
+   * a warm instance leased a second time is never restarted, so its `orch.run` and `orch.lease` labels
+   * still name the *first* lease and are not safe to act on. `orch.pool` stays true for the container's
+   * whole life.
+   */
+  readonly sweep: () => ServiceSweepResult;
+}
+
+/** One pooled container a label sweep found, with what its labels could say about it. */
+export interface SweptInstance {
+  readonly containerName: string;
+  /** The kind its `orch.resource` label names, or `null` when the label is missing or unrecognised. */
+  readonly kind: ServiceKind | null;
+  readonly image: string;
+}
+
+export interface ServiceSweepResult extends ServiceOperationResult {
+  readonly instances: readonly SweptInstance[];
 }
 
 export interface ServiceStartOutcome extends ServiceOperationResult {
@@ -447,13 +552,28 @@ export const createServiceOperator = (invoke: ContainerInvoker): ServiceOperator
   return {
     start: (request: ServiceStartRequest): ServiceStartOutcome => {
       const args = composeServiceRunArgs(request);
-      const result = invoke({ subcommand: CONTAINER_SUBCOMMANDS.run, args });
+      const result = invoke({
+        subcommand: CONTAINER_SUBCOMMANDS.run,
+        args,
+        // The caller's bound when it declared one; otherwise a ceiling generous enough for a cold image
+        // pull, because the 30s control-plane default killed one and reported it as a lease timeout.
+        timeoutMs: request.timeoutMs ?? SERVICE_START_TIMEOUT_MS,
+      });
       return {
         ok: result.status === 0,
         detail: result.status === 0 ? result.stdout.trim() : (result.stderr.trim() || result.stdout.trim()),
         instance: instanceFor(request),
         argv: result.argv,
       };
+    },
+    exists: (instance: ServiceInstance): ServiceOperationResult => {
+      const result = invoke({
+        subcommand: CONTAINER_SUBCOMMANDS.inspectContainer,
+        args: ['--format', '{{.State.Status}}', instance.containerName],
+        timeoutMs: CONTAINER_CONTROL_TIMEOUT_MS,
+      });
+      const detail = (result.stdout.trim() === '' ? result.stderr : result.stdout).trim();
+      return { ok: result.status === 0, detail: detail === '' ? 'no such container' : detail };
     },
     ready: (instance: ServiceInstance): ServiceOperationResult => {
       const definition = serviceDefinition(instance.kind);
@@ -492,13 +612,54 @@ export const createServiceOperator = (invoke: ContainerInvoker): ServiceOperator
       });
       const removed = invoke({
         subcommand: CONTAINER_SUBCOMMANDS.remove,
-        args: ['--volumes', instance.containerName],
+        // `--force` because the `stop` above can legitimately fail: a process that ignores SIGTERM and
+        // outlives the grace period leaves the container *running*, and a plain `rm` refuses a running
+        // container — so the instance would then be destroyed by nothing at all, on this pass or any
+        // later one. AD-32 makes the pass the only thing that removes a container, so the pass has to be
+        // able to.
+        args: ['--force', '--volumes', instance.containerName],
       });
       const detail = (removed.stderr.trim() === '' ? removed.stdout : removed.stderr).trim();
       if (removed.status === 0) return { ok: true, detail: detail === '' ? 'removed' : detail };
       // Already gone is the outcome the caller wanted, reached by another route.
       if (/no such container/i.test(detail)) return { ok: true, detail: 'the instance was already gone' };
       return { ok: false, detail: `${detail} (stop reported ${String(stopped.status)})` };
+    },
+    sweep: (): ServiceSweepResult => {
+      const result = invoke({
+        subcommand: CONTAINER_SUBCOMMANDS.list,
+        args: [
+          '--all',
+          '--filter',
+          `label=${SERVICE_LABEL_KEYS.pool}=1`,
+          '--format',
+          `{{.Names}}\t{{.Label "${SERVICE_LABEL_KEYS.resource}"}}\t{{.Image}}`,
+        ],
+        timeoutMs: CONTAINER_CONTROL_TIMEOUT_MS,
+      });
+      if (result.status !== 0) {
+        const detail = (result.stderr.trim() === '' ? result.stdout : result.stderr).trim();
+        // A sweep that could not run has established nothing. It must never read as "no containers".
+        return { ok: false, instances: [], detail };
+      }
+      const instances = result.stdout
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line !== '')
+        .map((line): SweptInstance => {
+          const [name = '', resource = '', image = ''] = line.split('\t');
+          return {
+            containerName: name,
+            kind: (SERVICE_KINDS as readonly string[]).includes(resource) ? (resource as ServiceKind) : null,
+            image,
+          };
+        })
+        .filter((instance) => instance.containerName !== '');
+      return {
+        ok: true,
+        instances,
+        detail: `${String(instances.length)} pooled container(s) carry ${SERVICE_LABEL_KEYS.pool}=1`,
+      };
     },
   };
 };

@@ -100,11 +100,16 @@ export const FORBIDDEN_RUN_FLAGS: readonly string[] = Object.keys(FORBIDDEN_RUN_
  *
  * Exported so the AD-20 suite can drive the matcher against vectors this composer would never build.
  * A self-check nothing can test is a comment that happens to compile.
+ *
+ * `reasons` is a parameter rather than a closed-over constant because `service.ts` derives its own table
+ * from this one and had, before this, its own hand-written loop with the `=`-form blind spot this matcher
+ * exists to close. One matcher over two tables is one place a spelling can be forgotten.
  */
 export const firstForbiddenFlag = (
   tokens: readonly string[],
+  reasons: Readonly<Record<string, string>> = FORBIDDEN_RUN_FLAG_REASONS,
 ): { readonly flag: string; readonly reason: string } | null => {
-  for (const [flag, reason] of Object.entries(FORBIDDEN_RUN_FLAG_REASONS)) {
+  for (const [flag, reason] of Object.entries(reasons)) {
     const separator = flag.indexOf('=');
     const name = separator === -1 ? flag : flag.slice(0, separator);
     const value = separator === -1 ? null : flag.slice(separator + 1);

@@ -1,100 +1,129 @@
----
-title: 'Worktree lifecycle, leased resource pool, reconcile reclamation'
-type: 'feature'
+---title: Worktree lifecycle, leased resource pool, reconcile reclamation
+type: feature
 created: '2026-09-20'
-status: 'in-review'
-review_loop_iteration: 0
+status: done
+review_loop_iteration: 1
 followup_review_recommended: true
 context:
-  - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/SPEC.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-5-container-wrapper.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-3-engine-reconciler.md'
-warnings: ['oversized'] # 10 files and 14 I/O scenarios; spans git worktrees, leased containers and an AD-32 reconcile pass
+- '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/SPEC.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-5-container-wrapper.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-3-engine-reconciler.md'
+warnings:
+- oversized
 deferred:
-  - summary: >-
-      RESOLVED: the tier-2 execution conflict this story recorded was accepted as ADR-001.
-    evidence: |-
-      RESOLVED 2026-09-20: ADR-001-tier-2-execution.md was accepted and AD-1, AD-20 and AD-20's egress line amended in the spine, which moves the containment boundary from
-      the agent process to the commands the agent runs. The decisive finding is that the subscription
-      credential is in the macOS keychain rather than a file, so no mount can put it inside a
-      container — making AD-20's container and AD-1's subscription-only auth incompatible on the
-      stated primary platform. The ADR is proposed, not accepted; it awaits Deep's sign-off and amends
-      AD-1 and AD-20, which live in an adopted companion this session does not own.
-    location: >-
-      docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-001-tier-2-execution.md
-    severity: high
-  - summary: >-
-      A tier-2 step still cannot reach the instance it leases: execution runs with no general network and
-      a leased service is published on loopback.
-    evidence: |-
-      `src/container/flags.ts` composes `--network none` for the execution phase (AD-20), and
-      `src/container/service.ts` publishes a leased instance on `127.0.0.1:<port>`. Both are correct to
-      their own contracts and they do not meet. Bridging them is the egress work this story's Never list
-      assigns to story 2-10; CAP-11 is therefore mechanised end to end for the *host* and not yet for a
-      confined step.
-    location: >-
-      src/container/service.ts
-    severity: high
-  - summary: >-
-      A tier-2 step cannot run git inside its worktree: the worktree's `.git` points outside the one
-      directory story 1-5 mounts.
-    evidence: |-
-      `git worktree add` writes a `.git` *file* naming `<repo>/.git/worktrees/<run-branch>`, and AD-20's
-      mount allow-list admits only the worktree and the run's session directory. So a step that commits
-      its own work — which the crash fixture's executor does on the host — would fail inside a container.
-      Mount discipline is story 1-5's and this story may not widen it, so the gap is recorded rather than
-      papered over. A linked worktree is still the right shape; what needs deciding is whether the admin
-      directory is mounted or the step commits through the engine.
-    location: >-
-      src/pool/worktree.ts
-    severity: high
-  - summary: >-
-      On a host where the engine is not root, a worktree is made writable by the executor uid by widening
-      its mode rather than by chowning it.
-    evidence: |-
-      `makeWritableByExecutorUid` chowns when `process.getuid()` is 0 and otherwise sets the other-write
-      and other-execute bits, because there is no other way for a *fixed* foreign uid to write a tree this
-      process owns. The widening is confined to `ORCH_HOME/worktrees/` and holds a disposable checkout.
-      The alternative — passing the host uid to the container — is refused because it would make the flag
-      set depend on who ran the engine and story 1-5's suite could no longer assert a fixed non-root user.
-      Asserted either way by `unwritablePaths`, which is empty after creation and non-empty before.
-    location: >-
-      src/pool/worktree.ts
-    severity: medium
-  - summary: >-
-      The two service image pins are unresolved, and a pooled service is a stock image rather than a
-      locally built one.
-    evidence: |-
-      `postgres:17.2-alpine` and `redis:7.4-alpine` are pins nothing has pulled, because no daemon
-      answers here. AD-11's build-it-locally rule binds the *executor* image; a leased database is not it,
-      and building postgres from a Dockerfile in this repository would be a second image to maintain for
-      no isolation gain. A wrong pin surfaces as a failed start, which the lease reports as
-      `resource.lease_timed_out` rather than as a hang.
-    location: >-
-      src/container/service.ts
-    severity: medium
-  - summary: >-
-      A quarantined instance is reclaimed by no pass, by design, so a dirty return leaves a container
-      standing until a person acts.
-    evidence: |-
-      `resource.return_dirty` is declared `escalate-to-human`. Destroying the instance would delete the
-      evidence the escalation is about, and reclaiming it would be the pass deciding a question the AD-35
-      table assigns to a person. The record under `pool/quarantine/` names the instance and its residue;
-      nothing yet renders that, which is story 1-7's surface.
-    location: >-
-      src/pool/lease.ts
-    severity: low
-  - summary: >-
-      The AD-31 containment gate is still not met on this machine, unchanged from story 1-5.
-    evidence: |-
-      `docker info` still fails, so the seven container assertion tests skip and this story's one
-      daemon-requiring lease test skips with them, through story 1-5's existing probe and marker. No
-      second marker mechanism was introduced, and this story wrote no gate marker.
-    location: >-
-      tests/pool.lease.test.ts
-    severity: high
-baseline_revision: '7487508adede8190394f060cac16ca3b9184f656'
+- summary: 'RESOLVED: the tier-2 execution conflict this story recorded was accepted as ADR-001.'
+  evidence: 'RESOLVED 2026-09-20: ADR-001-tier-2-execution.md was accepted and AD-1, AD-20 and AD-20''s
+    egress line amended in the spine, which moves the containment boundary from
+
+    the agent process to the commands the agent runs. The decisive finding is that the subscription
+
+    credential is in the macOS keychain rather than a file, so no mount can put it inside a
+
+    container — making AD-20''s container and AD-1''s subscription-only auth incompatible on the
+
+    stated primary platform. The ADR is proposed, not accepted; it awaits Deep''s sign-off and amends
+
+    AD-1 and AD-20, which live in an adopted companion this session does not own.'
+  location: docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-001-tier-2-execution.md
+  severity: high
+- summary: 'A tier-2 step still cannot reach the instance it leases: execution runs with no general network
+    and a leased service is published on loopback.'
+  evidence: '`src/container/flags.ts` composes `--network none` for the execution phase (AD-20), and
+
+    `src/container/service.ts` publishes a leased instance on `127.0.0.1:<port>`. Both are correct to
+
+    their own contracts and they do not meet. Bridging them is the egress work this story''s Never list
+
+    assigns to story 2-10; CAP-11 is therefore mechanised end to end for the *host* and not yet for a
+
+    confined step.'
+  location: src/container/service.ts
+  severity: high
+- summary: 'A tier-2 step cannot run git inside its worktree: the worktree''s `.git` points outside the
+    one directory story 1-5 mounts.'
+  evidence: '`git worktree add` writes a `.git` *file* naming `<repo>/.git/worktrees/<run-branch>`, and
+    AD-20''s
+
+    mount allow-list admits only the worktree and the run''s session directory. So a step that commits
+
+    its own work — which the crash fixture''s executor does on the host — would fail inside a container.
+
+    Mount discipline is story 1-5''s and this story may not widen it, so the gap is recorded rather than
+
+    papered over. A linked worktree is still the right shape; what needs deciding is whether the admin
+
+    directory is mounted or the step commits through the engine.'
+  location: src/pool/worktree.ts
+  severity: high
+- summary: On a host where the engine is not root, a worktree is made writable by the executor uid by
+    widening its mode rather than by chowning it.
+  evidence: '`makeWritableByExecutorUid` chowns when `process.getuid()` is 0 and otherwise sets the other-write
+
+    and other-execute bits, because there is no other way for a *fixed* foreign uid to write a tree this
+
+    process owns. The widening is confined to `ORCH_HOME/worktrees/` and holds a disposable checkout.
+
+    The alternative — passing the host uid to the container — is refused because it would make the flag
+
+    set depend on who ran the engine and story 1-5''s suite could no longer assert a fixed non-root user.
+
+    Asserted either way by `unwritablePaths`, which is empty after creation and non-empty before.'
+  location: src/pool/worktree.ts
+  severity: medium
+- summary: The two service image pins are unresolved, and a pooled service is a stock image rather than
+    a locally built one.
+  evidence: '`postgres:17.2-alpine` and `redis:7.4-alpine` are pins nothing has pulled, because no daemon
+
+    answers here. AD-11''s build-it-locally rule binds the *executor* image; a leased database is not
+    it,
+
+    and building postgres from a Dockerfile in this repository would be a second image to maintain for
+
+    no isolation gain. A wrong pin surfaces as a failed start, which the lease reports as
+
+    `resource.lease_timed_out` rather than as a hang.'
+  location: src/container/service.ts
+  severity: medium
+- summary: A quarantined instance is reclaimed by no pass, by design, so a dirty return leaves a container
+    standing until a person acts.
+  evidence: '`resource.return_dirty` is declared `escalate-to-human`. Destroying the instance would delete
+    the evidence the escalation is about, and reclaiming it would be the pass deciding a question the
+    AD-35 table assigns to a person. The record under `pool/quarantine/` names the instance and its residue;
+    nothing yet renders that, which is story 1-7''s surface. CORRECTED 2026-09-21 by review: the contract
+    was NOT holding. A crash between writing the quarantine record and removing the lease record left
+    both, and the pass enumerated lease records only, so the next pass destroyed the very instance a human
+    was asked to inspect. Enumeration now excludes quarantined lease ids and container names.'
+  location: src/pool/lease.ts
+  severity: low
+- summary: 'RESOLVED: the containment gate is met and the live-instance suites run.'
+  evidence: Docker 29.8.0 is reachable, the AD-31 suite passes, and this story's live redis suite now
+    runs for real — which is what let the rewritten wipe test verify emptiness against an instance that
+    actually held data.
+  location: tests/pool.lease.test.ts
+  severity: high
+- summary: The label sweep reports unrecorded containers but does not destroy them.
+  evidence: '`SERVICE_LABEL_KEYS` carries no `ORCH_HOME` and AD-30''s lock is per home, not per machine,
+    so destroying on that evidence would let one engine reclaim another home''s live instances. The AD-32
+    invisibility half is closed — such a container is now named in every pass. Closing the destructive
+    half needs a home-scoped label key, which is new surface rather than a correction.'
+  location: src/container/service.ts
+  severity: medium
+- summary: Postgres cluster-wide residue is reported but cannot be removed by the wipe.
+  evidence: Extra databases and roles are outside what a single-database wipe can reach, so such an instance
+    is quarantined for a person rather than handed on. Fail-closed and consistent with the quarantine
+    design, but the wipe is narrower than the probe, which is worth closing with a multi-database loop
+    before CAP-11 carries real features.
+  location: src/container/service.ts
+  severity: medium
+- summary: '`branchExists` still adopts an existing `orch/run/<id>` branch, though branch deletion now
+    makes that unreachable for a fresh run id.'
+  evidence: 'Reported rather than rewritten: branch naming belongs to story 2-7, and the root cause —
+    a permanent ref left by every run — is fixed. The adopt path remains as dead-but-reachable-by-collision
+    code.'
+  location: src/pool/worktree.ts
+  severity: low
+baseline_revision: 7487508adede8190394f060cac16ca3b9184f656
 ---
 
 <intent-contract>
@@ -245,6 +274,56 @@ Carried forward from stories 1-3 through 1-5:
 
 ## Review Triage Log
 
+### 2026-09-21 — Review pass (follow-up, on a `done` spec)
+
+- claims filed: 55 across four layers — blind-hunter 15, edge-case-hunter 22, verification-gap 3 gap + 5
+  other, intent-alignment 10. Several were filed by more than one layer (the symlink escape by two, the
+  unwired-callers gap by three), so the filed count is larger than the number of distinct defects.
+- grouped into the 33 rows below: high 5, medium 22, low 4 grouped classes, false 2, maybe-false 1.
+  25 entries patched, 4 deferred, the rest rejected on their refutation or as cosmetic.
+- the counts here describe the rows, not a separate tally. On story 1-5 I declared a finding total that did
+  not match its rows, which the protocol names as a triage failure; I then over-counted in the other
+  direction here by expanding grouped rows into claim counts. Both were my arithmetic, not the layers'. The
+  auditable facts are the two above: 55 claims filed, 33 rows, 25 patched, and no filed claim without a row.
+- I verified every `high` myself against HEAD, three of them empirically by running the compiled build: the
+  symlink escape, the stray-directory abort, and the forged-marker analogue in 1-5. Rows resting on the patch
+  round's verification are the `low` corrections; rows from the verification-gap layer arrive pre-verified per
+  the protocol.
+
+- `[high]` `[patch]` `makeWritableByExecutorUid` followed symlinks out of the worktree, so an agent-authored symlink widened an arbitrary host file. I proved it: an outside file went from `-rw-------` to `-rw----rw-`. `walk()` pushed every entry and only gated *descent* on the Dirent. The reachable form needs no root — the non-root branch ORs the other-write bit; the root branch chowns host files to uid 10001, the executor's own uid. Fixed by `lstat`ing each path and skipping symlinks, with `lchownSync` on the root branch. My probe now leaves the target at `-rw------- 501:0`.
+- `[high]` `[patch]` One stray directory under `worktrees/` switched off all reclamation. I proved it: `worktrees/.staging/` made the compiled pass throw `UnsafePathSegmentError` before enumerating anything, so a valid lease in the same pass was neither decided nor acted on — and from the loop that repeats every pass, forever. Exactly the invisible-leak state AD-32 exists to prevent. Now the unusable entry is reported into `summary.failed` and the pass continues; my probe reports the stray and reclaims the rest.
+- `[high]` `[patch]` A quarantined instance was destroyed by the next pass, contradicting this story's own `deferred[4]` contract whose whole purpose is preserving evidence for a human. A crash between writing the quarantine record and removing the lease record leaves both, and the pass enumerated lease records only. Enumeration now excludes lease ids *and* container names present under `pool/quarantine/`.
+- `[high]` `[patch]` A warm instance could be leased twice: `claimWarm` claimed with `rmSync(..., { force: true })`, which swallows ENOENT, so two concurrent `acquire()` calls both won and both wrote a lease naming the same container — breaking this story's own criterion that two runs of one kind never see each other's data. Now an atomic `renameSync` into `pool/claims/`, where ENOENT means you lost.
+- `[medium]` `[patch]` The warm-claim window lost a container permanently — the warm record was deleted before the lease record was written, so a crash in between left a running container recorded nowhere and nothing enumerates containers. `claimWarm`'s own comment asserted the opposite, and `release()` already ordered the other way for exactly this reason. The record is now moved to `pool/claims/` first, so some durable file names the container at every instant.
+- `[medium]` `[patch]` `release()` never verified it still held the lease, so a stale `Lease` released twice wiped an instance another run had since acquired — data destruction in the module whose purpose is that one feature's data never reaches another. Now reads the record first and throws `LeaseNotHeldError`.
+- `[medium]` `[patch]` Warm instances were reclaimable by nothing: they belong to no run, `decideReclamation` needs a run, so a returned instance ran forever across restarts holding a port and its memory limit. No idle TTL, no ceiling, and the story's `deferred` block never mentioned it. Added `WARM_IDLE_TTL_MS`, `MAX_WARM_PER_KIND` and a pure `decideWarmExpiry`.
+- `[medium]` `[patch]` The readiness bound used wall-clock time, so a backwards clock step meant `elapsed` never reached `boundMs` — an unbounded hang, which is what CAP-11 declares impossible. Now monotonic.
+- `[medium]` `[patch]` The declared time bound did not cover `start`: the clock began after `operator.start()` returned, and start fell back to a 30s control timeout, so a 30s redis bound could take 60s. The clock now starts before the claim and the deadline is checked before each probe.
+- `[medium]` `[patch]` A failed start was reported as `resource.lease_timed_out`, whose disposition is retry-with-backoff — a retry loop over a permanent failure like a bad image pin. `ServiceOperationError`/`container.start_failed` was already declared and thrown nowhere; it is now thrown here. Port exhaustion threw a bare `Error` with no AD-35 code and now throws `PoolPortsExhaustedError`.
+- `[medium]` `[patch]` A stale warm record burned the entire bound: records are durable and containers are not, so after a reboot `acquire` polled a dead container for the full bound instead of starting a fresh one. Liveness is now probed after the atomic claim.
+- `[medium]` `[patch]` `release` rejoined an instance as available when the WIPE FAILED and only the probe happened to read empty — `wiped: wipe.ok` was recorded and never acted on. A failed wipe now quarantines.
+- `[medium]` `[patch]` Worktree adoption accepted any directory inside any git repository (`rev-parse --git-dir` succeeding), and reported the *intended* branch regardless of the actual checkout — and story 1-3 resets to `baseline_ref` on that branch, so this was a path to resetting the wrong checkout. Now compares `--git-common-dir`, requires a linked worktree, reports the branch `symbolic-ref` names, and refuses a detached HEAD.
+- `[medium]` `[patch]` `writableByUid` could not distinguish 'chowned to 10001' from 'writable by every uid on the box' — it returned true on the other-write bit alone, and the one test that could tell them apart returned early under root. Replaced by `ownershipViolations`, which checks the route the recorded strategy actually claims.
+- `[medium]` `[patch]` A corrupt record was skipped silently, so the resource it named became invisible and was reclaimed by nothing — the failure shape AD-32 exists to prevent. Skipping is right for pass liveness; it now surfaces in `summary.failed`. Records that parse but do not match the shape were silent too, and are now reported.
+- `[medium]` `[patch]` `src/container/service.ts` repeated the `=`-form blind spot in its own forbidden-flag check, derived from the same table, so `--cap-add=SYS_ADMIN` passed and its `--pid=host`/`--network=host` entries could never fire. Carried over from 1-5's review, where it was correctly left alone as this story's file. Now uses the `firstForbiddenFlag` that round exported. Its `destroy` also ran `rm` without `--force` after a stop, so a container ignoring stop was never destroyed.
+- `[medium]` `[patch]` `refusals.push(refusalFor('(reclamation)', ...))` put a literal non-run string into a field documented as holding run ids, and any consumer building `runs/<run>/` from it hits the same `UnsafePathSegmentError` as the stray-directory finding. `RunRefusal` gained a `scope` and pass-scoped refusals use an empty run. The summary's `failed` list was surfaced by nothing and is now reported per resource.
+- `[medium]` `[patch]` The live wipe test verified nothing: its comment promised data and the code asserted `definition.wipe.length > 0`, so CAP-11's central claim would have passed against an empty instance — and it sat inside a `skipIf` that had never run. It now writes real keys into two redis databases, asserts residue before the release, and re-probes after. It ran green against a real `redis:7.4-alpine`.
+- `[medium]` `[patch]` Warm reuse had no readiness re-verification anywhere — removing the readiness wait for a reused instance kept every test green, because the double answered ready on its first call and no other test reused a warm instance. A reused instance could then be handed out as an endpoint while not serving.
+- `[medium]` `[patch]` The emptiness probes verified less than the wipes cleared: postgres saw only schema `public` of one database while a feature can `CREATE SCHEMA`/`DATABASE`/`ROLE`, and redis's `dbsize` read one database while `flushall` clears sixteen. Both widened. Postgres readiness was also fail-open — `pg_isready -q` prints nothing and `readyWhen` was a negative match, so it returned true for the empty output `-q` guarantees. Now a positive match.
+- `[medium]` `[patch]` `SERVICE_LABEL_KEYS` was documented as the sweep's discovery mechanism and nothing swept by it, so a container whose record was lost was unreclaimable by any pass. A label sweep now exists in `service.ts` and reports unrecorded containers into the summary.
+- `[medium]` `[patch]` `ReclamationSummary`/`ReclaimedResource` were declared separately on both sides of the seam with nothing asserting they still matched. Compile-time assertions added, so drift fails typecheck rather than a run.
+- `[medium]` `[patch]` `realGitRunner` passed no `env`, so an inherited `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` overrode the `-C <repo>` targeting and could point `worktree add`/`remove` at another repository. Now sanitised, with a test that poisons `process.env.GIT_DIR`.
+- `[medium]` `[patch]` Nothing deleted the `orch/run/<run-id>` branch, so every run left a permanent ref and `branchExists` then silently reused a stale branch if the run id recurred. `removeWorktree` now deletes it, scoped to the `orch/run/` prefix so no other branch can be caught.
+- `[low]` `[patch]` Five smaller real defects: an empty repository surfaced as a reference error rather than a refusal naming AD-26's baseline; `repositoryOf` derived the repo by string-stripping an obfuscated `` `${'/'}.git` `` literal that breaks for `--separate-git-dir`; a broken symlink or a path removed mid-walk threw a raw ENOENT instead of a dispositioned error. All direct corrections. (5 findings)
+- `[high]` `[defer]` `createWorktree` and `createLeasePool` have no production caller, and no `Reconciler` is constructed anywhere in `src/` — so in production the pass enumerates zero resources and tier 2 has no producer of worktrees. Reported independently by three layers. Same class as 1-5's wiring gap and owned by stage 2; not this story's to fix.
+- `[medium]` `[defer]` The label sweep reports rather than destroys, because `SERVICE_LABEL_KEYS` carries no `ORCH_HOME` and AD-30's lock is per home, not per machine — destroying on that evidence would have one engine reclaiming another home's live instances. The invisibility half is closed; the destructive half needs a home-scoped label key, which is new surface rather than a correction.
+- `[medium]` `[defer]` Postgres cluster-wide residue is now *reported* but still cannot be *removed*: extra databases and roles are outside what the wipe can reach, so such an instance is quarantined for a person rather than handed on. Fail-closed and consistent with `deferred[4]`, but the wipe is narrower than the probe.
+- `[maybe-false]` `[defer]` Nine service-definition claims inherited from 1-5's triage, including whether `REDIS_ARGS` is read at all by the official image and whether `SERVICE_USER` matches its tooling. The redis path is now exercised against a real image by the rewritten wipe test, which settles part of it; the rest needs a real postgres run. If true each is medium, none high. (9 findings)
+- `[false]` `[reject]` Two claims that mutual exclusion was at risk for the recorder and engine claims. The create decides and is atomic; what was broken was naming the holder, which story 1-12 already fixed. Refuted at the cited lines. (2 findings)
+- `[false]` `[reject]` `CONTAINER_SUBCOMMANDS` has no `stop`, and `reconcilerReclamation` takes no pool. Both false as stated: `stop` is declared for `service.ts`, and `ReclamationPassOptions` has `pool?: LeasePool`. The substantive points behind them — a running container was unreclaimable, and no call site supplies a pool — were real and are handled above and in the wiring deferral.
+- `[low]` `[reject]` Eleven hardening suggestions on inputs no caller can supply: a `requestedTier` outside 0..2, a warm `container_name` that is not a safe segment, an image reference that is uppercase or digest-shaped, and similar. The callers are typed and internal, and each fix adds a branch guarding state never demonstrated reachable. (11 findings)
+- `[low]` `[reject]` Six cosmetic observations already true or already corrected elsewhere in this round — stale comment wording, a regex that is text-shaped rather than semantic, and the note that the crash-injection harness does not reach the new reclamation boundaries (true, and the reason the story's own Auto Run Result gives for the unchanged boundary count). (6 findings)
+
 ## Design Notes
 
 **Worktree ownership is the obligation story 1-5 handed over, and its own probe cannot catch a failure.** Story 1-5 mounts the worktree into a container running as uid 10001 and chmods its own temp directories so that its assertion suite tests the mount rather than the host uid map. That means a worktree created writable only by the host user would pass every existing test and fail on the first real tier-2 run. Assert the mode here, in this story, against a real directory.
@@ -274,41 +353,46 @@ The container runtime CLI is installed (29.7.2) but its daemon is unreachable; `
 
 ## Auto Run Result
 
-Status: done
-Blocking condition: none — but two recorded blockers stand between this and a working tier-2 run with a
-leased resource (`deferred[0]` and `deferred[1]`), and the stage-1 containment gate remains unmet on this
-machine (`deferred[5]`, unchanged from story 1-5).
+**Status: done, reviewed.** The four-layer review ran on 2026-09-21 as a follow-up pass on a `done` spec.
+55 claims were filed, grouped into 33 triage rows; 25 entries were patched, 4 deferred with owners named, the
+rest rejected. The suite went 1300 -> 1346 tests across 51 files, zero skips, zero failures, with the live
+redis suite running against a real `redis:7.4-alpine` rather than skipping.
 
-**REVIEW WAS SKIPPED** for this story; no review layers ran. The suites and the parent's own greps are the
-only scrutiny it received.
+**Four high findings, and the first is a sandbox escape.** `makeWritableByExecutorUid` followed symlinks out
+of the worktree: `walk()` pushed every entry and gated only *descent* on the Dirent, then `chmod`/`chown` were
+applied to each collected path, and both follow symlinks. I demonstrated it — a worktree holding one symlink
+to an outside file took that file from `-rw-------` to `-rw----rw-`. The reachable form needs no root, because
+the non-root branch ORs the other-write bit; the root branch is worse, chowning arbitrary host files to uid
+10001, the executor's own uid, which hands the confined party write access outside its sandbox. A step agent
+authors repository content, so a committed symlink is the lever. After the fix my probe leaves the target at
+`-rw------- 501:0`.
 
-**Implemented change.** `src/pool/` (worktree lifecycle, leased resource pool, the AD-32 reclamation pass,
-and the surface the engine wires in), plus `src/container/service.ts` for the leased-service flag set and
-two additive subcommands in `src/container/runtime.ts`. `src/engine/reconciler.ts` gained exactly one
-additive seam: a `reclamation` port invoked first in every `pass()`, its result reported as
-`PassResult.reclaimed`, and a durable boundary per resource reclaimed. No existing reconciler behaviour
-changed.
+The other three: one stray directory under `worktrees/` threw `UnsafePathSegmentError` before anything was
+enumerated, switching off *all* reclamation on every pass — the invisible-leak state AD-32 exists to prevent,
+caused by a directory nobody would think twice about. A quarantined instance was destroyed by the next pass,
+contradicting this story's own `deferred[4]` contract whose entire purpose is preserving evidence for a human.
+And a warm instance could be leased twice, because `rmSync(..., { force: true })` swallows ENOENT, so two
+concurrent claims both won — breaking this story's own criterion that two runs of one kind never see each
+other's data.
 
-**Runtime state: the second of the two.** The container runtime CLI is present (Docker 29.7.2) and its
-daemon is unreachable — `docker info` fails. No daemon was started, nothing was faked, and no model call
-was spent. Eight tests skip: story 1-5's seven AD-31 assertions and this story's one live-instance lease
-test, which skips through the same probe and the same `CONTAINMENT_SKIP_MARKER` and writes no gate marker
-of its own.
+**Files changed:** `src/pool/{worktree,lease,reclaim}.ts`, `src/container/{service,flags,runtime}.ts`,
+`src/engine/reconciler.ts`, and four test suites.
 
-**Verification.** `npm run typecheck`, `npm run lint`, `npm run build` all exit 0. `npm test` → 26 files,
-**784 passed, 8 skipped**. The four new suites are present: `pool.worktree` (17), `pool.lease` (17 + 1
-skipped), `pool.reclaim` (38), `container.service` (38). Both spec greps pass: `src/pool/` names no
-container runtime and imports only `../contracts/`, `../runtime/` and `../container/`.
+**Three mutations, all caught, and I re-ran two of them myself** rather than accepting the patch round's word:
+reverting the symlink guard makes the outside file `0o606` again and fails two tests; reverting the
+stray-directory filter makes the pass throw before enumerating; reverting the quarantine exclusion has the
+pass destroy the quarantined container.
 
-**The crash-injection suite still converges, on the same 21 boundaries.** Re-run on its own: 5 passed,
-20s. The boundary count was measured directly by driving the harness (`boundaries: 21`), so the "no change
-to story 1-3's existing behaviour" clause holds literally — the reclamation port is not wired into the
-crash harness, so it adds no boundary there, while `tests/pool.reclaim.test.ts` asserts that a wired
-reclamation *does* cross one per resource so a future harness kills at it.
+**A pattern worth recording, because it recurred.** Three separate checks in this story verified something
+adjacent to what they claimed: `writableByUid` could not tell "chowned to uid 10001" from "writable by every
+uid on the box"; worktree adoption reported the *intended* branch rather than the actual checkout, which is
+what story 1-3 resets on; and the live wipe test's comment promised written data while the code asserted a
+list's length. Each read as a check and proved nothing. Together with story 1-5's mount allow-list validating
+against its own caller's input, that is four instances in two stories.
 
-**What the AD-32 rule cost, and how it is held.** Reclamation is a pure comparison
-(`decideReclamation`) over live resources and run state, with the acting split into `performReclamation`.
-Three independent guards hold the negative property: the comparison is asserted to write nothing (the
-`ORCH_HOME` tree is byte-compared before and after), a kill is modelled by putting resources on disk and
-building a pass with nothing in memory, and every file in `src/pool/` is read to assert no `process.on`,
-no signal or exit handler and no `finally`.
+**Residual risk, and why `followup_review_recommended` is true.** Four high entries were patched, which sets
+the flag. The specific unverified risk: the atomic warm-claim, the claims directory and the idle sweep are new
+durable state in a module whose crash-safety is its reason for existing, and the crash-injection harness does
+not reach reclamation boundaries — so their behaviour under a real kill is asserted by hand-built disk state
+rather than by an injected kill. That is the same structural gap the alignment layer named, and it closes when
+the reclamation port is wired into the harness.
