@@ -116,6 +116,15 @@ export const CONTAINER_SUBCOMMANDS = {
    */
   exec: ['exec'] as const,
   stop: ['stop'] as const,
+  /**
+   * `--version` is a flag rather than a subcommand, and it is declared here anyway.
+   *
+   * {@link ContainerInvocation} says its `subcommand` is one of these, and the reachability probe needs
+   * the client-only spelling — the one that answers when no daemon does. Passing it as a bare `args`
+   * entry with an empty subcommand satisfied the runtime and broke that contract, which is how a second
+   * vocabulary starts.
+   */
+  versionFlag: ['--version'] as const,
   inspectImage: ['image', 'inspect'] as const,
   inspectContainer: ['container', 'inspect'] as const,
   info: ['info'] as const,
@@ -202,6 +211,44 @@ export class ContainerRuntimeUnreachableError extends Error {
     this.orchError = makeError(this.code, message, detail);
   }
 }
+
+/** The daemon answered, but it is older than the Stack table's floor. */
+export class ContainerRuntimeBelowFloorError extends Error {
+  readonly code = 'container.start_failed';
+  readonly version: string | null;
+  readonly orchError: OrchError;
+
+  constructor(version: string | null, detail: string) {
+    const message =
+      `The container runtime reports version ${version ?? '<unreadable>'}, below the Stack table's ` +
+      `floor of ${CONTAINER_RUNTIME_MIN_VERSION}: ${detail}. The floor is a declared dependency, and ` +
+      'a flag this system composes that an older daemon silently ignores is containment that is not ' +
+      'there — which is the one failure AD-20 may not have.';
+    super(message);
+    this.name = 'ContainerRuntimeBelowFloorError';
+    this.version = version;
+    this.orchError = makeError(this.code, message, detail);
+  }
+}
+
+/**
+ * What a daemon that is not running says, in the shapes the runtimes say it in.
+ *
+ * Declared here because recognising the sentence means knowing the runtime's own wording, and this is
+ * the file allowed to. `image.ts` reads it so that "the image is absent" and "nothing is listening" stay
+ * two different answers: the first is a build, the second is a machine that cannot confine anything.
+ */
+export const DAEMON_UNREACHABLE_PATTERNS: readonly RegExp[] = [
+  /cannot connect to the [\w .-]*daemon/i,
+  /is the [\w .-]*daemon running/i,
+  /daemon is not running/i,
+  /connect: connection refused/i,
+  /error during connect/i,
+];
+
+/** True when a failed invocation failed because nothing was listening, rather than on its merits. */
+export const looksLikeUnreachableDaemon = (output: string): boolean =>
+  DAEMON_UNREACHABLE_PATTERNS.some((pattern) => pattern.test(output));
 
 /** Absolute, executable and a file. Mirrors the CLI resolution in `src/engine/cli.ts`. */
 const isExecutableFile = (candidate: string): boolean => {
@@ -354,7 +401,7 @@ export const probeContainerRuntime = (
   let clientVersion =
     formatted.status === 0 && formatted.stdout.trim() !== '' ? formatted.stdout.trim() : null;
   if (clientVersion === null) {
-    const bare = invoke({ subcommand: [], args: ['--version'] });
+    const bare = invoke({ subcommand: CONTAINER_SUBCOMMANDS.versionFlag, args: [] });
     const reported = `${bare.stdout} ${formatted.stdout}`;
     const parsed = /(\d+\.\d+\.\d+)/.exec(reported);
     clientVersion = parsed?.[1] ?? null;
@@ -393,12 +440,27 @@ export const probeContainerRuntime = (
   };
 };
 
-/** The reachability check the engine wires in. Refuses by name rather than returning a flag. */
+/**
+ * The reachability check the engine wires in. Refuses by name rather than returning a flag.
+ *
+ * The version floor is refused here too, because {@link ContainerRuntimeReachability} promises it is
+ * "never silently ignored" and a field nobody reads is exactly a silent ignore. A daemon below
+ * `>=29.7` accepts the AD-20 argv and may not honour every flag in it, so it is a machine a tier-2 step
+ * must not start on rather than a degraded one.
+ */
 export const requireReachableContainerRuntime = (
   options: { readonly env?: NodeJS.ProcessEnv; readonly invoke?: ContainerInvoker } = {},
 ): ContainerRuntimeReachability => {
   const probe = probeContainerRuntime(options);
-  if (probe.reachable) return probe;
+  if (probe.reachable) {
+    if (!probe.meetsVersionFloor) {
+      throw new ContainerRuntimeBelowFloorError(
+        probe.serverVersion ?? probe.clientVersion,
+        probe.detail,
+      );
+    }
+    return probe;
+  }
   if (probe.runtime === null) {
     throw new ContainerRuntimeMissingError(
       options.env?.[CONTAINER_RUNTIME_ENV_VAR]?.trim() ?? DEFAULT_CONTAINER_RUNTIME,

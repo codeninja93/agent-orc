@@ -6,12 +6,21 @@
 #
 # Four properties this file is responsible for, and what each one prevents:
 #
-#   * A pinned base. `node:24.21.0-bookworm-slim` rather than `node:24` or `node:lts`, so the same
-#     Dockerfile hash always means the same sandbox. A floating base tag would make the content hash a
-#     lie — identical bytes here, a different image on two machines.
+#   * A pinned base. `node:24.21.0-bookworm-slim` rather than `node:24` or `node:lts`, so the base layer
+#     cannot float behind an unchanged hash. What the hash guarantees is bounded and worth stating
+#     exactly: the same hash means the same *definition* — the same base digest resolved by tag, the same
+#     uid, the same flags, the same pinned CLI version. It does not mean a byte-identical image, because
+#     `apt-get install` resolves whatever the Debian archive serves that day and `npm install --global`
+#     resolves the CLI's transitive dependencies at build time. Reproducing an image exactly would need
+#     a digest-pinned base, pinned `.deb` versions and a lockfile; none of those is here, so the claim
+#     is not made.
 #   * A non-root user, created with the exact uid:gid `src/container/flags.ts` passes to `--user`
-#     (10001:10001). The AD-31 suite asserts `id -u` is not 0 from inside a running container.
-#   * The step toolchain and nothing else: node (from the base), git, and the `claude` CLI at
+#     (10001:10001), spelled literally rather than through a build argument: the tag is this file's
+#     content hash, so a value that could be overridden at build time is a value the identity does not
+#     cover. `tests/container.image.test.ts` asserts the literals here equal EXECUTOR_UID,
+#     EXECUTOR_GID and CONTAINER_HOME, and the AD-31 suite asserts `id -u` and `id -un` from inside a
+#     running container.
+#   * The step toolchain and nothing else: node (from the base), git, ripgrep, and the `claude` CLI at
 #     /usr/local/bin/claude, which is the absolute path `wrapper.ts` runs. Nothing is fetched at run
 #     time, because execution has no general network (AD-20's two-phase sandbox).
 #   * No credential of any kind. No ARG carrying a token, no COPY of a config file, no ssh key, no
@@ -23,12 +32,6 @@
 # why apt and npm appear here and nowhere in the run path.
 
 FROM node:24.21.0-bookworm-slim
-
-# The uid:gid `--user` is given. Kept identical to EXECUTOR_UID/EXECUTOR_GID in src/container/flags.ts;
-# a mismatch would leave the container running as a uid with no passwd entry and no writable home.
-ARG EXECUTOR_UID=10001
-ARG EXECUTOR_GID=10001
-ARG EXECUTOR_USER=orch
 
 # The CLI version. The Stack table's floor is >=2.1.259; this is the version story 1-4 verified its
 # flag behaviour against. Pinned, for the same reason the base image is.
@@ -44,9 +47,12 @@ RUN apt-get update \
     ripgrep \
   && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd --gid "${EXECUTOR_GID}" "${EXECUTOR_USER}" \
-  && useradd --uid "${EXECUTOR_UID}" --gid "${EXECUTOR_GID}" --home-dir /home/"${EXECUTOR_USER}" \
-    --create-home --shell /bin/bash "${EXECUTOR_USER}"
+# The uid:gid `--user` is given, and the home directory `HOME` below names. Literal, and identical to
+# EXECUTOR_UID/EXECUTOR_GID/CONTAINER_HOME in src/container/flags.ts: a mismatch leaves the container
+# running as a uid with no passwd entry, where `id -un` fails and git has no identity to work from.
+RUN groupadd --gid 10001 orch \
+  && useradd --uid 10001 --gid 10001 --home-dir /home/orch \
+    --create-home --shell /bin/bash orch
 
 # Installed globally so the entry point is the absolute /usr/local/bin/claude that wrapper.ts runs:
 # a read-only root and a --restricted CLI are not a place to depend on PATH resolution.
@@ -64,7 +70,7 @@ ENV HOME=/home/orch \
 
 # Belt to the run-time braces: the container also runs with --user, --read-only, --cap-drop=ALL,
 # no-new-privileges, a seccomp profile, memory and pid limits, and --network none.
-USER ${EXECUTOR_UID}:${EXECUTOR_GID}
+USER 10001:10001
 
 # No ENTRYPOINT: the wrapper composes the full command line (the image's own CLI plus story 1-4's
 # unchanged AD-1 argv), and an entry point that wrapped it would be a second place the invocation is

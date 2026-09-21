@@ -30,7 +30,9 @@ import type { OrchError } from '../contracts/index.js';
 import {
   CONTAINER_BUILD_TIMEOUT_MS,
   CONTAINER_SUBCOMMANDS,
+  ContainerRuntimeUnreachableError,
   DOCKERFILE_RELATIVE_PATH,
+  looksLikeUnreachableDaemon,
 } from './runtime.js';
 import type { ContainerInvoker } from './runtime.js';
 
@@ -70,9 +72,27 @@ export const hashDockerfileContent = (content: string | Uint8Array): string =>
 export const imageTagForContent = (content: string | Uint8Array): string =>
   `${IMAGE_REPOSITORY}:${hashDockerfileContent(content).slice(0, IMAGE_TAG_HASH_LENGTH)}`;
 
-/** The tag a hash corresponds to, when the hash is already in hand. */
-export const imageTagForHash = (hash: string): string =>
-  `${IMAGE_REPOSITORY}:${hash.slice(0, IMAGE_TAG_HASH_LENGTH)}`;
+/** The digest shape {@link imageTagForHash} will derive a tag from: a full lower-case SHA-256. */
+export const DOCKERFILE_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * The tag a hash corresponds to, when the hash is already in hand.
+ *
+ * The digest is checked rather than sliced on trust. AD-11 makes the hash the image's identity, so a
+ * caller that passes a tag, a short hash or an empty string would otherwise mint a *different*
+ * identity that still looks like one — and `--pull never` turns that into a step that cannot start,
+ * reported as a missing image rather than as the bad digest it is.
+ */
+export const imageTagForHash = (hash: string): string => {
+  if (!DOCKERFILE_DIGEST_PATTERN.test(hash)) {
+    throw new Error(
+      `Refusing to derive an executor image tag from "${hash}": AD-11 makes the Dockerfile's full ` +
+        'SHA-256 the image identity, and a tag derived from anything else names an image whose ' +
+        'content nothing has established.',
+    );
+  }
+  return `${IMAGE_REPOSITORY}:${hash.slice(0, IMAGE_TAG_HASH_LENGTH)}`;
+};
 
 /** The build failed. `container.image_build_failed` is retryable — a transient network is the usual cause. */
 export class ImageBuildError extends Error {
@@ -150,17 +170,33 @@ export const createImageResolver = (options: ImageResolverOptions): ImageResolve
   const resolve = (): ImageResolution => {
     const hash = readHash();
     const tag = imageTagForHash(hash);
-    if (present.has(tag)) {
-      return { tag, hash, built: false, reason: 'cached', dockerfile };
-    }
 
+    // Asked of the machine every time, including for a tag this resolver has already seen. The cache
+    // was a memory of what was once true, and an image removed outside this process — a prune, a
+    // `rm`, a disk reclaim — left it vouching for an image that is gone, which `--pull never` turns
+    // into a run that cannot start rather than a rebuild. The cache is now only the difference
+    // between `cached` and `present` in the answer: one local inspect is cheap, and being wrong here
+    // is not.
     const inspected = options.invoke({
       subcommand: CONTAINER_SUBCOMMANDS.inspectImage,
       args: [tag],
     });
     if (inspected.status === 0) {
+      const seen = present.has(tag);
       present.add(tag);
-      return { tag, hash, built: false, reason: 'present', dockerfile };
+      return { tag, hash, built: false, reason: seen ? 'cached' : 'present', dockerfile };
+    }
+    present.delete(tag);
+    // "The image is absent" and "nothing is listening" are different facts with different fixes, and
+    // an inspect that failed because the daemon is down is not evidence about any image. Reporting it
+    // as a build failure sends a reader to the Dockerfile for a machine that needs its daemon started.
+    const inspectOutput = `${inspected.stderr}\n${inspected.stdout}`;
+    if (looksLikeUnreachableDaemon(inspectOutput)) {
+      throw new ContainerRuntimeUnreachableError(
+        `the image ${tag} could not be inspected: ${
+          inspectOutput.split('\n').find((line) => line.trim() !== '')?.trim() ?? 'no output'
+        }`,
+      );
     }
 
     const build = options.invoke({

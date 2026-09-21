@@ -12,13 +12,14 @@ context:
 warnings: ['oversized'] # 18 files and 16 I/O scenarios; the largest story in stage 1, carrying the AD-31 crash-injection suite
 deferred:
   - summary: >-
-      Review was SKIPPED for this story at the user's explicit instruction; no four-layer review ran.
+      RESOLVED: the four-layer review DID run for this story, in a later pass; this entry was stale.
     evidence: |-
-      The user directed: 'No need to wait for reviews. You can complete as many as you can. I will
-      review code later.' Stories 1-1 and 1-2 each had four review layers, 68-70 findings and a patch
-      round; this story had none. The gate (typecheck, lint, 417 tests, build) and the parent's own
-      probes are the only scrutiny it received, so treat status: done as 'implemented and gated', not
-      'reviewed'.
+      Recorded when the review was deferred, and never cleared once it ran. The Review Triage Log below
+      carries the pass: 56 findings — high 22, medium 27, low 7 — across blind-hunter (14),
+      edge-case-hunter (27), verification-gap (2 gap + 3 other) and intent-alignment (10), committed as
+      `a4fb3f4` "Story 1-3 review: 56 findings, 42 patches". Corrected 2026-09-21 while scoping the
+      outstanding reviews, because a story that says it was never reviewed when it was is a false record
+      that makes the real gaps harder to find.
     severity: high
   - summary: >-
       The AD-21 redaction allow-list was widened to six envelope fields — a security-adjacent change

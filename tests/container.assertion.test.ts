@@ -23,9 +23,8 @@
  * because a suite that starts six containers is a suite that takes a minute per assertion and gets
  * quietly disabled.
  */
-import { chmodSync, mkdirSync, mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { chmodSync, mkdirSync, rmSync } from 'node:fs';
+import { isAbsolute, relative, sep } from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -33,6 +32,10 @@ import {
   CONTAINER_BUILD_TIMEOUT_MS,
   CONTAINER_SUBCOMMANDS,
   CONTAINMENT_SKIP_MARKER,
+  DEFAULT_MEMORY_LIMIT,
+  DEFAULT_PIDS_LIMIT,
+  EXECUTOR_UID,
+  IMAGE_CLI_PATH,
   REQUIRED_CONTAINMENT_CHECKS,
   RUNTIME_SOCKET_PATHS,
   composeRunArgs,
@@ -40,13 +43,17 @@ import {
   createContainerInvoker,
   createImageResolver,
   currentDockerfileHash,
+  ensureSessionDir,
   isCredentialEnvName,
+  memoryLimitBytes,
   probeContainerRuntime,
   readContainmentMarker,
   recordContainmentMarker,
   removeContainerIfTerminal,
+  sessionDirFor,
 } from '../src/container/index.js';
 import type { ContainerInvoker } from '../src/container/index.js';
+import { resolveOrchHome, runPaths, worktreeDir } from '../src/runtime/index.js';
 
 /** Probed once, at import time, so the decision to skip is made before any test is collected. */
 const runtime = probeContainerRuntime();
@@ -72,14 +79,15 @@ const suiteName = runtime.reachable
 /**
  * The two directories the probe container mounts.
  *
- * Real directories, because `composeRunArgs` refuses any mount outside the allow-list and the allow-list
- * is exactly these two — the probe is given the same shape a run has, with nothing of the host in it.
+ * Under `ORCH_HOME`, at the paths AD-9 gives a run's worktree and session directory, because
+ * `composeRunArgs` now refuses an allow-list that is not rooted there — the probe is given the same shape
+ * a real run has, with nothing of the host in it, and a temp directory somewhere else would have been a
+ * shape no run can have. Removed again in `afterAll`.
  */
-const probeRoot = mkdtempSync(join(tmpdir(), 'orch-ad31-'));
-const probeWorktree = join(probeRoot, 'worktree');
-const probeSession = join(probeRoot, 'session');
+const probeWorktree = worktreeDir(RUN_ID);
+const probeSession = sessionDirFor(RUN_ID);
 mkdirSync(probeWorktree, { recursive: true });
-mkdirSync(probeSession, { recursive: true });
+ensureSessionDir(probeSession);
 // Writable by any uid, because the container runs as 10001 and these directories are created by whoever
 // runs the suite. That ownership question is real for a production run too — a bind-mounted worktree
 // owned by the host user is not writable by the executor uid on Linux — and it belongs to story 1-6,
@@ -103,11 +111,42 @@ if (!runtime.reachable) {
   });
 }
 
+/**
+ * The host's own `HOME`, passed *into* the probe.
+ *
+ * The `no-host-home` check used to assert that the probe's output did not contain `${hostHome}/.` while
+ * the probe only ever stat-ed paths inside the container — so it could not fail for the reason it names.
+ * The container has to be asked about the host's path by name for the answer to mean anything.
+ */
+const hostHome = process.env['HOME'] ?? '';
+
 /** The probe script: `key=value` lines, read back by the assertions below. */
 const PROBE_SCRIPT = [
   'set -u',
   'echo "uid=$(id -u)"',
   'echo "gid=$(id -g)"',
+  // `id -un`, not only `id -u`. A uid with no passwd entry ships as fully "verified" otherwise: every
+  // observation below is identical, while `id -un` fails and git has no identity inside any tier-2 step.
+  'echo "uname=$(id -un 2>/dev/null || echo NO_PASSWD_ENTRY)"',
+  'echo "home_env=$HOME"',
+  // The substitution the whole wrapper design rests on: the image's own CLI at the absolute path
+  // `wrapper.ts` composes. Asserted by *running* it, because comparing the argv to the same constant the
+  // argv was built from proves only that the constant exists.
+  `if [ -x ${IMAGE_CLI_PATH} ]; then echo "cli_executable=yes"; else echo "cli_executable=no"; fi`,
+  `echo "cli_version=$(${IMAGE_CLI_PATH} --version 2>&1 | head -1)"`,
+  // The limits, read back from inside rather than trusted because the flag was composed. cgroup v2
+  // first, then v1, because a limit nobody can read is a limit nobody has checked.
+  'echo "memory_max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo unknown)"',
+  'echo "pids_max=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || echo unknown)"',
+  // `--network none` from the inside: a name that does not resolve and a connection that does not open.
+  'if getent hosts example.com >/dev/null 2>&1; then echo "dns=resolved"; else echo "dns=failed"; fi',
+  'node -e \'const s=require("net").connect(80,"93.184.216.34");s.setTimeout(3000);' +
+    's.on("error",()=>{console.log("egress=error");process.exit(0)});' +
+    's.on("timeout",()=>{console.log("egress=timeout");process.exit(0)});' +
+    's.on("connect",()=>{console.log("egress=connected");process.exit(0)})\'',
+  // A credential by the shape of its *value*, not of its name — so the prover and the filter can
+  // disagree. Asserting with the same predicate that does the filtering only proves the pair agrees.
+  'if env | grep -Eq "(ghp_|gho_|ghs_|github_pat_|sk-ant-|sk-[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16}|-----BEGIN )"; then echo "credvalue=yes"; else echo "credvalue=no"; fi',
   'if touch /orch-probe-write 2>/dev/null; then echo "root_writable=yes"; else echo "root_writable=no"; fi',
   'echo "caps=$(awk \'/^CapEff/ {print $2}\' /proc/self/status)"',
   'echo "cap_bnd=$(awk \'/^CapBnd/ {print $2}\' /proc/self/status)"',
@@ -118,6 +157,21 @@ const PROBE_SCRIPT = [
   '  if [ -e "$p" ]; then echo "credpath=$p"; fi',
   'done',
   'echo "env_names=$(env | cut -d= -f1 | sort | tr "\\n" " ")"',
+  // The host's HOME, asked of the container by its real path. It can *exist* without being a leak: the
+  // worktree and the session directory are mounted at their own absolute paths and AD-9's default
+  // ORCH_HOME is `~/.orch`, so the runtime creates the empty path chain that leads to each mount. What
+  // may never exist is any of the host's content under it — which is the thing a mounted HOME would
+  // bring, and the thing the old form could not have detected.
+  ...(hostHome === ''
+    ? []
+    : [
+        `for p in "${hostHome}/.ssh" "${hostHome}/.aws" "${hostHome}/.gitconfig" ` +
+          `"${hostHome}/.git-credentials" "${hostHome}/.netrc" "${hostHome}/.claude" ` +
+          `"${hostHome}/.npmrc" "${hostHome}/.docker" "${hostHome}/.config" "${hostHome}/Library"; do`,
+        '  if [ -e "$p" ]; then echo "hostcredpath=$p"; fi',
+        'done',
+        `echo "hosthome_entries=$(ls -A "${hostHome}" 2>/dev/null | tr "\\n" " ")"`,
+      ]),
   'echo "workdir=$(pwd)"',
   'if [ -w . ]; then echo "worktree_writable=yes"; else echo "worktree_writable=no"; fi',
   'echo "done=1"',
@@ -186,6 +240,10 @@ describe.skipIf(!runtime.reachable)(suiteName, () => {
       // through the same path a real run's is — never with `--rm` (AD-20).
       removeContainerIfTerminal(containerName, 'committed', invoke);
     }
+    // The two directories go too. They live under ORCH_HOME at a real run's paths, and a suite that
+    // leaves them behind leaves a machine holding a worktree and a transcript for a run that never was.
+    rmSync(probeWorktree, { recursive: true, force: true });
+    rmSync(runPaths(RUN_ID).runDir, { recursive: true, force: true });
   });
 
   it('ran the probe at all', () => {
@@ -194,12 +252,35 @@ describe.skipIf(!runtime.reachable)(suiteName, () => {
     expect(probe?.status).toBe(0);
   });
 
+  it('runs the CLI the wrapper substitutes, at the absolute path it substitutes it at', () => {
+    // The wrapper drops the host's interpreter and runs `IMAGE_CLI_PATH` with story 1-4's argv. Until
+    // now that path was only ever compared to the constant it was built from, and the one suite that
+    // starts a real container ran `/bin/sh` — so the substitution the whole design rests on was verified
+    // nowhere. Here the image is asked to execute it.
+    expect(probe?.value('cli_executable')).toBe('yes');
+    expect(probe?.value('cli_version') ?? '').toMatch(/\d+\.\d+\.\d+/);
+  });
+
+  it('has no general network, and the limits the argv asked for', () => {
+    // `--network none` from the inside rather than from the argv: a name that does not resolve and a
+    // connection that does not open. And the limits read back out of the cgroup, because a flag composed
+    // is not a limit imposed — `--memory 0` is the same argv shape with no limit at all.
+    expect(probe?.value('dns')).toBe('failed');
+    expect(probe?.value('egress')).not.toBe('connected');
+    expect(probe?.value('memory_max')).toBe(String(memoryLimitBytes(DEFAULT_MEMORY_LIMIT)));
+    expect(probe?.value('pids_max')).toBe(String(DEFAULT_PIDS_LIMIT));
+  });
+
   it('reaches no push credential from inside', () => {
     // Two halves: no credential-shaped environment variable, and no credential file on disk.
     const names = (probe?.value('env_names') ?? '').split(/\s+/).filter((name) => name !== '');
     expect(names.length).toBeGreaterThan(0);
     for (const name of names) expect(isCredentialEnvName(name), name).toBe(false);
     expect(probe?.all('credpath') ?? []).toStrictEqual([]);
+    // And by the shape of the *values*, which is a different question from the shape of the names: the
+    // filter and the prover can now disagree, where asserting with `isCredentialEnvName` alone only
+    // proved the one predicate agrees with itself.
+    expect(probe?.value('credvalue')).toBe('no');
     passed.add('no-push-credential');
   });
 
@@ -216,9 +297,19 @@ describe.skipIf(!runtime.reachable)(suiteName, () => {
     passed.add('read-only-root');
   });
 
-  it('is not root', () => {
+  it('is not root, and is a uid the image actually has a passwd entry for', () => {
     expect(probe?.value('uid')).not.toBe('0');
     expect(probe?.value('gid')).not.toBe('0');
+    // The exact uid `flags.ts` passes to `--user`, so a Dockerfile that drifted from the constant is
+    // caught here rather than at the first `git` a step runs.
+    expect(probe?.value('uid')).toBe(String(EXECUTOR_UID));
+    // And the uid resolves to a name. A uid with no passwd entry passed every other assertion in this
+    // file unchanged — `id -u` is the same number, the root is as read-only, the capabilities are as
+    // dropped — while `id -un` fails, `$HOME` belongs to nobody, and git has no identity to work from.
+    const name = probe?.value('uname') ?? '';
+    expect(name).not.toBe('NO_PASSWD_ENTRY');
+    expect(name).not.toBe('');
+    expect(name).not.toMatch(/^\d+$/);
     passed.add('non-root-user');
   });
 
@@ -232,10 +323,35 @@ describe.skipIf(!runtime.reachable)(suiteName, () => {
   });
 
   it('cannot see the host home directory', () => {
-    const home = process.env['HOME'] ?? '';
-    expect(home).not.toBe('');
+    expect(hostHome).not.toBe('');
     expect(probe?.value('workdir')).toBe(probeWorktree);
-    expect(probe?.lines.join('\n')).not.toContain(`${home}/.`);
+    // The host's path, asked of the container by name. The old form asserted that the probe's own output
+    // did not mention `${hostHome}/.` while the probe only ever stat-ed paths *inside* the container, so
+    // it could not fail for the reason it names.
+    expect(probe?.all('hostcredpath') ?? []).toStrictEqual([]);
+    // And nothing of the host's under it at all: the only entries permitted are the empty directories the
+    // runtime had to create to place the two mounts, since AD-9's default ORCH_HOME is inside HOME.
+    const permitted = new Set<string>();
+    for (const mount of [probeWorktree, probeSession]) {
+      const rel = relative(hostHome, mount);
+      if (rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)) {
+        const first = rel.split(sep)[0];
+        if (first !== undefined) permitted.add(first);
+      }
+    }
+    const entries = (probe?.value('hosthome_entries') ?? '').split(/\s+/).filter((one) => one !== '');
+    for (const entry of entries) expect(permitted, entry).toContain(entry);
+    // And the container's own HOME is the tmpfs one, not a path of the host's.
+    expect(probe?.value('home_env')).not.toBe(hostHome);
+    // The original form of this assertion, kept and made able to fail. It reads every line of the probe's
+    // output for a dotted path under the host's HOME — the shape a mounted `~/.ssh` or `~/.claude` would
+    // take. The one exception is ORCH_HOME itself: AD-9's default is `~/.orch`, so the run worktree and
+    // the session transcript legitimately have the host home as a path prefix, and refusing that would
+    // refuse the layout AD-9 defines rather than a leak.
+    const dottedHomePaths = (probe?.lines ?? []).filter(
+      (line) => line.includes(`${hostHome}/.`) && !line.includes(resolveOrchHome()),
+    );
+    expect(dottedHomePaths).toStrictEqual([]);
     passed.add('no-host-home');
   });
 });

@@ -179,10 +179,22 @@ export const highBlastRadiusPaths = (paths: readonly string[]): readonly string[
  */
 export const classifyTier = (shape: ChangeShape): TierDecision => {
   const risky = highBlastRadiusPaths(shape.paths);
-  const lines = shape.changedLines ?? 0;
+  const lines = shape.changedLines;
 
   if (shape.kind !== undefined && TIER_2_KINDS.includes(shape.kind)) {
     return { tier: 2, reason: `the change is a ${shape.kind}`, evidence: risky };
+  }
+  // Missing evidence raises the tier; it never zeroes out. `changedLines` is optional and reading an
+  // absent one as 0 walked a change of any size past both tier-1 ceilings and then reported it as "a
+  // small change" — and a negative or non-finite count did the same. An empty `paths` is the same
+  // failure from the other side: no path can be high-blast-radius if no path was named. For a module
+  // whose whole stance is refusal, the unknown case has to be the expensive one.
+  if (shape.paths.length === 0) {
+    return {
+      tier: 2,
+      reason: 'no paths were named, so nothing is known about what the change touches',
+      evidence: risky,
+    };
   }
   if (risky.length > 0) {
     return {
@@ -195,6 +207,16 @@ export const classifyTier = (shape: ChangeShape): TierDecision => {
     return {
       tier: 2,
       reason: `it touches ${String(shape.paths.length)} files, above the tier-1 ceiling of ${String(TIER_1_MAX_FILES)}`,
+      evidence: [],
+    };
+  }
+  if (lines === undefined || !Number.isFinite(lines) || lines < 0) {
+    return {
+      tier: 2,
+      reason:
+        lines === undefined
+          ? 'its size is unknown — no changed-line count was given, so neither tier-1 ceiling can be checked'
+          : `its changed-line count is ${String(lines)}, which is not a count, so neither tier-1 ceiling can be checked`,
       evidence: [],
     };
   }

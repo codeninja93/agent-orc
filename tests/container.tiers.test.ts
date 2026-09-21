@@ -74,6 +74,26 @@ describe('classification', () => {
     expect(classifyTier({ paths: ['src/a.ts'], changedLines: TIER_1_MAX_LINES + 1 }).tier).toBe(2);
   });
 
+  it('raises the tier when the evidence for a lower one is missing', () => {
+    // `changedLines` is optional, and reading an absent one as 0 walked a change of any size past both
+    // tier-1 ceilings and then called it "a small change". An empty `paths` is the same failure from the
+    // other side: no path can be high-blast-radius if no path was named. For a module whose whole stance
+    // is refusal, the unknown case has to be the expensive one.
+    expect(classifyTier({ paths: ['src/a.ts'] }).tier).toBe(2);
+    expect(classifyTier({ paths: ['src/a.ts'] }).reason).toContain('size is unknown');
+    expect(classifyTier({ paths: ['README.md'], kind: 'typo' }).tier).toBe(2);
+    for (const changedLines of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const decision = classifyTier({ paths: ['src/a.ts'], changedLines });
+      expect(decision.tier, String(changedLines)).toBe(2);
+      expect(decision.reason, String(changedLines)).toContain('not a count');
+    }
+    const nothing = classifyTier({ paths: [], changedLines: 3 });
+    expect(nothing.tier).toBe(2);
+    expect(nothing.reason).toContain('no paths were named');
+    // And the refusal to soften still applies, so missing evidence cannot be asked down to tier 1.
+    expect(() => selectTier({ paths: [], changedLines: 3, requestedTier: 1 })).toThrow(TierSoftenedError);
+  });
+
   it('does not let "documentation" talk a risky path out of a container', () => {
     // A README fix is tier 0; a README fix *plus* a workflow edit is not.
     expect(classifyTier({ paths: ['README.md', '.github/workflows/ci.yml'], changedLines: 4 }).tier).toBe(2);

@@ -38,13 +38,13 @@
  */
 import { makeError } from '../contracts/index.js';
 import type { OrchError } from '../contracts/index.js';
-import { resolveOrchHome } from '../runtime/index.js';
+import { resolveOrchHome, worktreesDir } from '../runtime/index.js';
 
-import { composeRunArgs } from './flags.js';
+import { composeRunArgs, isStrictlyWithin } from './flags.js';
 import type { ContainerRunRequest } from './flags.js';
 import { createImageResolver } from './image.js';
 import type { ImageResolver } from './image.js';
-import { containerNameFor, sessionDirFor } from './lifecycle.js';
+import { containerNameFor, ensureSessionDir, sessionDirFor } from './lifecycle.js';
 import { CONTAINER_SUBCOMMANDS, requireContainerRuntime } from './runtime.js';
 import type { ContainerInvoker, ContainerRuntime } from './runtime.js';
 import { selectTier, tierUsesContainer } from './tiers.js';
@@ -133,11 +133,24 @@ export interface ContainerWrapperOptions {
   /** A resolver, or a tag for a caller that has already resolved one. */
   readonly image?: ImageResolver | string;
   readonly orchHome?: string;
-  /** The worktree to mount. Defaults to the plan's cwd, which story 1-4 sets to the run worktree. */
+  /**
+   * The worktree to mount. Defaults to the plan's cwd, which story 1-6 sets to the run worktree.
+   *
+   * Whatever it resolves to is refused unless it is inside `ORCH_HOME/worktrees/` (AD-9), because this
+   * is the one writable mount: a cwd the engine set to a target repository would otherwise become a
+   * writable bind mount of that repository.
+   */
   readonly worktreeFor?: (plan: WrappablePlan) => string;
   /** The run's session directory. Defaults to `ORCH_HOME/runs/<run-id>/session`. */
   readonly sessionDirFor?: (plan: WrappablePlan) => string;
-  /** The attempt number, for the container's name. Defaults to 1. */
+  /**
+   * The attempt number, for the container's name.
+   *
+   * Defaults to how many times *this* wrapper has already wrapped this run and step. A fixed default of
+   * 1 named every retry's container the same thing, and since `--rm` is never composed (AD-20) the
+   * first attempt's container still exists — so the retry died at container start with "name already in
+   * use" rather than running. A caller that tracks attempts itself passes them and wins.
+   */
   readonly attemptFor?: (plan: WrappablePlan) => number;
   readonly memoryLimit?: string;
   readonly pidsLimit?: number;
@@ -178,6 +191,9 @@ export const createContainerWrapper = (options: ContainerWrapperOptions): PlanWr
     return imageResolver.resolve().tag;
   };
 
+  /** How many times this wrapper has wrapped each run and step, which is that step's attempt count. */
+  const attempts = new Map<string, number>();
+
   const wrap = <P extends WrappablePlan>(plan: P): P => {
     const tier = resolveTier(plan);
     const worktree = options.worktreeFor?.(plan) ?? plan.cwd;
@@ -198,8 +214,23 @@ export const createContainerWrapper = (options: ContainerWrapperOptions): PlanWr
     }
 
     const orchHome = options.orchHome ?? resolveOrchHome(plan.env);
-    const sessionDir = options.sessionDirFor?.(plan) ?? sessionDirFor(plan.run, orchHome);
-    const attempt = options.attemptFor?.(plan) ?? 1;
+    // The one writable mount, refused unless AD-9 says a run worktree can be there. The allow-list in
+    // `flags.ts` asks the same question of the request it is given; this is the side that can still name
+    // the *step* in its refusal, and a tier-2 step that cannot be confined does not run at all.
+    if (!isStrictlyWithin(worktreesDir(orchHome), worktree)) {
+      throw new TierTwoUnconfinableError(
+        plan.step,
+        `its worktree ${worktree} is not inside ${worktreesDir(orchHome)}, so mounting it writable ` +
+          'would hand the container a directory AD-20 never admitted — the run worktree is the only ' +
+          'checkout a step may edit (AD-23)',
+      );
+    }
+    // A bind mount does not create its source: without this the runtime refuses the invocation with
+    // "bind source path does not exist" and the step never starts.
+    const sessionDir = ensureSessionDir(options.sessionDirFor?.(plan) ?? sessionDirFor(plan.run, orchHome));
+    const priorAttempts = attempts.get(`${plan.run} ${plan.step}`) ?? 0;
+    attempts.set(`${plan.run} ${plan.step}`, priorAttempts + 1);
+    const attempt = options.attemptFor?.(plan) ?? priorAttempts + 1;
     const containerName = containerNameFor(plan.run, plan.step, attempt);
     const runtime = options.runtime ?? requireContainerRuntime(plan.env);
     const image = imageTag(plan.step);
@@ -218,6 +249,9 @@ export const createContainerWrapper = (options: ContainerWrapperOptions): PlanWr
       // AD-28 inside the container: the absolute interpreter is the image's, not the host's.
       env: { ...plan.env, ORCH_NODE: IMAGE_NODE_PATH },
       phase: 'execution',
+      // The same ORCH_HOME the two mountable directories were derived from, so the allow-list in
+      // `flags.ts` checks them against the machine this run belongs to rather than the ambient default.
+      orchHome,
       ...(options.memoryLimit === undefined ? {} : { memoryLimit: options.memoryLimit }),
       ...(options.pidsLimit === undefined ? {} : { pidsLimit: options.pidsLimit }),
       ...(options.seccompProfile === undefined ? {} : { seccompProfile: options.seccompProfile }),

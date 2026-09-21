@@ -11,12 +11,12 @@
  *   runtime is named in exactly one file — which is the AD-20 invariant the whole package exists to
  *   make true.
  */
-import { readFileSync, readdirSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 
 import {
   CONTAINER_SUBCOMMANDS,
@@ -27,8 +27,10 @@ import {
   PhaseOrderError,
   TierTwoUnconfinableError,
   UnprotectedDefaultBranchError,
+  EXECUTOR_UID,
   containerNameFor,
   createContainerWrapper,
+  ensureSessionDir,
   createPhaseSequencer,
   envEntriesOf,
   executionPlan,
@@ -51,7 +53,22 @@ import type { Recorder } from '../src/runtime/index.js';
 import type { SpawnPlan, SpawnWrapper, StepSpawnerOptions } from '../src/engine/index.js';
 
 const RUN = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
-const WORKTREE = '/tmp/orch-home/worktrees/01ARZ3NDEKTSV4RRFFQ69G5FAV';
+/**
+ * A real temp `ORCH_HOME`, not a literal path.
+ *
+ * Two reasons it has to be real now. The mount allow-list refuses a worktree that is not under
+ * `ORCH_HOME/worktrees/` (AD-9), so the fixture has to name one that is; and the wrapper *creates* the
+ * session directory, because `--mount type=bind` does not create its source and a real daemon refuses
+ * the invocation with "bind source path does not exist". A temp home keeps both facts true without the
+ * suite writing into the machine's own state.
+ */
+const ORCH_HOME = mkdtempSync(join(tmpdir(), 'orch-wrapper-home-'));
+const WORKTREE = join(ORCH_HOME, 'worktrees', RUN);
+mkdirSync(WORKTREE, { recursive: true });
+
+afterAll(() => {
+  rmSync(ORCH_HOME, { recursive: true, force: true });
+});
 const RUNTIME: ContainerRuntime = { command: '/usr/local/bin/orch-runtime', name: 'runtime', source: 'path' };
 
 /** A plan exactly as story 1-4 builds one: host Node, host CLI entry, and the CLI argv on its own. */
@@ -121,7 +138,7 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
       runtime: RUNTIME,
       invoke: presentImage(),
       image: 'orch-executor:0123456789abcdef',
-      orchHome: '/tmp/orch-home',
+      orchHome: ORCH_HOME,
     });
     const input = plan();
     const output = wrapper(input);
@@ -145,7 +162,7 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
       runtime: RUNTIME,
       image: 'orch-executor:0123456789abcdef',
       invoke: presentImage(),
-      orchHome: '/tmp/orch-home',
+      orchHome: ORCH_HOME,
     });
     const output = wrapper(plan());
     const image = output.args.indexOf('orch-executor:0123456789abcdef');
@@ -168,7 +185,7 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
       runtime: RUNTIME,
       image: 'orch-executor:0123456789abcdef',
       invoke: presentImage(),
-      orchHome: '/tmp/orch-home',
+      orchHome: ORCH_HOME,
     });
     const args = wrapper(plan()).args;
     // A detached invocation would exit 0 the instant the container started, so every step would be
@@ -184,16 +201,20 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
       runtime: RUNTIME,
       image: 'orch-executor:0123456789abcdef',
       invoke: presentImage(),
-      orchHome: '/tmp/orch-home',
+      orchHome: ORCH_HOME,
     });
     const args = wrapper(plan()).args;
     const mounts = mountsOf(args);
     expect(mounts).toHaveLength(2);
     expect(mounts[0]).toContain(WORKTREE);
-    expect(mounts[1]).toContain(sessionDirFor(RUN, '/tmp/orch-home'));
-    expect(sessionDirFor(RUN, '/tmp/orch-home')).toBe(
-      join('/tmp/orch-home', 'runs', RUN, 'session'),
-    );
+    expect(mounts[1]).toContain(sessionDirFor(RUN, ORCH_HOME));
+    expect(sessionDirFor(RUN, ORCH_HOME)).toBe(join(ORCH_HOME, 'runs', RUN, 'session'));
+    // And it exists on disk by now, writable by the uid the container runs as: a bind mount does not
+    // create its source, so a missing session directory is a container that never starts.
+    const sessionDir = sessionDirFor(RUN, ORCH_HOME);
+    expect(existsSync(sessionDir)).toBe(true);
+    const mode = statSync(sessionDir).mode & 0o777;
+    expect(statSync(sessionDir).uid === EXECUTOR_UID || (mode & 0o007) === 0o007).toBe(true);
   });
 
   it('passes the image\'s Node through ORCH_NODE and drops the host credential', () => {
@@ -202,7 +223,7 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
       runtime: RUNTIME,
       image: 'orch-executor:0123456789abcdef',
       invoke: presentImage(),
-      orchHome: '/tmp/orch-home',
+      orchHome: ORCH_HOME,
     });
     const entries = envEntriesOf(wrapper(plan()).args);
     expect(entries).toContain(`ORCH_NODE=${IMAGE_NODE_PATH}`);
@@ -215,7 +236,7 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
     const wrapper = createContainerWrapper({
       tier: 2,
       runtime: RUNTIME,
-      orchHome: '/tmp/orch-home',
+      orchHome: ORCH_HOME,
       invoke: (invocation: ContainerInvocation): ContainerResult => {
         seen.push(invocation);
         return presentImage()(invocation);
@@ -229,8 +250,68 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
   it('refuses to run a tier-2 step at all when it cannot be confined', () => {
     // No invoker and no tag: the image cannot be resolved, so the step does not run on the host
     // instead. Falling back is the failure containment exists to prevent.
-    const wrapper = createContainerWrapper({ tier: 2, runtime: RUNTIME, orchHome: '/tmp/orch-home' });
+    const wrapper = createContainerWrapper({ tier: 2, runtime: RUNTIME, orchHome: ORCH_HOME });
     expect(() => wrapper(plan())).toThrow(TierTwoUnconfinableError);
+  });
+
+  it('names a different container on a second wrap of the same plan', () => {
+    // `--rm` is never composed (AD-20), so attempt 1's container still exists when a step is retried.
+    // A fixed default attempt of 1 therefore named the retry's container the same thing, and the retry
+    // died at container start with "name already in use" rather than running.
+    const names: (string | null)[] = [];
+    const wrapper = createContainerWrapper({
+      tier: 2,
+      runtime: RUNTIME,
+      image: 'orch-executor:0123456789abcdef',
+      invoke: presentImage(),
+      orchHome: ORCH_HOME,
+      onWrap: (record) => names.push(record.containerName),
+    });
+    wrapper(plan());
+    wrapper(plan());
+    expect(names).toStrictEqual([containerNameFor(RUN, 'implement', 1), containerNameFor(RUN, 'implement', 2)]);
+    expect(new Set(names).size).toBe(2);
+    // A caller that tracks attempts itself still wins.
+    const fixed: (string | null)[] = [];
+    const explicit = createContainerWrapper({
+      tier: 2,
+      runtime: RUNTIME,
+      image: 'orch-executor:0123456789abcdef',
+      invoke: presentImage(),
+      orchHome: ORCH_HOME,
+      attemptFor: () => 7,
+      onWrap: (record) => fixed.push(record.containerName),
+    });
+    explicit(plan());
+    expect(fixed).toStrictEqual([containerNameFor(RUN, 'implement', 7)]);
+  });
+
+  it('refuses a worktree that is not the run\'s, rather than mounting it writable', () => {
+    // The default is the plan's cwd, so whatever the engine set became the one writable bind mount —
+    // a target repository, or `/`. AD-9 says where a run worktree lives; anything else is a tier-2 step
+    // that does not run, because falling back to the host is the failure containment prevents.
+    for (const worktree of ['/', '/etc', '/Users/somebody', join(ORCH_HOME, 'worktrees')]) {
+      const wrapper = createContainerWrapper({
+        tier: 2,
+        runtime: RUNTIME,
+        image: 'orch-executor:0123456789abcdef',
+        invoke: presentImage(),
+        orchHome: ORCH_HOME,
+        worktreeFor: () => worktree,
+      });
+      expect(() => wrapper(plan()), worktree).toThrow(TierTwoUnconfinableError);
+    }
+    // Including through the plan's own cwd, which is where the default comes from.
+    const wrapper = createContainerWrapper({
+      tier: 2,
+      runtime: RUNTIME,
+      image: 'orch-executor:0123456789abcdef',
+      invoke: presentImage(),
+      orchHome: ORCH_HOME,
+    });
+    expect(() => wrapper(plan({ cwd: '/Users/somebody/some-target-repo' }))).toThrow(
+      TierTwoUnconfinableError,
+    );
   });
 
   it('reports what it did for the event log, wrapped or not', () => {
@@ -240,7 +321,7 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
       runtime: RUNTIME,
       image: 'orch-executor:0123456789abcdef',
       invoke: presentImage(),
-      orchHome: '/tmp/orch-home',
+      orchHome: ORCH_HOME,
       onWrap: (record) => records.push({ tier: record.tier, wrapped: record.wrapped }),
     });
     wrapper(plan());
@@ -274,8 +355,62 @@ describe('removal, which happens only at a terminal disposition', () => {
     for (const state of ['committed', 'hibernated', 'killed', 'handed_off'] as const) {
       expect(removeContainerIfTerminal('orch-c', state, invoke).removed, state).toBe(true);
     }
-    expect(removals).toHaveLength(4);
-    expect(removals[0]?.subcommand).toStrictEqual([...CONTAINER_SUBCOMMANDS.remove]);
+    // Two invocations per removal now: the stop that a running container needs, then the removal.
+    // Asserted as a sequence rather than as a count, because the order is the whole fix.
+    expect(removals).toHaveLength(8);
+    expect(removals[0]?.subcommand).toStrictEqual([...CONTAINER_SUBCOMMANDS.stop]);
+    expect(removals[1]?.subcommand).toStrictEqual([...CONTAINER_SUBCOMMANDS.remove]);
+    expect(removals[0]?.args).toContain('orch-c');
+  });
+
+  it('reclaims a container that is still running, which a removal alone cannot', () => {
+    // A run can reach a terminal state — `killed`, a hand-off — with its container still up, and a
+    // removal refuses a running container. Without the stop the sweep reported `removed: false` on
+    // every pass for ever, and the resource AD-32 exists to reclaim was never reclaimed.
+    const seen: ContainerInvocation[] = [];
+    let running = true;
+    const runningContainer = (invocation: ContainerInvocation): ContainerResult => {
+      seen.push(invocation);
+      const argv = ['<runtime>', ...invocation.subcommand, ...invocation.args];
+      if (invocation.subcommand.join(' ') === CONTAINER_SUBCOMMANDS.stop.join(' ')) {
+        running = false;
+        return { status: 0, stdout: 'orch-c', stderr: '', argv };
+      }
+      return running
+        ? {
+            status: 1,
+            stdout: '',
+            stderr:
+              'Error response from daemon: cannot remove container "orch-c": container is running: ' +
+              'stop the container before removing or force remove',
+            argv,
+          }
+        : { status: 0, stdout: 'orch-c', stderr: '', argv };
+    };
+    const decision = removeContainerIfTerminal('orch-c', 'killed', runningContainer);
+    expect(decision.removed).toBe(true);
+    expect(seen.map((one) => one.subcommand.join(' '))).toStrictEqual([
+      CONTAINER_SUBCOMMANDS.stop.join(' '),
+      CONTAINER_SUBCOMMANDS.remove.join(' '),
+    ]);
+    // And still never with --force: a stop the runtime declines is a fact to record, where a forced
+    // removal would discard the transcript the stop was waiting to flush (AD-8).
+    for (const invocation of seen) {
+      expect(invocation.args).not.toContain('--force');
+      expect(invocation.args).not.toContain('-f');
+    }
+  });
+
+  it('reports a removal that still failed, and what the stop before it said', () => {
+    const decision = removeContainerIfTerminal('orch-c', 'committed', (invocation) => ({
+      status: invocation.subcommand.join(' ') === CONTAINER_SUBCOMMANDS.stop.join(' ') ? 1 : 1,
+      stdout: '',
+      stderr: 'Error response from daemon: container is restarting',
+      argv: ['<runtime>', ...invocation.subcommand],
+    }));
+    expect(decision.removed).toBe(false);
+    expect(decision.reason).toContain('removal failed');
+    expect(decision.reason).toContain('the stop before it reported 1');
   });
 
   it('treats an already-gone container as removed rather than as a failure', () => {
@@ -306,10 +441,12 @@ describe('provisioning, then execution', () => {
     attempt: 1,
     containerName: 'orch-c',
     worktree: WORKTREE,
-    sessionDir: sessionDirFor(RUN, '/tmp/orch-home'),
+    sessionDir: sessionDirFor(RUN, ORCH_HOME),
     command: IMAGE_CLI_PATH,
     commandArgs: ['--print', 'x'],
     home: '/Users/somebody',
+    // The ORCH_HOME the two mountable directories belong to: the allow-list is checked against it.
+    orchHome: ORCH_HOME,
   };
 
   it('gives the install phase a network and the execution phase none', () => {
@@ -325,13 +462,31 @@ describe('provisioning, then execution', () => {
   it('refuses to execute before provisioning has ended', () => {
     const sequencer = createPhaseSequencer();
     expect(() => sequencer.beginExecution(executionPlan(request))).toThrow(PhaseOrderError);
-    sequencer.provision(provisioningPlan(request, ['npm', 'ci']));
+    // The outcome of the provisioning *container*, not only its argv: see the test below.
+    sequencer.provision(provisioningPlan(request, ['npm', 'ci']), { status: 0 });
     expect(sequencer.state()).toBe('provisioned');
     sequencer.beginExecution(executionPlan(request));
     expect(sequencer.state()).toBe('executing');
     sequencer.endExecution();
     // And provisioning cannot come back afterwards, which would be a networked phase after execution.
-    expect(() => sequencer.provision(provisioningPlan(request, ['npm', 'ci']))).toThrow(PhaseOrderError);
+    expect(() =>
+      sequencer.provision(provisioningPlan(request, ['npm', 'ci']), { status: 0 }),
+    ).toThrow(PhaseOrderError);
+  });
+
+  it('does not treat a composed provisioning argv as a provisioned worktree', () => {
+    // Marking `provisioned` on composition authorised execution on the strength of an argv nobody had
+    // run: a provisioning container that exited non-zero, or never started, still let the step run with
+    // no network to install anything with. The declared `provisioning` state was unreachable, too.
+    const sequencer = createPhaseSequencer();
+    expect(() =>
+      sequencer.provision(provisioningPlan(request, ['npm', 'ci']), {
+        status: 1,
+        stderr: 'npm error code E404',
+      }),
+    ).toThrow(PhaseOrderError);
+    expect(sequencer.state()).toBe('provisioning');
+    expect(() => sequencer.beginExecution(executionPlan(request))).toThrow(PhaseOrderError);
   });
 
   it('lets a caller state that nothing needs installing, which is not the same as forgetting', () => {
@@ -345,6 +500,32 @@ describe('provisioning, then execution', () => {
     sequencer.skipProvisioning();
     const networked = { ...executionPlan(request), args: ['--network', 'bridge'] };
     expect(() => sequencer.beginExecution(networked)).toThrow(PhaseOrderError);
+  });
+
+  it('reads the token after --network rather than looking for the word anywhere in the argv', () => {
+    // `args.includes('none')` is satisfied by any label, path or environment value containing the word
+    // — so an argv on `bridge` passed as long as something, anywhere, said `none`.
+    const sequencer = () => {
+      const one = createPhaseSequencer();
+      one.skipProvisioning();
+      return one;
+    };
+    const disguised = {
+      ...executionPlan(request),
+      args: ['--label', 'orch.profile=none', '--network', 'bridge'],
+    };
+    expect(() => sequencer().beginExecution(disguised)).toThrow(/--network bridge/);
+    // Two --network flags is the same defect from the other side: the last one wins and the first is
+    // what a reader sees.
+    const twice = {
+      ...executionPlan(request),
+      args: ['--network', NETWORK_NONE, '--network', 'bridge'],
+    };
+    expect(() => sequencer().beginExecution(twice)).toThrow(/2 --network flags/);
+    // A --network with nothing after it is refused rather than read as absent.
+    expect(() => sequencer().beginExecution({ ...executionPlan(request), args: ['--network'] })).toThrow(
+      PhaseOrderError,
+    );
   });
 });
 
@@ -477,9 +658,16 @@ describe('the dependency direction', () => {
   });
 
   it('writes nothing inside a target repository', () => {
-    // A sanity check on the one path this package does write: the AD-31 marker, which AD-9 puts under
-    // ORCH_HOME. A temp ORCH_HOME proves the path is derived from it rather than from cwd.
+    // The two paths this package writes are the session directory and the AD-31 marker, and AD-9 puts
+    // both under ORCH_HOME. Asserted by writing: the directory tree of the working directory — which is
+    // the *target repository* for most of this system's life — is compared before and after, because a
+    // test that only derives a path proves nothing about where a write lands.
     const home = mkdtempSync(join(tmpdir(), 'orch-home-'));
-    expect(sessionDirFor(RUN, home).startsWith(home)).toBe(true);
+    const before = readdirSync(process.cwd()).sort();
+    const sessionDir = ensureSessionDir(sessionDirFor(RUN, home));
+    expect(sessionDir.startsWith(home)).toBe(true);
+    expect(existsSync(sessionDir)).toBe(true);
+    expect(readdirSync(process.cwd()).sort()).toStrictEqual(before);
+    rmSync(home, { recursive: true, force: true });
   });
 });

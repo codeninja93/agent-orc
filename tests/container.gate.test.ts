@@ -144,7 +144,57 @@ describe('the containment claim, and what it takes to make it', () => {
     expect(verification.reason).toContain('capabilities-dropped');
   });
 
-  it('is made exactly when all four conditions hold', () => {
+  it('refuses a marker whose checks are not a list of names, however well they read', () => {
+    // The forgery this closes, and it is the *second* time the same hole has been open here: the first
+    // fix taught the gate to check membership and left the type to `JSON.parse`. `checks` as the single
+    // string "no-push-credential no-runtime-socket read-only-root non-root-user capabilities-dropped
+    // no-host-home" satisfies every required check by substring — `includes` is the same call on a
+    // string as on an array — and the refusal message would have reported 99 containment properties.
+    const env = tempHome();
+    const path = containmentMarkerPath(env);
+    mkdirSync(dirname(path), { recursive: true });
+    const forged = {
+      ...marker(),
+      checks: REQUIRED_CONTAINMENT_CHECKS.join(' '),
+    };
+    writeFileSync(path, `${JSON.stringify(forged, null, 2)}\n`, 'utf8');
+    // Not "a weaker proof": no proof at all, so it reads exactly as an absent marker.
+    expect(readContainmentMarker(env)).toBeNull();
+    const verification = containmentVerification({ env, invoke: answeringRuntime });
+    expect(verification.verified).toBe(false);
+    expect(verification.reason).toContain('never recorded an outcome');
+    expect(() => assertContainmentVerified({ env, invoke: answeringRuntime })).toThrow(
+      ContainmentUnverifiedError,
+    );
+    // Every other shape `checks` could arrive in is refused the same way, including an absent one.
+    for (const checks of [42, null, 'no-push-credential', { 0: 'no-push-credential' }, ['ok', 7]]) {
+      writeFileSync(path, `${JSON.stringify({ ...marker(), checks }, null, 2)}\n`, 'utf8');
+      expect(readContainmentMarker(env), JSON.stringify(checks)).toBeNull();
+    }
+    const { checks: _omitted, ...withoutChecks } = marker();
+    writeFileSync(path, `${JSON.stringify(withoutChecks, null, 2)}\n`, 'utf8');
+    expect(readContainmentMarker(env)).toBeNull();
+  });
+
+  it('cannot be made by a daemon older than the Stack table\'s floor', () => {
+    // `meetsVersionFloor` was computed and read by nothing, so a daemon below >=29.7 passed the gate —
+    // against the field's own promise that the floor is never silently ignored. A flag the daemon is too
+    // old to know is accepted and not honoured, which is containment that is not there.
+    const env = tempHome();
+    recordContainmentMarker(marker(), env);
+    const oldDaemon = (invocation: ContainerInvocation): ContainerResult => ({
+      status: 0,
+      stdout: '24.0.7\n',
+      stderr: '',
+      argv: ['<runtime>', ...invocation.subcommand, ...invocation.args],
+    });
+    const verification = containmentVerification({ env, invoke: oldDaemon });
+    expect(verification.verified).toBe(false);
+    expect(verification.reason).toContain('below the Stack table');
+    expect(() => assertContainmentVerified({ env, invoke: oldDaemon })).toThrow(ContainmentUnverifiedError);
+  });
+
+  it('is made exactly when every one of its conditions holds', () => {
     const env = tempHome();
     recordContainmentMarker(marker(), env);
     const verification = containmentVerification({ env, invoke: answeringRuntime });

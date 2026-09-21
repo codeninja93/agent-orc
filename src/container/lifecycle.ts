@@ -23,26 +23,33 @@
  * takes for redaction.
  *
  * **And the gate.** AD-31 names the container assertion suite as one of three suites required before any
- * unattended run. This machine cannot run it — the runtime binary is installed and its daemon does not
- * answer — so the suite skips. A skip that leaves no trace is indistinguishable from a pass, and this
- * project has already found five green suites hiding a deleted guard. So the suite records what it did,
- * and {@link containmentVerification} treats the claim "containment is verified" as true only when all
- * three of these hold: the marker says the assertions ran and passed, the Dockerfile has not changed
- * since, and a runtime answers now. `npm test` may be green while the stage-1 gate is undeclarable;
- * that is the intended, honest state of this machine today.
+ * unattended run, and it needs a daemon that not every machine has. A skip that leaves no trace is
+ * indistinguishable from a pass, and this project has already found five green suites hiding a deleted
+ * guard. So the suite records what it did, and {@link containmentVerification} treats the claim
+ * "containment is verified" as true only when every one of its conditions holds: the marker parses into
+ * the shape the gate reads, it says the assertions ran and passed, its Dockerfile digest still matches,
+ * a runtime answers now at or above the Stack table's floor, and it names each of the six
+ * {@link REQUIRED_CONTAINMENT_CHECKS}. `npm test` may be green while the stage-1 gate is undeclarable;
+ * on a machine whose daemon does not answer, that is the intended and honest state.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { isTerminalFeatureState, makeError } from '../contracts/index.js';
 import type { FeatureState, OrchError } from '../contracts/index.js';
 import { resolveOrchHome, runPaths } from '../runtime/index.js';
 
-import { composeRunArgs, NETWORK_NONE, NETWORK_PROVISIONING } from './flags.js';
+import {
+  composeRunArgs,
+  EXECUTOR_GID,
+  EXECUTOR_UID,
+  NETWORK_NONE,
+  NETWORK_PROVISIONING,
+} from './flags.js';
 import type { ContainerRunRequest } from './flags.js';
 import { createImageResolver, dockerfilePath, hashDockerfileContent } from './image.js';
-import { CONTAINER_SUBCOMMANDS, probeContainerRuntime } from './runtime.js';
+import { CONTAINER_RUNTIME_MIN_VERSION, CONTAINER_SUBCOMMANDS, probeContainerRuntime } from './runtime.js';
 import type { ContainerInvoker, ContainerRuntimeReachability } from './runtime.js';
 
 /** The directory name of a run's session transcript, under `runs/<run-id>/` (AD-9's layout). */
@@ -57,6 +64,31 @@ export const SESSION_DIR_NAME = 'session';
  */
 export const sessionDirFor = (run: string, orchHome: string = resolveOrchHome()): string =>
   join(runPaths(run, orchHome).runDir, SESSION_DIR_NAME);
+
+/**
+ * Create the session directory, writable by the container's executor uid, and return it.
+ *
+ * A bind mount does not create its source: the runtime refuses the invocation with "bind source path
+ * does not exist", so without this the first real tier-2 run fails at container start rather than
+ * anywhere a test was looking. Nothing else writes this directory — `RunPaths` has no entry for it,
+ * because AD-8's transcript is written by the CLI *inside* the container and by nothing on the host.
+ *
+ * Writability is the same problem story 1-6 solves for the worktree and it is solved the same way: as
+ * root, own it as the executor uid; otherwise widen the mode, because a *fixed* foreign uid cannot
+ * otherwise write a directory this process owns. A read-only root plus an unwritable
+ * `CLAUDE_CONFIG_DIR` is a step that fails on its first line.
+ */
+export const ensureSessionDir = (sessionDir: string): string => {
+  mkdirSync(sessionDir, { recursive: true });
+  if (process.getuid?.() === 0) {
+    chownSync(sessionDir, EXECUTOR_UID, EXECUTOR_GID);
+    chmodSync(sessionDir, 0o700);
+    return sessionDir;
+  }
+  // Execute as well as write: a uid that may write a directory it cannot traverse writes nothing.
+  chmodSync(sessionDir, (statSync(sessionDir).mode & 0o777) | 0o007);
+  return sessionDir;
+};
 
 /** Characters a container name may carry. Everything else in a step name becomes `-`. */
 const NAME_SAFE = /[^A-Za-z0-9_.-]/g;
@@ -114,6 +146,12 @@ export const removeContainerIfTerminal = (
       reason: `the run is in state "${state}", which is not terminal; AD-20 keeps the container and its transcript`,
     };
   }
+  // Stop first. A run can reach a terminal state — `killed`, or a hand-off — with its container still
+  // up, and a removal refuses a running container, so the sweep would report `removed: false` on every
+  // pass for ever and the resource AD-32 exists to reclaim would never be reclaimed. `--force` is still
+  // not used: a stop the runtime declines is a fact the sweep records, where a forced removal would
+  // discard the transcript the stop was waiting to flush.
+  const stopped = invoke({ subcommand: CONTAINER_SUBCOMMANDS.stop, args: ['--timeout', '5', containerName] });
   const result = invoke({ subcommand: CONTAINER_SUBCOMMANDS.remove, args: ['--volumes', containerName] });
   if (result.status === 0) {
     return { removed: true, containerName, reason: `the run reached the terminal state "${state}"` };
@@ -122,7 +160,11 @@ export const removeContainerIfTerminal = (
   if (/no such container/i.test(detail)) {
     return { removed: true, containerName, reason: 'the container was already gone' };
   }
-  return { removed: false, containerName, reason: `removal failed: ${detail}` };
+  return {
+    removed: false,
+    containerName,
+    reason: `removal failed: ${detail} (the stop before it reported ${String(stopped.status)})`,
+  };
 };
 
 /** The strict form: for a caller that believes the run is terminal and wants to be wrong loudly. */
@@ -192,9 +234,16 @@ export type PhaseState = 'fresh' | 'provisioning' | 'provisioned' | 'executing' 
  * statement — not the same thing as forgetting to provision, and it still cannot be said after
  * execution has begun.
  */
+/** What a provisioning container reported. Only its exit status decides whether provisioning happened. */
+export interface PhaseOutcome {
+  readonly status: number | null;
+  readonly stdout?: string;
+  readonly stderr?: string;
+}
+
 export interface PhaseSequencer {
   readonly state: () => PhaseState;
-  readonly provision: (plan: PhasePlan) => void;
+  readonly provision: (plan: PhasePlan, outcome: PhaseOutcome) => void;
   readonly skipProvisioning: () => void;
   readonly beginExecution: (plan: PhasePlan) => void;
   readonly endExecution: () => void;
@@ -204,9 +253,22 @@ export const createPhaseSequencer = (): PhaseSequencer => {
   let state: PhaseState = 'fresh';
   return {
     state: (): PhaseState => state,
-    provision: (plan: PhasePlan): void => {
+    provision: (plan: PhasePlan, outcome: PhaseOutcome): void => {
       if (plan.phase !== 'provisioning') throw new PhaseOrderError('a non-provisioning plan was provisioned');
       if (state !== 'fresh') throw new PhaseOrderError(`provisioning was requested from state "${state}"`);
+      // `provisioning` is entered before the outcome is judged, so a provisioning run that failed — or
+      // one that was composed and never started — leaves the sequencer in a state execution refuses
+      // rather than in `provisioned`. Marking `provisioned` on *composition* authorised execution on
+      // the strength of an argv nobody had run.
+      state = 'provisioning';
+      if (outcome.status !== 0) {
+        const detail = (outcome.stderr ?? '').trim() === '' ? (outcome.stdout ?? '').trim() : (outcome.stderr ?? '').trim();
+        throw new PhaseOrderError(
+          `the provisioning container exited ${String(outcome.status)}${detail === '' ? '' : `: ${detail}`}` +
+            ', so its dependencies are not installed and execution — which has no network to install ' +
+            'them with — would run against a half-provisioned worktree',
+        );
+      }
       state = 'provisioned';
     },
     skipProvisioning: (): void => {
@@ -220,9 +282,22 @@ export const createPhaseSequencer = (): PhaseSequencer => {
           `execution was requested from state "${state}"; provisioning must have ended first`,
         );
       }
-      if (!plan.args.includes(NETWORK_NONE)) {
+      // The *token after* `--network`, and exactly one `--network` in the vector. Testing whether the
+      // argv contains the bare word `none` anywhere passes for an argv carrying `--network bridge`
+      // beside any label, environment value or path that happens to contain it — and a second
+      // `--network` is how a later flag quietly wins over the first.
+      const networkFlags = plan.args.filter((token) => token === '--network');
+      if (networkFlags.length !== 1) {
         throw new PhaseOrderError(
-          `the execution argv does not carry --network ${NETWORK_NONE}; execution has no general network`,
+          `the execution argv carries ${String(networkFlags.length)} --network flags; exactly one is ` +
+            'the only way to know which network the runtime will use',
+        );
+      }
+      const network = plan.args[plan.args.indexOf('--network') + 1];
+      if (network !== NETWORK_NONE) {
+        throw new PhaseOrderError(
+          `the execution argv carries --network ${network ?? '<nothing>'} rather than ` +
+            `--network ${NETWORK_NONE}; execution has no general network`,
         );
       }
       state = 'executing';
@@ -402,22 +477,48 @@ export const recordContainmentMarker = (
   return path;
 };
 
-/** Read the marker, or `null` when the suite has never recorded one on this machine. */
+/** A string, or `''` — the marker's own prose fields say nothing when they are not strings. */
+const markerText = (value: unknown): string => (typeof value === 'string' ? value : '');
+
+/** A string, or `null` — an unrecorded digest, tag or version, which every reader already handles. */
+const markerNullableText = (value: unknown): string | null =>
+  typeof value === 'string' ? value : null;
+
+/**
+ * Read the marker, or `null` when the suite has never recorded one on this machine — or wrote one whose
+ * shape cannot bear the weight the gate puts on it.
+ *
+ * `checks` is validated as an array of strings rather than coerced, and this is the second time the same
+ * hole has been open here: the first fix taught the gate to check *membership* and left the *type* to
+ * `JSON.parse`. A marker whose `checks` is the single string "no-push-credential no-runtime-socket
+ * read-only-root non-root-user capabilities-dropped no-host-home" then satisfies every required check by
+ * substring — `String.prototype.includes` is the same call on a string as on an array — and reports its
+ * length as 99 containment properties. A forged or drifted shape is not a weaker proof; it is no proof,
+ * so it reads as an absent marker and the gate refuses.
+ */
 export const readContainmentMarker = (env: NodeJS.ProcessEnv = process.env): ContainmentMarker | null => {
   try {
     const parsed: unknown = JSON.parse(readFileSync(containmentMarkerPath(env), 'utf8'));
     if (typeof parsed !== 'object' || parsed === null) return null;
-    const record = parsed as Partial<ContainmentMarker>;
-    if (record.state !== 'verified' && record.state !== 'skipped' && record.state !== 'failed') return null;
+    const record = parsed as Record<string, unknown>;
+    const state = record['state'];
+    if (state !== 'verified' && state !== 'skipped' && state !== 'failed') return null;
+    const rawChecks = record['checks'];
+    if (!Array.isArray(rawChecks)) return null;
+    const checks: string[] = [];
+    for (const check of rawChecks) {
+      if (typeof check !== 'string') return null;
+      checks.push(check);
+    }
     return {
-      state: record.state,
-      at: record.at ?? '',
-      reason: record.reason ?? '',
-      dockerfileHash: record.dockerfileHash ?? null,
-      imageTag: record.imageTag ?? null,
-      runtimeVersion: record.runtimeVersion ?? null,
-      checks: record.checks ?? [],
-      suite: record.suite ?? '',
+      state,
+      at: markerText(record['at']),
+      reason: markerText(record['reason']),
+      dockerfileHash: markerNullableText(record['dockerfileHash']),
+      imageTag: markerNullableText(record['imageTag']),
+      runtimeVersion: markerNullableText(record['runtimeVersion']),
+      checks,
+      suite: markerText(record['suite']),
     };
   } catch {
     return null;
@@ -451,17 +552,6 @@ export const currentDockerfileHash = (): string | null => {
 };
 
 /**
- * The single authority on whether AD-31's container suite has actually been satisfied here.
- *
- * Three conditions, and the reason each one is a condition:
- *
- * - the marker says `verified` — a skip or a failure is not a pass, and an absent marker is not either;
- * - its `dockerfileHash` matches the Dockerfile now — a hardening edit makes yesterday's proof a proof
- *   about a different sandbox, which AD-11 already treats as a different image;
- * - a runtime answers now — a tier-2 step cannot be confined by a daemon that is not running, so a
- *   stale pass must not authorise an unattended run on a machine that has since lost its runtime.
- */
-/**
  * The containment properties a marker must name before the gate may be declared met.
  *
  * This list lives here, beside the reader that enforces it, rather than in the assertion suite that
@@ -480,6 +570,22 @@ export const REQUIRED_CONTAINMENT_CHECKS = [
 
 export type ContainmentCheck = (typeof REQUIRED_CONTAINMENT_CHECKS)[number];
 
+/**
+ * The single authority on whether AD-31's container suite has actually been satisfied here.
+ *
+ * Five conditions, and the reason each one is a condition:
+ *
+ * - the marker parses into the shape the gate reads — see {@link readContainmentMarker}; a forged or
+ *   drifted shape is no proof rather than a weaker one;
+ * - it says `verified` — a skip or a failure is not a pass, and an absent marker is not either;
+ * - its `dockerfileHash` matches the Dockerfile now — a hardening edit makes yesterday's proof a proof
+ *   about a different sandbox, which AD-11 already treats as a different image;
+ * - a runtime answers now, at or above the Stack table's floor — a tier-2 step cannot be confined by a
+ *   daemon that is not running, and a daemon that silently ignores a flag it is too old to know is
+ *   containment that is not there;
+ * - it names every one of the {@link REQUIRED_CONTAINMENT_CHECKS} — all six, so the claim is about the
+ *   properties the verifier requires rather than about however many the prover happened to record.
+ */
 export const containmentVerification = (
   options: ContainmentVerificationOptions = {},
 ): ContainmentVerification => {
@@ -522,6 +628,15 @@ export const containmentVerification = (
       ...base,
       verified: false,
       reason: `no container runtime answers now (${runtime.detail}), so nothing can be confined`,
+    };
+  }
+  if (!runtime.meetsVersionFloor) {
+    return {
+      ...base,
+      verified: false,
+      reason:
+        `the runtime that answers now (${runtime.detail}) is below the Stack table's floor of ` +
+        `${CONTAINER_RUNTIME_MIN_VERSION}, so a flag in the AD-20 set may be accepted and not honoured`,
     };
   }
   const missingChecks = REQUIRED_CONTAINMENT_CHECKS.filter(
