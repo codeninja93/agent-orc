@@ -112,6 +112,19 @@ export const buildCompletionCard = (input: CompletionCardInput): CompletionCard 
    * unknown gap is the more dangerous of the two.
    */
   const notVerified = [
+    /**
+     * R8's sharpest case: **nothing ran**, which is not the same as nothing failing.
+     *
+     * A plan with no verification phase — or one whose verification steps never started — folds to
+     * `verified: []` and to an empty list of incomplete steps, so every entry below could be satisfied and
+     * the notice would print "verified: nothing" directly above "the work is finished and verified". That
+     * is precisely the failure R8 exists to prevent: an absent check reading as a passed one. The absence
+     * is therefore an entry of its own, stated first because it is the one a reader would otherwise never
+     * think to look for.
+     */
+    ...(verificationSteps.length === 0
+      ? ['no verification step ran at all, so nothing here has been checked by one']
+      : []),
     ...(testStatus === UNRECORDED_PRESENTATION
       ? ['no test result is recorded, so nothing here has been shown to pass']
       : []),
@@ -128,8 +141,18 @@ export const buildCompletionCard = (input: CompletionCardInput): CompletionCard 
       ),
   ];
 
+  /**
+   * "Finished **and verified**" is a claim about something positive, so it needs positive evidence.
+   *
+   * Gated on the empty `notVerified` list alone, the sentence was reachable by a run that had verified
+   * nothing whatsoever — the list being empty says only that nothing *known* is outstanding, and a run with
+   * no verification step has nothing known to be outstanding. Both halves are required: `verified.length`
+   * is the evidence, and the empty list is the absence of counter-evidence. The redundancy is deliberate —
+   * the entry added to `notVerified` above already covers today's zero-step case, and this is what keeps
+   * the claim honest if that entry is ever shortened or a later story reshapes the list.
+   */
   const nothingIsNeeded =
-    notVerified.length === 0
+    notVerified.length === 0 && verified.length > 0
       ? 'nothing is needed from you: the work is finished and verified'
       : 'nothing is needed from you for this run to finish — it already has. What is listed above as ' +
         'unverified is unverified, and no later pass will verify it';

@@ -31,9 +31,12 @@
  * still wins, because the file is the question as its owner wrote it; a reader with only the log is no
  * longer reduced to ids.
  *
- * **A settled question keeps its card.** The outcome does not vanish the moment it arrives: a person who
- * was mid-sentence when the window closed is owed the sentence `describeDefaultTaken` composes, which is
- * the engine's own words to a losing resolver rather than a paraphrase this card invented.
+ * **A settled question keeps its card, and is told what actually happened to it.** The outcome does not
+ * vanish the moment it arrives: a person who was mid-sentence when the *window closed* is owed the sentence
+ * `describeDefaultTaken` composes, which is the engine's own words to a losing resolver rather than a
+ * paraphrase this card invented. That sentence is used only where it is true — see {@link takenByTheClock}.
+ * Every other settled question states the fold's own outcome, because a card that told the winner somebody
+ * else had got there first would be worse than one that said nothing.
  *
  * **A draft is echoed, never submitted.** Re-rendering is not consent. The card shows what has been typed
  * and says which keystroke sends it; the only thing that writes anything is a control invoked from
@@ -170,15 +173,49 @@ export const readQuestion = (detail: QuestionDetail | null, view: ShellView): Re
 };
 
 /**
+ * The concrete options, with the escape removed from among them.
+ *
+ * A question whose `options` list *also* contains its escape — which the fold's own split cannot produce
+ * but a question state file can — used to render it twice: once numbered as an ordinary choice and once as
+ * `[esc]`. Two rows offering the same thing is two things to weigh where there is one, on the surface whose
+ * whole purpose is to be answerable in a glance (Q3). It is listed once, as what it is.
+ *
+ * Exported because both the bound and the count of what did not fit have to be taken over the same list:
+ * counting the escape as a concrete option would report one more hidden option than there are.
+ */
+export const concreteOptions = (read: ReadQuestion): readonly QuestionOption[] => {
+  const escape = read.escape;
+  return escape === null ? read.concrete : read.concrete.filter((option) => option.id !== escape.id);
+};
+
+/**
  * The three options that reach a person, then the escape, with the recommendation marked (Q1).
  *
  * Exported so a suite can assert Q1's bound without building a whole card, and taking the already-read
  * question rather than either source: the bound is one rule, and a second entry point that read a source of
  * its own is how a rule acquires two behaviours.
+ *
+ * **The recommended option is kept when the list is trimmed, exactly as the escape is.** Slicing the first
+ * three and reading the recommendation from the *unsliced* list meant a question whose
+ * `recommended_option_id` named the fourth option rendered `1, 2, 3, [esc]` with no row marked
+ * `(recommended)`, while the card went on printing "recommended: D" and "if ignored: take D" — pointing a
+ * person at an option they could not select. Q1 says "a recommended default and at most three concrete
+ * options"; the bound is what makes the recommendation matter, so the bound must not be what removes it.
+ * It displaces the last of the three rather than being appended, because the bound is a promise about how
+ * many things a person is asked to weigh.
  */
 export const boundedOptions = (read: ReadQuestion): readonly QuestionCardOption[] => {
   const recommendedId = read.recommendedId;
-  const concrete = read.concrete.slice(0, MAX_QUESTION_CARD_OPTIONS).map((option) => ({
+  const all = concreteOptions(read);
+  const head = all.slice(0, MAX_QUESTION_CARD_OPTIONS);
+  const recommended =
+    recommendedId === null ? null : (all.find((option) => option.id === recommendedId) ?? null);
+  const shown =
+    recommended !== null && !head.some((option) => option.id === recommended.id)
+      ? [...head.slice(0, MAX_QUESTION_CARD_OPTIONS - 1), recommended]
+      : head;
+
+  const concrete = shown.map((option) => ({
     id: option.id,
     label: option.label,
     consequence: option.consequence,
@@ -211,7 +248,18 @@ export const boundedOptions = (read: ReadQuestion): readonly QuestionCardOption[
 const windowPhrase = (read: ReadQuestion, now: Date): string => {
   const askedAt = read.askedAt;
   const windowMs = read.windowMs;
-  if (askedAt !== null && windowMs !== null) {
+  /**
+   * An instant that does not parse is an instant the card does not have.
+   *
+   * `Date.parse` answers `NaN` for anything it cannot read, and the countdown carried it through
+   * arithmetic into `formatDuration`, which refuses a non-finite number — so the card rendered
+   * "not yet recorded left before the default is taken", a sentence with a hole in the middle of it. A
+   * `question.asked` line whose `asked_at` an older or foreign writer spelled differently reaches exactly
+   * this (AD-5), and the honest answer is the one the third case below already gives: state the declared
+   * window and say that is what it means.
+   */
+  const startedAt = askedAt === null ? Number.NaN : Date.parse(askedAt);
+  if (askedAt !== null && windowMs !== null && Number.isFinite(startedAt)) {
     const remaining = questionWindowRemainingMs({ asked_at: askedAt, default_window_ms: windowMs }, now);
     return remaining === 0
       ? 'the window has passed; the default is due'
@@ -243,6 +291,24 @@ const recommendationFor = (read: ReadQuestion): { label: string; consequence: st
 };
 
 /**
+ * True when the **clock** settled this question, which is the one case `describeDefaultTaken` describes.
+ *
+ * The gate matters because that function composes a sentence for a *losing* resolver, and the card used to
+ * render it for any settled question at all. Its non-timeout branch reads "the `<resolver>` resolver got
+ * there first, on behalf of `<principal>` … this answer wrote nothing" — so a person whose own answer won
+ * the AD-25 compare-and-set was handed a card naming their own resolver and their own principal and telling
+ * them somebody else had beaten them to it. Story 1-8's patch round made that sentence *better*, which made
+ * the misuse more convincing rather than less: the improvement is exactly what put a person's own name in a
+ * sentence about losing.
+ *
+ * So the engine's words are used where they are true — matrix 3, the window closing while somebody was
+ * typing — and every other settled question states the fold's own outcome, which is a description of what
+ * happened rather than a message to somebody it did not happen to.
+ */
+const takenByTheClock = (settled: QuestionState): boolean =>
+  settled.resolution !== null && settled.resolution.resolver === 'timeout_default';
+
+/**
  * Build the one-question card.
  *
  * Pure, and a fold of what the log and — when it is in reach — the question state file hold. Nothing here
@@ -261,8 +327,13 @@ export const buildQuestionCard = (input: QuestionCardInput): QuestionCard => {
   const brief = presentValue(read.brief);
   const options = boundedOptions(read);
   // The escape is never one of the ones dropped, so only the *concrete* options are counted against Q1's
-  // bound: counting the escape in would report one fewer hidden option than there are.
-  const optionsNotShown = Math.max(read.concrete.length - MAX_QUESTION_CARD_OPTIONS, 0);
+  // bound: counting the escape in would report one fewer hidden option than there are. Counted over the
+  // rows actually shown rather than over the bound, because which three are shown is no longer simply the
+  // first three — the recommended option displaces one when it would otherwise fall outside.
+  const optionsNotShown = Math.max(
+    concreteOptions(read).length - options.filter((option) => !option.escape).length,
+    0,
+  );
   const defaultAction = presentValue(read.defaultAction);
   const window = windowPhrase(read, now);
   const recommended = recommendationFor(read);
@@ -281,8 +352,10 @@ export const buildQuestionCard = (input: QuestionCardInput): QuestionCard => {
       ...(optionsNotShown === 0
         ? []
         : [
-            `  ${String(optionsNotShown)} further option${optionsNotShown === 1 ? '' : 's'} ` +
-              'were offered and are not shown; at most three reach you, plus the escape (Q1)',
+            `  ${String(optionsNotShown)} further option${optionsNotShown === 1 ? ' was' : 's were'} ` +
+              'offered and ' +
+              `${optionsNotShown === 1 ? 'is' : 'are'} not shown; at most three reach you, plus the ` +
+              'escape (Q1)',
           ]),
       `if ignored: ${defaultAction}`,
       `window: ${window}`,
@@ -310,14 +383,12 @@ export const buildQuestionCard = (input: QuestionCardInput): QuestionCard => {
     };
   }
 
-  // A settled question, including the case the window settled while somebody was typing. The engine's own
-  // sentence to a losing resolver is preferred over the fold's shorter one whenever the reader has the
-  // settled state, so the terminal and the refusal say the same thing about the same decision.
+  // A settled question, including the case the window settled while somebody was typing.
   const settled = detail?.settled ?? null;
   const outcome =
     slot.state === 'empty'
       ? null
-      : settled !== null
+      : settled !== null && takenByTheClock(settled)
         ? describeDefaultTaken(settled)
         : (slot.outcome ?? 'no outcome recorded');
 

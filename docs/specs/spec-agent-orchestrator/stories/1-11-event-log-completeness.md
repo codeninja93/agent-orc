@@ -2,7 +2,7 @@
 title: 'Event-log completeness — the facts the required surfaces are specified to show'
 type: 'feature'
 created: '2026-09-20'
-status: 'done'
+status: 'in-review'
 review_loop_iteration: 0
 followup_review_recommended: true
 baseline_revision: 'db11e4b'

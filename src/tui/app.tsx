@@ -37,11 +37,15 @@
 import { Box, Text, render, useInput, useStdin } from 'ink';
 import type { ReactNode } from 'react';
 
-import { CardView } from './cards.js';
-import { cardForView } from './cards/index.js';
-import type { Card, CardInputs } from './cards/index.js';
+import { Command } from '../contracts/index.js';
+
+import { BriefCardView, CardView } from './cards.js';
+import { DEFAULT_BRIEF_HEIGHT, buildBriefCard, cardForView } from './cards/index.js';
+import type { BriefCard, Card, CardInputs } from './cards/index.js';
 import { CONTROLS, formatControlHints, invokeControl } from './controls.js';
 import type { ControlContext, ControlOutcome } from './controls.js';
+import { foldFleet } from './fleet.js';
+import type { FleetView } from './fleet.js';
 import { initialInputState, reduceKey } from './input.js';
 import type { InputEffect, InputKey, InputState } from './input.js';
 import { formatModeExplanation, formatModeLine } from './mode.js';
@@ -511,11 +515,44 @@ export const mountShell = (options: MountShellOptions): ShellHandle => {
   let notice: string | null = null;
   let lastControl: ControlOutcome | null = null;
 
+  /**
+   * The draft, but only when it is an answer to the question the card is about.
+   *
+   * `cardForView` hands its `draft` to the question card, whose field means "what you have typed and not
+   * sent *in reply to this question*" — and the whole draft was being passed through whatever it was being
+   * composed for. A rejection reason half-typed at a gate, or the wording of an amended criterion,
+   * therefore rendered under "typed and not yet sent" beneath the pending question, as if it were an
+   * answer about to resolve it. Q6 makes the answer free text, so nothing about the characters themselves
+   * could have told the card otherwise; what distinguishes them is the control they belong to, which the
+   * reducer already records.
+   */
+  const answerDraft = (): string | null =>
+    input.composingFor === Command.Answer && input.draft !== '' ? input.draft : null;
+
+  /**
+   * The context one keystroke writes against, resolved now rather than at mount.
+   *
+   * `ControlContext.currentStep` is what a `current-step` control — approve, reject, kill, inject-note —
+   * names in its intent file, and it was taken from the object the caller handed over when the shell was
+   * mounted. A shell is mounted once and lives for the whole run, so that value is a snapshot: it was
+   * `null` for every shell mounted before a step started, and stale for every step after the first. An
+   * approval recorded against a null or stale step is an approval attributed to the wrong gate, and AD-19
+   * makes the intent durable and its principal attributable precisely so it can be read back later.
+   *
+   * The view is re-folded from the log on every frame, so its `currentStep` is what the log says is in
+   * flight right now (AD-4). A caller's own value is kept as the fallback for the case the view has none —
+   * an embedder that knows a step the log has not recorded yet is still believed over nothing.
+   */
+  const contextNow = (control: ControlContext): ControlContext => ({
+    ...control,
+    currentStep: view.progress.currentStep ?? control.currentStep ?? null,
+  });
+
   const cardFor = (current: ShellView): Card | null =>
     cardForView(current, {
       ...options.cards,
       ...(options.now === undefined ? {} : { now: options.now }),
-      draft: input.draft === '' ? null : input.draft,
+      draft: answerDraft(),
     });
 
   let card = cardFor(view);
@@ -542,9 +579,25 @@ export const mountShell = (options: MountShellOptions): ShellHandle => {
   /** True once `unmount` has run. Every entry point checks it, so nothing draws to a dead instance. */
   let unmounted = false;
 
+  /**
+   * The Ink instance, which does not exist yet when the first frame is being committed.
+   *
+   * `draw` closed over a `const instance` assigned only after `render(frame())` *returns*, while `frame()`
+   * itself mounts {@link Keyboard} — so a keystroke delivered during that first commit reached `draw` and
+   * threw a `ReferenceError` from the temporal dead zone, taking the whole terminal down on the one
+   * keystroke a person is most likely to have already been pressing. Declared here and checked, so the
+   * effect is still applied and the redraw happens as soon as there is something to draw to.
+   */
+  let instance: ReturnType<typeof render> | null = null;
+  let drawPending = false;
+
   const draw = (): void => {
     if (unmounted) return;
     card = cardFor(view);
+    if (instance === null) {
+      drawPending = true;
+      return;
+    }
     instance.rerender(frame());
   };
 
@@ -557,6 +610,15 @@ export const mountShell = (options: MountShellOptions): ShellHandle => {
    * died of it would lose whatever else they had typed.
    */
   function press(key: InputKey): InputEffect {
+    /**
+     * After `unmount`, a keystroke does nothing — including writing an intent file.
+     *
+     * `refresh` already answered this way and `press` did not, so a key delivered to a handle a caller had
+     * finished with still reached `invokeControl` and wrote a durable command (AD-19) on behalf of a view
+     * that no longer exists. `none` is the honest effect: nothing was decided and nothing happened.
+     */
+    if (unmounted) return { kind: 'none' };
+
     const next = reduceKey(input, key);
     input = next.state;
     const effect = next.effect;
@@ -571,7 +633,7 @@ export const mountShell = (options: MountShellOptions): ShellHandle => {
           break;
         }
         try {
-          lastControl = invokeControl(effect.command, control, effect.argument);
+          lastControl = invokeControl(effect.command, contextNow(control), effect.argument);
           notice =
             `"${effect.command}" written as a durable intent; the loop applies it on its next pass`;
         } catch (thrown: unknown) {
@@ -592,6 +654,15 @@ export const mountShell = (options: MountShellOptions): ShellHandle => {
         break;
       case 'ignored':
       case 'none':
+        /**
+         * The last keystroke's acknowledgement is about the *last* keystroke.
+         *
+         * Left standing, the sentence from an earlier key sat beside every unbound key and every typed
+         * character that followed it — so "answer was abandoned; nothing was written" stayed on the frame
+         * while somebody typed the next sentence, which reads as a statement about what they are typing
+         * now. A key that did nothing is acknowledged by there being nothing to acknowledge.
+         */
+        notice = null;
         break;
     }
 
@@ -599,13 +670,20 @@ export const mountShell = (options: MountShellOptions): ShellHandle => {
     return effect;
   }
 
-  const instance = render(frame(), {
+  instance = render(frame(), {
     // Never patched: a shell that rewired `console` would change the behaviour of whatever mounted it,
     // and nothing here writes diagnostics to stdout in any case (Consistency Conventions).
     patchConsole: false,
     ...(options.stdout === undefined ? {} : { stdout: options.stdout }),
     ...(options.debug === undefined ? {} : { debug: options.debug }),
   });
+
+  // A keystroke that landed during the first commit changed the state but had nothing to draw to. Now
+  // there is, so the frame catches up rather than showing what was true before the key was pressed.
+  if (drawPending) {
+    drawPending = false;
+    draw();
+  }
 
   /**
    * Re-fold the log and redraw. After `unmount` it does nothing.
@@ -640,6 +718,126 @@ export const mountShell = (options: MountShellOptions): ShellHandle => {
     lastControl: (): ControlOutcome | null => lastControl,
     lastCard: (): Card | null => card,
     lastView: (): ShellView => view,
+    unmount: (): void => {
+      if (unmounted) return;
+      unmounted = true;
+      if (timer !== null) clearInterval(timer);
+      screen.off('resize', onResize);
+      instance?.unmount();
+    },
+  };
+};
+
+// -------------------------------------------------------------------------------------------------
+// The morning brief, which is a fold of every run rather than of one
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * Mount the morning brief (CAP-22).
+ *
+ * **Why this is a second mount rather than a seventh branch of `cardForView`.** Five of the six surfaces
+ * are folds of one `ShellView`; the brief is a fold of *every* run under `runsDir`, so it cannot be chosen
+ * by looking at one view — that reasoning is story 1-10's and it still holds. What did not hold was the
+ * conclusion drawn from it: the brief was left with no mount at all, so the **first** entry under the
+ * contract's "Required surfaces" existed only as a function a suite called. A surface nothing can put on a
+ * screen is not a surface.
+ *
+ * So the brief is a separate invocation, which is what it is: `mountShell` is "watch this feature" and this
+ * is "what is everything doing". Nothing here is a fleet-steering UX — there is no selection, no cursor and
+ * no keyboard, because a keystroke needs one run to write its intent against (AD-19) and choosing that run
+ * is a decision this round is not entitled to take. It draws, it re-folds, and it stops.
+ *
+ * The bound is measured, as CAP-22 requires: the height is the terminal's own rows and the wrapper is the
+ * frame's own `wrapLine` at the terminal's own columns, so "fits one screen" is a claim about the screen
+ * being drawn to rather than about an assumed one.
+ */
+export interface MountBriefOptions {
+  /** `ORCH_HOME`. Defaults to the one the runtime resolves, exactly as every other reader does. */
+  readonly orchHome?: string;
+  /** The runs to fold. Defaults to every directory under `runs/`. */
+  readonly runIds?: readonly string[];
+  /** How often to re-fold the fleet. `null` installs no interval, for a caller driving `refresh` itself. */
+  readonly pollMs?: number | null;
+  readonly columns?: number;
+  readonly rows?: number;
+  readonly now?: Date;
+  readonly stdout?: NodeJS.WriteStream;
+  readonly debug?: boolean;
+}
+
+/** What a mounted brief hands back. No `press`: the brief steers nothing (AD-19). */
+export interface BriefHandle {
+  /** Re-fold every run and redraw. The logs are the only input, so this is the whole of "refresh". */
+  readonly refresh: () => void;
+  readonly unmount: () => void;
+  readonly lastCard: () => BriefCard;
+  readonly lastFleet: () => FleetView;
+}
+
+export const mountBrief = (options: MountBriefOptions = {}): BriefHandle => {
+  const screen: NodeJS.WriteStream = options.stdout ?? process.stdout;
+  const columnsNow = (): number =>
+    options.columns ?? screen.columns ?? process.stdout.columns ?? DEFAULT_COLUMNS;
+  const rowsNow = (): number =>
+    options.rows ?? screen.rows ?? process.stdout.rows ?? DEFAULT_BRIEF_HEIGHT;
+
+  const fold = (): FleetView =>
+    foldFleet({
+      ...(options.orchHome === undefined ? {} : { orchHome: options.orchHome }),
+      ...(options.runIds === undefined ? {} : { runIds: options.runIds }),
+    });
+
+  let fleet = fold();
+
+  const build = (): BriefCard => {
+    const columns = columnsNow();
+    return buildBriefCard({
+      fleet,
+      height: rowsNow(),
+      // The frame's own wrapper at the terminal's own width, so the height bound is measured over the
+      // rows that are actually drawn rather than over unwrapped lines.
+      wrap: (line: string): readonly string[] => wrapLine(line, columns),
+      ...(options.now === undefined ? {} : { now: options.now }),
+    });
+  };
+
+  let card = build();
+  let unmounted = false;
+
+  const frame = (): ReactNode => <BriefCardView card={card} columns={columnsNow()} />;
+
+  const draw = (): void => {
+    if (unmounted) return;
+    card = build();
+    instance.rerender(frame());
+  };
+
+  const instance = render(frame(), {
+    patchConsole: false,
+    ...(options.stdout === undefined ? {} : { stdout: options.stdout }),
+    ...(options.debug === undefined ? {} : { debug: options.debug }),
+  });
+
+  const refresh = (): void => {
+    if (unmounted) return;
+    fleet = fold();
+    draw();
+  };
+
+  const onResize = (): void => {
+    draw();
+  };
+  screen.on('resize', onResize);
+
+  const interval =
+    options.pollMs === null ? null : Math.max(options.pollMs ?? DEFAULT_POLL_MS, MIN_POLL_MS);
+  const timer = interval === null ? null : setInterval(refresh, interval);
+  timer?.unref();
+
+  return {
+    refresh,
+    lastCard: (): BriefCard => card,
+    lastFleet: (): FleetView => fleet,
     unmount: (): void => {
       if (unmounted) return;
       unmounted = true;

@@ -71,9 +71,28 @@ export interface SpecEchoCardInput {
  * The line number leads, because the intent's argument is free text that the engine parses and the one
  * thing it must be able to recover is *which* criterion was amended. Q6 still holds: the amendment itself
  * is whatever the person wrote, unaltered and untrimmed of meaning.
+ *
+ * **A keystroke does not go through this function, and that is the honest contract.** There is no line
+ * selection in this card — no cursor, no highlighted row — so a person pressing the edit key types the
+ * number themselves and `src/tui/input.ts` sends the draft verbatim (AD-19, Q6). This is the canonical
+ * spelling, for a programmatic caller that already knows the line and for pinning the *other* half of the
+ * agreement: `criterionEditedPayload` in the reconciler has to read back both what this writes and what
+ * {@link EDIT_CRITERION_HINT} tells a person to type, and `tests/tui.cards.test.ts` asserts it does.
  */
 export const editCriterionArgument = (line: number, amendment: string): string =>
   `criterion ${String(line)}: ${amendment}`;
+
+/**
+ * What the card tells a person to type, which has to be something the engine can read back.
+ *
+ * It said "give its number and your wording, in your own words" while the engine's parser accepted only a
+ * leading literal `criterion N:` — so the amendment a person was invited to type was recorded with no line
+ * number at all, and the spec echo went on showing the original wording. The parser now reads a bare
+ * leading number too, and this states the shape rather than leaving it to be guessed. It is addressing, not
+ * formatting: Q6 governs the *wording*, which is untouched.
+ */
+export const EDIT_CRITERION_HINT =
+  'start with the line number — "3: <your wording>" — and then say it in your own words';
 
 /** The criteria, numbered as a person counts them. Nothing injected has been edited, by construction. */
 export const numberCriteria = (criteria: readonly string[]): readonly SpecEchoCriterion[] =>
@@ -131,7 +150,7 @@ export const buildSpecEchoCard = (input: SpecEchoCardInput): SpecEchoCard => {
                 } amended after they were first recorded; the wording above is the current one`,
               ]),
           `press "${confirmKey}" to confirm all ${String(criteria.length)} as written`,
-          `press "${editKey}" to amend one: give its number and your wording, in your own words`,
+          `press "${editKey}" to amend one: ${EDIT_CRITERION_HINT}`,
         ];
 
   return {

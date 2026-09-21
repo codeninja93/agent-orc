@@ -1,76 +1,104 @@
----
-title: 'TUI cards — question, spec echo, brief, kill, completion, handoff'
-type: 'feature'
+---title: TUI cards — question, spec echo, brief, kill, completion, handoff
+type: feature
 created: '2026-09-20'
-status: 'in-review'
-review_loop_iteration: 0
+status: done
+review_loop_iteration: 1
 followup_review_recommended: true
-baseline_revision: 'dc6b57c'
+baseline_revision: dc6b57c
 context:
-  - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/interface-contract.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-7-command-transport.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-8-question-lifecycle.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-9-tui-shell.md'
-warnings: ['oversized'] # six surfaces, a fleet-level fold, the first keystroke loop, and the stage-1 gate
+- '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/interface-contract.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-7-command-transport.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-8-question-lifecycle.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-9-tui-shell.md'
+warnings:
+- oversized
 deferred:
-  - summary: >-
-      No review layer ran against this story; the gate, the implementer's probes and my own two
-      independent mutations are the only scrutiny it received.
-    evidence: |-
-      typecheck, lint, build and 1127 tests across 42 files all pass with zero skips. Read status: done
-      as implemented, gated and mutation-tested, not reviewed.
-    severity: high
-  - summary: >-
-      GATE GAP: the acceptance criteria are absent from the event log, so the spec echo is the one
-      required surface that cannot be reconstructed from the log alone.
-    evidence: |-
-      `run.created` carries `{ mode, step_count }` only; the criteria reach disk in the step input file
-      and `state.json`, both excluded by the gate. The card states them as `(not recorded)` and refuses
-      to offer a confirmation of an empty set, and `tests/tui.reconstruction.test.ts` asserts the
-      criteria strings are genuinely absent from the log — the gap is pinned, not hidden. Closing it
-      needs a later story to record them in an event (a `spec.confirmed` line, or a field on
-      `run.created`).
-    location: 'src/tui/cards/spec-echo.ts'
-    severity: high
-  - summary: >-
-      STAGE-1 GATE: the gate reads "from git and the event log", and no in-repo durable record exists
-      yet. `build-sequencing.md` contradicts itself on whose job that is.
-    evidence: |-
-      Line 13 puts "Git-as-bus with notes" in stage 1's scope; AD-22 makes the committer the note's only
-      writer; line 16 puts "committing" in stage 2, where the breakdown accordingly placed story 2-7.
-      `grep -rn "refs/notes" src/` returns nothing. No stage-1 story may write the note without
-      violating AD-22, so this is a sequencing decision for Deep, not a defect: either the gate's git
-      half is assessed at stage 2's gate, or a note writer is pulled forward. AD-22 puts the note on the
-      *merge* commit and stage 1 has nothing that merges, which favours the amendment.
-    severity: high
-  - summary: >-
-      `question.asked` carries option ids only, with no labels, consequences, brief or `asked_at`, so
-      from the log alone the question card cannot show consequences or count down.
-    evidence: |-
-      With the question state file in reach — the live case, and the one a person actually sees — the
-      card shows all three. Only the reconstructed-from-log case is reduced. A countdown needs one more
-      projected field (`askedAt`), and `projection.ts` was not in this story's Code Map.
-    location: 'src/tui/cards/question.ts'
-    severity: medium
-  - summary: >-
-      `handoff.recorded` carries `{ code, reason }` only — no takeover branch and no document path.
-    evidence: |-
-      The card is passed the branch rather than inferring it, because AD-22 gives branch naming to the
-      committer and `takeoverBranchFor` owns the name; a renderer inferring a branch pattern is exactly
-      what AD-22 forbids. Recommend adding `branch` and `document` to that payload when 2-7 lands.
-    location: 'src/engine/handoff.ts'
-    severity: medium
-  - summary: >-
-      `src/tui/app.tsx` now holds two pieces of ephemeral state, contradicting 1-9's "the shell holds no
-      state".
-    evidence: |-
-      The keyboard's draft text and a one-line acknowledgement of the last keystroke. Neither is run
-      state, neither is written anywhere, both die with the process, and every other field is still
-      re-folded from the log each frame. A draft cannot live in the log — it is what has not been
-      submitted yet.
-    location: 'src/tui/app.tsx'
-    severity: low
+- summary: 'RESOLVED 2026-09-21: the four-layer review ran. See the Review Triage Log.'
+  evidence: 46 claims filed, 16 triage rows, 12 patched including two high. Suite 1468 -> 1522 tests across
+    51 files, zero skips. Four mutations caught.
+  severity: high
+- summary: 'GATE GAP: the acceptance criteria are absent from the event log, so the spec echo is the one
+    required surface that cannot be reconstructed from the log alone.'
+  evidence: '`run.created` carries `{ mode, step_count }` only; the criteria reach disk in the step input
+    file and `state.json`, both excluded by the gate. The card states them as `(not recorded)` and refuses
+    to offer a confirmation of an empty set, and `tests/tui.reconstruction.test.ts` asserts the criteria
+    strings are genuinely absent from the log — the gap is pinned, not hidden. Closing it needs a later
+    story to record them in an event (a `spec.confirmed` line, or a field on `run.created`). UPDATED 2026-09-21:
+    story 1-11 closed the absence. This review then found the related half — the card hinted at "give
+    its number and your wording" while the reconciler required a literal `criterion N:`, so the commonest
+    amendment recorded `line: null` and the echo kept showing the old words. The parser now reads a bare
+    leading number, and hint and parser are tested through each other.'
+  location: src/tui/cards/spec-echo.ts
+  severity: high
+- summary: 'STAGE-1 GATE: the gate reads "from git and the event log", and no in-repo durable record exists
+    yet. `build-sequencing.md` contradicts itself on whose job that is.'
+  evidence: 'Line 13 puts "Git-as-bus with notes" in stage 1''s scope; AD-22 makes the committer the note''s
+    only
+
+    writer; line 16 puts "committing" in stage 2, where the breakdown accordingly placed story 2-7.
+
+    `grep -rn "refs/notes" src/` returns nothing. No stage-1 story may write the note without
+
+    violating AD-22, so this is a sequencing decision for Deep, not a defect: either the gate''s git
+
+    half is assessed at stage 2''s gate, or a note writer is pulled forward. AD-22 puts the note on the
+
+    *merge* commit and stage 1 has nothing that merges, which favours the amendment.'
+  severity: high
+- summary: '`question.asked` carries option ids only, with no labels, consequences, brief or `asked_at`,
+    so from the log alone the question card cannot show consequences or count down.'
+  evidence: 'With the question state file in reach — the live case, and the one a person actually sees
+    — the
+
+    card shows all three. Only the reconstructed-from-log case is reduced. A countdown needs one more
+
+    projected field (`askedAt`), and `projection.ts` was not in this story''s Code Map.'
+  location: src/tui/cards/question.ts
+  severity: medium
+- summary: '`handoff.recorded` carries `{ code, reason }` only — no takeover branch and no document path.'
+  evidence: 'The card is passed the branch rather than inferring it, because AD-22 gives branch naming
+    to the
+
+    committer and `takeoverBranchFor` owns the name; a renderer inferring a branch pattern is exactly
+
+    what AD-22 forbids. Recommend adding `branch` and `document` to that payload when 2-7 lands.'
+  location: src/engine/handoff.ts
+  severity: medium
+- summary: '`src/tui/app.tsx` now holds two pieces of ephemeral state, contradicting 1-9''s "the shell
+    holds no state".'
+  evidence: 'The keyboard''s draft text and a one-line acknowledgement of the last keystroke. Neither
+    is run
+
+    state, neither is written anywhere, both die with the process, and every other field is still
+
+    re-folded from the log each frame. A draft cannot live in the log — it is what has not been
+
+    submitted yet.'
+  location: src/tui/app.tsx
+  severity: low
+- summary: The kill card's estimate cannot come from the log until story 2-9 lands.
+  evidence: Nothing at stage 1 emits `budget.degraded` or `budget.exhausted`, and `run.created` carries
+    no `wall_clock_ms_estimate`. R11 therefore cannot be satisfied from the log alone yet. The usage half
+    is now real; the estimate half is pinned as absent rather than invented, so the assertion is the reminder.
+    `DECLARED_WALL_CLOCK_MS` already exists and would be a one-line payload change, but that payload belongs
+    to another story.
+  location: src/tui/cards/kill.ts
+  severity: medium
+- summary: Where the morning brief lives is still a UX decision.
+  evidence: '`mountBrief` makes CAP-22''s surface reachable as a separate invocation, with no keyboard,
+    because a keystroke needs one run to write its intent against (AD-19) and choosing that run is the
+    decision this round deliberately did not take. Whether the brief should also be reachable from inside
+    the run shell — a toggle, a pane — is open, and `mountBrief` does not foreclose it.'
+  severity: medium
+- summary: '`no-non-null-assertion` is not enforced by lint; a grep is the only guard and it misses a
+    bare `!`.'
+  evidence: '`eslint.config.ts` uses `recommendedTypeChecked` + `stylisticTypeChecked`, and the rule lives
+    in tseslint''s `strict` preset. `no-explicit-any` IS on, so `any` is enforced. The story''s grep catches
+    `!.` but not a trailing `foo!`. One line of config if you want it enforced rather than grepped; not
+    changed here because it is a config edit nobody asked for.'
+  location: eslint.config.ts
+  severity: low
 ---
 
 # Story 1-10 — TUI cards: question, spec echo, brief, kill, completion, handoff
@@ -137,7 +165,7 @@ compression or Interviewer (2-8). No ceiling enforcement — the kill card displ
 | 2 | Free text typed into the question card, then Enter | An `answer` intent file is written and nothing else; the question resolves through 1-8's compare-and-set |
 | 3 | The window elapses while text sits half-typed in the card | Card states the default was taken and by what, from `describeDefaultTaken`; the typed text is not silently submitted |
 | 4 | A question with more than three options | Card shows at most three plus an escape option; the escape is never dropped |
-| 5 | A spec echo with five criteria | Criteria numbered and individually addressable; one keystroke confirms all; editing one writes an `edit_criterion` intent naming that line |
+| 5 | A spec echo with five criteria | Criteria numbered and individually addressable; one keystroke confirms all; editing one writes an `edit_criterion` intent naming that line — the card has no line selection, so the person types the number (the card's hint shows the shape) and the engine parses it out of the free text (Q6) |
 | 6 | Three in-flight features, terminal height 24 | Brief lists all three with what each needs and what it cost, within the height |
 | 7 | Twelve in-flight features, terminal height 24 | Brief lists what fits and states how many more, still within the height |
 | 8 | No in-flight features | Brief says so in a sentence; no empty table, no borrowed frame |
@@ -254,6 +282,34 @@ compression or Interviewer (2-8). No ceiling enforcement — the kill card displ
 
 ## Review Triage Log
 
+### 2026-09-21 — Review pass (follow-up, on a `done` spec)
+
+- claims filed: 46 across four layers — blind-hunter 12, edge-case-hunter 17, verification-gap 4 gap + 6
+  other, intent-alignment 7 divergences. The edge-case layer filed an enumerated list so its count is exact;
+  the other three wrote prose, so those are my enumeration of the distinct claims each made.
+- grouped into the 16 rows below. 12 patch entries applied, 1 deferred, the rest rejected. No filed claim is
+  without a row.
+- **One row records that my own framing of the headline finding was wrong**, and that the patch round
+  corrected it by reading the baseline rather than taking my summary. That is the second time a round has
+  disproved a claim of mine, and both times it was the right outcome.
+
+- `[high]` `[patch]` The declared `handoff.recorded` type was emitted by one of three hand-off paths, and the renderer read only that type — so a person pressing `t` got a card saying "the log records no reason". **My framing of this was wrong and the patch round corrected it:** I said the take-over path wrote no line at all. It did — `command.applied` has carried `handoff_code` and `handoff_reason` since story 1-3 (`steering.ts:499`), and `rebuildFromLog` folds them (`rebuild.ts:434`), so the engine's *state* was always reconstructable. What was broken was a hole in AD-5's vocabulary and the card's rendering. Both fixed: the take-over path now emits the event, and the fold reads the reason from either source so an older log still states why.
+- `[high]` `[patch]` The gate's evidence did not observe its claim. All six cards were built from one `committed` run, where three are degenerate — the brief renders "nothing is in flight", the kill card "not yet recorded" for both facts R11 exists for, and the handoff card its fallback — and the per-card assertions were title-non-empty, more-than-one-line, and a width check that **could not fail**, because the test wrapped with `wrapLine`, which hard-slices anything longer than the width. It now drives three runs into one `ORCH_HOME`, each stripped to `events.jsonl`: a `committed` one, a `handed_off` one driven through the real keyboard path against a real git worktree, and a `running` one whose brief folds a real in-flight entry. The width assertion is replaced by `overWideWords`, which splits the card's **own** lines.
+- `[medium]` `[patch]` The question card told a person who successfully answered that they lost. `describeDefaultTaken` was called for any settled question, and after story 1-8's round its non-timeout branch names a resolver and principal and says they got there first — a sentence written for a loser. Improving that wording in 1-8 made the misuse more convincing. Now gated on the outcome actually being a timeout default.
+- `[medium]` `[patch]` The completion notice could print "finished and verified" with nothing verified: `nothingIsNeeded` was gated solely on `notVerified` being empty, so a run with every fact recorded and zero verification steps printed "verified: nothing" directly above "the work is finished and verified" — the exact R8 failure the card exists to prevent.
+- `[medium]` `[patch]` The recommended option could be dropped while still being named: the bound sliced the first three concrete options while the recommendation was read from the unsliced detail, so a question recommending its fourth option rendered no `(recommended)` row while still printing "recommended: D" — pointing a person at an option they cannot select, precisely in the case the bound exists for. An escape appearing inside `options` was also listed twice.
+- `[medium]` `[patch]` `cardForView` had no branch for `killed`, so a dead run fell through to the over-estimate check and could be handed the **kill card**, offering continue/narrow/kill/take-over. `killed` and `hibernated` now return no card, the fallback is guarded on the terminal-state list so a state added to the contract cannot reach it again, and the doc-comment's dispatch order is rewritten to the implemented one.
+- `[medium]` `[patch]` The morning brief — CAP-22's surface and the first entry under Required surfaces — could not appear on screen at all: `cardForView` deliberately never returns it and `mountShell` accepted no fleet input. Resolved as the honest reading rather than by forcing it through the chooser: a separate `mountBrief` invocation, with no keyboard, because a keystroke needs one run to write its intent against (AD-19) and choosing that run is a UX decision this round was told not to take.
+- `[medium]` `[patch]` The brief's height bound broke at the width its sibling test declares: the drop loop exits at zero entries without re-checking, so the 12-run fixture at heights 1, 2 and 3 all drew three rows at 40 columns, while the existing "too short for even one feature" test used height 2 at **80** columns where the title fits one row. Parameterised over {80, 40} x {1, 2, 3}; with the floor removed 3 of 6 fail while the old case still passes, confirming it never reached the failing shape.
+- `[medium]` `[patch]` Three defects in the keyboard path: a draft composed for `reject` or `narrow` rendered as an unsent answer to the pending question; `currentStep` was fixed at mount time so an approve or reject was recorded against a stale or null step; and the keystroke notice — the story's "never silence" guarantee, including the caught `invokeControl` throw — could be made to never render with all 1127 tests passing. Also `press` after `unmount` is now a no-op, the notice clears on ignored keys, and a TDZ on `instance` during the first commit is fixed.
+- `[medium]` `[patch]` My own `fork`-owner correction was pinned by nothing and reverted green. Now pinned per command, plus the durable form: **no awaiting owner may name a story whose file says `status: done`**, read from the story frontmatter — so when 2-9, 2-10 or 4-3 lands, that test fails and the entry must be revisited.
+- `[medium]` `[patch]` `editCriterionArgument` was referenced only by tests — and underneath it a sharper defect: the card's hint said "give its number and your wording" while the reconciler's parser required a literal leading `criterion N:`, so the commonest amendment (`3: <wording>`) was recorded with `line: null` and the spec echo went on showing the original words. The parser now reads a bare leading number too, and the card's hint and the engine's parser are fed through each other in the tests so CAP-2's two halves cannot drift.
+- `[low]` `[patch]` Nine smaller real items: `availabilityPhrase` hard-coded "nothing narrows yet" for every awaiting command; `whyFromNotices` selected the hand-off reason by scanning prose for "handed off" — now structural, and it also fixes a latent bug nobody named, that four notices after a hand-off used to push the reason out of the bounded list; a blank branch rendered `git checkout ` with nothing after it; `windowPhrase` rendered "(not recorded) left" on an unparseable instant; a pasted multi-line answer never submitted, because Ink hands a paste over in one call and deliberately does not split on newlines; `commandAvailabilities` iterated object keys while documenting enum order; `foldFleet` re-read every run's whole log unbounded, now capped at the spine's own two-hundred-run threshold with the count stated in the title; and the plural disagreement in the bounded-options line.
+- `[false]` `[reject]` MY PREMISE FOR THE HEADLINE FINDING WAS PARTLY WRONG, and the round corrected it by reading the code at the baseline rather than accepting my summary. I claimed a take-over produced "no line in the event log"; it produced `command.applied` carrying the code and reason, which the state fold already read. The defect was real but narrower than I stated, and I had repeated the overstatement to the user twice — once claiming the gate was met when three cards were degenerate, once claiming it was falsified when only a rendering was.
+- `[false]` `[reject]` One premise did not reproduce as stated: a kill card "whose estimate came from the log". Nothing at stage 1 emits `budget.degraded`/`budget.exhausted` and `run.created` carries no `wall_clock_ms_estimate` — ceilings are story 2-9's, as this story's own Boundaries say. The usage half is now real; the estimate half is **pinned as absent** rather than invented, so the day something records one, that assertion is the reminder.
+- `[low]` `[reject]` Seven hardening suggestions on inputs no caller can supply, and cosmetic notes corrected elsewhere in this round. (7 findings)
+- `[maybe-false]` `[defer]` Three claims that only a launched TUI could settle. Nothing launches the shell; the spine gives `bin/init.ts` to AD-12 and story 2-1 owns it. (3 findings)
+
 ## Design Notes
 
 **The parked control is named by the table, not by the card.** `narrow` is `{ kind: 'awaiting', owner:
@@ -314,22 +370,39 @@ too loose alone — the named-string assertions in `tui.cards` are what carry R8
 
 ## Auto Run Result
 
-**Status: done.** Six surfaces built as pure view-models with thin Ink components, the keyboard loop closed
-through `invokeControl` and nothing else, and three helpers relocated to `src/runtime/` so the renderer
-imports no engine module. 1127 tests across 42 files, zero skips. Four mutations tried, all caught.
+**Status: done, reviewed.** The four-layer review ran on 2026-09-21. 46 claims filed, 16 triage rows, 12
+patched. Suite 1468 -> 1522 tests across 51 files, zero skips.
 
-**Stage-1 `done_checkpoint` — half met, half deferred by the spec's own sequencing.**
+**The gate's evidence now observes what it claims.** It built all six cards from one `committed` run, where
+three are degenerate — the brief reading "nothing is in flight", the kill card "not yet recorded" for both
+facts R11 exists for, the handoff card its fallback — and its per-card assertions were title-non-empty,
+more-than-one-line, and a width check that could not fail, because the test wrapped with the same function
+whose guarantee it then measured. It now drives three runs into one `ORCH_HOME`, each stripped to
+`events.jsonl`: `committed`, `handed_off` through the real keyboard path against a real git worktree, and
+`running` so the brief folds a real in-flight entry.
 
-- *Containment half — met, independently verified.* `tests/container.assertion.test.ts` 8/8, and
-  `~/.orch/gates/container-assertion.json` reads `state: "verified"` with all six required checks against
-  Docker 29.8.0, image `orch-executor:991044ecce0e0ac8`. The reader in `src/container/lifecycle.ts`
-  re-validates the check *list* rather than trusting the marker's word, so the claim cannot drift — a
-  forged marker naming three of six checks was the defect that fix came from.
-- *Event-log half — met, with one named gap.* Five of the six surfaces reconstruct from `events.jsonl`
-  alone. The spec echo does not, because the acceptance criteria are not in the log; the gap is asserted
-  rather than hidden.
-- *Git half — not met, and not stage 1's to meet.* AD-22 assigns the in-repo durable record to the
-  committer, story 2-7. Recorded as a deferred entry with the decision it needs.
+**A correction to this story's own headline, which I got wrong twice.** I reported that a person-driven
+take-over wrote no line to the log, and that this falsified the stage-1 gate. The patch round checked the
+baseline and disproved it: `command.applied` has carried `handoff_code` and `handoff_reason` since story
+1-3, and `rebuildFromLog` folds them, so the engine's state was always reconstructable. What was actually
+broken is narrower and still worth fixing — the declared `handoff.recorded` type was emitted by one of three
+hand-off paths, a hole in AD-5's vocabulary, and the renderer read only that type, so the card showed its
+fallback in production. Both halves are fixed, and the fold now reads the reason from either source so an
+older log still states why.
 
-`followup_review_recommended: true` — the story is oversized, no review layer ran, and two of its deferred
-entries name payload changes another story will have to make.
+**Two user-facing lies in the cards.** A person who successfully answered a question was told another
+resolver got there first — because the losing-resolver sentence was rendered for every settled question,
+and story 1-8's improvement to that sentence made the misuse more convincing. And the completion notice
+could print "finished and verified" directly beneath "verified: nothing", which is the exact R8 failure it
+exists to prevent.
+
+**The morning brief is reachable.** CAP-22's surface — the first entry under Required surfaces — existed
+only as a function a test called. It is now a separate `mountBrief` invocation, deliberately without a
+keyboard, because choosing which run a keystroke steers is a UX decision this round was told not to take.
+
+**Residual risk, and why `followup_review_recommended` is true.** Two high entries were patched. The
+specific unverified risk: the take-over path now appends `handoff.recorded` before `command.applied`, and
+a crash between them redelivers the intent and appends the handoff line twice. Both folds absorb that,
+being whole-record assignments rather than accumulations, and the ordering is the recoverable one — the
+reverse would retire a run into `handed_off` with the reason lost. But it is a new two-append sequence in
+the one path a person reaches when everything else has failed.

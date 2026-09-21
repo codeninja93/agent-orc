@@ -18,7 +18,7 @@
  * `tests/tui.cards.test.ts`.
  */
 import { EventEmitter } from 'node:events';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 
 import { Text } from 'ink';
 import { createElement } from 'react';
@@ -43,11 +43,12 @@ import {
   foldFleet,
   formatControlHints,
   idleShellView,
+  mountBrief,
   mountShell,
   shellSections,
   wrapLine,
 } from '../src/tui/index.js';
-import type { Card, ShellView } from '../src/tui/index.js';
+import type { Card, ControlContext, ShellView } from '../src/tui/index.js';
 
 import { makeHome } from './helpers/engine-fixture.js';
 import {
@@ -368,6 +369,115 @@ describe('the Ink shell draws the card inside the persistent slot', () => {
 });
 
 /**
+ * CAP-22's surface, on a screen.
+ *
+ * The morning brief is the **first** entry under the contract's "Required surfaces", and until this it
+ * could not be drawn at all: `cardForView` deliberately never returns it — a fleet fold is not derivable
+ * from one view — and `mountShell` took no fleet, so the brief existed only as a function a suite called.
+ * `mountBrief` is the separate invocation it always was: "what is everything doing", beside `mountShell`'s
+ * "watch this feature". It steers nothing and has no keyboard, because a keystroke needs one run to write
+ * its intent against (AD-19).
+ */
+describe('the morning brief can be put on a screen', () => {
+  class BriefScreen extends EventEmitter {
+    columns = 80;
+    rows = 24;
+    readonly writes: string[] = [];
+
+    write(chunk: string): boolean {
+      this.writes.push(chunk);
+      return true;
+    }
+
+    frame(): string {
+      return this.writes.join('');
+    }
+  }
+
+  const writeRunLog = (runId: string, feature: string): void => {
+    const paths = runPaths(runId, home);
+    mkdirSync(paths.runDir, { recursive: true });
+    writeFileSync(
+      paths.eventLog,
+      logText(
+        buildLog(
+          [
+            runCreated(),
+            featureStateChanged('confirmed'),
+            featureStateChanged('running', 'confirmed'),
+            stepStarted('implement'),
+          ],
+          { feature, run: runId },
+        ),
+      ),
+      'utf8',
+    );
+  };
+
+  it('draws every in-flight feature through a real Ink render, bounded by the terminal', async () => {
+    writeRunLog('01K5NQ9ZJ7V3M2P9XQWRTC4BD1', 'refund-flow');
+    writeRunLog('01K5NQ9ZJ7V3M2P9XQWRTC4BD2', 'tui-cards');
+
+    const stdout = new BriefScreen();
+    const handle = mountBrief({
+      orchHome: home,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      pollMs: null,
+      debug: true,
+      now: NOW,
+    });
+
+    try {
+      await vi.waitFor(() => {
+        expect(stdout.frame()).toContain('morning brief');
+      });
+      const frame = stdout.frame();
+
+      expect(handle.lastCard().kind).toBe('brief');
+      expect(handle.lastCard().inFlight).toBe(2);
+      expect(frame).toContain('refund-flow');
+      expect(frame).toContain('tui-cards');
+      expect(frame).toContain('needs:');
+      // CAP-22 — one screen, measured against the terminal's own rows rather than an assumed height.
+      expect(handle.lastCard().height).toBe(stdout.rows);
+      expect(cardLines(handle.lastCard()).flatMap((line) => wrapLine(line, stdout.columns)).length)
+        .toBeLessThanOrEqual(stdout.rows);
+      // R6 — a run id is carried to find the log and never rendered.
+      expect(frame).not.toContain('01K5NQ9ZJ7V3M2P9XQWRTC4BD1');
+    } finally {
+      handle.unmount();
+    }
+  });
+
+  it('re-folds every run on refresh, and stops when it is unmounted', () => {
+    writeRunLog('01K5NQ9ZJ7V3M2P9XQWRTC4BD1', 'refund-flow');
+
+    const stdout = new BriefScreen();
+    const handle = mountBrief({
+      orchHome: home,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      pollMs: null,
+      now: NOW,
+    });
+
+    try {
+      expect(handle.lastCard().inFlight).toBe(1);
+      writeRunLog('01K5NQ9ZJ7V3M2P9XQWRTC4BD2', 'tui-cards');
+      handle.refresh();
+      expect(handle.lastCard().inFlight).toBe(2);
+      expect(handle.lastFleet().runs).toHaveLength(2);
+    } finally {
+      handle.unmount();
+    }
+
+    // After unmounting nothing draws: a refresh that still wrote would be a viewer outliving its own exit.
+    const after = stdout.writes.length;
+    handle.refresh();
+    expect(stdout.writes.length).toBe(after);
+  });
+});
+
+/**
  * The shell as a *running* thing: it re-reads, it re-measures, and it stops when it is told to.
  *
  * None of this was covered. Replacing the body of `mountShell`'s `refresh` with a no-op left all 87 TUI
@@ -514,6 +624,194 @@ describe('a mounted shell keeps up with the run, and stops when it is unmounted'
       expect(narrow).not.toContain(formatControlHints(80)[0]);
       for (const row of narrow) expect(row.length, row).toBeLessThanOrEqual(NARROW_COLUMNS);
       expect(stdout.last()).toContain(`${MODE_LABEL} `);
+    } finally {
+      handle.unmount();
+    }
+  });
+});
+
+/**
+ * The keyboard, as the frame shows it — the half of the loop nothing observed.
+ *
+ * `tests/tui.input.test.ts` drives the reducer and the intent file it causes; what nobody checked was what
+ * a person is *told*. Making the keystroke notice never render left every test passing, so the story's
+ * "never silence" guarantee — a refusal always stated, including the one the `try/catch` around
+ * `invokeControl` catches — could have been deleted without a failure, and deleting the `try/catch` itself
+ * would have turned a refusal into a dead terminal with nothing to say so.
+ */
+describe('the frame states what a keystroke did, and never falls silent', () => {
+  class KeyScreen extends EventEmitter {
+    columns = 80;
+    rows = 40;
+    readonly writes: string[] = [];
+
+    write(chunk: string): boolean {
+      this.writes.push(chunk);
+      return true;
+    }
+
+    last(): string {
+      return this.writes.at(-1) ?? '';
+    }
+  }
+
+  const preparedLog = (specs: Parameters<typeof buildLog>[0]): string => {
+    const paths = runPaths(RUN, home);
+    mkdirSync(paths.runDir, { recursive: true });
+    writeFileSync(paths.eventLog, logText(buildLog(specs, { feature: 'tui-cards', run: RUN })), 'utf8');
+    return paths.eventLog;
+  };
+
+  const mount = (
+    specs: Parameters<typeof buildLog>[0],
+    control: ControlContext | null | undefined,
+  ): { readonly handle: ReturnType<typeof mountShell>; readonly stdout: KeyScreen } => {
+    const eventLog = preparedLog(specs);
+    const stdout = new KeyScreen();
+    const handle = mountShell({
+      eventLog,
+      feature: 'tui-cards',
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      pollMs: null,
+      debug: true,
+      now: NOW,
+      ...(control === undefined ? {} : { control }),
+    });
+    return { handle, stdout };
+  };
+
+  const steerable = (): ControlContext => ({
+    paths: runPaths(RUN, home),
+    feature: 'tui-cards',
+    principal: { kind: 'user', id: 'deep' },
+  });
+
+  it('says so in the frame when there is no run to steer', () => {
+    const { handle, stdout } = mount([runCreated(), featureStateChanged('running')], null);
+    try {
+      handle.press({ input: 'g' });
+      expect(stdout.last()).toContain('was not written');
+      expect(stdout.last()).toContain('no run to steer');
+    } finally {
+      handle.unmount();
+    }
+  });
+
+  it('says so in the frame when a control that carries words was sent empty', () => {
+    const { handle, stdout } = mount(
+      [runCreated(), { ...questionAsked(QUESTION_ID), atMs: 2_000 }],
+      steerable(),
+    );
+    try {
+      handle.press({ input: 'a' });
+      handle.press({ input: '', return: true });
+      expect(stdout.last()).toContain('there are none yet, so nothing was written');
+    } finally {
+      handle.unmount();
+    }
+  });
+
+  it('says so in the frame when a draft is abandoned', () => {
+    const { handle, stdout } = mount([runCreated(), featureStateChanged('running')], steerable());
+    try {
+      handle.press({ input: 'a' });
+      handle.press({ input: '', escape: true });
+      expect(stdout.last()).toContain('was abandoned; nothing was written');
+    } finally {
+      handle.unmount();
+    }
+  });
+
+  /**
+   * The caught refusal, which is the one a deleted `try/catch` would turn into a dead terminal.
+   *
+   * `mintIntentId` is injectable, so a throw from inside `invokeControl` is reachable without breaking a
+   * filesystem: what matters is that *something* thrown there becomes a line in the frame rather than an
+   * unhandled exception through Ink's render.
+   */
+  it('states a refusal thrown by invokeControl rather than taking the frame down with it', () => {
+    const { handle, stdout } = mount([runCreated(), featureStateChanged('running')], {
+      ...steerable(),
+      mintIntentId: (): string => {
+        throw new Error('the intent id could not be minted on this machine');
+      },
+    });
+    try {
+      expect(() => handle.press({ input: 'g' })).not.toThrow();
+      expect(stdout.last()).toContain('the intent id could not be minted on this machine');
+      expect(handle.lastControl()).toBeNull();
+    } finally {
+      handle.unmount();
+    }
+  });
+
+  it('clears the notice on a key that did nothing, rather than leaving it beside the next one', () => {
+    const { handle, stdout } = mount([runCreated(), featureStateChanged('running')], steerable());
+    try {
+      handle.press({ input: 'a' });
+      handle.press({ input: '', escape: true });
+      expect(stdout.last()).toContain('was abandoned');
+      // An unbound key: nothing happened, so nothing from before is still being acknowledged.
+      handle.press({ input: 'z' });
+      expect(stdout.last()).not.toContain('was abandoned');
+    } finally {
+      handle.unmount();
+    }
+  });
+
+  it('writes nothing once the shell has been unmounted', () => {
+    const { handle } = mount([runCreated(), featureStateChanged('running')], steerable());
+    handle.unmount();
+
+    expect(handle.press({ input: 'g' }).kind).toBe('none');
+    expect(handle.lastControl()).toBeNull();
+    // AD-19 — the single effect of a control is one file under `commands/`, and none was created.
+    const commands = runPaths(RUN, home).commandsDir;
+    expect(existsSync(commands) ? readdirSync(commands) : []).toStrictEqual([]);
+  });
+
+  it('keeps a reject reason off the question card, where it would read as an answer', () => {
+    const { handle, stdout } = mount(
+      [runCreated(), { ...questionAsked(QUESTION_ID), atMs: 2_000 }],
+      steerable(),
+    );
+    try {
+      // `n` is reject, which carries a reason — not an answer to the question in the slot.
+      handle.press({ input: 'n' });
+      for (const character of [...'the gate is wrong']) handle.press({ input: character });
+
+      const frame = stdout.last();
+      // The prompt shows what is being composed, and says which control it belongs to.
+      expect(frame).toContain('reject > the gate is wrong');
+      // The question card does not claim it as an unsent answer.
+      expect(frame).not.toContain('typed and not yet sent');
+      const card = handle.lastCard();
+      expect(card?.kind).toBe('question');
+      if (card?.kind === 'question') expect(card.draft).toBeNull();
+    } finally {
+      handle.unmount();
+    }
+  });
+
+  it('records the step the log says is in flight, not the one known when it was mounted', () => {
+    const { handle } = mount(
+      [
+        runCreated(),
+        featureStateChanged('running'),
+        stepStarted('implement'),
+        stepTerminated('implement'),
+        stepStarted('verify', 'verification'),
+      ],
+      // Mounted with no step, exactly as a shell started before any step was known would be.
+      steerable(),
+    );
+    try {
+      handle.press({ input: 'y' });
+      const outcome = handle.lastControl();
+      if (outcome === null) throw new Error('approve wrote no intent');
+      const intent = JSON.parse(readFileSync(outcome.intentPath, 'utf8')) as { step?: unknown };
+      // The step the log has in flight now, not the `null` the context was built with (AD-4).
+      expect(intent.step).toBe('verify');
     } finally {
       handle.unmount();
     }

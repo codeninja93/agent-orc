@@ -24,7 +24,7 @@
  * already makes for a single run, applied to the list: one unreadable log costs that feature's line and
  * nothing else.
  */
-import { inFlightRuns } from '../fleet.js';
+import { MAX_FLEET_RUNS, inFlightRuns } from '../fleet.js';
 import type { FleetRun, FleetView } from '../fleet.js';
 import { statusFields } from '../status.js';
 
@@ -112,13 +112,25 @@ export const buildBriefCard = (input: BriefCardInput): BriefCard => {
   const runs = inFlightRuns(input.fleet);
   const all = runs.map((run) => fleetEntry(run, now));
 
-  const title = `morning brief — ${String(all.length)} feature${all.length === 1 ? '' : 's'} in flight`;
+  /**
+   * The count that was not read, stated in the **title**, which is the one row never given up.
+   *
+   * `foldFleet` is bounded (`MAX_FLEET_RUNS`), so on a machine with more run directories than that the
+   * brief is a fold of the most recent ones and not of everything. Saying so in a body line would be
+   * saying so in the rows the height bound drops first, which is the same as not saying it.
+   */
+  const notRead = input.fleet.notRead;
+  const title =
+    `morning brief — ${String(all.length)} feature${all.length === 1 ? '' : 's'} in flight` +
+    (notRead > 0 ? `, of the ${String(MAX_FLEET_RUNS)} most recent runs` : '');
   const titleRows = wrap(title).length;
 
   if (all.length === 0) {
     return {
       kind: 'brief',
-      title: 'morning brief — nothing is in flight',
+      title:
+        'morning brief — nothing is in flight' +
+        (notRead > 0 ? `, among the ${String(MAX_FLEET_RUNS)} most recent runs` : ''),
       entries: [],
       notShown: 0,
       inFlight: 0,
@@ -140,21 +152,55 @@ export const buildBriefCard = (input: BriefCardInput): BriefCard => {
   const overflowLine = (count: number): string =>
     `and ${String(count)} more in flight, not shown: this terminal has ${String(height)} rows`;
 
-  const measure = (entries: readonly FleetEntry[]): number => {
-    const notShown = all.length - entries.length;
-    const body = entries.flatMap((entry) => entryLines(entry));
-    const tail = notShown > 0 ? [overflowLine(notShown)] : [];
-    return titleRows + [...body, ...tail].flatMap((line) => wrap(line)).length;
+  /**
+   * The same fact in the fewest cells it can be said in, for a terminal with no room for the long form.
+   *
+   * It drops the explanation and keeps the count, because the count is the part a person cannot infer and
+   * the explanation is the part they are looking at.
+   */
+  const shortOverflowLine = (count: number): string => `and ${String(count)} more, not shown`;
+
+  const rowsOf = (lines: readonly string[]): number => lines.flatMap((line) => wrap(line)).length;
+
+  const bodyFor = (entries: readonly FleetEntry[], short: boolean): readonly string[] => {
+    const hidden = all.length - entries.length;
+    return [
+      ...entries.flatMap((entry) => entryLines(entry)),
+      ...(hidden > 0 ? [short ? shortOverflowLine(hidden) : overflowLine(hidden)] : []),
+    ];
   };
 
+  /**
+   * The rows the body may occupy: the height, less the title, which is never given up.
+   *
+   * The title carries the count of everything in flight, so it is the one row that stays honest when
+   * nothing else fits — and R3 makes a headline that stands alone the point of it.
+   */
+  const room = Math.max(height - titleRows, 0);
+
   let shown = [...all];
-  while (shown.length > 0 && measure(shown) > height) shown = shown.slice(0, -1);
+  while (shown.length > 0 && rowsOf(bodyFor(shown, false)) > room) shown = shown.slice(0, -1);
+
+  /**
+   * The floor the loop above cannot reach, and where the bound used to break.
+   *
+   * `while (shown.length > 0 && …)` stops at zero entries **without re-checking**, so when the wrapped
+   * title plus the wrapped overflow line alone exceeded the height the card returned more rows than it
+   * advertised — measured, the twelve-run fixture at heights 1, 2 and 3 all drew three rows at 40 columns.
+   * The 80-column case never reached that shape, which is why nothing caught it: at 80 the title is one row
+   * and so is the overflow line.
+   *
+   * So the tail shrinks when the entries have run out, and gives way entirely when even the short form does
+   * not fit. Losing the line is not losing the fact: the title states how many features are in flight and
+   * none are listed beneath it, which is visibly incomplete rather than quietly wrong — and a card that
+   * overflowed its own bound would put the *first* rows of the terminal, including whatever is above it,
+   * out of reach.
+   */
+  let lines = bodyFor(shown, false);
+  if (rowsOf(lines) > room) lines = bodyFor(shown, true);
+  if (rowsOf(lines) > room) lines = [];
 
   const notShown = all.length - shown.length;
-  const lines = [
-    ...shown.flatMap((entry) => entryLines(entry)),
-    ...(notShown > 0 ? [overflowLine(notShown)] : []),
-  ];
 
   return { kind: 'brief', title, entries: shown, notShown, inFlight: all.length, height, lines };
 };

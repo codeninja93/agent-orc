@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { runPaths, runsDir } from '../src/runtime/index.js';
 import {
   DEFAULT_BRIEF_HEIGHT,
+  MAX_FLEET_RUNS,
   NARROW_COLUMNS,
   UNNAMED_FEATURE,
   buildBriefCard,
@@ -206,17 +207,50 @@ describe('twelve features in flight, on a terminal 24 rows tall', () => {
     expect(cardText(brief)).toContain('more in flight, not shown');
   });
 
-  it('keeps the height on a terminal too short for even one feature, and says nothing is shown', () => {
+  /**
+   * The floor, at both declared widths and at the three heights that reach it.
+   *
+   * This case used to be checked at `height: 2` and **80 columns only**, where the title is one row and the
+   * overflow line is one row — so the shape that breaks the bound was never reached. At 40 columns the
+   * overflow line wraps to two rows, the entry-dropping loop stops at zero entries without re-checking, and
+   * the card returned three rows at every one of heights 1, 2 and 3 while advertising the height it was
+   * given. Matrix 15 declares 40 columns, so the bound is asserted there too.
+   */
+  it.each([
+    [80, 1],
+    [80, 2],
+    [80, 3],
+    [NARROW_COLUMNS, 1],
+    [NARROW_COLUMNS, 2],
+    [NARROW_COLUMNS, 3],
+  ])('keeps the height at %i columns and %i rows, too short for even one feature', (columns, height) => {
     twelve();
     const brief = buildBriefCard({
       fleet: foldFleet({ orchHome: home }),
-      height: 2,
-      wrap: (line) => wrapLine(line, 80),
+      height,
+      wrap: (line) => wrapLine(line, columns),
       now: NOW,
     });
+
     expect(brief.entries).toHaveLength(0);
     expect(brief.notShown).toBe(12);
-    expect(drawnRows(cardText(brief).split('\n'), 80)).toBeLessThanOrEqual(2);
+    expect(drawnRows(cardText(brief).split('\n'), columns)).toBeLessThanOrEqual(height);
+    // The headline is never given up, so the count of what is in flight survives every height (R3).
+    expect(brief.title).toContain('12 features in flight');
+  });
+
+  it('shortens the overflow line rather than overflowing, when there is a row for it', () => {
+    twelve();
+    // Three rows at 40 columns: one for the title, two left — where the long overflow line takes two and
+    // the entries take none, so the long form fits exactly and nothing has to shrink.
+    const brief = buildBriefCard({
+      fleet: foldFleet({ orchHome: home }),
+      height: 3,
+      wrap: (line) => wrapLine(line, NARROW_COLUMNS),
+      now: NOW,
+    });
+    expect(drawnRows(cardText(brief).split('\n'), NARROW_COLUMNS)).toBeLessThanOrEqual(3);
+    expect(cardText(brief)).toContain('12 more');
   });
 });
 
@@ -296,5 +330,54 @@ describe('the fleet fold reads the layout AD-9 declares', () => {
 
     const fleet = foldFleet({ orchHome: home, runIds: [runIdFor(2)] });
     expect(fleet.runs.map((run) => run.view.feature)).toStrictEqual(['second']);
+  });
+});
+
+/**
+ * The fold is bounded, because the brief re-folds on every poll.
+ *
+ * `foldFleet` read and replayed **every** run's whole `events.jsonl` on each call, so the work per second
+ * grew without limit with the number of run directories a machine had accumulated — on the one surface a
+ * person leaves open all morning. It stops at {@link MAX_FLEET_RUNS} and says how many it did not read;
+ * the most recent are kept because a run id is a ULID and therefore sorts chronologically (AD-29).
+ */
+describe('the fleet fold is bounded, and says what it did not read', () => {
+  it('reads every run when there are fewer than the bound, and reports nothing unread', () => {
+    writeRunningLog(1, 'tui-cards');
+    writeRunningLog(2, 'question-lifecycle');
+
+    const fleet = foldFleet({ orchHome: home });
+    expect(fleet.runs).toHaveLength(2);
+    expect(fleet.notRead).toBe(0);
+    expect(cardText(buildBriefCard({ fleet, now: NOW }))).not.toContain('most recent runs');
+  });
+
+  it('reads the most recent runs and reports the rest as unread', () => {
+    for (let index = 1; index <= 5; index += 1) writeRunningLog(index, `feature-${String(index)}`);
+
+    const fleet = foldFleet({ orchHome: home, limit: 2 });
+    expect(fleet.runs).toHaveLength(2);
+    expect(fleet.notRead).toBe(3);
+    // The tail: the ids sort chronologically, so the two kept are the two newest.
+    expect(fleet.runs.map((run) => run.view.feature)).toStrictEqual(['feature-4', 'feature-5']);
+  });
+
+  it('states in the title — the one row never given up — that it is not the whole list', () => {
+    for (let index = 1; index <= 5; index += 1) writeRunningLog(index, `feature-${String(index)}`);
+
+    const brief = buildBriefCard({
+      fleet: foldFleet({ orchHome: home, limit: 2 }),
+      height: DEFAULT_BRIEF_HEIGHT,
+      wrap: (line) => wrapLine(line, 80),
+      now: NOW,
+    });
+    expect(brief.title).toContain('most recent runs');
+    expect(brief.title).toContain(String(MAX_FLEET_RUNS));
+    expect(drawnRows(cardText(brief).split('\n'), 80)).toBeLessThanOrEqual(DEFAULT_BRIEF_HEIGHT);
+  });
+
+  it('declares a bound rather than leaving it to a caller to remember', () => {
+    expect(MAX_FLEET_RUNS).toBeGreaterThan(0);
+    expect(Number.isInteger(MAX_FLEET_RUNS)).toBe(true);
   });
 });

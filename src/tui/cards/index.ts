@@ -18,9 +18,14 @@
  *
  * **The brief is not in {@link cardForView}, and that is deliberate.** Five of the six are folds of one
  * `ShellView`; the morning brief is a fold of *every* run under `runsDir` (CAP-22), so it cannot be
- * chosen by looking at one view. The caller that has a fleet builds it; `cardForView` answers the
- * narrower question of which card *this run* is asking for.
+ * chosen by looking at one view. `cardForView` answers the narrower question of which card *this run* is
+ * asking for.
+ *
+ * What does not follow from that — and was for a while treated as if it did — is that the brief has no way
+ * onto a screen. It is a **separate invocation**: `mountBrief` in `src/tui/app.tsx`, beside `mountShell`.
+ * One is "watch this feature" and the other is "what is everything doing", and the contract lists both.
  */
+import { STOPPED_FEATURE_STATES } from '../mode.js';
 import type { ShellView } from '../projection.js';
 
 import type { BriefCard } from './brief.js';
@@ -114,15 +119,22 @@ export interface CardInputs {
 /**
  * Which card this run is asking for, decided in one place.
  *
- * The order is the order of urgency, and each branch is a claim about what the person is for:
+ * The order is the order of urgency, and each branch is a claim about what the person is for. The list is
+ * the implemented order, including the step between the switch and the last call that the previous version
+ * of this comment left out:
  *
  * 1. a pending question outranks everything — it is the only state where the run cannot proceed without
  *    them (R14);
  * 2. `drafting` is the spec echo: the run is waiting on the criteria being confirmed (CAP-2);
- * 3. a terminal state gets the card that explains it — the completion notice or the colleague's note;
- * 4. a run over its estimate, or degraded at a ceiling, gets the kill card, because that is the moment
- *    R11 exists for: abandoning early has to be easy;
- * 5. otherwise no card. The shell's own question slot already states that nothing needs them, and a card
+ * 3. the two terminal states that have something to explain get the card that explains it — `committed`
+ *    the completion notice, `handed_off` the colleague's note;
+ * 4. `degraded` gets the kill card: a ceiling was reached and the choice is now a person's;
+ * 5. a question that has *settled* keeps its card, so the outcome somebody was waiting for does not
+ *    vanish the instant it arrives;
+ * 6. a run over its estimate gets the kill card, because that is the moment R11 exists for: abandoning
+ *    early has to be easy — and only a run that is still going can be abandoned, which is why a stopped
+ *    run never reaches it;
+ * 7. otherwise no card. The shell's own question slot already states that nothing needs them, and a card
  *    drawn for the sake of having one is noise a person learns to skip (R1).
  */
 export const cardForView = (view: ShellView, inputs: CardInputs = {}): Card | null => {
@@ -158,6 +170,23 @@ export const cardForView = (view: ShellView, inputs: CardInputs = {}): Card | nu
       });
     case 'degraded':
       return buildKillCard({ view, now });
+    /**
+     * The two terminal states that have no card of their own, named rather than left to the default.
+     *
+     * Without this they fell through to {@link isOverEstimate} and could be handed the **kill card** —
+     * "continue / narrow / kill / take over" offered for a run that is already dead. Every one of those
+     * four gestures is a claim that something is still going, and a person pressing `k` on a killed run
+     * would write a durable intent (AD-19) against a run the reconciler will refuse, having been told by
+     * the surface that it was theirs to stop. `hibernated` is the same shape: AD-24 has a run reach a
+     * ceiling and stop, so `narrow` and `continue` are equally untrue of it.
+     *
+     * No card, rather than a card that says nothing: the frame's mode line already reads
+     * `mode stopped · killed` in every frame, which is the whole of what a person needs, and R1 makes
+     * silence the default.
+     */
+    case 'killed':
+    case 'hibernated':
+      return null;
     default:
       break;
   }
@@ -173,5 +202,13 @@ export const cardForView = (view: ShellView, inputs: CardInputs = {}): Card | nu
     });
   }
 
-  return isOverEstimate(view, now) ? buildKillCard({ view, now }) : null;
+  /**
+   * Only a run that is still going can be abandoned early, so only one reaches the kill card here.
+   *
+   * The switch names the four terminal states above, so this guard is today a second lock on a door that
+   * is already shut — and it is the one that stays shut when a terminal state is added to the contract and
+   * not to the switch, which is precisely how `killed` reached this line in the first place.
+   */
+  const stopped = view.featureState !== null && STOPPED_FEATURE_STATES.includes(view.featureState);
+  return !stopped && isOverEstimate(view, now) ? buildKillCard({ view, now }) : null;
 };

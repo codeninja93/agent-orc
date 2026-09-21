@@ -31,7 +31,7 @@
  * send a person to a file that is not there.
  */
 import { runPaths, takeoverBranchOrNull } from '../../runtime/index.js';
-import { UNRECORDED_PRESENTATION } from '../projection.js';
+import { UNRECORDED_PRESENTATION, handoffSentence } from '../projection.js';
 import type { ShellView } from '../projection.js';
 
 import type { CardBody } from './index.js';
@@ -95,16 +95,16 @@ const derivedLocation = (input: HandoffCardInput): HandoffLocation => {
 };
 
 /**
- * The fold already turned the `handoff.recorded` line into a sentence, and this is its one reader.
+ * A value the card has, as against one that is present and empty.
  *
- * Reading the notice rather than re-deriving the sentence from the payload keeps one spelling of one fact:
- * the notice a person sees in the shell's own list and the headline on this card are the same words,
- * because they are literally the same string.
+ * `??` alone does not answer this: a caller holding an escape-hatch outcome whose branch is the empty
+ * string — which is what a failed `git` leaves — passed it straight through, and the card printed
+ * "your work is on the branch: " and "pick the work up with: git checkout " with nothing after either.
+ * An empty string is not a branch, and a command a person could copy and run to no effect is worse than
+ * being told the branch was not recorded.
  */
-const HANDOFF_NOTICE_MARK = 'handed off';
-
-const whyFromNotices = (view: ShellView): string | null =>
-  [...view.notices].reverse().find((notice) => notice.text.includes(HANDOFF_NOTICE_MARK))?.text ?? null;
+const present = (value: string | null | undefined): string | null =>
+  value === undefined || value === null || value.trim() === '' ? null : value;
 
 /**
  * Build the handoff card.
@@ -119,14 +119,26 @@ export const buildHandoffCard = (input: HandoffCardInput): HandoffCard => {
   const derived = derivedLocation(input);
   // An explicitly given location wins: a caller holding the escape hatch's own outcome knows which branch
   // the work actually landed on, and the derivation only knows which branch it would have been named.
-  const knownBranch = given.branch ?? derived.branch ?? null;
-  const knownDocument = given.document ?? derived.document ?? null;
+  const knownBranch = present(given.branch) ?? present(derived.branch);
+  const knownDocument = present(given.document) ?? present(derived.document);
   const feature = view.feature ?? 'this feature';
 
+  /**
+   * Why, selected by **event kind** rather than by scanning prose.
+   *
+   * This used to find the last notice whose text contained the substring `'handed off'` — which matched
+   * any unrelated notice carrying the words, fell back silently the day the projection reworded its own
+   * sentence, and lost the fact entirely once `MAX_NOTICES` had pushed it out of the bounded list. The
+   * fold now carries the hand-off as a fact (`view.handoff`, from `handoff.recorded` or from the
+   * `handoff_code` a `command.applied` line carries), and `handoffSentence` is the one place the words
+   * live, so this card and the notice still say the same thing because they are the same function.
+   */
+  const recorded = view.handoff;
   const why =
-    whyFromNotices(view) ??
-    `I stopped working on ${feature} and the log records no reason, so treat the work as unfinished ` +
-      'rather than as abandoned for a known cause';
+    recorded === null
+      ? `I stopped working on ${feature} and the log records no reason, so treat the work as unfinished ` +
+        'rather than as abandoned for a known cause'
+      : handoffSentence(recorded);
   const branch = knownBranch ?? UNRECORDED_PRESENTATION;
   const document = knownDocument ?? UNRECORDED_PRESENTATION;
   const nextStep =
@@ -136,8 +148,10 @@ export const buildHandoffCard = (input: HandoffCardInput): HandoffCard => {
 
   const lines = [
     why,
-    `I have stopped working on ${feature} and left everything where it is. Nothing was merged, and ` +
-      'nothing was thrown away.',
+    // Not a second sentence about having stopped: when `why` is the fallback the two read as one
+    // paragraph saying the same thing twice, which is how a reader learns to skip the second line —
+    // and the second line is the one carrying the fact nothing was lost.
+    'Nothing was merged and nothing was thrown away; everything is where it was left.',
     `your work is on the branch: ${branch}`,
     `the full note, in prose: ${document}`,
     nextStep,

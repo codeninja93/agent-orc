@@ -139,6 +139,31 @@ export const reduceKey = (state: InputState, key: InputKey): InputStep => {
       return step({ ...state, draft: state.draft.slice(0, -1) }, { kind: 'none' });
     }
 
+    /**
+     * A paste, which arrives as one chunk that may carry its own line breaks.
+     *
+     * Ink's `useInput` hands the whole pasted string over in a single call, and its parser deliberately
+     * does **not** split on `\r` or `\n` "because they can legitimately appear inside pasted text" — so
+     * `key.return` is false and the break is just another character. Appending it blindly meant a person
+     * who pasted an answer ending in a newline watched nothing happen, and the newline that meant "send"
+     * became the last character of a durable decision (AD-25). A format imposed by the terminal, which is
+     * exactly what Q6 forbids.
+     *
+     * So a **trailing** break is the send, and interior ones are kept: a three-line answer is three lines
+     * of the person's words, not one line and two discarded ones. A chunk with an interior break and no
+     * trailing one is still being composed, and return sends it as it always did.
+     */
+    if (/[\r\n]/u.test(key.input)) {
+      const appended = `${state.draft}${key.input}`;
+      if (!/[\r\n]$/u.test(key.input)) {
+        return step({ ...state, draft: appended }, { kind: 'none' });
+      }
+      const text = appended.replace(/[\r\n]+$/u, '');
+      return text.trim() === ''
+        ? step({ ...state, draft: text }, { kind: 'empty', command })
+        : step(initialInputState, { kind: 'invoke', command, argument: text });
+    }
+
     // Anything else typed is text, including a character that is also a control key: while a draft is open
     // there are no control keys, because a person typing a sentence must not have "k" mean "kill".
     return key.input === ''

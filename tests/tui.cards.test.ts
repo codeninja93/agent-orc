@@ -22,6 +22,7 @@ import { describe, expect, it } from 'vitest';
 
 import { CURRENT_SCHEMA_VERSION, Command, QuestionStateSchema } from '../src/contracts/index.js';
 import type { QuestionState } from '../src/contracts/index.js';
+import { criterionEditedPayload } from '../src/engine/index.js';
 import { commandAvailability, describeDefaultTaken } from '../src/runtime/index.js';
 import {
   CONTROLS,
@@ -36,9 +37,12 @@ import {
   buildSpecEchoCard,
   cardForView,
   cardText,
+  EDIT_CRITERION_HINT,
   editCriterionArgument,
   foldEvents,
   idleShellView,
+  isOverEstimate,
+  killCardControl,
 } from '../src/tui/index.js';
 import type { QuestionDetail, ShellView } from '../src/tui/index.js';
 
@@ -47,10 +51,13 @@ import {
   budgetDegraded,
   buildLog,
   featureStateChanged,
+  commandApplied,
   handoffRecorded,
   questionAsked,
   questionDefaultTaken,
+  questionResolved,
   runCreated,
+  specCriterionEdited,
   stepStarted,
   stepTerminated,
 } from './helpers/tui-log.js';
@@ -193,7 +200,50 @@ describe('a question with more than three options shows three plus the escape', 
 
   it('states how many were offered and not shown, rather than dropping them in silence', () => {
     expect(card.optionsNotShown).toBe(1);
-    expect(cardText(card)).toContain('1 further option');
+    expect(cardText(card)).toContain('1 further option was offered and is not shown');
+  });
+
+  /**
+   * Q1's "the recommended option is marked", in exactly the case the bound exists for.
+   *
+   * The bound sliced the first three concrete options while the recommendation was read from the
+   * *unsliced* list, so a question recommending its fourth option rendered three rows with nothing marked
+   * `(recommended)` — while the card went on printing "recommended: index it in SQLite" and naming it as
+   * what silence would take. A person was pointed at an option that was not on the card.
+   */
+  it('keeps the recommended option when it would fall outside the bound', () => {
+    const recommendsTheFourth = buildQuestionCard({
+      view: pendingQuestionView(),
+      question: { ...fourOptions, recommended_option_id: 'sqlite' },
+    });
+
+    expect(recommendsTheFourth.options.filter((option) => !option.escape)).toHaveLength(
+      MAX_QUESTION_CARD_OPTIONS,
+    );
+    expect(recommendsTheFourth.options.map((option) => option.id)).toContain('sqlite');
+    expect(
+      recommendsTheFourth.options.filter((option) => option.recommended).map((option) => option.id),
+    ).toStrictEqual(['sqlite']);
+    expect(cardText(recommendsTheFourth)).toContain('(recommended)');
+    // Still three plus the escape, and still honest about how many did not fit.
+    expect(recommendsTheFourth.optionsNotShown).toBe(1);
+    expect(recommendsTheFourth.options.filter((option) => option.escape)).toHaveLength(1);
+  });
+
+  it('lists an escape that also appears among the options exactly once', () => {
+    const escape = threeOptionQuestion().escape;
+    if (escape === undefined) throw new Error('the fixture has no escape');
+    const duplicated = buildQuestionCard({
+      view: pendingQuestionView(),
+      question: { ...threeOptionQuestion(), options: [...(threeOptionQuestion().options ?? []), escape] },
+    });
+
+    expect(duplicated.options.filter((option) => option.id === escape.id)).toHaveLength(1);
+    expect(duplicated.options.filter((option) => option.escape).map((option) => option.id)).toStrictEqual([
+      escape.id,
+    ]);
+    // And it is not counted as one of the concrete options that did not fit.
+    expect(duplicated.optionsNotShown).toBe(0);
   });
 });
 
@@ -225,6 +275,84 @@ describe('the window closing while somebody is typing', () => {
   });
 });
 
+describe('a question whose asked_at nothing can parse', () => {
+  it('states the declared window rather than a sentence with a hole in it', () => {
+    /**
+     * `Date.parse` answers `NaN` for anything it cannot read, and the countdown carried it through
+     * arithmetic into `formatDuration`, which refuses a non-finite number — so the card rendered
+     * "not yet recorded left before the default is taken".
+     */
+    const card = buildQuestionCard({
+      view: pendingQuestionView(),
+      question: { ...threeOptionQuestion(), asked_at: 'the day before yesterday' },
+      now: new Date(FIXTURE_RUN_START_MS + 62_000),
+    });
+
+    expect(card.window).not.toContain(UNRECORDED_PRESENTATION);
+    expect(card.window).not.toContain('not yet recorded');
+    expect(card.window).not.toContain('NaN');
+    // The third case, which is the honest one when the instant is not known: the declared window, said
+    // to be the declared window (Q2).
+    expect(card.window).toBe('10m00s from when it was asked');
+  });
+});
+
+describe('a question a person answered and won', () => {
+  /**
+   * The card must not tell the winner that somebody else got there first.
+   *
+   * `describeDefaultTaken` composes a sentence for a *losing* resolver, and the card used to render it for
+   * any settled question at all. Its non-timeout branch names the resolver and the principal of the
+   * decision that stands — which, for the person who won, are their own — and then says "got there first …
+   * this answer wrote nothing". Story 1-8's patch round improved that wording, which made the misuse more
+   * convincing rather than less.
+   */
+  const resolvedState = (): QuestionState =>
+    QuestionStateSchema.parse({
+      ...timedOutState(),
+      resolution: {
+        resolver: 'tui',
+        principal: { kind: 'user', id: 'deep' },
+        answer: 'poll, it cannot miss a line',
+        option_id: 'poll',
+        resolved_at: new Date(FIXTURE_RUN_START_MS + 62_000).toISOString(),
+      },
+    });
+
+  const card = buildQuestionCard({
+    view: foldEvents(
+      buildLog([
+        runCreated(),
+        { ...questionAsked(QUESTION_ID), atMs: 2_000 },
+        { ...questionResolved(QUESTION_ID), atMs: 62_000 },
+      ]),
+    ),
+    question: { ...threeOptionQuestion(), settled: resolvedState() },
+  });
+
+  it('does not claim another resolver got there first', () => {
+    expect(card.state).toBe('resolved');
+    expect(cardText(card)).not.toContain('got there first');
+    expect(cardText(card)).not.toContain('this answer wrote nothing');
+    expect(card.outcome).not.toBe(describeDefaultTaken(resolvedState()));
+  });
+
+  it('states the fold’s own outcome instead, which describes what happened', () => {
+    expect(card.outcome).toBe(
+      foldEvents(
+        buildLog([
+          runCreated(),
+          { ...questionAsked(QUESTION_ID), atMs: 2_000 },
+          { ...questionResolved(QUESTION_ID), atMs: 62_000 },
+        ]),
+      ).question.outcome,
+    );
+    expect(cardText(card)).toContain('poll, it cannot miss a line');
+    // And no window expired, so nothing on the card may say one did.
+    expect(cardText(card)).not.toContain('No window expired');
+  });
+});
+
 describe('the spec echo is numbered, confirmable in one keystroke and editable line by line', () => {
   const criteria = [
     'the loop takes at most one action per pass',
@@ -253,6 +381,40 @@ describe('the spec echo is numbered, confirmable in one keystroke and editable l
     const argument = editCriterionArgument(3, 'a killed step is never re-run and never resumed');
     expect(argument).toContain('criterion 3');
     expect(argument).toContain('never resumed');
+  });
+
+  /**
+   * The other half of CAP-2's one agreement, which nothing was checking.
+   *
+   * `editCriterionArgument` is called by no keystroke: there is no line selection in this card, so the
+   * reducer sends the raw draft and what reaches the engine is whatever the person typed. The card's hint
+   * said "give its number and your wording" while `criterionEditedPayload` accepted **only** a leading
+   * literal `criterion N:` — so the commonest amendment there is, `3: <wording>`, was recorded with
+   * `line: null` and the spec echo went on showing the original words. Both halves are asserted against
+   * the engine's own parser, so the card and the parser cannot drift apart again.
+   */
+  it.each([
+    editCriterionArgument(3, 'a killed step is never re-run'),
+    '3: a killed step is never re-run',
+    '3. a killed step is never re-run',
+    '3 - a killed step is never re-run',
+  ])('the engine reads back "%s" as an amendment to line 3', (argument) => {
+    const payload = criterionEditedPayload(argument);
+    expect(payload['line']).toBe(3);
+    expect(payload['text']).toBe('a killed step is never re-run');
+  });
+
+  it('tells a person to type what the engine can actually read back', () => {
+    expect(cardText(card)).toContain(EDIT_CRITERION_HINT);
+    // The shape the hint shows, parsed by the engine rather than by a second copy of the rule here.
+    const shown = /"([^"]+)"/u.exec(EDIT_CRITERION_HINT)?.[1] ?? '';
+    expect(criterionEditedPayload(shown.replace('<your wording>', 'the new words'))['line']).toBe(3);
+  });
+
+  it('still records an amendment that names no line, rather than discarding the words (Q6)', () => {
+    const payload = criterionEditedPayload('the second one should say "never resumed" too');
+    expect(payload['line']).toBeNull();
+    expect(payload['text']).toBe('the second one should say "never resumed" too');
   });
 
   it('says the criteria are unrecorded rather than offering to confirm nothing', () => {
@@ -333,11 +495,25 @@ describe('a control nothing acts on yet says so, in the words of the table that 
   it('does not present narrow as effective, and does present kill and take over as effective', () => {
     expect(narrow?.honoured).toBe(false);
     expect(narrow?.availability).toContain('written and kept');
-    expect(narrow?.availability).toContain('nothing narrows yet');
+    // Neutral about *what* is awaited, because the same phrase serves `pause`, `inject_note` and `fork`:
+    // it said "nothing narrows yet" for all four, describing one control by the behaviour of another.
+    expect(narrow?.availability).toContain('nothing acts on it yet');
+    expect(narrow?.availability).not.toContain('narrows yet');
     for (const command of [Command.Kill, Command.TakeOver]) {
       expect(card.controls.find((control) => control.command === command)?.honoured).toBe(true);
     }
   });
+
+  it.each([Command.Pause, Command.InjectNote, Command.Fork])(
+    '%s is described by what is awaited, not by what narrowing would do',
+    (command) => {
+      const control = killCardControl(command);
+      expect(control.honoured).toBe(false);
+      expect(control.availability).toContain('written and kept');
+      expect(control.availability).not.toContain('narrow');
+      expect(control.availability).toContain(commandAvailability(command).owner ?? 'an owner');
+    },
+  );
 });
 
 /** A run the log records as committed, with one verification step that completed. */
@@ -418,6 +594,33 @@ describe('the completion notice states what was not verified rather than omittin
     expect(recorded.notVerified).toStrictEqual([]);
     expect(recorded.nothingIsNeeded).toContain('finished and verified');
   });
+
+  /**
+   * The R8 failure this card exists to prevent, arrived at from the direction nothing was checking.
+   *
+   * A run with every recordable fact recorded and **no verification step at all** folds to `verified: []`,
+   * and `notVerified` was assembled only from unrecorded facts and from verification steps that did not
+   * complete — so it was empty, and the notice printed "verified: nothing — no verification step is
+   * recorded as completed" directly above "the work is finished and verified".
+   */
+  it('never claims a verified pass for a run that verified nothing (R8)', () => {
+    const nothingVerified = buildCompletionCard({
+      view: foldEvents(
+        buildLog([
+          runCreated(),
+          stepStarted('implement'),
+          stepTerminated('implement'),
+          featureStateChanged('committed'),
+        ]),
+      ),
+      facts: { merged: 'feature/no-gates into main', fileCount: 3, testStatus: '12 passed' },
+    });
+
+    expect(nothingVerified.verified).toStrictEqual([]);
+    expect(nothingVerified.notVerified.join(' ')).toContain('no verification step ran at all');
+    expect(nothingVerified.nothingIsNeeded).not.toContain('finished and verified');
+    expect(cardText(nothingVerified)).not.toContain('the work is finished and verified');
+  });
 });
 
 const handedOffView = (): ShellView =>
@@ -433,6 +636,91 @@ const handedOffView = (): ShellView =>
       featureStateChanged('handed_off', 'running'),
     ]),
   );
+
+describe('the handoff card takes its reason from the log rather than from prose', () => {
+  /**
+   * Selected by event kind, not by a substring of a notice.
+   *
+   * The card used to find the last notice whose text contained `'handed off'`. That matches an unrelated
+   * notice carrying the words, it falls back silently the day the projection rewords itself, and the notice
+   * list is bounded — so a hand-off followed by `MAX_NOTICES` later notices lost the reason entirely.
+   */
+  it('still states why after later notices have pushed the hand-off out of the notice list', () => {
+    const view = foldEvents(
+      buildLog([
+        runCreated(),
+        stepStarted('implement'),
+        handoffRecorded('user.take_over', 'user "deep" took the work over, so the run halted'),
+        featureStateChanged('handed_off', 'running'),
+        // Distinct intents, so each really produces a notice and the bounded list really rolls over.
+        ...Array.from({ length: 6 }, (_unused, index) =>
+          commandApplied('continue', { intent_id: `cmd-continue-${String(index)}` }),
+        ),
+      ]),
+    );
+
+    // The notice really is gone from the bounded list, which is what used to take the reason with it.
+    expect(view.notices.some((notice) => notice.text.includes('handed off'))).toBe(false);
+    expect(view.handoff?.code).toBe('user.take_over');
+
+    const card = buildHandoffCard({ view });
+    expect(card.why).toContain('took the work over');
+    expect(card.why).not.toContain('the log records no reason');
+  });
+
+  it('is not fooled by an unrelated notice that happens to say "handed off"', () => {
+    const view = foldEvents(
+      buildLog([
+        runCreated(),
+        specCriterionEdited(1, 'the work is handed off to a person when the gate fails'),
+        featureStateChanged('handed_off'),
+      ]),
+    );
+
+    expect(view.handoff).toBeNull();
+    // No hand-off was recorded, so the card says so rather than quoting whatever mentioned the words.
+    expect(buildHandoffCard({ view }).why).toContain('the log records no reason');
+  });
+
+  it('takes the reason from a command.applied line, for a log with no handoff.recorded', () => {
+    const view = foldEvents(
+      buildLog([
+        runCreated(),
+        commandApplied('take_over', {
+          handoff_code: 'user.take_over',
+          handoff_reason: 'user "deep" took the work over, so the run halts',
+          to_state: 'handed_off',
+        }),
+      ]),
+    );
+
+    expect(view.handoff?.code).toBe('user.take_over');
+    expect(buildHandoffCard({ view }).why).toContain('took the work over');
+  });
+
+  it('never prints an empty branch or a checkout command with nothing after it', () => {
+    const card = buildHandoffCard({
+      view: handedOffView(),
+      // What a failed escape hatch leaves: present, and empty.
+      location: { branch: '', document: '   ' },
+    });
+
+    expect(card.branch).toBe(UNRECORDED_PRESENTATION);
+    expect(card.document).toBe(UNRECORDED_PRESENTATION);
+    expect(card.nextStep).not.toContain('git checkout');
+    expect(cardText(card)).not.toMatch(/git checkout\s*$/mu);
+    expect(cardText(card)).not.toMatch(/branch:\s*$/mu);
+  });
+
+  it('does not open with two sentences that say the same thing', () => {
+    // The fallback case, where the first line already says the run stopped and named the feature.
+    const card = buildHandoffCard({ view: idleShellView('refund-flow') });
+    const [first, second] = cardText(card).split('\n').slice(1);
+    expect(first).toContain('I stopped working on refund-flow');
+    expect(second).not.toContain('stopped working on');
+    expect(second).toContain('nothing was thrown away');
+  });
+});
 
 describe('the handoff card reads as a colleague note, not a stack trace', () => {
   const card = buildHandoffCard({
@@ -504,6 +792,36 @@ describe('which card a view calls for is decided in one place', () => {
     expect(card.kind).toBe('completion');
     expect(cardText(card)).toContain('1024 passed');
   });
+
+  /**
+   * A dead run is never offered the four gestures for steering a live one.
+   *
+   * `killed` and `hibernated` had no branch in the switch, so they fell through to the over-estimate check
+   * and a run that had passed its estimate before being killed was handed the **kill card** — "continue /
+   * narrow / kill / take over" for a run that is already stopped. Each of the four is a claim that
+   * something is still going, and pressing one writes a durable intent (AD-19) the reconciler will refuse.
+   */
+  it.each(['killed', 'hibernated'] as const)(
+    'offers no live-run controls to a %s run, even one past its estimate',
+    (state) => {
+      const stopped = foldEvents(
+        buildLog([
+          runCreated(),
+          featureStateChanged('confirmed'),
+          featureStateChanged('running', 'confirmed'),
+          stepStarted('implement'),
+          { ...budgetDegraded(0.82, 60_000), atMs: 120_000 },
+          // Well past the 180s the degradation implied, so the run really is over its estimate.
+          { ...featureStateChanged(state, 'running'), atMs: 800_000 },
+        ]),
+      );
+
+      expect(stopped.featureState).toBe(state);
+      // The run really is past its estimate, so the only thing keeping the kill card away is the state.
+      expect(isOverEstimate(stopped, OVER_ESTIMATE_NOW)).toBe(true);
+      expect(cardForView(stopped, { now: OVER_ESTIMATE_NOW })).toBeNull();
+    },
+  );
 });
 
 describe('src/tui/cards/ imports only contracts, runtime and its own siblings', () => {
@@ -591,6 +909,8 @@ describe('no card renders a currency amount (R10)', () => {
       buildBriefCard({
         fleet: {
           runs: [{ runId: '01K5NQ9Z-J7V3M2P9-XQWRTC4B-DE', view: withUsage(), inFlight: true }],
+          // Bounded folds report how many run directories they did not read; this one read them all.
+          notRead: 0,
         },
         height: 24,
       }),

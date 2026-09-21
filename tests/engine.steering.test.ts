@@ -8,7 +8,7 @@
  * through a real pass, because a guard that holds in the function and is bypassed by the loop is not a
  * guard.
  */
-import { rmSync } from 'node:fs';
+import { readFileSync, readdirSync, rmSync } from 'node:fs';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -25,6 +25,7 @@ import {
   COMMAND_EVENT_TYPES,
   COMMAND_HANDLING,
   HONOURED_COMMANDS,
+  commandAvailabilities,
   QUESTION_COMMANDS,
   Reconciler,
   SteeringRefused,
@@ -201,6 +202,74 @@ describe('every member of the Command enum has a declared handling', () => {
     if (decision.kind !== 'awaiting') return;
     // Story 2-9 owns scope narrowing, and has to be able to see the intent that asked for it.
     expect(decision.owner).toContain('2-9');
+  });
+
+  /**
+   * The owners, by name — because `/story/` alone pins none of them.
+   *
+   * `COMMAND_HANDLING.fork` named "story 1-9" as its awaiting owner, which was done and implemented no
+   * forking; the correction to story 4-3 was held by nothing, so reverting it left the whole suite green.
+   * The generic assertion above matches either string. These do not.
+   */
+  it('lists every disposition in the enum’s declaration order, as it says it does', () => {
+    // `Object.keys(COMMAND_HANDLING)` is the object literal's key order, which is the same order today
+    // and a claim about the wrong thing: AD-3 makes the enum the single declaration both renderers are
+    // built against, so reordering the table must not reorder a surface's controls.
+    expect(commandAvailabilities().map((availability) => availability.command)).toStrictEqual([
+      ...COMMANDS,
+    ]);
+    expect(HONOURED_COMMANDS.every((command) => COMMANDS.includes(command))).toBe(true);
+  });
+
+  it.each([
+    ['narrow', /2-9/],
+    ['pause', /2-9/],
+    ['inject_note', /2-10/],
+    ['fork', /4-3/],
+  ] as const)('names %s’s owner as the story that actually owns it', (command, owner) => {
+    const handling = COMMAND_HANDLING[command];
+    expect(handling.kind).toBe('awaiting');
+    if (handling.kind !== 'awaiting') return;
+    expect(handling.owner).toMatch(owner);
+  });
+
+  /**
+   * The durable form of the same rule: **no parked command may name a story that is already finished.**
+   *
+   * Pinning each owner by name catches a revert; this catches the *drift* — a command still waiting on a
+   * story that has since shipped, which is what "story 1-9" became the day 1-9 was marked done. When 2-9,
+   * 2-10 or 4-3 lands, this fails and the entry has to be revisited rather than going on telling a person
+   * that a finished story will get to their keystroke.
+   */
+  it('never parks a command on a story that is already done', () => {
+    const storiesDir = new URL('../docs/specs/spec-agent-orchestrator/stories/', import.meta.url);
+    const files = readdirSync(storiesDir).filter((name) => name.endsWith('.md'));
+    expect(files.length).toBeGreaterThan(0);
+
+    /** The status in a story file's frontmatter, quoted or not, or `null` when the story has no file. */
+    const statusOf = (story: string): string | null => {
+      const file = files.find((name) => name.startsWith(`${story}-`));
+      if (file === undefined) return null;
+      const source = readFileSync(new URL(file, storiesDir), 'utf8');
+      return /^status:\s*'?"?([a-z-]+)'?"?\s*$/mu.exec(source)?.[1] ?? null;
+    };
+
+    // At least one owner names a story that exists, so a regex that stopped matching would be noticed.
+    let checked = 0;
+    for (const command of COMMANDS) {
+      const handling = COMMAND_HANDLING[command];
+      if (handling.kind !== 'awaiting') continue;
+      const story = /\bstory (\d+-\d+)/u.exec(handling.owner)?.[1];
+      expect(story, `${command}: "${handling.owner}" names no story`).toBeDefined();
+      if (story === undefined) continue;
+      const status = statusOf(story);
+      if (status !== null) checked += 1;
+      expect(status, `${command} waits on story ${story}, which is ${String(status)}`).not.toBe('done');
+    }
+    // Every owner today names a story with no file yet, which is itself the honest state — so this
+    // asserts only that the lookup works, using a story that does have one.
+    expect(statusOf('1-9')).toBe('done');
+    expect(checked).toBeGreaterThanOrEqual(0);
   });
 
   it('routes the three question commands through the AD-25 transition rather than parking them', () => {

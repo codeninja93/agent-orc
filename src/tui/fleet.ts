@@ -46,11 +46,36 @@ export interface FleetRun {
 
 export interface FleetView {
   readonly runs: readonly FleetRun[];
+  /**
+   * How many run directories existed and were not read, because the fold is bounded.
+   *
+   * Stated rather than dropped, and for the reason every other absence in this directory is: a brief that
+   * silently stopped looking would be a brief a person trusts to be complete.
+   */
+  readonly notRead: number;
 }
+
+/**
+ * How many runs one fold reads, at most.
+ *
+ * The brief re-folds on every poll (`mountBrief`, once a second by default) and a fold reads and replays
+ * every line of every run's `events.jsonl` — so the work per second grew without limit with the number of
+ * runs a machine had ever accumulated, on the one surface a person leaves open all morning. Two hundred is
+ * the spine's own threshold: "build [a SQLite query index] when … one project passes roughly two hundred
+ * runs", which is the point at which scanning JSONL stops being the right mechanism at all. Until that
+ * index exists, the fold stops there and says how many it did not read.
+ *
+ * The **most recent** are kept, because a run id is a ULID (AD-29) and therefore sorts chronologically: the
+ * runs a person might still steer are the recent ones, and a run old enough to fall outside this bound and
+ * still be in flight is a stale directory rather than a feature anybody is waiting on.
+ */
+export const MAX_FLEET_RUNS = 200;
 
 export interface FoldFleetOptions {
   /** `ORCH_HOME`. Defaults to the one the runtime resolves, exactly as every other reader does. */
   readonly orchHome?: string;
+  /** How many runs to read, most recent first. Defaults to {@link MAX_FLEET_RUNS}. */
+  readonly limit?: number;
   /**
    * The runs to fold, for a caller that already knows them.
    *
@@ -73,13 +98,16 @@ export const isRunInFlight = (view: ShellView): boolean => {
  */
 export const foldFleet = (options: FoldFleetOptions = {}): FleetView => {
   const orchHome = options.orchHome;
-  const ids = options.runIds ?? listRunIds(orchHome === undefined ? runsDir() : runsDir(orchHome));
+  const all = options.runIds ?? listRunIds(orchHome === undefined ? runsDir() : runsDir(orchHome));
+  const limit = Math.max(options.limit ?? MAX_FLEET_RUNS, 0);
+  // The tail, because the ids sort chronologically and the recent ones are the ones still in flight.
+  const ids = all.length > limit ? all.slice(all.length - limit) : all;
   const runs = ids.map((runId) => {
     const paths = orchHome === undefined ? runPaths(runId) : runPaths(runId, orchHome);
     const view = loadShellView(paths.eventLog);
     return { runId, view, inFlight: isRunInFlight(view) };
   });
-  return { runs };
+  return { runs, notRead: all.length - ids.length };
 };
 
 /** The in-flight runs, which is what CAP-22's one screen is a screen of. */

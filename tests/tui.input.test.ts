@@ -400,3 +400,49 @@ describe('a ctrl chord never reaches a control', () => {
     expect(outcome.state.draft).toBe('');
   });
 });
+
+describe('a pasted answer, which arrives as one chunk that carries its own line breaks', () => {
+  /**
+   * Ink hands a paste over in a single `useInput` call and its parser deliberately does not split on
+   * `\r` or `\n`, "because they can legitimately appear inside pasted text" — so `key.return` is false
+   * and the break used to be appended as an ordinary character. A person who pasted an answer ending in a
+   * newline saw nothing happen, and the newline that meant "send" became the last character of a durable
+   * decision (AD-25).
+   */
+  it('submits a multi-line paste that ends in a newline, keeping the interior breaks (Q6)', () => {
+    const { state, effects } = reduceKeys([
+      { input: 'a' },
+      { input: 'poll it.\nthe interval stays at a second.\n' },
+    ]);
+
+    const invoked = effects.filter((effect) => effect.kind === 'invoke');
+    expect(invoked).toHaveLength(1);
+    const only = invoked[0];
+    if (only?.kind !== 'invoke') throw new Error('the paste did not submit');
+    // Exactly the words, with the interior break kept and the trailing one spent as the send.
+    expect(only.argument).toBe('poll it.\nthe interval stays at a second.');
+    expect(state).toStrictEqual(initialInputState);
+  });
+
+  it('keeps composing a paste with an interior break and no trailing one', () => {
+    const { state, effects } = reduceKeys([{ input: 'a' }, { input: 'poll it.\nand keep' }]);
+
+    expect(effects.some((effect) => effect.kind === 'invoke')).toBe(false);
+    expect(state.mode).toBe('composing');
+    expect(state.draft).toBe('poll it.\nand keep');
+
+    // Return still sends it, exactly as it always did.
+    const sent = reduceKey(state, { input: '', return: true });
+    expect(sent.effect).toStrictEqual({
+      kind: 'invoke',
+      command: 'answer',
+      argument: 'poll it.\nand keep',
+    });
+  });
+
+  it('refuses a paste that is nothing but line breaks, rather than recording an empty decision', () => {
+    const { effects } = reduceKeys([{ input: 'a' }, { input: '\n\n' }]);
+    expect(effects.at(-1)?.kind).toBe('empty');
+    expect(effects.some((effect) => effect.kind === 'invoke')).toBe(false);
+  });
+});

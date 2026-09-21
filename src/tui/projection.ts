@@ -109,6 +109,8 @@ export const TUI_PAYLOAD_KEYS = {
   WallClockMsRemaining: 'wall_clock_ms_remaining',
   WallClockMsEstimate: 'wall_clock_ms_estimate',
   Code: 'code',
+  HandoffCode: 'handoff_code',
+  HandoffReason: 'handoff_reason',
   /** CAP-2 — `spec.recorded`: the user's own words, and the criteria in their declared order. */
   Request: 'request',
   AcceptanceCriteria: 'acceptance_criteria',
@@ -166,6 +168,16 @@ export const isRedacted = (value: string | null): boolean =>
  * `presentValue`'s own `(not recorded)` is right inside a slot that names the field; inside a sentence
  * it is not, which is why each notice keeps the phrase it already read.
  */
+/**
+ * The one sentence that says a run was handed off and why.
+ *
+ * Exported so the notice a person reads in the shell's own list and the headline on the handoff card are
+ * the same words because they are the same function, rather than because two spellings currently agree.
+ */
+export const handoffSentence = (handoff: HandoffView): string =>
+  `handed off (${presentOr(handoff.code, 'no code recorded')}): ` +
+  `${presentOr(handoff.reason, 'no reason recorded')}`;
+
 const presentOr = (value: string | null, fallback: string): string =>
   value === null ? fallback : presentValue(value);
 
@@ -295,6 +307,27 @@ const EMPTY_QUESTION_SLOT: QuestionSlotView = Object.freeze({
   outcome: null,
 });
 
+/**
+ * Why this run was handed off, as a fact rather than as a sentence in a bounded list.
+ *
+ * The handoff card used to recover this by scanning {@link ShellView.notices} for the substring
+ * `'handed off'`, which is wrong in three ways at once: it matches any *other* notice that happens to
+ * contain the words, it falls back silently the day the projection rewords its own notice, and the notice
+ * list is bounded by {@link MAX_NOTICES} — so a hand-off followed by four later notices lost the reason
+ * entirely, on the one card whose whole purpose is to state it.
+ *
+ * Folded from `handoff.recorded` **and** from the `handoff_code` / `handoff_reason` a `command.applied`
+ * line carries, because both record the same fact and a log written before the engine appended the former
+ * on the take-over path carries only the latter (AD-5).
+ */
+export interface HandoffView {
+  /** The AD-35 code, or `null` when the line carried none. */
+  readonly code: string | null;
+  readonly reason: string | null;
+  /** The instant the line was appended. */
+  readonly at: string;
+}
+
 /** One thing worth saying that is not the mode, the status or the question. Bounded, so nothing scrolls. */
 export interface NoticeView {
   readonly at: string;
@@ -350,6 +383,8 @@ export interface ShellView {
   readonly usage: UsageView;
   readonly spec: SpecView;
   readonly question: QuestionSlotView;
+  /** Why the run was handed off, when the log says, or `null`. Read by the handoff card (CAP-23). */
+  readonly handoff: HandoffView | null;
   readonly notices: readonly NoticeView[];
   /**
    * A plain statement of why this view is not a projection of a log, or `null` when it is.
@@ -524,6 +559,7 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
   let startedAt: string | null = null;
   let lastActivityAt: string | null = null;
   let question: QuestionSlotView = EMPTY_QUESTION_SLOT;
+  let handoff: HandoffView | null = null;
   /**
    * Every question the log has asked and not yet settled, in the order it asked them.
    *
@@ -626,6 +662,22 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
         const command = text(payload, TUI_PAYLOAD_KEYS.Command);
         if (command !== null) autonomy = applyCommandToMode(autonomy, command);
         state = featureState(text(payload, TUI_PAYLOAD_KEYS.ToState)) ?? state;
+        /**
+         * The hand-off a steering command carries, which is where a take-over's reason lives.
+         *
+         * `command.applied` has carried `handoff_code` and `handoff_reason` since story 1-3 and this fold
+         * ignored them, so a run handed off by a person had its reason in the log and nowhere on screen.
+         * Read here as well as from `handoff.recorded` so a log written before the engine appended that
+         * line on the intent path still states why (AD-5).
+         */
+        const appliedCode = text(payload, TUI_PAYLOAD_KEYS.HandoffCode);
+        if (appliedCode !== null) {
+          handoff = {
+            code: appliedCode,
+            reason: text(payload, TUI_PAYLOAD_KEYS.HandoffReason),
+            at: event.ts,
+          };
+        }
         if (command !== null) {
           // Every interpolated field goes through `presentValue`: AD-21's marker is an *internal* token,
           // and a notice reading "reject applied: [redacted]" would put it in front of a person as if it
@@ -796,11 +848,12 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
       }
 
       case TUI_EVENT_TYPES.HandoffRecorded: {
-        notice(
-          event.ts,
-          `handed off (${presentOr(text(payload, TUI_PAYLOAD_KEYS.Code), 'no code recorded')}): ` +
-            `${presentOr(text(payload, TUI_PAYLOAD_KEYS.Reason), 'no reason recorded')}`,
-        );
+        handoff = {
+          code: text(payload, TUI_PAYLOAD_KEYS.Code),
+          reason: text(payload, TUI_PAYLOAD_KEYS.Reason),
+          at: event.ts,
+        };
+        notice(event.ts, handoffSentence(handoff));
         break;
       }
 
@@ -865,6 +918,7 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
     },
     spec: { request: specRequest, criteria, recorded: specRecorded },
     question,
+    handoff,
     notices,
     problem: null,
   };

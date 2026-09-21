@@ -191,14 +191,21 @@ export const SPEC_CRITERION_EDITED_EVENT_TYPE = 'spec.criterion_edited';
 const EDIT_CRITERION_COMMAND = 'edit_criterion';
 
 /**
- * How the spec echo card spells an amendment's line number, read back here.
+ * How an amendment names the line it amends, read back here.
  *
  * `editCriterionArgument` in `src/tui/cards/spec-echo.ts` writes `criterion 3: <wording>`, and this is the
  * other half of that one agreement. It is a *parse*, not a format: Q6 forbids imposing a format on a
  * person, so an amendment that names no line is still recorded with the text it carried and a `null` line,
  * and a reader states it as an edit it could not place rather than discarding what somebody wrote.
+ *
+ * **The word `criterion` is optional, because nobody types it.** A keystroke sends the raw draft — there is
+ * no line selection in the card and the card's own hint tells a person to give the number themselves — so
+ * the commonest amendment there is reads `3: <wording>`, and requiring the noun recorded every one of them
+ * with `line: null`. The card said "give its number", the engine accepted only "criterion 3:", and the two
+ * halves of CAP-2's one agreement disagreed with nobody in a position to notice. Parsing what a person
+ * actually types is what Q6 means by the system parsing.
  */
-const CRITERION_AMENDMENT = /^\s*criterion\s+(\d+)\s*[:.\-]\s*(.*)$/is;
+const CRITERION_AMENDMENT = /^\s*(?:criterion\s+)?(\d+)\s*[:.\-]\s*(.*)$/is;
 
 /** The payload of a `spec.recorded` line: the request, and the criteria in their declared order. */
 export const specRecordedPayload = (plan: FeaturePlan): Record<string, unknown> =>
@@ -1522,6 +1529,35 @@ export class Reconciler {
         code: corrected.handoff.code,
         reason: corrected.handoff.reason,
         escape,
+      });
+      /**
+       * AD-4 — a hand-off a *person* asked for is recorded in the log, not only in a document on disk.
+       *
+       * This line was missing, and its absence falsified the stage-1 gate rather than merely degrading a
+       * card. `handoff.recorded` was emitted at exactly one place — {@link handOff}, reached from the AD-35
+       * `hand-off` disposition and the baseline-reset failure — so the take-over intent path wrote
+       * `HANDOFF.md` and appended nothing. A run a person took over therefore reached `handed_off` with
+       * *why* existing nowhere in the durable truth: `command.applied` carries the state change and its
+       * `reason`, but nothing carried the AD-35 code, so `rebuildFromLog` left `handoff` null and every
+       * reader fell back. AD-4 makes the log the sole durable truth and the gate reads "fully
+       * reconstructable from the event log alone" — a document is not the log, and the commonest hand-off
+       * there is was the one that could not be reconstructed.
+       *
+       * **Before `command.applied`, for the reason every other side effect here is.** `command.applied` is
+       * the ledger entry and the effect in one append (story 1-7): it carries `to_state: 'handed_off'`, so
+       * the fold does not reach `handed_off` until it lands, and `consumeIntents` retires the file only
+       * after this method returns. A crash between the two therefore leaves the intent unretired and the
+       * next pass applies it again — appending this line a second time, which both folds absorb because
+       * each is a plain assignment of the whole `handoff` record rather than an accumulation. The opposite
+       * order is the one that cannot be recovered from: it would retire a run into `handed_off` with the
+       * reason lost, which is precisely the defect being fixed. Merged into `command.applied` it would be
+       * worse again — two facts in one line means a reader wanting the code has to know which command
+       * implies one, and `handoff.recorded` is already the type both folds read (AD-5).
+       */
+      this.emit(recorder, {
+        step: effect === null ? pending.intent.step : effect.step,
+        type: ENGINE_EVENT_TYPES.HandoffRecorded,
+        payload: { code: corrected.handoff.code, reason: corrected.handoff.reason },
       });
     }
 

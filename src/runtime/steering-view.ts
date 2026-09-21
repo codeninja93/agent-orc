@@ -16,6 +16,7 @@
  * Nothing here decides an effect. The engine still owns what a command *does*; this owns only the claim
  * a surface is allowed to make about whether pressing the key will be acted on, and by whom.
  */
+import { COMMANDS } from '../contracts/index.js';
 import type { Command, CommandMap } from '../contracts/index.js';
 
 /**
@@ -103,7 +104,7 @@ export const isStopCommand = (command: Command): boolean => STOP_COMMANDS.includ
  * second changes nothing by design.
  */
 export const HONOURED_COMMANDS: readonly Command[] = Object.freeze(
-  (Object.keys(COMMAND_HANDLING) as Command[]).filter((command) => {
+  COMMANDS.filter((command) => {
     const kind = COMMAND_HANDLING[command].kind;
     return kind === 'effect' || kind === 'question';
   }),
@@ -111,9 +112,7 @@ export const HONOURED_COMMANDS: readonly Command[] = Object.freeze(
 
 /** The commands that resolve a question rather than changing the run's own state. */
 export const QUESTION_COMMANDS: readonly Command[] = Object.freeze(
-  (Object.keys(COMMAND_HANDLING) as Command[]).filter(
-    (command) => COMMAND_HANDLING[command].kind === 'question',
-  ),
+  COMMANDS.filter((command) => COMMAND_HANDLING[command].kind === 'question'),
 );
 
 /**
@@ -161,6 +160,14 @@ export const commandAvailability = (command: Command): CommandAvailability => {
   }
 };
 
-/** Every command's disposition, in the enum's declaration order. */
+/**
+ * Every command's disposition, in the enum's declaration order.
+ *
+ * `COMMANDS` rather than `Object.keys(COMMAND_HANDLING)`, which is this object literal's key order — the
+ * same order today and a claim about the wrong thing. AD-3 makes the enum the single declaration both
+ * renderers are built against, so "the enum's declaration order" has to be read from the enum; a table
+ * whose keys were reordered would silently reorder every surface that lists the controls. The three lists
+ * above are derived from it for the same reason.
+ */
 export const commandAvailabilities = (): readonly CommandAvailability[] =>
-  (Object.keys(COMMAND_HANDLING) as Command[]).map(commandAvailability);
+  COMMANDS.map(commandAvailability);

@@ -100,9 +100,17 @@ const availabilityPhrase = (availability: CommandAvailability): string => {
     case 'acknowledge':
       return availability.note ?? 'recorded, and nothing else changes';
     case 'awaiting':
+      /**
+       * Neutral about *what* is awaited, because this phrase is not only `narrow`'s.
+       *
+       * It said "nothing narrows yet" for every awaiting command, so rendering `pause`, `inject_note` or
+       * `fork` produced a sentence about narrowing — a control described by the behaviour of a different
+       * one. The parked fact is the same in all four cases and it is the one worth saying: the file is
+       * written, it is kept, and a named unit will act on it (AD-19).
+       */
       return (
         'the intent file is written and kept, unconsumed, awaiting ' +
-        `${availability.owner ?? 'the unit that owns it'} — nothing narrows yet`
+        `${availability.owner ?? 'the unit that owns it'} — nothing acts on it yet`
       );
   }
 };
