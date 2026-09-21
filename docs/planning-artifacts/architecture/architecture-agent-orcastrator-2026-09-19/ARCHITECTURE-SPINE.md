@@ -7,7 +7,7 @@ paradigm: 'Reconciled pipeline — a controller-style reconciler loop over durab
 scope: 'Full target architecture for SPEC-agent-orchestrator, CAP-1 through CAP-23. Fixes only the invariants that independently-built units could otherwise choose incompatibly: agent invocation and spawn arguments, language and schema export, event truth and checkpoint rank, state ownership, resume and disposition semantics, step baseline, command transport, containment, redaction, plane separation, ceilings, question lifecycle, on-disk layout and versioning, project identity, distribution, external-domain access and the write surface, agent-roster declaration, profile precedence, and the system own verification floor.'
 status: final
 created: '2026-09-19'
-updated: '2026-09-19'
+updated: '2026-09-21'
 binds:
   - CAP-1
   - CAP-2
@@ -36,6 +36,7 @@ sources:
   - ../../../specs/spec-agent-orchestrator/SPEC.md
 companions:
   - ./ADR-001-tier-2-execution.md
+  - ./ADR-002-question-compare-and-set-artifact.md
   - ../../../specs/spec-agent-orchestrator/architecture.md
   - ../../../specs/spec-agent-orchestrator/interface-contract.md
   - ../../../specs/spec-agent-orchestrator/memory-design.md
@@ -227,8 +228,8 @@ flowchart TD
 ### AD-25 — The question lifecycle is one compare-and-set transition
 
 - **Binds:** the Interviewer, both renderers, CAP-1, CAP-2, CAP-3, CAP-4, CAP-18
-- **Prevents:** the three resolvers — TUI answer, web answer, timeout default — racing and poisoning the decision ledger with conflicting answers
-- **Rule:** a question is a contract type in `contracts/` with a single state machine; exactly one transition from `asked` to `resolved` is accepted, decided by a compare-and-set on the question state file, later resolvers receiving an already-resolved result; the winning transition records its resolver and principal; only a resolved question writes to the decision ledger; the event vocabulary includes `question.asked`, `question.resolved`, `question.default_taken` and `question.deflected`.
+- **Prevents:** the three resolvers — TUI answer, web answer, timeout default — racing and poisoning the decision ledger with conflicting answers (**ADR-002**: arbitrated by an exclusive `link(2)` on the outcome file)
+- **Rule:** a question is a contract type in `contracts/` with a single state machine; exactly one transition from `asked` to `resolved` is accepted, decided by a compare-and-set on the question state file, later resolvers receiving an already-resolved result; the winning transition records its resolver and principal; only a resolved question writes to the decision ledger; the event vocabulary includes `question.asked`, `question.resolved`, `question.default_taken` and `question.deflected`. **Amended by ADR-002:** the contended artifact is `questions/<id>/outcome.json`, created exclusively with `link(2)` — not the question state file. `state.json` is *derived* from the winning outcome and stands to it as it stands to the event log under AD-4: where they disagree the outcome wins. The reason is that a compare-and-set on the state file must create it exclusively, and the `'wx'`-then-write shape publishes a zero-length file between create and write — the torn read this decision exists to prevent, found in story 1-8 and recorded in three other stories before story 1-12 extracted the fix. `QuestionOutcomeSchema` therefore lives in `contracts/` alongside the question type, and the vocabulary also includes `decision.recorded`, the ledger line a resolved question writes. A losing resolver's *decision* is never accepted; a loser may converge the derived `state.json` to the winner's content, and skips even that when the winner got there first.
 
 ### AD-26 — Every step records a baseline commit that re-run resets to
 
@@ -364,7 +365,7 @@ $ORCH_HOME/                     # default ~/.orch
     state.json                  # rebuildable checkpoint; sole writer is the reconciler, AD-4
     config/                     # per-run config snapshot taken at run start, AD-9
     commands/                   # durable steering intent files, AD-19
-    questions/                  # question state files, compare-and-set resolved, AD-25
+    questions/                  # <id>/outcome.json is the contended artifact; state.json is derived (AD-25, ADR-002)
     fetch-record.json           # run shared external fetch record, AD-13 / AD-14
   worktrees/<run-id>/           # reclaimed by a reconcile pass at terminal disposition, AD-20, AD-32
   pool/                         # leased ephemeral resources, reclaimed by reconcile, AD-32
@@ -430,12 +431,12 @@ stateDiagram-v2
     asked --> resolved: web answer wins the compare-and-set
     asked --> resolved: timeout default wins, question.default_taken
     asked --> deflected: answered from repo, history or ledger
-    resolved --> ledger: question.resolved writes the decision
+    resolved --> ledger: question.resolved, then decision.recorded
     deflected --> [*]: question.deflected
     ledger --> [*]
 ```
 
-Losing resolvers receive an already-resolved result and write nothing.
+Losing resolvers receive an already-resolved result, and no losing resolver's decision is ever accepted (ADR-002).
 
 ## Capability → Architecture Map
 
