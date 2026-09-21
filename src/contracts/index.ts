@@ -21,6 +21,7 @@ export * from './event.js';
 export * from './fetch.js';
 export * from './installer.js';
 export * from './node-floor.js';
+export * from './project.js';
 export * from './question.js';
 export * from './registry.js';
 export * from './schema-version.js';

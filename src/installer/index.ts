@@ -13,15 +13,21 @@
  *      recognise is refused by name rather than read as if it were current (AD-28).
  *   3. **Ask only what is missing**, in `build-sequencing.md`'s order.
  *   4. **Write atomically, skipping what would not change**, and record every file in the manifest.
+ *   5. **Register the project centrally (AD-10).** The id 2-1 confirms is the id that exists under
+ *      `ORCH_HOME/projects/<project-id>/`, so `.orch/` and the central record cannot disagree about
+ *      which project this repository is. Registration is idempotent along with everything else, and a
+ *      repository that has moved updates its pointer rather than becoming a second project (AD-33).
  *
- * **What this does not do.** It does not register the project centrally — the first-commit SHA is
- * detected and confirmed here, and story 2-2 owns registration and the prune command. It does not
- * compress the interview through a model; these thirteen questions are asked in the terminal. It
- * does not run a feature: this installs a project, it does not start one.
+ * **What this does not do.** It does not compress the interview through a model; these thirteen
+ * questions are asked in the terminal. It does not run a feature: this installs a project, it does
+ * not start one. And it stores no memory centrally — the registration record is a pointer, and what
+ * memory is kept beside it is story 5-1's.
  */
 import { createInterface } from 'node:readline/promises';
 
 import { AGENTS_DIR_NAME } from '../contracts/index.js';
+import { registerProject } from '../runtime/projects.js';
+import type { RegisteredProject } from '../runtime/projects.js';
 
 import { detectDefaults } from './detect.js';
 import { orchPaths, readExistingInstall } from './answers.js';
@@ -37,6 +43,23 @@ import type { FileOutcome } from './write.js';
  * the installer version the manifest records, which is this package's own.
  */
 export { PACKAGE_VERSION } from '../contracts/index.js';
+
+/**
+ * AD-9's prune and AD-10's registration, re-exported so `bin/init.ts` keeps one import.
+ *
+ * They live in `src/runtime/projects.ts`, where every other `ORCH_HOME` write does. What is re-exported
+ * here is the *command* surface: `bin/init.ts` is this package's only entry point, `package.json`
+ * exposes it through `./installer`, and AD-9's prune is a subcommand of that same binary. A second
+ * export map entry would make the delivery path — the one thing story 2-1 proved by running rather
+ * than by reading — carry a second contract for no gain.
+ */
+export { pruneProject, readProjectRegistration, registerProject, resolveProject } from '../runtime/projects.js';
+export type {
+  ProjectResolution,
+  PruneOptions,
+  PruneOutcome,
+  RegisteredProject,
+} from '../runtime/projects.js';
 
 export * from './answers.js';
 export * from './detect.js';
@@ -67,6 +90,13 @@ export interface InitOptions {
   readonly io: InterviewIo;
   /** Injected so a test can assert on the manifest's own refresh rather than race a clock. */
   readonly now?: Date;
+  /**
+   * Where the central registration lands. Defaults to the AD-9 `ORCH_HOME`.
+   *
+   * Injected for the same reason `now` is: a test that registered into a developer's real `~/.orch`
+   * would leave records behind on the machine it ran on.
+   */
+  readonly orchHome?: string;
 }
 
 export interface InitOutcome {
@@ -76,6 +106,8 @@ export interface InitOutcome {
   readonly dispositions: readonly FileOutcome[];
   readonly recovered: readonly HalfInstallFinding[];
   readonly gitignore: 'appended' | 'unchanged';
+  /** What registering this project under `ORCH_HOME/projects/<project-id>/` did (AD-10). */
+  readonly registration: RegisteredProject;
   /** R3 — one headline that stands alone, before any detail. */
   readonly summary: string;
 }
@@ -90,6 +122,7 @@ const summarise = (
   dispositions: readonly FileOutcome[],
   recovered: readonly HalfInstallFinding[],
   gitignore: 'appended' | 'unchanged',
+  registration: RegisteredProject,
 ): string => {
   const created = dispositions.filter((entry) => entry.disposition === 'created').length;
   const updated = dispositions.filter((entry) => entry.disposition === 'updated').length;
@@ -102,6 +135,16 @@ const summarise = (
   ];
   if (recovered.length > 0) parts.push(`${count(recovered.length, 'file')} recovered`);
   if (gitignore === 'appended') parts.push('.gitignore appended');
+  // The central record is named in the headline because it is the half of the install that is not in
+  // the repository: a person who saw only file dispositions would have no way to tell whether the
+  // project this `.orch/` describes exists centrally (AD-10).
+  parts.push(
+    registration.disposition === 'created'
+      ? `project ${registration.projectId} registered`
+      : registration.disposition === 'pointer_updated'
+        ? `project ${registration.projectId} re-pointed here`
+        : `project ${registration.projectId} already registered`,
+  );
   return `.orch/ is installed in ${repository}: ${parts.join(', ')}.`;
 };
 
@@ -185,7 +228,42 @@ export const runInit = async (options: InitOptions): Promise<InitOutcome> => {
     );
   }
 
+  /**
+   * The confirmed id has to *be* this repository's first commit, and this is the last moment nothing
+   * has been written.
+   *
+   * Question 2 offers the detected SHA and checks that what comes back is shaped like one, and a
+   * disagreeing id already on disk is re-asked above — but a person can still type forty different
+   * hexadecimal characters at the prompt. Writing that would put one id in `.orch/profile.toml` and
+   * another in `ORCH_HOME/projects/`, which is the split into two projects AD-10 exists to prevent.
+   * Refusing here rather than after `writeInstall` keeps the property matrix rows 7 and 8 rely on:
+   * every refusal is taken before a file is touched.
+   */
+  if (complete.project.id !== detected.firstCommitSha) {
+    throw new InstallRefusal(
+      `The confirmed project id ${complete.project.id} is not this repository's first commit, which ` +
+        `is ${detected.firstCommitSha}. A project is identified by the SHA of its first commit ` +
+        '(AD-10), so installing under another id would key this repository to a project it is not. ' +
+        'Re-run the installer and accept the offered id. Nothing has been written.',
+    );
+  }
+
   const written = writeInstall(detected.repositoryPath, complete, options.now ?? new Date());
+
+  /**
+   * Registration comes last, because it records a *completed* install (matrix 16).
+   *
+   * The id is computed from the repository by `registerProject` rather than passed to it, and the id
+   * the interview settled is handed over as `expectedProjectId` so the two are checked against each
+   * other rather than one being trusted. A failure here leaves `.orch/` written and the manifest
+   * describing it, which is the same recoverable half-install AD-12 already requires a re-run to
+   * complete — registration is idempotent, so the re-run finishes it.
+   */
+  const registration = registerProject(detected.repositoryPath, {
+    expectedProjectId: complete.project.id,
+    ...(options.orchHome === undefined ? {} : { orchHome: options.orchHome }),
+    ...(options.now === undefined ? {} : { now: options.now }),
+  });
 
   return {
     repository: detected.repositoryPath,
@@ -194,12 +272,14 @@ export const runInit = async (options: InitOptions): Promise<InitOutcome> => {
     dispositions: written.dispositions,
     recovered,
     gitignore: written.gitignore,
+    registration,
     summary: summarise(
       detected.repositoryPath,
       asked,
       written.dispositions,
       recovered,
       written.gitignore,
+      registration,
     ),
   };
 };
@@ -208,62 +288,121 @@ export const runInit = async (options: InitOptions): Promise<InitOutcome> => {
 export const installTarget = (repository: string): string => orchPaths(repository).orchDir;
 
 export interface ParsedArguments {
-  readonly kind: 'init' | 'help' | 'version';
+  readonly kind: 'init' | 'prune' | 'help' | 'version';
   readonly repository: string;
+  /**
+   * The project id `prune` names, and `null` for every other command.
+   *
+   * A project id, never a path — AD-9's prune deletes central state, and a command that took a path
+   * would let a person standing in the wrong directory delete the wrong project's memory. There is
+   * deliberately no default: `prune` with no argument is a usage error rather than a prune of whatever
+   * repository the shell happens to be sitting in.
+   */
+  readonly projectId: string | null;
+  /** `prune --force`: delete a project that still resolves. Off unless it was asked for. */
+  readonly force: boolean;
   /** Present only for `kind: 'help'` reached by a usage error, which exits non-zero. */
   readonly error: string | null;
 }
 
 export const USAGE = `orch init [path]
+orch prune <project-id> [--force]
 
-Onboard a repository: ask what the orchestrator needs to know about it and write
-<path>/.orch/ — profile.toml, permissions.toml, agents/*.toml and a manifest —
-appending the runtime paths to .gitignore. Defaults to the current directory.
+init — onboard a repository: ask what the orchestrator needs to know about it and
+write <path>/.orch/ — profile.toml, permissions.toml, agents/*.toml and a manifest
+— appending the runtime paths to .gitignore, and registering the project centrally
+under ORCH_HOME/projects/<project-id>/. Defaults to the current directory.
+
+prune — remove the central state of one project, named by its project id, which is
+the SHA of its first commit (AD-10). It takes an id and never a path, so standing
+in the wrong directory cannot delete the wrong project. A project whose repository
+is still there is refused rather than pruned: prune is for state orphaned by a
+deleted project directory (AD-9), and --force is how you say you mean otherwise.
 
   --help       print this and exit
   --version    print the installer version and exit
 
-Re-running preserves every answer already on disk and asks only what is missing,
-which is how an upgrade works (AD-12). Nothing is written until every question is
-answered, and no credential is ever collected: question 9 takes the NAMES of the
-environment variables holding them.`;
+Re-running init preserves every answer already on disk and asks only what is
+missing, which is how an upgrade works (AD-12). Nothing is written until every
+question is answered, and no credential is ever collected: question 9 takes the
+NAMES of the environment variables holding them.`;
 
 /**
- * Parse `init [path]`, plus the two flags every entry point is expected to answer.
+ * Parse `init [path]` and `prune <project-id>`, plus the two flags every entry point is expected to
+ * answer.
  *
  * It lives here rather than in `bin/init.ts` so it is covered by the same typecheck, lint and tests
  * as everything else; the entry point keeps only what an entry point has to own, which is process
  * arguments in and an exit code out.
+ *
+ * Flags are validated **per command** rather than globally, which is why `--force` does not simply
+ * join the accepted set: `orch init --force` has to stay a usage error, because a flag the command
+ * does not act on being silently accepted is how a person comes to believe they forced something.
  */
 export const parseInitArguments = (argv: readonly string[]): ParsedArguments => {
   const args = argv.filter((argument) => argument !== '');
+  const cwd = process.cwd();
+  const base = { repository: cwd, projectId: null, force: false } as const;
   if (args.includes('--help') || args.includes('-h')) {
-    return { kind: 'help', repository: process.cwd(), error: null };
+    return { ...base, kind: 'help', error: null };
   }
   if (args.includes('--version') || args.includes('-v')) {
-    return { kind: 'version', repository: process.cwd(), error: null };
+    return { ...base, kind: 'version', error: null };
   }
   const positional = args.filter((argument) => !argument.startsWith('-'));
-  const unknownFlag = args.find((argument) => argument.startsWith('-'));
-  if (unknownFlag !== undefined) {
-    return { kind: 'help', repository: process.cwd(), error: `Unknown option "${unknownFlag}".` };
+  const flags = args.filter((argument) => argument.startsWith('-'));
+  const [command, first, ...rest] = positional;
+
+  if (command === 'init') {
+    const unknownFlag = flags[0];
+    if (unknownFlag !== undefined) {
+      return { ...base, kind: 'help', error: `Unknown option "${unknownFlag}".` };
+    }
+    if (rest.length > 0) {
+      return {
+        ...base,
+        kind: 'help',
+        error: `init takes at most one path; received ${String(positional.length - 1)}.`,
+      };
+    }
+    return { ...base, kind: 'init', repository: first ?? cwd, error: null };
   }
-  const [command, path, ...rest] = positional;
-  if (command !== 'init') {
+
+  if (command === 'prune') {
+    const unknownFlag = flags.find((flag) => flag !== '--force');
+    if (unknownFlag !== undefined) {
+      return { ...base, kind: 'help', error: `Unknown option "${unknownFlag}".` };
+    }
+    if (first === undefined) {
+      return {
+        ...base,
+        kind: 'help',
+        error:
+          'prune needs the project id to remove: the SHA of that project\'s first commit (AD-10). ' +
+          'It takes an id and never a path, so the directory you are standing in decides nothing.',
+      };
+    }
+    if (rest.length > 0) {
+      return {
+        ...base,
+        kind: 'help',
+        error: `prune takes exactly one project id; received ${String(positional.length - 1)}.`,
+      };
+    }
     return {
-      kind: 'help',
-      repository: process.cwd(),
-      error: command === undefined ? 'No command given.' : `Unknown command "${command}".`,
+      ...base,
+      kind: 'prune',
+      projectId: first,
+      force: flags.includes('--force'),
+      error: null,
     };
   }
-  if (rest.length > 0) {
-    return {
-      kind: 'help',
-      repository: process.cwd(),
-      error: `init takes at most one path; received ${String(positional.length - 1)}.`,
-    };
-  }
-  return { kind: 'init', repository: path ?? process.cwd(), error: null };
+
+  return {
+    ...base,
+    kind: 'help',
+    error: command === undefined ? 'No command given.' : `Unknown command "${command}".`,
+  };
 };
 
 /**

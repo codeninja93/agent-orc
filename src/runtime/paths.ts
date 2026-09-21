@@ -80,6 +80,27 @@ export const worktreeDir = (runId: string, orchHome: string = resolveOrchHome())
 export const projectDir = (projectId: string, orchHome: string = resolveOrchHome()): string =>
   join(projectsDir(orchHome), assertSafePathSegment(projectId, 'a project id'));
 
+/**
+ * AD-9, AD-10, AD-33 — `projects/<project-id>/registration.json`, the central registration record.
+ *
+ * Spelled here beside the run file names for the reason every other name in this module is: a second
+ * spelling would be a second on-disk layout, and this file is what makes a moved repository *the same
+ * project*. An installer writing one name and a resolver reading another would silently register every
+ * move as a new project, which is exactly the split AD-10 exists to prevent.
+ *
+ * JSON rather than TOML, per the Consistency Conventions: it is machine-owned state, not a file a
+ * person is invited to edit. `projects/<project-id>/` holds the per-project ledger and memory too
+ * (stories 5-1 and on), so the registration is a *file* inside that directory rather than being the
+ * directory's only content.
+ */
+export const PROJECT_REGISTRATION_FILE_NAME = 'registration.json';
+
+/** `projects/<project-id>/registration.json` for one project id. */
+export const projectRegistrationPath = (
+  projectId: string,
+  orchHome: string = resolveOrchHome(),
+): string => join(projectDir(projectId, orchHome), PROJECT_REGISTRATION_FILE_NAME);
+
 /** The file names inside a run directory, so no caller spells one itself. */
 export const EVENT_LOG_FILE_NAME = 'events.jsonl';
 export const FETCH_RECORD_FILE_NAME = 'fetch-record.json';

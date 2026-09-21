@@ -174,6 +174,10 @@ describe('npm resolves this repository’s git ref into a runnable init (matrix 
       // whole interview, not printing a usage message.
       input: '\n'.repeat(40),
       stdio: ['pipe', 'pipe', 'pipe'],
+      // Story 2-2 — the install registers the project centrally (AD-10), and this is a real child
+      // process: without an ORCH_HOME of its own it would write into the `~/.orch` of the machine
+      // running the suite.
+      env: { ...process.env, ORCH_HOME: scratch('orch-delivery-home-') },
     });
 
     expect(output).toContain('.orch/ is installed');

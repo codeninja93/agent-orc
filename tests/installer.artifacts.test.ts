@@ -16,7 +16,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
   CURRENT_SCHEMA_VERSION,
@@ -45,6 +45,27 @@ const scratchDirectory = (): string => {
 
 afterAll(() => {
   for (const path of disposable.splice(0)) rmSync(path, { recursive: true, force: true });
+});
+
+/**
+ * Story 2-2 — a completed install registers the project under `ORCH_HOME` (AD-10), so this suite points
+ * `ORCH_HOME` at a scratch directory of its own.
+ *
+ * Not a nicety: without it these tests would leave registration records in the real `~/.orch` of
+ * whichever machine ran them, and a suite whose side effects escape its temporary directories is a
+ * suite that changes the thing it is measuring.
+ */
+const realOrchHome = process.env['ORCH_HOME'];
+
+beforeAll(() => {
+  const home = mkdtempSync(join(tmpdir(), 'orch-home-'));
+  disposable.push(home);
+  process.env['ORCH_HOME'] = home;
+});
+
+afterAll(() => {
+  if (realOrchHome === undefined) delete process.env['ORCH_HOME'];
+  else process.env['ORCH_HOME'] = realOrchHome;
 });
 
 /** A credential that is not one: shaped like the real thing, and never valid anywhere. */

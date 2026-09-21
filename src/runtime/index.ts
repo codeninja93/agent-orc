@@ -20,9 +20,19 @@
  * `runs.ts` enumerates the run directories the morning brief folds. Each is re-exported by the engine
  * module it came from, so again no engine caller changed. Nothing that *decides* moved: the timeout
  * resolver, the compare-and-set and every intent effect are still the engine's.
+ *
+ * Story 2-2 added the two modules that make a project an identity rather than a path. `projects.ts`
+ * registers, resolves and prunes `ORCH_HOME/projects/<project-id>/` per AD-10 and AD-33 — here because
+ * every other `ORCH_HOME` write already is, and because the installer must be able to register without
+ * importing anything the spine forbids it. `repository.ts` holds the three git reads that answer what a
+ * repository is, which moved down from `src/installer/detect.ts` because resolution has to verify a
+ * recorded path by reading the first-commit SHA at it; `detect.ts` re-exports all three, so no installer
+ * caller changed. That is the fifth time this relocation has been made, and always for the same rule.
  */
 export * from './paths.js';
 export * from './exclusive-create.js';
+export * from './repository.js';
+export * from './projects.js';
 export * from './branches.js';
 export * from './redaction.js';
 export * from './recorder.js';

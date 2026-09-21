@@ -7,10 +7,11 @@
  * modification times, because a rewrite of identical bytes would pass the first check and fail the
  * second — and a rewrite is exactly what an idempotent installer must not do.
  */
-import { appendFileSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { ManifestSchema } from '../src/contracts/index.js';
 import { GITIGNORE_LINES, parseToml, runInit } from '../src/installer/index.js';
@@ -26,6 +27,27 @@ const repository = (options?: Parameters<typeof makeRepository>[0]): string => {
 
 afterAll(() => {
   for (const path of disposable.splice(0)) rmSync(path, { recursive: true, force: true });
+});
+
+/**
+ * Story 2-2 — a completed install registers the project under `ORCH_HOME` (AD-10), so this suite points
+ * `ORCH_HOME` at a scratch directory of its own.
+ *
+ * Not a nicety: without it these tests would leave registration records in the real `~/.orch` of
+ * whichever machine ran them, and a suite whose side effects escape its temporary directories is a
+ * suite that changes the thing it is measuring.
+ */
+const realOrchHome = process.env['ORCH_HOME'];
+
+beforeAll(() => {
+  const home = mkdtempSync(join(tmpdir(), 'orch-home-'));
+  disposable.push(home);
+  process.env['ORCH_HOME'] = home;
+});
+
+afterAll(() => {
+  if (realOrchHome === undefined) delete process.env['ORCH_HOME'];
+  else process.env['ORCH_HOME'] = realOrchHome;
 });
 
 const FIRST_RUN_AT = new Date('2026-09-21T09:00:00.000Z');

@@ -20,6 +20,7 @@ import {
   PermissionsSchema,
   ProfileSchema,
 } from './installer.js';
+import { ProjectRegistrationSchema } from './project.js';
 import { QuestionStateSchema } from './question.js';
 import { RunStateSchema } from './state.js';
 import { StepInputSchema, StepOutputSchema } from './step.js';
@@ -124,6 +125,15 @@ export const CONTRACTS = {
       'is detectable and recoverable (AD-12, AD-28).',
     model_produced: false,
     schema: ManifestSchema,
+  },
+  'project.registration': {
+    id: 'project.registration',
+    kind: 'artifact',
+    description:
+      'The central registration record at ORCH_HOME/projects/<project-id>/registration.json, keyed ' +
+      'by the first-commit SHA (AD-9, AD-10, AD-28, AD-33).',
+    model_produced: false,
+    schema: ProjectRegistrationSchema,
   },
   'error.shape': {
     id: 'error.shape',
