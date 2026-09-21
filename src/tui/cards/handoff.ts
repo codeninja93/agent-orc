@@ -107,6 +107,24 @@ const present = (value: string | null | undefined): string | null =>
   value === undefined || value === null || value.trim() === '' ? null : value;
 
 /**
+ * Whether the caller *said anything* about this half of the location, absence included.
+ *
+ * This is the precondition the `git checkout` sentence actually needs, and getting it wrong is why the same
+ * defect has now arrived three times. Story 1-7's round fixed the escape-hatch-failed case, 1-10's round
+ * fixed the empty string, and `location: { branch: null }` — what a caller passes when the escape hatch
+ * created no branch at all — was a third path into the same sentence, because `present(given.branch) ??
+ * present(derived.branch)` cannot tell "nobody spoke" from "somebody said there is none" and falls through
+ * to the derivation for both. Each round patched the *value* it was shown; the values are unbounded.
+ *
+ * The derivation only knows what a takeover branch *would be named*. A caller holding the escape hatch's
+ * own outcome knows whether one exists. So a stated location wins over the derivation whatever it states,
+ * and the derivation answers only the question nobody answered — which is the whole of the rule, and it
+ * holds for every absent value anyone passes next.
+ */
+const stated = (location: HandoffLocation, key: keyof HandoffLocation): boolean =>
+  key in location && location[key] !== undefined;
+
+/**
  * Build the handoff card.
  *
  * Pure. A run whose log records no hand-off reason still gets a card that says so: the feature state is
@@ -117,10 +135,11 @@ export const buildHandoffCard = (input: HandoffCardInput): HandoffCard => {
   const view = input.view;
   const given = input.location ?? {};
   const derived = derivedLocation(input);
-  // An explicitly given location wins: a caller holding the escape hatch's own outcome knows which branch
-  // the work actually landed on, and the derivation only knows which branch it would have been named.
-  const knownBranch = present(given.branch) ?? present(derived.branch);
-  const knownDocument = present(given.document) ?? present(derived.document);
+  // An explicitly given location wins, including when what it gives is absence: a caller holding the escape
+  // hatch's own outcome knows whether the branch exists, and the derivation only knows what it would have
+  // been named. See {@link stated} for why the test is "did the caller speak" and not "is the value usable".
+  const knownBranch = stated(given, 'branch') ? present(given.branch) : present(derived.branch);
+  const knownDocument = stated(given, 'document') ? present(given.document) : present(derived.document);
   const feature = view.feature ?? 'this feature';
 
   /**

@@ -51,6 +51,7 @@ import {
   specRecorded,
   stepStarted,
   stepTerminated,
+  territoryDeclared,
   unknownEvent,
 } from './helpers/tui-log.js';
 
@@ -189,12 +190,82 @@ describe('a new event type is invisible to a reader that does not know it', () =
     expect(foldEvents(withUnknown)).toStrictEqual(foldEvents(without));
   });
 
+  it('ignores a territory declaration, which the shell folds nothing from (AD-5)', () => {
+    /**
+     * `feature.territory_declared` is written by the engine and read by the replay in
+     * `src/engine/territory.ts`; the shell has no use for it. So it belongs to exactly the case AD-5 is
+     * about from the renderer's side — a type in the shared vocabulary that this fold does not handle —
+     * and it must change nothing at all rather than being handled by accident.
+     */
+    const known = [
+      { ...runCreated(), atMs: 0 },
+      { ...specRecorded(['the criteria are in the log']), atMs: 1_000 },
+      { ...featureStateChanged('confirmed'), atMs: 2_000 },
+    ];
+    const withTerritory = buildLog([
+      known[0] ?? runCreated(),
+      { ...territoryDeclared(['src/engine', 'src/tui']), atMs: 500 },
+      ...known.slice(1),
+    ]);
+    expect(isDeclaredEventType('feature.territory_declared')).toBe(true);
+    expect(foldEvents(withTerritory)).toStrictEqual(foldEvents(buildLog(known)));
+  });
+
   it('declares every new type in the shared vocabulary, dot-namespaced and past-tense', () => {
     for (const type of ['spec.recorded', 'spec.criterion_edited', 'feature.territory_declared']) {
       expect(EVENT_TYPES).toContain(type);
       expect(isDeclaredEventType(type)).toBe(true);
       expect(type).toMatch(/^[a-z_]+\.[a-z_]+$/);
     }
+  });
+});
+
+describe('a criterion entry this build cannot read does not renumber the ones after it', () => {
+  it('keeps every readable criterion at the line the log declared for it', () => {
+    /**
+     * AD-5 requires this reader to survive a payload a newer or stranger writer produced, and the fold
+     * dropped the unreadable entry and then numbered the *survivors* — so criterion 4 became criterion 3,
+     * and an `edit_criterion` naming a line would have amended a different one. A gap in the numbering is
+     * the honest reading: the log holds something at position two that this build cannot state.
+     */
+    const view = foldEvents(
+      buildLog([
+        runCreated(),
+        {
+          type: 'spec.recorded',
+          payload: {
+            request: 'keep the numbering stable',
+            acceptance_criteria: ['the first one', 42, 'the third one', 'the fourth one'],
+          },
+        },
+      ]),
+    );
+
+    expect(view.spec.criteria.map((criterion) => criterion.text)).toStrictEqual([
+      'the first one',
+      'the third one',
+      'the fourth one',
+    ]);
+    expect(view.spec.criteria.map((criterion) => criterion.line)).toStrictEqual([1, 3, 4]);
+
+    // And an amendment naming line 3 still amends the criterion the engine would address.
+    const amended = foldEvents(
+      buildLog([
+        runCreated(),
+        {
+          type: 'spec.recorded',
+          payload: {
+            request: 'keep the numbering stable',
+            acceptance_criteria: ['the first one', 42, 'the third one', 'the fourth one'],
+          },
+        },
+        specCriterionEdited(3, 'the third one, reworded'),
+      ]),
+    );
+    expect(amended.spec.criteria.find((criterion) => criterion.line === 3)?.text).toBe(
+      'the third one, reworded',
+    );
+    expect(amended.spec.criteria.find((criterion) => criterion.line === 4)?.edited).toBe(false);
   });
 });
 

@@ -342,6 +342,33 @@ describe('a step that completes', () => {
     expect(exits[0]?.payload['had_terminal_output']).toBe(true);
   });
 
+  /**
+   * Story 1-11's task 5, asserted on the one path a real run takes.
+   *
+   * `tests/contracts.usage.test.ts` proves the parser and `tests/engine.usage.test.ts` proves the fold, but
+   * both hand their numbers in: one calls `usageFromResultLine` directly and the other scripts an executor
+   * double with a pre-built `StepTermination`. Neither touches the single line in `spawner.ts` where the
+   * parsed usage crosses onto the termination the reconciler writes to `step.terminated` — so replacing it
+   * with `usage: null` left all 1522 tests passing, and the whole cost-and-token half of this story could
+   * have been a no-op in production while every surface read `(not recorded)` and AD-24's ceilings had
+   * nothing to decide against. This is the assertion that closes that: the real spawner, the real
+   * transcript, the numbers that transcript actually carries.
+   */
+  it('carries the cost and token counts the transcript reports onto the termination', async () => {
+    const harness = openTracked({ fixture: 'completed.jsonl' });
+    const termination = await harness.spawner.start(harness.request());
+
+    expect(termination.disposition).toBe('completed');
+    // The values are the recorded transcript's own terminal result line, not a fixture written here.
+    expect(termination.usage).toEqual({
+      cost_usd: 0.0354739,
+      input_tokens: 18,
+      output_tokens: 524,
+      cache_creation_input_tokens: 15647,
+      cache_read_input_tokens: 15419,
+    });
+  });
+
   it('survives stdout arriving in chunks that cut JSON lines apart', async () => {
     const harness = openTracked({
       fixture: 'completed.jsonl',

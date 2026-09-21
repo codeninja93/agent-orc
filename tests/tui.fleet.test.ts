@@ -189,6 +189,29 @@ describe('twelve features in flight, on a terminal 24 rows tall', () => {
     expect(cardText(brief)).toContain(`and ${String(brief.notShown)} more in flight, not shown`);
   });
 
+  it('fits a stated number of features, so a taller entry cannot silently shrink the fleet', () => {
+    /**
+     * The height bound above says the brief never *overflows*; it says nothing about how much of the fleet
+     * a person actually sees, and that is the number CAP-22 is about. An entry grew from two rows to three
+     * with no change to the budget and nothing to notice that a third of the fleet had stopped being
+     * listed. The arithmetic is stated rather than derived so a fourth row per entry fails here: at 24 rows
+     * the title takes one and the overflow line one, leaving 22 for entries at three rows each — seven,
+     * with one row spare.
+     */
+    twelve();
+    const brief = buildBriefCard({
+      fleet: foldFleet({ orchHome: home }),
+      height: DEFAULT_BRIEF_HEIGHT,
+      wrap: (line) => wrapLine(line, 80),
+      now: NOW,
+    });
+
+    expect(brief.entries).toHaveLength(7);
+    expect(brief.notShown).toBe(5);
+    // And the rows really are three per entry, which is what makes the number above mean something.
+    expect(drawnRows(cardText(brief).split('\n'), 80)).toBe(1 + 7 * 3 + 1);
+  });
+
   it('keeps the height when the terminal is 40 columns and every line wraps', () => {
     twelve();
     const brief = buildBriefCard({

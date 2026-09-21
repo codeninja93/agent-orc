@@ -93,6 +93,45 @@ describe('the cost and the token counts come off a real recorded result line', (
     expect(merged?.cache_read_input_tokens).toBe(7);
   });
 
+  it('reads a token count outside the safe integer range as unreported, and never throws', () => {
+    /**
+     * `Number.isInteger(2 ** 53)` is `true` and `z.int()` refuses that value as too big, so a count at or
+     * above 2^53 made `StepUsageSchema.parse` throw *out of* the stream parser — which degrades every other
+     * unreadable shape to a malformed record rather than throwing. A count that cannot be represented is a
+     * count that was not read (R8), so it reads as absent like any other unusable field.
+     */
+    const huge = usageFromResultLine({
+      total_cost_usd: 0.5,
+      usage: { input_tokens: 2 ** 53, output_tokens: Number.MAX_SAFE_INTEGER },
+    });
+    expect(huge).toStrictEqual(usage({ cost_usd: 0.5, output_tokens: Number.MAX_SAFE_INTEGER }));
+
+    // And the same through the per-model map, where the unsafe value is reached by summing safe ones.
+    const summed = usageFromResultLine({
+      modelUsage: {
+        a: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 3 },
+        b: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 4 },
+      },
+    });
+    expect(summed?.input_tokens).toBe(Number.MAX_SAFE_INTEGER);
+    expect(summed?.output_tokens).toBe(7);
+  });
+
+  it('degrades a whole result line it cannot read to a malformed record rather than throwing', () => {
+    // The invariant the clamp protects, asserted through the parser a real stream goes through.
+    const line = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      total_cost_usd: 0.1,
+      usage: { input_tokens: 2 ** 60 },
+    });
+    expect(() => parseStream(`${line}\n`)).not.toThrow();
+    expect(parseStream(`${line}\n`).find((entry) => entry.kind === 'result')?.usage).toStrictEqual(
+      usage({ cost_usd: 0.1 }),
+    );
+  });
+
   it('reads an unusable field as unreported rather than as a number the schema would refuse', () => {
     const odd = usageFromResultLine({
       total_cost_usd: Number.NaN,

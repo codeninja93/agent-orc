@@ -1,55 +1,80 @@
----
-title: 'Event-log completeness — the facts the required surfaces are specified to show'
-type: 'feature'
+---title: Event-log completeness — the facts the required surfaces are specified to show
+type: feature
 created: '2026-09-20'
-status: 'in-review'
-review_loop_iteration: 0
+status: done
+review_loop_iteration: 1
 followup_review_recommended: true
-baseline_revision: 'db11e4b'
+baseline_revision: db11e4b
 context:
-  - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/interface-contract.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/build-sequencing.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-10-tui-cards.md'
-warnings: ['oversized'] # five independent log gaps across contracts, engine and renderer; carries the stage-1 gate
+- '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/interface-contract.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/build-sequencing.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-10-tui-cards.md'
+warnings:
+- oversized
 deferred:
-  - summary: >-
-      No review layer ran against this story; the gate, the implementer's four mutations and my own
-      independent measurement and mutation are the only scrutiny it received.
-    evidence: |-
-      typecheck, lint, build and 1206 tests across 48 files all pass with zero skips. Read status: done as
-      implemented, gated and mutation-tested, not reviewed.
-    severity: high
-  - summary: >-
-      A territory path that is long, dotless and hyphenless is redacted, and the reader then substitutes
-      `['.']`, which collides with every other feature.
-    evidence: |-
-      Measured directly: `docs/planning/architecture/spine/decisions/records` is 50 characters in one
-      unbroken run at 3.78 bits/char and is replaced, while `src/engine/reconciler.ts` survives because its
-      dots and slashes break the run. The substitution is deliberately fail-safe — a feature serialised
-      unnecessarily costs one pass, a feature admitted wrongly costs another feature's work — but it is a
-      real loss of parallelism for a repository with deep dotless directories. The durable fix is the same
-      punctuated-identifier idiom stories 1-7 and 1-8 used, applied to declared paths.
-    location: 'src/engine/territory.ts'
-    severity: medium
-  - summary: >-
-      The enriched `question.asked` keys have no payload schema, unlike the three new event types.
-    evidence: |-
-      `questionAskedPayload` is their single writer and the fold reads them defensively, so nothing is
-      unsafe today. Adding one would have meant either modifying `src/contracts/question.ts`, which this
-      story's Code Map did not cover, or duplicating `QuestionOptionSchema` into `event.ts`. The asymmetry
-      is the thing to close: three of four new payloads are schema'd and one is not.
-    location: 'src/contracts/event.ts'
-    severity: medium
-  - summary: >-
-      `question.asked` now carries both `options` and `offered_options`, describing the same set two ways.
-    evidence: |-
-      Required by AD-5: `options` keeps its old meaning — the joined id string — because changing an
-      existing key's meaning is breaking, and the labels and consequences arrive on a new key. The escape
-      option is inside `offered_options` with `escape: true`, so both keys describe the same set in the same
-      order. Nothing enforces that they agree, so a future writer can drift them.
-    location: 'src/engine/questions.ts'
-    severity: low
+- summary: 'RESOLVED 2026-09-21: the four-layer review ran. See the Review Triage Log.'
+  evidence: 58 claims filed, 17 triage rows, 12 patched including three high. Suite 1522 -> 1542 tests
+    across 51 files, zero skips. Four mutations caught, and the decisive one — discarding every parsed
+    usage record, which passed 1522/1522 before — now fails.
+  severity: high
+- summary: A territory path that is long, dotless and hyphenless is redacted, and the reader then substitutes
+    `['.']`, which collides with every other feature.
+  evidence: 'Measured directly: `docs/planning/architecture/spine/decisions/records` is 50 characters
+    in one
+
+    unbroken run at 3.78 bits/char and is replaced, while `src/engine/reconciler.ts` survives because
+    its
+
+    dots and slashes break the run. The substitution is deliberately fail-safe — a feature serialised
+
+    unnecessarily costs one pass, a feature admitted wrongly costs another feature''s work — but it is
+    a
+
+    real loss of parallelism for a repository with deep dotless directories. The durable fix is the same
+
+    punctuated-identifier idiom stories 1-7 and 1-8 used, applied to declared paths.'
+  location: src/engine/territory.ts
+  severity: medium
+- summary: The enriched `question.asked` keys have no payload schema, unlike the three new event types.
+  evidence: '`questionAskedPayload` is their single writer and the fold reads them defensively, so nothing
+    is
+
+    unsafe today. Adding one would have meant either modifying `src/contracts/question.ts`, which this
+
+    story''s Code Map did not cover, or duplicating `QuestionOptionSchema` into `event.ts`. The asymmetry
+
+    is the thing to close: three of four new payloads are schema''d and one is not.'
+  location: src/contracts/event.ts
+  severity: medium
+- summary: '`question.asked` now carries both `options` and `offered_options`, describing the same set
+    two ways.'
+  evidence: 'Required by AD-5: `options` keeps its old meaning — the joined id string — because changing
+    an
+
+    existing key''s meaning is breaking, and the labels and consequences arrive on a new key. The escape
+
+    option is inside `offered_options` with `escape: true`, so both keys describe the same set in the
+    same
+
+    order. Nothing enforces that they agree, so a future writer can drift them.'
+  location: src/engine/questions.ts
+  severity: low
+- summary: 'SPEC DECISION: replay cannot reproduce the shared-worktree half of territory serialisation.'
+  evidence: 'Two features configured to share one worktree are serialised live and admitted together on
+    replay. Neither remedy exists: the worktree is declared configuration, not a function of the run id,
+    so it cannot be derived as the handoff branch is; and carrying it would put an absolute path holding
+    a bare ULID in a payload, which AD-21 replaces. Now documented and demonstrated by a test. Latent,
+    because four of the five territory readers have no callers.'
+  location: src/engine/territory.ts
+  severity: medium
+- summary: 'SPEC DECISION: whether a terminal run should ever be back-filled.'
+  evidence: This round decided no — a finished run never acts again, so the repair buys nothing while
+    costing a declaration built from today's plan appended to a finished record. If the gate is read as
+    "every run's log must be complete, including finished ones", that reverses. Worth an explicit ruling
+    because the gate is load-bearing.
+  location: src/engine/reconciler.ts
+  severity: medium
 ---
 
 # Story 1-11 — Event-log completeness
@@ -259,6 +284,36 @@ and in particular no new entry in the allow-list.
 
 ## Review Triage Log
 
+### 2026-09-21 — Review pass (follow-up, on a `done` spec)
+
+- claims filed: 58 across four layers — blind-hunter 14, edge-case-hunter 20, verification-gap 4 gap + 3
+  other, intent-alignment 6 divergences plus an ambiguity in the premise. The edge-case layer filed an
+  enumerated list so its count is exact; the other three wrote prose, so those are my enumeration.
+- grouped into the 17 rows below. 12 patch entries applied, 3 deferred, the rest rejected. No filed claim is
+  without a row.
+- **Two rows record failures in my own work on this story** — the currency guard I added to catch a shipped
+  R10 violation was pointed at a state where the violation cannot occur, and one of my patch-brief claims
+  did not reproduce and was correctly reverted rather than patched. A third row corrects my description of
+  the poison loop: the failure was real, my account of how it presented was not.
+
+- `[high]` `[patch]` The spawner discarded every usage record it parsed and the suite stayed green. `spawner.ts:1031` is the only place parsed usage crosses onto `StepTermination`, and I verified at HEAD that replacing it with `usage: null` left all 1522 tests passing — so this story's whole cost-and-token half could be a no-op in the one path a real run takes, with 2-9's ceilings left nothing to read. It passed because every test either fed the parser directly or handed a scripted executor a pre-built termination. One assertion against the transcript's own figures now closes it; I re-ran the mutation myself after the fix and it fails.
+- `[high]` `[patch]` THE CURRENCY GUARD I ADDED WAS A NO-OP FOR THE VIOLATION IT WAS WRITTEN AGAINST. After this story shipped `0.0396 usd` onto two surfaces I removed the rendering and added a six-card guard — whose fixture built from `stepTerminated`, which writes no usage key, so every card rendered `(not recorded)` and the assertions ran against strings containing no number. Proved by prepending a `$` figure to `formatTokenUsage`: the guard stayed silent. Now built from `stepTerminatedWithUsage`, the helper this story added and no test imported; the mutation now fails four tests.
+- `[high]` `[patch]` `recordDeclarations` could freeze a run forever: its emit loop was unguarded and its call site sits in `pass()`'s per-run enumeration, so an AD-21 fail-closed `UnrecordedAction` excluded the run from `entries` on that pass and every pass after. Same poison shape story 1-7 fixed in `applyIntent`, in a path that runs for every run. Now the failure is a per-run refusal and the run stays in the enumeration. **One correction to my claim:** the catch was not silent — it already pushed a refusal. The freeze was real; my description of it was not.
+- `[medium]` `[patch]` The back-fill could discard a person's amendments: it checked `carried` for `spec.recorded` and the territory type but not `spec.criterion_edited`, so a run with edits and no declaration got the declaration appended *after* them and the fold's later-wins rule reset the criteria — amendments in the log and gone from the view. Now every carried edit is re-appended after the declaration in `seq` order, bounded so nothing replays twice.
+- `[medium]` `[patch]` A terminal run is no longer back-filled at all, and repairs are marked. The back-fill built its declaration from *today's* plan, so a run whose plan had changed gained a record claiming to be what it was accepted against. Terminal runs are now skipped — a finished run never acts again, so the repair buys nothing and costs a false record — and every back-filled line carries `repaired: true` so a replay can tell a repair from a declaration.
+- `[medium]` `[patch]` The territory completeness check failed **open** under partial redaction: it filtered with exact equality, so `docs/[redacted]/records` survived and `complete: true` was returned for a territory the log does not carry. This is the same defect story 1-9's round fixed in the renderer's `isRedacted`; the fix had landed in the renderer and not the engine, because nobody was looking at both.
+- `[medium]` `[patch]` Two unsafe-integer paths that threw on ordinary input: `criterionEditedPayload` on a long digit run, and the token counts in `stream.ts` — the latter including the summed total, where each term is safe but the sum need not be. Q6 promises free text is never refused, and `parseStreamLine` is supposed to degrade to a malformed record rather than throw.
+- `[medium]` `[patch]` THE CHECKOUT SENTENCE, FIXED AT ITS PRECONDITION RATHER THAN ITS INPUT. `present(given.branch) ?? present(derived.branch)` cannot distinguish "nobody spoke" from "somebody said there is none", so every absent value fell through to the derivation — which is exactly why story 1-7 patched the escape-hatch-failure case, 1-10 patched the empty string, and `null` arrived as a third. The rule is now that a *stated* location wins whatever it states, absence included, testing key presence rather than usability. The existing empty-string test had passed only because it supplied no `run`, so the derivation was null anyway.
+- `[medium]` `[patch]` `cardForView` could drop `run` and `orchHome` with nothing failing, so the handoff derivation was pinned only through a constructor the shell never calls. Now asserted through the dispatch.
+- `[medium]` `[patch]` A redacted criterion rendered as the raw marker, and the card still offered "confirm all N as written" — asking for a durable CAP-18 decision over wording the run cannot show. Pinned through a real `acceptFeature` so the sweep replaces a genuine ULID, and the card now states how many criteria are not in the log as written *before* offering the confirmation.
+- `[medium]` `[patch]` `readQuestion`'s `??` let a detail holding `options: []` beat the richer folded list, so the card showed no options at all — against its own stated intent of "the most the two sources together know".
+- `[low]` `[patch]` Seven smaller items: `criteriaList` renumbered every later criterion around a non-string entry, so an `edit_criterion` line number then addressed the wrong one; the brief's per-entry height grew 50% with no capacity test, now pinned at 7 of 12 features in 24 rows with the arithmetic stated; the three new event types and their payload keys were spelled in three places despite the "spelled once" claim, now built from single declarations in contracts; `UNRECORDED_USAGE` was exported, documented with three false claims and imported by nothing, now deleted; `STEP_USAGE_FIELDS`'s documented purpose matched no surface; a garbled duplicated clause in `formatTokenUsage`'s doc; and `emit`'s JSDoc had been orphaned onto `recordDeclarations`.
+- `[medium]` `[defer]` SPEC DECISION NEEDED: replay cannot reproduce the shared-worktree half of serialisation. Two features configured to share one worktree are serialised live and admitted together on replay. Neither remedy is available — the worktree is declared configuration, not a function of the run id, so it cannot be derived the way the handoff branch is; and carrying it would put an absolute path holding a bare ULID in a payload, which AD-21 replaces. The divergence is now documented and demonstrated by a test rather than left to be discovered. Latent today, because four of the five territory readers have no callers and the live path reads folded state.
+- `[medium]` `[defer]` SPEC DECISION NEEDED: whether a terminal run should ever be back-filled. This round decided no and documented why at length. If the stage-1 gate is read as "every run's log must be complete, including finished ones", that reverses — but the only way to satisfy it is to append today's plan to a finished run's record, which is the worse failure. Worth an explicit ruling, since the gate is load-bearing.
+- `[false]` `[reject]` MY CLAIM THAT AN EMPTY `spec.criterion_edited` TEXT REACHES THE LOG DOES NOT REPRODUCE. `edit_criterion` is in `ARGUMENT_REQUIRED_COMMANDS` and `CommandIntentSchema` refuses a whitespace-only argument on both entry points — the method path and the durable-file path. The round wrote the guard, could not construct a scenario for it, and reverted it; the emit condition is byte-identical to HEAD. Residual, left deliberately: `criterionEditedPayload('   ')` in isolation does return an empty text, so its "never empty" comment is true because of an upstream contract rather than that expression.
+- `[low]` `[reject]` Six hardening suggestions on inputs no caller can supply, and cosmetic notes corrected elsewhere in this round. (6 findings)
+- `[maybe-false]` `[defer]` Three claims that only a launched TUI could settle. Story 2-1 owns the entry point. (3 findings)
+
 ## Design Notes
 
 **Two of the five gaps closed by deriving, and that was the right call for a reason worth keeping.** 1-10's
@@ -315,26 +370,40 @@ redactor, and reproduced every row. That measurement is what showed my own accep
 
 ## Auto Run Result
 
-**Status: done.** The five facts stage 1's surfaces are specified to show are now in the event log: the
-acceptance criteria and their edits, each question option's label and consequence plus `asked_at`, the
-declared territory, and per-step cost and token counts. The handoff's branch and document are derived rather
-than carried, so nothing new had to survive redaction. 1206 tests across 48 files, zero skips.
+**Status: done, reviewed.** The four-layer review ran on 2026-09-21. 58 claims filed, 17 triage rows, 12
+patched, 3 deferred. Suite 1522 -> 1542 tests across 51 files, zero skips.
 
-**Stage-1 `done_checkpoint` — MET, against the gate as amended on 2026-09-20.**
+**This story's cost-and-token half could have been a no-op in production.** `spawner.ts:1031` is the only
+place parsed usage crosses onto a termination, and replacing it with `usage: null` left all 1522 tests
+passing — verified at HEAD before the round, and it now fails a test. Every test that observed a usage
+number either fed the parser directly or handed a scripted executor a pre-built termination; the line
+joining them was tested by nothing, so story 2-9's ceilings would have had nothing to read.
 
-- *Containment half — met, independently verified.* All six required checks against Docker 29.8.0, image
-  `orch-executor:991044ecce0e0ac8`; `src/container/lifecycle.ts` re-validates the check list rather than
-  trusting the marker. Unchanged by this story.
-- *Event-log half — met, for all six surfaces.* `tests/tui.reconstruction.test.ts` drives a real feature to
-  `committed` through a real reconciler, with a question answered through the keystroke reducer and one
-  durable intent file, deletes every entry in the run directory except `events.jsonl`, asserts the directory
-  holds only that file, and then builds all six cards. The spec echo renders its criteria — the gap story
-  1-10 pinned. The question card shows every consequence and counts down from the log's own `asked_at`. The
-  handoff card names the takeover branch and the document path, with an assertion that no payload in the log
-  carries a `branch` or `document` key. Proved by deletion, not by omission.
-- *The git half was amended out of this gate* and now belongs to stage 2's, where story 2-7's committer
-  writes AD-22's note on the merge commit. Nothing in the amended stage-1 gate is unmet.
+**The guard I added to catch a shipped violation was pointed where the violation cannot occur.** After this
+story rendered `0.0396 usd` onto the brief and completion notice, I removed the rendering and added a
+six-card currency guard — whose fixture built from a helper that writes no usage key, so every card
+rendered `(not recorded)` and the assertions ran against strings with no number in them. Prepending a `$`
+figure to the formatter left the guard silent. It now builds from the usage-carrying helper this story
+added and no test had imported, and the same mutation fails four tests.
 
-Story 1-12 remains before stage 2: eight recorded defects, including the unbounded retry loop.
-`followup_review_recommended: true` — the story is oversized, no review layer ran, and it shipped a
-requirement violation that only a post-hoc check caught.
+**A sentence fixed three times is now fixed once.** The handoff card's "check out this branch" line was
+patched in story 1-7 for the escape-hatch failure and in 1-10 for the empty string, and `null` arrived as a
+third variant — because `present(given) ?? present(derived)` cannot distinguish "nobody spoke" from
+"somebody said there is none". The rule is now that a stated location wins whatever it states, absence
+included. The pre-existing empty-string test had passed only because it supplied no run id, so the
+derivation was null regardless.
+
+**Also closed:** the back-fill could freeze a run forever on an AD-21 fail-closed append, and could discard
+a person's criterion amendments by appending the declaration after them; the territory completeness check
+failed open under partial redaction, the same defect 1-9's round fixed in the renderer and not the engine;
+and two unsafe-integer paths threw where the contract promises free text is never refused.
+
+**One of my own claims did not reproduce and was reverted rather than patched** — an empty
+`spec.criterion_edited` text cannot reach the log, because the argument-required refinement gates both
+entry points. The round wrote the guard, failed to construct a scenario, and reverted it.
+
+**Residual risk, and why `followup_review_recommended` is true.** Three high entries were patched. The
+specific unverified risk: the back-fill now re-appends carried criterion edits after a repaired
+declaration, which is new write behaviour in the path that runs for every run on every pass. It is bounded
+— the next pass owes nothing and nothing replays twice, and that is asserted — but it is the first time
+this loop rewrites history rather than appending to it.

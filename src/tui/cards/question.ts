@@ -159,11 +159,25 @@ const fromFold = (options: readonly QuestionOptionView[]): {
 export const readQuestion = (detail: QuestionDetail | null, view: ShellView): ReadQuestion => {
   const slot = view.question;
   const folded = fromFold(slot.options);
+  /**
+   * A list the detail holds *and* has something in it beats the fold; an empty one does not.
+   *
+   * `??` alone answers the wrong question. A `QuestionDetail` carrying `options: []` — a state file written
+   * before the options were filled in, or one whose reader built it field by field — is present and empty,
+   * so it won against a fold that had read three options out of the log and the card rendered a question
+   * with nothing to choose. The stated intent of reading field by field is "the most the two sources
+   * together know", and an empty list knows nothing.
+   */
   const declaredOptions = detail?.options;
   const declaredEscape = detail?.escape;
   return {
-    concrete: declaredOptions ?? folded.concrete,
-    escape: declaredEscape ?? folded.escape,
+    concrete:
+      declaredOptions !== undefined && declaredOptions.length > 0
+        ? declaredOptions
+        : folded.concrete,
+    // The same, for the one option: an escape with no id is one nobody can name, which is what
+    // `optionList` already drops on the fold side. Presenting it would render an unchoosable `[esc]` row.
+    escape: declaredEscape !== undefined && declaredEscape.id !== '' ? declaredEscape : folded.escape,
     recommendedId: detail?.recommended_option_id ?? slot.recommendedOptionId,
     defaultAction: detail?.default_action ?? slot.defaultAction,
     brief: detail?.brief ?? slot.brief,

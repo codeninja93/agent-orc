@@ -34,7 +34,16 @@ import type {
   StepPhase,
   StepUsage,
 } from '../contracts/index.js';
-import { FEATURE_STATES, addUsage, compareEventOrder, usageFromPayload } from '../contracts/index.js';
+import {
+  DECLARATION_PAYLOAD_KEYS,
+  FEATURE_STATES,
+  SPEC_CRITERION_EDITED_EVENT_TYPE,
+  SPEC_RECORDED_EVENT_TYPE,
+  USAGE_PAYLOAD_KEY,
+  addUsage,
+  compareEventOrder,
+  usageFromPayload,
+} from '../contracts/index.js';
 
 import { DEFAULT_AUTONOMY_MODE, applyCommandToMode, modeForFeatureState } from './mode.js';
 import type { AutonomyMode } from './mode.js';
@@ -42,9 +51,13 @@ import type { AutonomyMode } from './mode.js';
 /**
  * The event types this fold acts on, as the log spells them.
  *
- * Declared here rather than imported, because `src/tui/` may not import `src/engine/` — and the log is
- * data on disk, not an engine API. Every name in this table is one the engine writes today; a name
- * added to the log later is ignored until a story adds it here, which is AD-5 working as intended.
+ * Declared here rather than imported from the engine, because `src/tui/` may not import `src/engine/` —
+ * and the log is data on disk, not an engine API. Every name in this table is one the engine writes today;
+ * a name added to the log later is ignored until a story adds it here, which is AD-5 working as intended.
+ *
+ * The names story 1-11 added are *referenced* from `src/contracts/`, which both layers may import, rather
+ * than spelled a third time here. A string a writer and a reader each spell separately is a field that
+ * silently stops being read the day one of them changes, which is what this table's own purpose is.
  */
 export const TUI_EVENT_TYPES = {
   RunCreated: 'run.created',
@@ -65,9 +78,9 @@ export const TUI_EVENT_TYPES = {
   PermissionDenied: 'permission.denied',
   RedactionFailed: 'redaction.failed',
   /** CAP-2 — the request and the ordered acceptance criteria, which story 1-11 put in the log. */
-  SpecRecorded: 'spec.recorded',
+  SpecRecorded: SPEC_RECORDED_EVENT_TYPE,
   /** One criterion amended, so the card renders the current text rather than the original. */
-  SpecCriterionEdited: 'spec.criterion_edited',
+  SpecCriterionEdited: SPEC_CRITERION_EDITED_EVENT_TYPE,
 } as const;
 
 export type TuiEventType = (typeof TUI_EVENT_TYPES)[keyof typeof TUI_EVENT_TYPES];
@@ -112,11 +125,11 @@ export const TUI_PAYLOAD_KEYS = {
   HandoffCode: 'handoff_code',
   HandoffReason: 'handoff_reason',
   /** CAP-2 — `spec.recorded`: the user's own words, and the criteria in their declared order. */
-  Request: 'request',
-  AcceptanceCriteria: 'acceptance_criteria',
+  Request: DECLARATION_PAYLOAD_KEYS.Request,
+  AcceptanceCriteria: DECLARATION_PAYLOAD_KEYS.AcceptanceCriteria,
   /** `spec.criterion_edited`: which line, and what it now says. */
-  CriterionLine: 'line',
-  CriterionText: 'text',
+  CriterionLine: DECLARATION_PAYLOAD_KEYS.CriterionLine,
+  CriterionText: DECLARATION_PAYLOAD_KEYS.CriterionText,
   /**
    * `question.asked`, enriched by story 1-11.
    *
@@ -125,11 +138,11 @@ export const TUI_PAYLOAD_KEYS = {
    * folds here. `Brief` and `AskedAt` are what Q3 and Q2 need from the log alone — the consequence of each
    * option, and the instant a countdown is measured from.
    */
-  OfferedOptions: 'offered_options',
-  Brief: 'brief',
-  AskedAt: 'asked_at',
+  OfferedOptions: DECLARATION_PAYLOAD_KEYS.OfferedOptions,
+  Brief: DECLARATION_PAYLOAD_KEYS.Brief,
+  AskedAt: DECLARATION_PAYLOAD_KEYS.AskedAt,
   /** `step.terminated`: what the attempt cost and consumed, when the CLI reported it (R10). */
-  Usage: 'usage',
+  Usage: USAGE_PAYLOAD_KEY,
 } as const;
 
 /** How a value the AD-21 pass replaced is presented: as redacted, never as a value and never as an error. */
@@ -448,13 +461,25 @@ const optionList = (payload: Record<string, unknown>, key: string): readonly Que
   return out;
 };
 
-/** The criteria a `spec.recorded` payload carries, numbered as a person counts them. */
+/**
+ * The criteria a `spec.recorded` payload carries, numbered as a person counts them.
+ *
+ * **Numbered from the declared position, before anything is dropped.** Filtering first and numbering the
+ * survivors renumbered every criterion after an entry this build could not read — a number, a null, a
+ * nested object from a writer AD-5 requires this reader to survive — so criterion 4 became criterion 3 and
+ * an `edit_criterion` naming a line then amended a different one. A gap in the numbering is honest: it says
+ * the log holds an entry at that position that this reader cannot state, and every other line keeps the
+ * number the engine's own parse will read back.
+ */
 const criteriaList = (payload: Record<string, unknown>): readonly SpecCriterionView[] => {
   const raw = payload[TUI_PAYLOAD_KEYS.AcceptanceCriteria];
   if (!Array.isArray(raw)) return [];
-  return raw
-    .filter((entry): entry is string => typeof entry === 'string')
-    .map((entry, index) => ({ line: index + 1, text: entry, edited: false }));
+  const out: SpecCriterionView[] = [];
+  raw.forEach((entry, index) => {
+    if (typeof entry !== 'string') return;
+    out.push({ line: index + 1, text: entry, edited: false });
+  });
+  return out;
 };
 
 /**

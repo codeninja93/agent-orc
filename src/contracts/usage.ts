@@ -44,7 +44,17 @@ export type StepUsage = z.infer<typeof StepUsageSchema>;
 /** The payload key a `step.terminated` line carries its usage under, spelled once. */
 export const USAGE_PAYLOAD_KEY = 'usage';
 
-/** The five fields, in the order a surface states them. */
+/**
+ * Every field of the record, once, in the order {@link StepUsageSchema} declares them.
+ *
+ * It is the list a reader iterates so it cannot miss one — {@link hasRecordedUsage} and
+ * {@link usageFromPayload} are both folds over it, and `tests/contracts.usage.test.ts` compares it against
+ * the schema's own keys so a field added to one and not the other fails a test rather than being silently
+ * unread. It is **not** a display order: `formatTokenUsage` in `src/tui/status.ts` states the token counts
+ * in the order a person reads them and states no cost at all, because R10 makes cost subscription usage
+ * and never currency. Calling this "the order a surface states them" described a surface that does not
+ * exist.
+ */
 export const STEP_USAGE_FIELDS = [
   'cost_usd',
   'input_tokens',
@@ -55,14 +65,15 @@ export const STEP_USAGE_FIELDS = [
 
 export type StepUsageField = (typeof STEP_USAGE_FIELDS)[number];
 
-/** A usage record with nothing in it. Never appended: it is the identity {@link addUsage} folds from. */
-export const UNRECORDED_USAGE: StepUsage = Object.freeze({
-  cost_usd: null,
-  input_tokens: null,
-  output_tokens: null,
-  cache_creation_input_tokens: null,
-  cache_read_input_tokens: null,
-});
+/**
+ * There is deliberately no exported "empty usage record" constant.
+ *
+ * One was exported and documented as "the identity {@link addUsage} folds from", and all three parts of
+ * that were false: {@link totalUsage} folds from `null`, nothing imported the constant, and a record of
+ * five nulls is not what absence is spelled as here — the *record being absent* is. Keeping it invited
+ * exactly the mistake this file exists to prevent, a caller reaching for a zeroed record where R8 wants no
+ * record at all.
+ */
 
 /** True when at least one field carries a number, so there is something to state. */
 export const hasRecordedUsage = (usage: StepUsage | null): boolean =>

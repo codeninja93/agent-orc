@@ -27,7 +27,7 @@
  */
 import { Command } from '../../contracts/index.js';
 import { CONTROLS } from '../controls.js';
-import { UNRECORDED_PRESENTATION, presentValue } from '../projection.js';
+import { UNRECORDED_PRESENTATION, isRedacted, presentValue } from '../projection.js';
 import type { ShellView, SpecCriterionView } from '../projection.js';
 
 import type { CardBody } from './index.js';
@@ -124,6 +124,16 @@ export const buildSpecEchoCard = (input: SpecEchoCardInput): SpecEchoCard => {
   const feature = input.view.feature ?? 'this feature';
   const request = presentValue(folded.request);
   const amended = criteria.filter((criterion) => criterion.edited);
+  /**
+   * The criteria the AD-21 sweep replaced, counted so the card can say so before it asks.
+   *
+   * `presentValue` already keeps the marker itself off the screen, so a redacted line reads
+   * `(redacted in the log)` rather than as somebody's words. What that alone does not do is warn the person
+   * that pressing the confirm key records a durable decision (CAP-18) over a set one of whose lines the
+   * durable truth does not carry. R8's instinct again: a confirmation states what was checked *and what was
+   * not*. The confirm is still offered — the run is waiting on it and the other criteria are readable.
+   */
+  const unreadable = criteria.filter((criterion) => isRedacted(criterion.text));
 
   const lines =
     criteria.length === 0
@@ -148,6 +158,14 @@ export const buildSpecEchoCard = (input: SpecEchoCardInput): SpecEchoCard => {
                 `${String(amended.length)} of these ${
                   amended.length === 1 ? 'was' : 'were'
                 } amended after they were first recorded; the wording above is the current one`,
+              ]),
+          ...(unreadable.length === 0
+            ? []
+            : [
+                `${String(unreadable.length)} of these ${
+                  unreadable.length === 1 ? 'is' : 'are'
+                } not in the log as written — the redaction pass replaced an identifier inside ` +
+                  'them, so confirming records a decision over wording this run cannot show you',
               ]),
           `press "${confirmKey}" to confirm all ${String(criteria.length)} as written`,
           `press "${editKey}" to amend one: ${EDIT_CRITERION_HINT}`,

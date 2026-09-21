@@ -34,11 +34,16 @@ import { join } from 'node:path';
 
 import {
   CURRENT_SCHEMA_VERSION,
+  DECLARATION_PAYLOAD_KEYS,
   MODEL_RUNGS,
+  REPAIRED_PAYLOAD_KEY,
+  SPEC_CRITERION_EDITED_EVENT_TYPE,
+  SPEC_RECORDED_EVENT_TYPE,
   SpecCriterionEditedPayloadSchema,
   SpecRecordedPayloadSchema,
   StepInputSchema,
   USAGE_PAYLOAD_KEY,
+  compareEventOrder,
   featureStateFingerprint,
   findStepRecord,
   formatTimestamp,
@@ -184,8 +189,7 @@ export const STEP_INPUT_FILE_NAME = 'input.json';
  * reconstructable from `events.jsonl` alone (AD-4). Recording them in both places is not a second
  * authority: the log is authoritative and the checkpoint is discarded and rebuilt from it.
  */
-export const SPEC_RECORDED_EVENT_TYPE = 'spec.recorded';
-export const SPEC_CRITERION_EDITED_EVENT_TYPE = 'spec.criterion_edited';
+export { SPEC_RECORDED_EVENT_TYPE, SPEC_CRITERION_EDITED_EVENT_TYPE };
 
 /** The command whose argument is an amended criterion, spelled once (CAP-2). */
 const EDIT_CRITERION_COMMAND = 'edit_criterion';
@@ -210,8 +214,8 @@ const CRITERION_AMENDMENT = /^\s*(?:criterion\s+)?(\d+)\s*[:.\-]\s*(.*)$/is;
 /** The payload of a `spec.recorded` line: the request, and the criteria in their declared order. */
 export const specRecordedPayload = (plan: FeaturePlan): Record<string, unknown> =>
   SpecRecordedPayloadSchema.parse({
-    request: plan.request,
-    acceptance_criteria: [...plan.acceptance_criteria],
+    [DECLARATION_PAYLOAD_KEYS.Request]: plan.request,
+    [DECLARATION_PAYLOAD_KEYS.AcceptanceCriteria]: [...plan.acceptance_criteria],
   });
 
 /** The payload of a `spec.criterion_edited` line, parsed out of the intent's free text (Q6). */
@@ -220,12 +224,21 @@ export const criterionEditedPayload = (argument: string): Record<string, unknown
   const line = match === null ? null : Number.parseInt(match[1] ?? '', 10);
   const text = match === null ? argument.trim() : (match[2] ?? '').trim();
   return SpecCriterionEditedPayloadSchema.parse({
-    // A line number that did not parse to a positive integer is no line number: better an edit recorded
-    // without one than an edit attached to criterion zero.
-    line: line === null || !Number.isInteger(line) || line < 1 ? null : line,
+    /**
+     * A line number that did not parse to a positive integer is no line number: better an edit recorded
+     * without one than an edit attached to criterion zero.
+     *
+     * **Safe** integer, not merely integer. `Number.parseInt` on a long run of digits yields a finite value
+     * outside the safe range — `Number.isInteger(1e20)` is `true` — and `z.int()` refuses it, so the parse
+     * below threw, the throw reached `applyIntent` and the amendment was quarantined. Q6 promises a person's
+     * free text is never refused, and "criterion 99999999999999999999: reword" is free text. It is an
+     * addressing failure, which this line already has an answer for: record the wording with no line.
+     */
+    [DECLARATION_PAYLOAD_KEYS.CriterionLine]:
+      line === null || !Number.isSafeInteger(line) || line < 1 ? null : line,
     // The wording a person gave, never the wrapper the card put around it — and never empty, because an
     // amendment with no text is still evidence that somebody edited that line.
-    text: text === '' ? argument.trim() : text,
+    [DECLARATION_PAYLOAD_KEYS.CriterionText]: text === '' ? argument.trim() : text,
   });
 };
 
@@ -2098,7 +2111,10 @@ export class Reconciler {
         // Re-read when a declaration was appended: the entry below is decided from this snapshot, and a
         // snapshot whose `last_event_seq` predates the lines just written would be checkpointed as a
         // disagreement with the log on the very next pass.
-        entries.push({ run, loaded: this.recordDeclarations(loaded) ? this.load(run) : loaded });
+        entries.push({
+          run,
+          loaded: this.recordDeclarations(loaded, refusals) ? this.load(run) : loaded,
+        });
       } catch (thrown: unknown) {
         // A directory with neither log nor checkpoint carries no state to reconcile and no feature to
         // name, so it is stepped over silently rather than reported as a fault every pass forever. Its
@@ -3033,12 +3049,6 @@ export class Reconciler {
    */
 
   /**
-   * Emit one event through the recorder.
-   *
-   * The engine never opens `events.jsonl` (AD-29). Identifiers go in envelope fields — `run`, `step`,
-   * `session_id`, `baseline_ref` — never in the payload, where the AD-21 pass would replace them.
-   */
-  /**
    * AD-32, AD-7 — append the run-level declarations the log still owes, on any pass.
    *
    * `acceptFeature` records `spec.recorded` and `feature.territory_declared` when the run is created, and
@@ -3052,30 +3062,90 @@ export class Reconciler {
    * restart. It changes no lifecycle state and is therefore not one of the pass's at-most-one actions —
    * exactly like `settleQuestions`, and for the same reason.
    *
+   * Four properties are load-bearing and each was missing once:
+   *
+   * **A terminal run is left exactly as its log left it.** This method runs inside the pass's enumeration of
+   * every run, which turned enumerating runs from a read into an append — including appends onto runs that
+   * have already committed, been killed or been handed off. Such a run will never act again, so the repair
+   * buys nothing, and what it costs is real: the declaration is built from the plan as it reads *today*, so
+   * a finished run would gain a claim about what it was accepted against that nobody made. Absence is the
+   * honest answer for a run whose log genuinely never carried the fact (R8, R12).
+   *
+   * **A repair is marked as one.** {@link REPAIRED_PAYLOAD_KEY} is what distinguishes a line written at
+   * `acceptFeature` from a line written days later out of a plan that may have changed since. Without it a
+   * replay cannot tell a declaration from a reconstruction of one, which is precisely the confusion AD-4's
+   * "the log is the durable truth" must not be built on. The key is additive and optional, so AD-5 makes it
+   * invisible to an older reader.
+   *
+   * **Amendments already in the log are replayed after the declaration.** The fold's later-wins rule means a
+   * `spec.recorded` appended *after* a run's `spec.criterion_edited` lines resets the criteria to the
+   * original set — so a person's amendments would be in the log and gone from every surface, on exactly the
+   * runs this repair exists for. They are re-appended, in `seq` order, each marked as a repair.
+   *
+   * **A line the log refuses does not poison the run.** {@link emit} throws {@link UnrecordedAction} when
+   * AD-21 drops a line, because an *action* the log cannot record must not happen. A declaration is not an
+   * action — nothing changes — and letting it throw out of here left the run refused on this pass and on
+   * every pass after it, never advancing: the poison loop story 1-7's review found in `applyIntent`, on a
+   * path that runs for every run on every pass. The failure is reported against its own run and the run goes
+   * on being reconciled with the declaration still owed.
+   *
    * Returns true when a line was appended, so the caller re-reads the state it had loaded rather than
    * carrying a `last_event_seq` the log has already moved past.
    */
-  private recordDeclarations(loaded: LoadedState): boolean {
+  private recordDeclarations(loaded: LoadedState, refusals: RunRefusal[]): boolean {
+    if (isTerminalFeatureState(loaded.state.state)) return false;
+
     const carried = new Set(loaded.events.map((event) => event.type));
-    const owed: readonly { readonly type: string; readonly payload: Record<string, unknown> }[] = [
-      ...(carried.has(SPEC_RECORDED_EVENT_TYPE)
-        ? []
-        : [{ type: SPEC_RECORDED_EVENT_TYPE, payload: specRecordedPayload(loaded.plan) }]),
+    const repaired = (payload: Record<string, unknown>): Record<string, unknown> => ({
+      ...payload,
+      [REPAIRED_PAYLOAD_KEY]: true,
+    });
+    const owesSpec = !carried.has(SPEC_RECORDED_EVENT_TYPE);
+    const owed: { readonly type: string; readonly payload: Record<string, unknown> }[] = [
+      ...(owesSpec
+        ? [{ type: SPEC_RECORDED_EVENT_TYPE, payload: repaired(specRecordedPayload(loaded.plan)) }]
+        : []),
       ...(carried.has(TERRITORY_DECLARED_EVENT_TYPE)
         ? []
         : [
             {
               type: TERRITORY_DECLARED_EVENT_TYPE,
-              payload: territoryDeclaredPayload(loaded.plan.territory),
+              payload: repaired(territoryDeclaredPayload(loaded.plan.territory)),
             },
           ]),
     ];
+    if (owesSpec) {
+      // The amendments, restated after the set they amend, or the fold would discard them. Bounded: the
+      // next pass sees `spec.recorded` carried and owes nothing, so no edit is ever replayed twice.
+      for (const event of [...loaded.events].sort(compareEventOrder)) {
+        if (event.type !== SPEC_CRITERION_EDITED_EVENT_TYPE) continue;
+        owed.push({ type: SPEC_CRITERION_EDITED_EVENT_TYPE, payload: repaired(event.payload) });
+      }
+    }
     if (owed.length === 0) return false;
+
     const recorder = this.recorderFor(loaded.state.run, loaded.state.feature);
-    for (const line of owed) this.emit(recorder, { step: null, ...line });
-    return true;
+    let appended = false;
+    for (const line of owed) {
+      try {
+        this.emit(recorder, { step: null, ...line });
+        appended = true;
+      } catch (thrown: unknown) {
+        // Fail closed for the rest of the batch — a declaration the log refused leaves the amendments after
+        // it meaningless — and report it against this run rather than throwing into the enumeration.
+        refusals.push(refusalFor(loaded.state.run, thrown));
+        break;
+      }
+    }
+    return appended;
   }
 
+  /**
+   * Emit one event through the recorder.
+   *
+   * The engine never opens `events.jsonl` (AD-29). Identifiers go in envelope fields — `run`, `step`,
+   * `session_id`, `baseline_ref` — never in the payload, where the AD-21 pass would replace them.
+   */
   private emit(
     recorder: Recorder,
     event: {

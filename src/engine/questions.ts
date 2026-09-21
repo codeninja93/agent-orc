@@ -57,6 +57,7 @@ import { join } from 'node:path';
 
 import {
   CURRENT_SCHEMA_VERSION,
+  DECLARATION_PAYLOAD_KEYS,
   QUESTION_RESOLVERS,
   QuestionDeflectionSchema,
   QuestionDraftSchema,
@@ -1174,7 +1175,7 @@ const questionIdsOfTypes = (
 };
 
 /** The payload key the enriched option list is carried under (story 1-11). */
-export const OFFERED_OPTIONS_PAYLOAD_KEY = 'offered_options';
+export const OFFERED_OPTIONS_PAYLOAD_KEY = DECLARATION_PAYLOAD_KEYS.OfferedOptions;
 
 /**
  * The payload key naming the free-text fields the AD-21 pass will rewrite in this very line.
@@ -1262,15 +1263,15 @@ export const questionAskedPayload = (
       prompt: state.question.prompt,
       options: offeredOptionIds(state.question).join(', '),
       [OFFERED_OPTIONS_PAYLOAD_KEY]: offeredOptionsPayload(state.question),
-      brief: state.question.brief,
+      [DECLARATION_PAYLOAD_KEYS.Brief]: state.question.brief,
       recommended_option_id: state.question.recommended_option_id,
       default_action: state.question.default_action,
       default_window_ms: state.question.default_window_ms,
-      asked_at: state.question.asked_at,
+      [DECLARATION_PAYLOAD_KEYS.AskedAt]: state.question.asked_at,
     },
     [
       ['prompt', state.question.prompt],
-      ['brief', state.question.brief],
+      [DECLARATION_PAYLOAD_KEYS.Brief, state.question.brief],
     ],
     policy,
   );

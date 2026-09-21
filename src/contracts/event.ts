@@ -46,6 +46,39 @@ export const formatTimestamp = (at: Date = new Date()): string => at.toISOString
 export const DECISION_RECORDED_EVENT_TYPE = 'decision.recorded';
 
 /**
+ * The three types story 1-11 added, and the payload keys they and the enriched `question.asked` carry.
+ *
+ * **Spelled here and nowhere else**, which the story claimed and did not have: each name was written out
+ * again in `src/engine/` and a third time in `TUI_PAYLOAD_KEYS`, so a rename would have left a writer and a
+ * reader disagreeing about a string with nothing to catch it — and a fold that silently stops reading a key
+ * is exactly the drift `TUI_PAYLOAD_KEYS`' own comment warns about. `src/tui/` may not import `src/engine/`,
+ * but it may import this, so the one shared home for a name on disk is the contracts layer.
+ */
+export const SPEC_RECORDED_EVENT_TYPE = 'spec.recorded';
+export const SPEC_CRITERION_EDITED_EVENT_TYPE = 'spec.criterion_edited';
+export const FEATURE_TERRITORY_DECLARED_EVENT_TYPE = 'feature.territory_declared';
+
+/** The payload keys of the three declaration types, and of the keys 1-11 added to `question.asked`. */
+export const DECLARATION_PAYLOAD_KEYS = {
+  /** `spec.recorded` — the user's own words. */
+  Request: 'request',
+  /** `spec.recorded` — the criteria, in their declared order. */
+  AcceptanceCriteria: 'acceptance_criteria',
+  /** `spec.criterion_edited` — which line, 1-based, or `null` for an amendment that named none (Q6). */
+  CriterionLine: 'line',
+  /** `spec.criterion_edited` — the amended wording, as the person wrote it. */
+  CriterionText: 'text',
+  /** `feature.territory_declared` — the normalised declared paths. */
+  TerritoryPaths: 'paths',
+  /** `question.asked` — each option's id, label, consequence and escape flag (Q1). */
+  OfferedOptions: 'offered_options',
+  /** `question.asked` — the self-contained mini-brief (Q3). */
+  Brief: 'brief',
+  /** `question.asked` — the instant a countdown is measured from (Q2). */
+  AskedAt: 'asked_at',
+} as const;
+
+/**
  * The declared event vocabulary. Dot-namespaced and past-tense. The vocabulary is open by
  * design: a reader meeting a type absent from this list accepts the envelope and ignores the
  * event, so later stories add types without a breaking change.
@@ -80,9 +113,9 @@ export const EVENT_TYPES = [
    * reconstructed from `events.jsonl` alone. This type is that gap closed. The later line wins: a second
    * `spec.recorded` for one feature replaces the set rather than adding to it.
    */
-  'spec.recorded',
+  SPEC_RECORDED_EVENT_TYPE,
   /** One criterion amended through `edit_criterion`, so the current text is in the log (CAP-2). */
-  'spec.criterion_edited',
+  SPEC_CRITERION_EDITED_EVENT_TYPE,
   /**
    * The declared file territory, so an overlap is recomputable by replay.
    *
@@ -91,7 +124,7 @@ export const EVENT_TYPES = [
    * why two features were serialised. See {@link FeatureTerritoryDeclaredPayloadSchema} for the one thing
    * AD-21 does to this payload that a reader has to expect.
    */
-  'feature.territory_declared',
+  FEATURE_TERRITORY_DECLARED_EVENT_TYPE,
 ] as const;
 
 export type DeclaredEventType = (typeof EVENT_TYPES)[number];
@@ -218,6 +251,24 @@ export const hasEventIdentityShape = (field: string, value: string): boolean => 
 export const compareEventOrder = (a: EventEnvelope, b: EventEnvelope): number => a.seq - b.seq;
 
 /**
+ * The key a *repair* carries, so a replay can tell a back-filled declaration from the original one.
+ *
+ * `recordDeclarations` in `src/engine/reconciler.ts` appends the declarations a crash left the log owing,
+ * on a later pass and from the plan as it reads *then*. Nothing else distinguishes that from the line
+ * `acceptFeature` writes at the moment the run is accepted — so a run whose plan changed in between would
+ * gain a declaration claiming to be what it was accepted against, and a reader reconstructing the run from
+ * the log alone would have no way to doubt it. The key is optional and additive, which AD-5 makes
+ * non-breaking: an older reader ignores it and a newer one knows not to read a repair as a declaration.
+ *
+ * Spelled once, here, beside the three schemas that admit it, so the emitter and every reader use the same
+ * string.
+ */
+export const REPAIRED_PAYLOAD_KEY = 'repaired';
+
+/** The optional `repaired` marker the three declaration payloads share. */
+const repairedKey = { [REPAIRED_PAYLOAD_KEY]: z.boolean().optional() };
+
+/**
  * The payload of a `spec.recorded` line: the user's words, and the criteria in the order they were stated.
  *
  * Loose rather than closed, for the same reason the envelope is: AD-5 makes adding a key non-breaking, so
@@ -234,9 +285,10 @@ export const compareEventOrder = (a: EventEnvelope, b: EventEnvelope): number =>
  */
 export const SpecRecordedPayloadSchema = z.looseObject({
   /** The user's original words, verbatim. */
-  request: z.string(),
+  [DECLARATION_PAYLOAD_KEYS.Request]: z.string(),
   /** The criteria, in the declared order. Replaced wholesale by a later `spec.recorded`. */
-  acceptance_criteria: z.array(z.string()),
+  [DECLARATION_PAYLOAD_KEYS.AcceptanceCriteria]: z.array(z.string()),
+  ...repairedKey,
 });
 
 export type SpecRecordedPayload = z.infer<typeof SpecRecordedPayloadSchema>;
@@ -249,9 +301,10 @@ export type SpecRecordedPayload = z.infer<typeof SpecRecordedPayloadSchema>;
  * reader states it as an edit it could not place rather than discarding it.
  */
 export const SpecCriterionEditedPayloadSchema = z.looseObject({
-  line: z.int().nullable(),
+  [DECLARATION_PAYLOAD_KEYS.CriterionLine]: z.int().nullable(),
   /** The amended criterion as the person wrote it, unaltered. */
-  text: z.string(),
+  [DECLARATION_PAYLOAD_KEYS.CriterionText]: z.string(),
+  ...repairedKey,
 });
 
 export type SpecCriterionEditedPayload = z.infer<typeof SpecCriterionEditedPayloadSchema>;
@@ -270,7 +323,8 @@ export type SpecCriterionEditedPayload = z.infer<typeof SpecCriterionEditedPaylo
  */
 export const FeatureTerritoryDeclaredPayloadSchema = z.looseObject({
   /** The normalised declared paths. */
-  paths: z.array(z.string()),
+  [DECLARATION_PAYLOAD_KEYS.TerritoryPaths]: z.array(z.string()),
+  ...repairedKey,
 });
 
 export type FeatureTerritoryDeclaredPayload = z.infer<typeof FeatureTerritoryDeclaredPayloadSchema>;

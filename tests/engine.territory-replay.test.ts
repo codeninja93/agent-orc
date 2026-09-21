@@ -23,6 +23,7 @@ import {
   TERRITORY_DECLARED_EVENT_TYPE,
   WHOLE_REPOSITORY_TERRITORY,
   admissionTerritoryOf,
+  admitByTerritory,
   admitReplayedTerritories,
   createRecordingResetter,
   createScriptedExecutor,
@@ -177,6 +178,68 @@ describe('two features with overlapping territories, rebuilt from the logs (matr
     const admission = admitReplayedTerritories([unreadable, unrelated.events]);
     expect(admission.deferred).toHaveLength(1);
     expect(admission.deferred[0]?.overlap.length).toBeGreaterThan(0);
+  });
+
+  it('treats a partly rewritten path as unreadable too, so the check fails safe (AD-21)', () => {
+    /**
+     * The sweep replaces the *run* it found and leaves the rest of the value: a declared
+     * `docs/planning/architecture/spine/decisions/records` comes back with its one unbroken segment
+     * replaced and its slashes intact. An equality test read that as an ordinary path and reported the
+     * territory complete — admitting a feature on a territory the log does not carry, which is the one
+     * direction this design must never fail in.
+     */
+    const partly = `docs/${REDACTION_MARKER}/records`;
+    const events: EventEnvelope[] = [
+      {
+        ts: '2026-09-20T09:00:00.000Z',
+        seq: 1,
+        feature: 'partly-redacted',
+        run: '01K5NQ9ZJ7V3M2P9XQWRTC4BDE',
+        step: null,
+        emitter: 'engine.reconciler',
+        type: TERRITORY_DECLARED_EVENT_TYPE,
+        payload: { paths: ['src/engine', partly] },
+      },
+    ];
+
+    const replayed = territoryFromEvents(events);
+    if (replayed === null) throw new Error('the log declares a territory');
+    expect(replayed.complete).toBe(false);
+    expect(replayed.unreadable).toBe(1);
+    expect(replayed.territory).toStrictEqual(['src/engine']);
+    expect(admissionTerritoryOf(replayed)).toStrictEqual(WHOLE_REPOSITORY_TERRITORY);
+
+    // And the admission that follows from it: nothing is let through beside a territory nobody can read.
+    const unrelated = acceptedLog('unrelated-partly', ['docs']);
+    expect(admitReplayedTerritories([events, unrelated.events]).deferred).toHaveLength(1);
+  });
+
+  it('does not reproduce the shared-worktree serialisation, which the log does not carry', () => {
+    /**
+     * The one place the replay and the live pass disagree, pinned so it stays known.
+     *
+     * `admitByTerritory` serialises two features sharing one worktree however disjoint their declared file
+     * territories are, because a baseline reset there discards the other feature's work wholesale. The
+     * worktree is `plan.worktree` — declared configuration, not a function of the run id — so it is in no
+     * log and is not derivable from one, and carrying it on the payload would put an absolute path holding
+     * a bare ULID where AD-21's sweep replaces it. So the replay admits this pair and the live pass does
+     * not, and that is a spec decision about naming a worktree rather than a defect in this function.
+     */
+    const alpha = acceptedLog('worktree-alpha', ['src/engine']);
+    const beta = acceptedLog('worktree-beta', ['docs']);
+
+    // Live, with the worktree the plans declare: serialised, on the worktree and not on the paths.
+    const live = admitByTerritory([
+      { run: alpha.run, feature: 'worktree-alpha', territory: ['src/engine'], worktree: '/tmp/shared' },
+      { run: beta.run, feature: 'worktree-beta', territory: ['docs'], worktree: '/tmp/shared' },
+    ]);
+    expect(live.admitted).toHaveLength(1);
+    expect(live.deferred[0]?.reason).toContain('runs in worktree');
+
+    // Replayed, from the two logs alone: admitted together, because no log carries a worktree.
+    const replay = admitReplayedTerritories([alpha.events, beta.events]);
+    expect(replay.admitted).toHaveLength(2);
+    expect(replay.deferred).toStrictEqual([]);
   });
 
   it('reports a complete territory as its own, not as the whole repository', () => {

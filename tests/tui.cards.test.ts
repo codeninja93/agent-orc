@@ -54,12 +54,14 @@ import {
   commandApplied,
   handoffRecorded,
   questionAsked,
+  questionAskedEnriched,
   questionDefaultTaken,
   questionResolved,
   runCreated,
   specCriterionEdited,
   stepStarted,
   stepTerminated,
+  stepTerminatedWithUsage,
 } from './helpers/tui-log.js';
 
 /** A question id shaped as the engine mints them: punctuated, so AD-21's sweep cannot reach it. */
@@ -177,6 +179,52 @@ describe('the one-question card states everything Q1 through Q3 require', () => 
     expect(fromLogAlone.brief).toBe(UNRECORDED_PRESENTATION);
     // The log carries the declared window but not the instant it started, so the card says which it means.
     expect(fromLogAlone.window).toContain('from when it was asked');
+  });
+});
+
+describe('the detail and the fold are read field by field, and an empty field knows nothing', () => {
+  it('keeps the folded options when the detail holds an empty list', () => {
+    /**
+     * `declaredOptions ?? folded.concrete` cannot tell "the reader had no list" from "the reader had an
+     * empty one", and an empty list is present, so it won — and a question the log had recorded three
+     * options for rendered with nothing to choose. The stated intent is "the most the two sources together
+     * know"; an empty list is the least.
+     */
+    const view = foldEvents(
+      buildLog([runCreated(), { ...questionAskedEnriched(QUESTION_ID), atMs: 2_000 }]),
+    );
+    const card = buildQuestionCard({
+      view,
+      question: { ...threeOptionQuestion(), options: [] },
+      now: new Date(FIXTURE_RUN_START_MS + 62_000),
+    });
+
+    expect(card.options.filter((option) => !option.escape).map((option) => option.id)).toStrictEqual([
+      'poll',
+      'watch',
+    ]);
+    for (const option of card.options) expect(option.consequence).not.toBe('');
+    // The prompt and the brief still come from the detail: the fallback is per field, not per object.
+    expect(card.prompt).toBe(threeOptionQuestion().prompt);
+  });
+
+  it('ignores an escape the detail carries with no id, which nobody could name', () => {
+    const view = foldEvents(
+      buildLog([runCreated(), { ...questionAskedEnriched(QUESTION_ID), atMs: 2_000 }]),
+    );
+    const card = buildQuestionCard({
+      view,
+      question: {
+        ...threeOptionQuestion(),
+        escape: { id: '', label: 'nothing', consequence: 'nothing' },
+      },
+      now: new Date(FIXTURE_RUN_START_MS + 62_000),
+    });
+
+    // `optionList` already drops an unnamed option on the fold side; the detail side now agrees.
+    expect(card.options.filter((option) => option.escape).map((option) => option.id)).not.toContain(
+      '',
+    );
   });
 });
 
@@ -712,6 +760,34 @@ describe('the handoff card takes its reason from the log rather than from prose'
     expect(cardText(card)).not.toMatch(/branch:\s*$/mu);
   });
 
+  it('does not offer a checkout for a branch the caller said does not exist', () => {
+    /**
+     * The third variant of the same sentence. Story 1-7's round fixed the escape-hatch-failed case and
+     * 1-10's the empty string; `null` — what a caller passes when the escape hatch created no branch at all
+     * — fell through to the derivation and got a `git checkout` line for a branch nobody made. The rule now
+     * pinned is the precondition rather than the value: a caller that *stated* the location wins, absence
+     * included, and the derivation answers only the question nobody answered.
+     */
+    const run = '01K5NQ9ZJ7V3M2P9XQWRTC4BDE';
+    const silent = buildHandoffCard({ view: handedOffView(), run, orchHome: '/tmp/orch' });
+    // With nobody stating a location the derivation still answers, which the stage-1 gate turns on.
+    expect(silent.nextStep).toContain(`git checkout orch/takeover/${run}`);
+
+    for (const branch of [null, '', '   '] as const) {
+      const card = buildHandoffCard({
+        view: handedOffView(),
+        run,
+        orchHome: '/tmp/orch',
+        location: { branch },
+      });
+      expect(card.branch, `branch ${JSON.stringify(branch)}`).toBe(UNRECORDED_PRESENTATION);
+      expect(card.nextStep).not.toContain('git checkout');
+      expect(cardText(card)).not.toContain('orch/takeover/');
+      // The document was not spoken about, so it is still derived: the two halves fail independently.
+      expect(card.document).toContain('HANDOFF.md');
+    }
+  });
+
   it('does not open with two sentences that say the same thing', () => {
     // The fallback case, where the first line already says the run stopped and named the feature.
     const card = buildHandoffCard({ view: idleShellView('refund-flow') });
@@ -762,6 +838,22 @@ describe('the handoff card reads as a colleague note, not a stack trace', () => 
 describe('which card a view calls for is decided in one place', () => {
   it('gives a pending question its card, whatever else the run is doing', () => {
     expect(cardForView(pendingQuestionView())?.kind).toBe('question');
+  });
+
+  it('forwards the run and the home to the handoff card it builds (matrix 7)', () => {
+    /**
+     * The dispatch the shell actually uses, asserted through {@link cardForView} rather than through
+     * `buildHandoffCard`. Every test of the derivation called the builder directly, so deleting the two
+     * spread lines that forward `run` and `orchHome` here left the whole suite green while the card the
+     * shell draws reported `(not recorded)` for both — the exact state story 1-10 was pinned at, reached
+     * through the one path a person's terminal takes.
+     */
+    const run = '01K5NQ9ZJ7V3M2P9XQWRTC4BDE';
+    const card = cardForView(handedOffView(), { run, orchHome: '/tmp/orch' });
+    if (card?.kind !== 'handoff') throw new Error('the handoff card was not dispatched');
+    expect(card.branch).toBe(`orch/takeover/${run}`);
+    expect(card.document).toContain(`${run}/HANDOFF.md`);
+    expect(card.nextStep).toContain(`git checkout orch/takeover/${run}`);
   });
 
   it('gives a drafting run the spec echo, a committed one the notice, a handed-off one the note', () => {
@@ -889,12 +981,28 @@ describe('no card renders a currency amount (R10)', () => {
   /** Every spelling a currency amount arrives as. The word "cost" is a legitimate label and is not one. */
   const CURRENCY_MARKERS = ['$', '€', '£', '¥', 'usd', 'eur', 'gbp', 'dollar', 'price'];
 
+  /**
+   * A view whose fold really carries a cost and token counts, which is what makes this block a guard.
+   *
+   * It used to build from {@link stepTerminated}, the pre-1-11 builder that writes no `usage` key at all —
+   * so `view.usage.total` folded to `null`, all six cards rendered `(not recorded)`, and the currency
+   * assertions below ran against strings with no number in them. Prepending a `$` figure to
+   * `formatTokenUsage` left the whole block silent. The numbers are the recorded transcript's own
+   * (`tests/fixtures/stream-json/completed.jsonl`), including the four-decimal `cost_usd` that is the exact
+   * shape R10 forbids a card from printing.
+   */
   const withUsage = (): ShellView =>
     foldEvents(
       buildLog([
         runCreated(),
         stepStarted('implement'),
-        stepTerminated('implement', 'completed'),
+        stepTerminatedWithUsage('implement', {
+          cost_usd: 0.0354739,
+          input_tokens: 18,
+          output_tokens: 524,
+          cache_creation_input_tokens: 15647,
+          cache_read_input_tokens: 15419,
+        }),
         featureStateChanged('committed'),
       ]),
     );

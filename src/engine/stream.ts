@@ -194,10 +194,16 @@ const numberOrNull = (value: unknown): number | null =>
  * An integer count, or `null`. A fractional token count is not a count, so it is read as unreported
  * rather than rounded: the contract declares `z.int()` and a value that would fail it must not be minted
  * here only to be refused by the schema later.
+ *
+ * **Safe** integer, for the same reason stated the other way round. `Number.isInteger(2 ** 53)` is `true`
+ * and `z.int()` refuses that value as too big, so a token count at or above 2^53 — anything a malformed or
+ * hostile result line can put there — made `StepUsageSchema.parse` throw out of {@link parseStreamLine},
+ * which for every other unreadable shape degrades to a malformed record rather than throwing. A count this
+ * function cannot represent is a count it did not read (R8): absence, not a throw.
  */
 const countOrNull = (value: unknown): number | null => {
   const found = numberOrNull(value);
-  return found !== null && Number.isInteger(found) ? found : null;
+  return found !== null && Number.isSafeInteger(found) ? found : null;
 };
 
 /**
@@ -220,7 +226,10 @@ const usageFromModelUsage = (value: unknown): StepUsage | null => {
   const add = (carried: number | null, next: number | null): number | null => {
     if (next === null) return carried;
     seen = true;
-    return (carried ?? 0) + next;
+    const sum = (carried ?? 0) + next;
+    // Each term is safe, their sum need not be, and `z.int()` refuses an unsafe one — the same throw the
+    // read above avoids, arrived at by arithmetic. A total this reader cannot state is one it did not read.
+    return Number.isSafeInteger(sum) ? sum : carried;
   };
   for (const entry of Object.values(value)) {
     if (!isObject(entry)) continue;

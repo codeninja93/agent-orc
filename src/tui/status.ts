@@ -120,9 +120,12 @@ const grouped = (count: number): string => {
  * subscription usage, never currency" — and AD-24 gives a run three ceilings "and no currency dimension".
  * Model usage is prepaid by subscription and costs nothing at the margin, so a figure with a currency mark
  * on it would be a fiction about the thing a person is deciding with. The CLI's own `total_cost_usd` is
- * recorded in the log because story 2-9's ceilings and story 3-3's measurement are specified to read it;
- * The CLI's cost figure is recorded in the log but rendered nowhere, and no ambient segment
- * does.
+ * recorded in the log because story 2-9's ceilings and story 3-3's measurement are specified to read it,
+ * and it is rendered here and in no other segment: nowhere at all.
+ *
+ * The counts are stated in the order a person reads them — what went in, what came out, then what the cache
+ * did — which is not `STEP_USAGE_FIELDS`' order and deliberately so: that list is every field once,
+ * for a reader that must not miss one, and this is a sentence.
  *
  * An unrecorded field is omitted from the phrase rather than printed as `0`: a count nobody measured is not
  * a count of nothing (R8, R12). A record with nothing in it reads `(not recorded)`.

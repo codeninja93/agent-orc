@@ -23,7 +23,11 @@
  */
 import { posix, sep } from 'node:path';
 
-import { FeatureTerritoryDeclaredPayloadSchema } from '../contracts/index.js';
+import {
+  DECLARATION_PAYLOAD_KEYS,
+  FEATURE_TERRITORY_DECLARED_EVENT_TYPE,
+  FeatureTerritoryDeclaredPayloadSchema,
+} from '../contracts/index.js';
 import type { EventEnvelope } from '../contracts/index.js';
 import { REDACTION_MARKER } from '../runtime/index.js';
 
@@ -211,9 +215,9 @@ export class TerritoryLedger {
  * type itself is declared in `src/contracts/event.ts`, which is where a reader that is not the engine —
  * there is none today, and story 3-1's web surface will be one — looks it up.
  */
-export const TERRITORY_DECLARED_EVENT_TYPE = 'feature.territory_declared';
+export const TERRITORY_DECLARED_EVENT_TYPE = FEATURE_TERRITORY_DECLARED_EVENT_TYPE;
 
-export const TERRITORY_PATHS_PAYLOAD_KEY = 'paths';
+export const TERRITORY_PATHS_PAYLOAD_KEY = DECLARATION_PAYLOAD_KEYS.TerritoryPaths;
 
 /** The payload of a `feature.territory_declared` line: normalised, de-duplicated, stably ordered. */
 export const territoryDeclaredPayload = (
@@ -267,7 +271,20 @@ export const territoryFromEvents = (
     const parsed = FeatureTerritoryDeclaredPayloadSchema.safeParse(event.payload);
     if (!parsed.success) continue;
     const declared = parsed.data[TERRITORY_PATHS_PAYLOAD_KEY];
-    const readable = declared.filter((path) => path !== REDACTION_MARKER);
+    /**
+     * The marker is matched **anywhere in the entry**, not only as the whole of it.
+     *
+     * `redactString` substitutes the marker *inside* a longer string — AD-21 replaces the run it found and
+     * leaves the rest of the value alone — so `docs/[redacted]/records` is a path the log does not carry,
+     * and testing for equality admitted it as one and reported `complete: true` for a territory nobody can
+     * reconstruct. That fails *open*, and the whole of this design is argued from failing safe: a feature
+     * serialised unnecessarily costs a pass, one admitted wrongly costs another feature's work.
+     *
+     * This is the same defect story 1-9's round fixed in `isRedacted` in `src/tui/projection.ts`; the fix
+     * landed in the renderer and not here, where the consequence is a wrong admission rather than a wrong
+     * word on a screen.
+     */
+    const readable = declared.filter((path) => !path.includes(REDACTION_MARKER));
     found = {
       run: event.run,
       feature: event.feature,
@@ -305,6 +322,24 @@ export const territoriesFromLogs = (
  * what makes the serialisation AD-4 requires *reconstructable* rather than merely repeatable. It is not a
  * second authority for the decision: a live pass still reads the plans, and this reads what those plans
  * were recorded as.
+ *
+ * **What this replay does not reproduce, stated rather than left to be discovered.** A live pass passes
+ * `worktree` on every candidate, and {@link sharesWorktree} serialises two features sharing one worktree
+ * however disjoint their declared file territories are — because a baseline reset there discards the other
+ * feature's work wholesale. The log carries no worktree, so a replay of exactly that pair **admits them
+ * together** where the live pass serialised them. The replay is therefore a faithful reconstruction of the
+ * *declared-territory* half of the decision and of nothing else.
+ *
+ * It is stated rather than fixed because neither remedy is available here. The worktree is
+ * `plan.worktree` — declared configuration, not a function of the run id, which is the whole point: two
+ * features are configured to share one. So it cannot be derived the way the handoff branch is. And carrying
+ * it on `feature.territory_declared` would put an absolute path containing a bare 26-character ULID inside
+ * a payload, which AD-21's entropy sweep replaces — leaving the replay reading `[redacted]` where it needed
+ * a directory, and the only escape a wider allow-list, which AD-21 admits no remedy for. Closing this needs
+ * a spec decision about how a worktree is named, not a patch here.
+ *
+ * `tests/engine.territory-replay.test.ts` pins the divergence directly, so it stays a known limitation
+ * rather than becoming a surprise the day something calls this.
  */
 export const admitReplayedTerritories = (
   logs: readonly (readonly EventEnvelope[])[],
