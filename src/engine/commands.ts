@@ -36,12 +36,14 @@
  * A restart has to reach the same state, and directory order is not a promise any filesystem makes.
  */
 import {
-  existsSync,
+  closeSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -58,8 +60,10 @@ import {
   INTENT_ID_PATTERN,
   INTENT_TEMP_SUFFIX,
   MAX_INTENT_ID_TOKEN_RUN,
+  fsyncDirectory,
   isLoggableIntentId,
 } from '../runtime/commands.js';
+import { isStopCommand } from '../runtime/steering-view.js';
 import type { RunPaths } from '../runtime/index.js';
 
 /**
@@ -112,6 +116,12 @@ export {
   MAX_INTENT_ID_TOKEN_RUN,
   isLoggableIntentId,
 };
+export {
+  ABANDONED_TEMPORARY_GRACE_MS,
+  INTENT_SEED_PATTERN,
+  UnusableIntentSeed,
+  sweepCommandTemporaries,
+} from '../runtime/commands.js';
 export type { NewCommandIntent } from '../runtime/commands.js';
 
 /** The suffix of the sidecar written beside a quarantined intent, naming why it was refused. */
@@ -126,6 +136,20 @@ export const REFUSAL_SIDECAR_EXTENSION = '.refusal.json';
  * Inside the grace the file is left for its writer to finish; outside it, nothing is coming.
  */
 export const TORN_INTENT_GRACE_MS = 5_000;
+
+/**
+ * How far into the future a file's modification time may sit before it is read as a skewed clock.
+ *
+ * A *tiny* negative age is ordinary and means nothing: a filesystem records mtime with sub-millisecond
+ * precision while `Date.now()` truncates to the millisecond, so a file written microseconds ago
+ * legitimately reads as a fraction of a millisecond "in the future". A second is orders of magnitude
+ * above that jitter and orders of magnitude below a skew worth acting on, so it is the line between "just
+ * written" and "written by a machine whose clock disagrees with this one".
+ *
+ * Beyond it, the mtime is not a time this process can wait out: a grace measured against a clock an hour
+ * ahead expires in an hour, during which the torn file is met by every pass and every 25ms poll.
+ */
+export const CLOCK_SKEW_TOLERANCE_MS = 1_000;
 
 /** Why an intent file was refused. Every reason is a constant, so a refusal is never free text. */
 export const INTENT_REFUSAL_REASONS = [
@@ -159,6 +183,29 @@ export const INTENT_REFUSAL_REASONS = [
   'no-open-question',
   /** The command is declared but not honoured by this build; the owning story is named. */
   'not-yet-honoured',
+  /**
+   * The id is in the log against a *different* command, so it is not a redelivery of this one.
+   *
+   * The exactly-once ledger keys on the id. Without the command beside it, a second intent reusing an
+   * id would be recognised as "already applied" and dropped with no effect and no refusal — a command
+   * that vanished. A reused id is a writer's fault, not a redelivery, and is refused as one.
+   */
+  'intent-id-reused',
+  /**
+   * The file exists but could not be read at all — EACCES, EIO, a directory where a file should be.
+   *
+   * Refused rather than skipped. A silent `continue` put the file in none of the three classes, so no
+   * pass reported it and no pass ever quarantined it: met and stepped over for ever, which is exactly
+   * the poison file the transport must not leave behind.
+   */
+  'unreadable-file',
+  /**
+   * Applying the effect threw, so the intent is not a transport fault but is not applicable either.
+   *
+   * Quarantined rather than left pending, because an intent whose effect throws throws again on every
+   * pass and on every 25ms mid-step poll — a poison file wearing an effect's clothes.
+   */
+  'effect-failed',
 ] as const;
 
 export type IntentRefusalReason = (typeof INTENT_REFUSAL_REASONS)[number];
@@ -183,6 +230,16 @@ export interface PendingIntent {
   readonly intent: CommandIntent;
   readonly fileName: string;
   readonly path: string;
+  /**
+   * How long ago the file was written, or `null` when that could not be read.
+   *
+   * Carried because one caller has to give a *valid* intent a grace period too, not only a torn one: an
+   * intent written between a run directory's creation and its first log append belongs to a run that
+   * carries no state yet, and quarantining it on sight destroys a command the user issued a millisecond
+   * too early. Age is the only thing that tells that case from an intent addressed to a run that will
+   * never exist.
+   */
+  readonly ageMs: number | null;
 }
 
 /** What one read of `commands/` found. */
@@ -209,21 +266,44 @@ const refusal = (
   quarantinedTo: null,
 });
 
-/** The field paths a Zod failure named, rendered for a person rather than dumped. */
-const namedFields = (issues: readonly { readonly path: readonly PropertyKey[] }[]): string =>
-  [...new Set(issues.map((issue) => issue.path.map(String).join('.')).filter((path) => path !== ''))]
-    .join(', ');
+/**
+ * The field paths a Zod failure named, rendered for a person rather than dumped.
+ *
+ * A failure at the *root* — the document is a string, a number or an array rather than an object —
+ * names no field at all, and the sentence built from it used to end "the declared shape rejects " with
+ * nothing after it. So the empty case is answered in words instead: the fault is the document, not a
+ * field of it.
+ */
+const namedFields = (issues: readonly { readonly path: readonly PropertyKey[] }[]): string => {
+  const named = [
+    ...new Set(issues.map((issue) => issue.path.map(String).join('.')).filter((path) => path !== '')),
+  ];
+  return named.length === 0
+    ? 'the document itself, which is valid JSON but not an object with the declared fields'
+    : named.join(', ');
+};
 
 /**
  * Order the intents of one pass.
  *
- * Issue time first, then the intent id, then the file name: three total keys, so two intents arriving
- * in one pass are applied in the same order however the directory was listed and however many times
- * the pass is repeated. A restart that applied them the other way round could reach a different state,
- * which is the one thing AD-7 does not allow.
+ * **A stop gesture goes first, whatever its issue time.** This is not a tidiness rule: a person who
+ * presses disengage while a `confirm_spec` or an `approve` is still sitting in `commands/` has pressed it
+ * *to override that command*, and applying the earlier one first walks the run into execution before
+ * stopping it. `issued_at` cannot arbitrate that — it is writer-supplied, so a skewed clock on the
+ * machine that wrote the approval is enough to put it first — and CAP-5's "always available" is not a
+ * promise a queue position can keep. The mid-step watcher already gives these three the same precedence;
+ * this makes the pass agree with it.
+ *
+ * After that: issue time, then the intent id, then the file name — three more total keys, so two intents
+ * arriving in one pass are applied in the same order however the directory was listed and however many
+ * times the pass is repeated. A restart that applied them the other way round could reach a different
+ * state, which is the one thing AD-7 does not allow.
  */
 export const orderIntents = (intents: readonly PendingIntent[]): readonly PendingIntent[] =>
   [...intents].sort((a, b) => {
+    const stopA = isStopCommand(a.intent.command);
+    const stopB = isStopCommand(b.intent.command);
+    if (stopA !== stopB) return stopA ? -1 : 1;
     if (a.intent.issued_at !== b.intent.issued_at) {
       return a.intent.issued_at < b.intent.issued_at ? -1 : 1;
     }
@@ -232,6 +312,8 @@ export const orderIntents = (intents: readonly PendingIntent[]): readonly Pendin
     }
     return a.fileName < b.fileName ? -1 : a.fileName > b.fileName ? 1 : 0;
   });
+
+export { STOP_COMMANDS, isStopCommand } from '../runtime/steering-view.js';
 
 /** Names of the files in `commands/` that could be intents, ignoring the two quarantine directories. */
 const intentFileNames = (paths: RunPaths): readonly string[] => {
@@ -244,16 +326,41 @@ const intentFileNames = (paths: RunPaths): readonly string[] => {
     // No commands directory is the ordinary case: a run nobody has steered.
     return [];
   }
+  /**
+   * No sidecar filter. A refusal sidecar is only ever written into `commands/refused/`, which this
+   * non-recursive listing never descends into, and an intent id may no longer contain a `.` — so no file
+   * in `commands/` can be named like one. The filter that used to sit here was dead in both directions,
+   * and worse than dead: it was the mechanism by which an id ending `.refusal` produced a file this
+   * reader hid from itself, so a disengage written with such an id was never read, never refused and
+   * never reported. The fix is in `INTENT_ID_PATTERN`, where a name can no longer be built that way.
+   */
   return entries
     .filter((name) => name.endsWith(INTENT_FILE_EXTENSION) && !name.endsWith(INTENT_TEMP_SUFFIX))
-    .filter((name) => !name.endsWith(REFUSAL_SIDECAR_EXTENSION))
     .sort();
 };
 
-/** How long ago a file was last written, or `null` when that cannot be read. */
+/**
+ * How long ago a file was last written, or `null` when that cannot be read.
+ *
+ * A *negative* age is reported as it is rather than clamped to zero. Clamping made a file whose mtime
+ * was in the future — a clock that stepped back, an NFS server a minute ahead — look permanently
+ * freshly-written, so a torn one stayed inside its grace on every pass and was classified `incomplete`
+ * for ever. A skew cannot be waited out, so the caller treats it as age rather than as youth.
+ */
 const ageMs = (path: string, now: number): number | null => {
   try {
-    return Math.max(now - statSync(path).mtimeMs, 0);
+    const age = now - statSync(path).mtimeMs;
+    /**
+     * Jitter is clamped to zero; a real skew is not.
+     *
+     * A file written microseconds ago reads as a fraction of a millisecond in the future, because the
+     * filesystem records sub-millisecond mtimes and `Date.now()` truncates — that is a brand-new file and
+     * is reported as one. A mtime a *second or more* ahead is a clock that disagrees, and the caller has
+     * to be able to tell: clamping it to zero (which is what this used to do to everything) made such a
+     * file look permanently freshly-written, so a torn one sat inside its grace on every pass until real
+     * time caught up, which for a badly-skewed clock is hours.
+     */
+    return age < 0 && age > -CLOCK_SKEW_TOLERANCE_MS ? 0 : age;
   } catch {
     return null;
   }
@@ -268,10 +375,24 @@ const ageMs = (path: string, now: number): number | null => {
  */
 export const readIntentFiles = (
   paths: RunPaths,
-  options: { readonly now?: () => Date; readonly tornGraceMs?: number } = {},
+  options: {
+    readonly now?: () => Date;
+    readonly tornGraceMs?: number;
+    /**
+     * How a file's bytes are read. The default is `readFileSync`, and nothing in production passes another.
+     *
+     * A seam, for the same reason `now` is one: the `EACCES`/`EIO` class — a file that is present and
+     * cannot be read — has no portable way to be produced on a filesystem. `chmod 000` does nothing when
+     * the suite runs as root, which it does in the container, and a directory is filtered out by the
+     * listing before it is ever read. Without the seam the branch that classifies it would be untestable,
+     * and it is the branch whose absence used to create a file no pass ever reported.
+     */
+    readonly readFile?: (path: string) => string;
+  } = {},
 ): IntentDirectoryRead => {
   const now = (options.now ?? ((): Date => new Date()))().getTime();
   const grace = options.tornGraceMs ?? TORN_INTENT_GRACE_MS;
+  const readFile = options.readFile ?? ((path: string): string => readFileSync(path, 'utf8'));
 
   const pending: PendingIntent[] = [];
   const refused: IntentRefusal[] = [];
@@ -280,12 +401,31 @@ export const readIntentFiles = (
   for (const fileName of intentFileNames(paths)) {
     const path = join(paths.commandsDir, fileName);
 
+    const age = ageMs(path, now);
+
     let raw: string;
     try {
-      raw = readFileSync(path, 'utf8');
-    } catch {
-      // Read after a concurrent rename, or a permission fault. Neither is a refusal: the file may
-      // well be there on the next pass, and refusing would quarantine something never inspected.
+      raw = readFile(path);
+    } catch (thrown: unknown) {
+      /**
+       * `ENOENT` is the one benign case: the file was retired, quarantined or renamed between the
+       * listing and this read, so there is nothing here to refuse and nothing to report.
+       *
+       * Everything else — `EACCES`, `EIO`, `EISDIR` — is a file that exists and cannot be read, and it
+       * used to be `continue`d silently. That put it in none of the three classes: no pass reported it,
+       * no pass quarantined it, and every pass and every 25ms mid-step poll met it again. That is the
+       * poison file this module exists to make impossible, created by the reader itself.
+       */
+      const code = (thrown as { code?: string } | null)?.code;
+      if (code === 'ENOENT') continue;
+      refused.push(
+        refusal(
+          fileName,
+          'unreadable-file',
+          `the file is present but could not be read (${code ?? 'no error code'}), so nothing about it ` +
+            'can be decided. It is moved out of the way rather than met again by every later pass.',
+        ),
+      );
       continue;
     }
 
@@ -297,9 +437,13 @@ export const readIntentFiles = (
        * A partial JSON write. Inside the grace it is the writer's business and is left alone — the
        * matrix's "the file is not treated as consumed". Outside it, no writer is coming back, and a
        * file left for ever would be met by every later pass.
+       *
+       * An unreadable mtime is treated as *outside* the grace, not inside it. A file whose age cannot be
+       * read will never become readable by waiting, so leaving it `incomplete` leaves it `incomplete` for
+       * ever — the same poison file by a different route. A future mtime lands here too, because
+       * {@link ageMs} reports skew as a negative age rather than clamping it away.
        */
-      const age = ageMs(path, now);
-      if (age === null || age < grace) {
+      if (age !== null && age >= 0 && age < grace) {
         incomplete.push(fileName);
         continue;
       }
@@ -307,8 +451,15 @@ export const readIntentFiles = (
         refusal(
           fileName,
           'abandoned-partial-write',
-          `the file is not whole JSON and was last written ${String(Math.round(age / 1000))}s ago, ` +
-            'so the writer that started it is not going to finish it',
+          age === null
+            ? 'the file is not whole JSON and its modification time could not be read, so there is no ' +
+              'grace period that could tell a live writer from a dead one'
+            : age < 0
+              ? `the file is not whole JSON and its modification time is ${String(
+                  Math.round(-age / 1000),
+                )}s in the future, so a grace period measured against it cannot be waited out`
+              : `the file is not whole JSON and was last written ${String(Math.round(age / 1000))}s ago, ` +
+                'so the writer that started it is not going to finish it',
         ),
       );
       continue;
@@ -400,23 +551,55 @@ export const readIntentFiles = (
       continue;
     }
 
-    pending.push({ intent, fileName, path });
+    pending.push({ intent, fileName, path, ageMs: age });
   }
 
   return { pending: orderIntents(pending), refused, incomplete };
 };
 
-/** Move a file aside, giving it a fresh name if something already sits there. */
+/**
+ * How many suffixed names a collision is given before the name is made unique by other means.
+ *
+ * A bound rather than a `while` loop, because the loop it replaces was unbounded: a directory holding
+ * every suffix would spin it, and the thing being protected is a pass that must finish.
+ */
+const MOVE_ASIDE_SUFFIX_LIMIT = 100;
+
+/**
+ * Move a file aside, giving it a fresh name if something already sits there.
+ *
+ * The name is reserved by an **exclusive create**, not by an `existsSync` test. The test-then-rename it
+ * replaces was a time-of-check/time-of-use gap on a directory two processes write to: both could see the
+ * same free name, and the second `rename` would replace — silently destroying the first quarantined
+ * file, which is the one copy of the evidence. `wx` decides the name atomically, and `rename` over the
+ * reservation this process owns is then safe.
+ *
+ * The first collision is named `.1`, which is what a reader expects of the first duplicate; the old
+ * numbering started at `.2` and left `.1` permanently unused.
+ */
 const moveAside = (from: string, intoDir: string, fileName: string): string => {
   mkdirSync(intoDir, { recursive: true });
-  let target = join(intoDir, fileName);
-  let suffix = 1;
-  while (existsSync(target)) {
-    suffix += 1;
-    target = join(intoDir, `${fileName}.${String(suffix)}`);
+  for (let suffix = 0; suffix <= MOVE_ASIDE_SUFFIX_LIMIT; suffix += 1) {
+    const target = join(intoDir, suffix === 0 ? fileName : `${fileName}.${String(suffix)}`);
+    try {
+      closeSync(openSync(target, 'wx'));
+    } catch (thrown: unknown) {
+      if ((thrown as { code?: string } | null)?.code === 'EEXIST') continue;
+      throw thrown;
+    }
+    renameSync(from, target);
+    fsyncDirectory(intoDir);
+    return target;
   }
-  renameSync(from, target);
-  return target;
+  // Every suffix taken. A name nothing can collide with, rather than a refusal: the file still has to
+  // leave `commands/`, or the pass that refused it meets it again.
+  const unique = join(
+    intoDir,
+    `${fileName}.${String(process.pid)}.${String(Date.now())}${INTENT_FILE_EXTENSION}`,
+  );
+  renameSync(from, unique);
+  fsyncDirectory(intoDir);
+  return unique;
 };
 
 /**
@@ -431,15 +614,27 @@ export const quarantineIntent = (paths: RunPaths, found: IntentRefusal): IntentR
   let quarantinedTo: string | null = null;
   try {
     quarantinedTo = moveAside(source, paths.commandsRefusedDir, found.fileName);
+    // As in `retireIntent`: the rename out of `commands/` is what stops the file being met again, so the
+    // directory it left is synced as well as the one it arrived in.
+    fsyncDirectory(paths.commandsDir);
   } catch {
     // The file is already gone, or the move failed. Either way the sidecar below still records the
     // refusal, and a file that cannot be moved is reported rather than retried silently.
     quarantinedTo = null;
   }
 
+  /**
+   * The sidecar is named after where the file *landed*, not after what it was called.
+   *
+   * Two files quarantined under one name is the ordinary consequence of {@link moveAside}'s suffixing,
+   * and a sidecar named from `found.fileName` would have been written twice to the same path — so the
+   * second refusal's explanation overwrote the first's, on the one artifact that is the only record when
+   * the run has no log to write to.
+   */
+  const sidecarFor = quarantinedTo === null ? found.fileName : basenameOf(quarantinedTo);
   try {
     writeFileSync(
-      join(paths.commandsRefusedDir, `${found.fileName}${REFUSAL_SIDECAR_EXTENSION}`),
+      join(paths.commandsRefusedDir, `${sidecarFor}${REFUSAL_SIDECAR_EXTENSION}`),
       `${JSON.stringify(
         {
           schema_version: CURRENT_SCHEMA_VERSION,
@@ -471,25 +666,95 @@ export const quarantineIntent = (paths: RunPaths, found: IntentRefusal): IntentR
  */
 export const retireIntent = (paths: RunPaths, pending: PendingIntent): string | null => {
   try {
-    return moveAside(pending.path, paths.commandsAppliedDir, pending.fileName);
+    const moved = moveAside(pending.path, paths.commandsAppliedDir, pending.fileName);
+    // The rename *out of* `commands/` is what stops the intent being redelivered, so that directory's
+    // own metadata is synced too: a crash that lost this rename would redeliver a command whose effect
+    // is already in the log. The id ledger makes that harmless, but harmless is not the same as durable.
+    fsyncDirectory(paths.commandsDir);
+    return moved;
   } catch {
     return null;
   }
 };
 
+/** The final path segment, used to name a sidecar after the file it explains. */
+const basenameOf = (path: string): string => path.slice(path.lastIndexOf('/') + 1);
+
 /**
- * Every intent id the log says has already been applied.
+ * How many retired and refused intents a run keeps before the oldest are removed.
+ *
+ * `applied/` and `refused/` are evidence, not state: nothing reads them, and the log holds every fact
+ * they carry. Unbounded, they are one file per keystroke for the life of a run — so they are pruned to a
+ * window that still answers "what steered this run recently" without growing without limit. Newest kept,
+ * because that is the window a person looks at.
+ */
+export const RETIRED_INTENT_KEEP = 200;
+
+/**
+ * Prune `commands/applied/` and `commands/refused/` to the most recent {@link RETIRED_INTENT_KEEP}.
+ *
+ * Ordering is by file name, which begins with the issue timestamp, so it is chronological without a
+ * `stat` per file. A refusal sidecar is pruned with the file it explains rather than counted separately:
+ * an explanation whose subject is gone explains nothing.
+ */
+export const pruneRetiredIntents = (paths: RunPaths, keep: number = RETIRED_INTENT_KEEP): number => {
+  let removed = 0;
+  for (const directory of [paths.commandsAppliedDir, paths.commandsRefusedDir]) {
+    let names: string[];
+    try {
+      names = readdirSync(directory).sort();
+    } catch {
+      continue;
+    }
+    const subjects = names.filter((name) => !name.endsWith(REFUSAL_SIDECAR_EXTENSION));
+    if (subjects.length <= keep) continue;
+    for (const name of subjects.slice(0, subjects.length - keep)) {
+      for (const victim of [name, `${name}${REFUSAL_SIDECAR_EXTENSION}`]) {
+        try {
+          unlinkSync(join(directory, victim));
+          removed += 1;
+        } catch {
+          // Already gone, or not ours to remove. Neither is a fault: the prune is best-effort tidying.
+        }
+      }
+    }
+  }
+  return removed;
+};
+
+/**
+ * Every intent id the log says has already been applied, **and which command it was applied for**.
  *
  * This is the exactly-once ledger, and it lives in the log because AD-4 makes the log the only
  * durable truth: a ledger kept anywhere else would be a second authority for the one fact that
  * decides whether a user's approval is applied twice.
+ *
+ * The command travels with the id because the id alone cannot tell a *redelivery* from a *reuse*. An
+ * intent whose id is already in the log against a different command is not the same gesture arriving
+ * twice — it is a second, different command that the ledger would have swallowed as "already applied",
+ * with no effect, no refusal and nothing anywhere saying it did nothing. A `Map` makes that
+ * distinguishable; a `Set` could not.
+ *
+ * The value is `null` for a logged line whose `command` field is absent or not a declared command: the
+ * id has been applied, but what it was applied *for* is unknown, so a later intent carrying it cannot be
+ * called a mismatch on evidence the log does not have.
  */
-export const appliedIntentIds = (events: readonly EventEnvelope[]): ReadonlySet<string> => {
-  const applied = new Set<string>();
+export const appliedIntentIds = (
+  events: readonly EventEnvelope[],
+): ReadonlyMap<string, Command | null> => {
+  const applied = new Map<string, Command | null>();
   for (const event of events) {
     if (event.type !== COMMAND_EVENT_TYPES.Applied) continue;
     const id = event.payload['intent_id'];
-    if (typeof id === 'string' && id !== '') applied.add(id);
+    if (typeof id !== 'string' || id === '') continue;
+    const command = event.payload['command'];
+    const declared =
+      typeof command === 'string' && (COMMANDS as readonly string[]).includes(command)
+        ? (command as Command)
+        : null;
+    // The first line for an id is the one that applied it; a later one is the redelivery the fold
+    // already ignores, so it does not get to restate what the command was.
+    if (!applied.has(id)) applied.set(id, declared);
   }
   return applied;
 };

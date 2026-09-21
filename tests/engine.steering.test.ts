@@ -19,7 +19,7 @@ import {
   commandRequiresArgument,
   makeError,
 } from '../src/contracts/index.js';
-import type { CommandIntent, RunState, StepRecord } from '../src/contracts/index.js';
+import type { Command, CommandIntent, RunState, StepRecord } from '../src/contracts/index.js';
 import { readEventLog, runPaths } from '../src/runtime/index.js';
 import {
   COMMAND_EVENT_TYPES,
@@ -163,7 +163,14 @@ const anUnvalidatedIntent = (
   argument,
 });
 
-const noneApplied = { applied: new Set<string>() };
+/**
+ * Nothing applied yet.
+ *
+ * A `Map` rather than a `Set` since the ledger began carrying the command beside the id: the id alone
+ * cannot tell a redelivery from a second command reusing an id, and the second used to be dropped as
+ * "already applied" with no effect and no refusal.
+ */
+const noneApplied = { applied: new Map<string, Command>() };
 
 describe('every member of the Command enum has a declared handling', () => {
   it('names an effect, an acknowledgement or the story that owns it, for all of them', () => {
@@ -246,14 +253,14 @@ describe('every member of the Command enum has a declared handling', () => {
 describe('the effect is idempotent on intent_id', () => {
   it('recognises an id already in the log and changes nothing', () => {
     const intent = anIntent('kill');
-    const decision = decideSteering(intent, aState(), { applied: new Set([intent.intent_id]) });
+    const decision = decideSteering(intent, aState(), { applied: new Map([[intent.intent_id, 'kill']]) });
     expect(decision.kind).toBe('already-applied');
   });
 
   it('applies the same command under a different id, because that is a second gesture', () => {
     const first = anIntent('kill');
     const second = anIntent('kill');
-    const decision = decideSteering(second, aState(), { applied: new Set([first.intent_id]) });
+    const decision = decideSteering(second, aState(), { applied: new Map([[first.intent_id, 'kill']]) });
     expect(decision.kind).toBe('apply');
   });
 });
@@ -270,13 +277,123 @@ describe('a terminal run refuses every command', () => {
     },
   );
 
-  it('refuses before the command is even read, so no command has its own way round it', () => {
+  it('refuses every one of the fourteen, including the ones a later story owns', () => {
+    /**
+     * The terminal guard used to sit *after* the `awaiting` branch, so seven of the fourteen commands could
+     * never be refused at all: an `answer`, `pause`, `fork`, `reject`, `narrow`, `inject_note` or
+     * `edit_criterion` addressed to a terminal run was neither refused nor quarantined, and its file was
+     * re-read and re-parsed by every pass and every 25ms mid-step poll for ever. A terminal run has no
+     * owner left to wait for — story 2-9 will not resume a committed feature either — and this story's own
+     * Always list says an intent for a run in a terminal state is refused naming the reason.
+     */
     for (const command of COMMANDS) {
       const decision = decideSteering(anIntent(command), aState({ state: 'committed' }), noneApplied);
-      // `answer` is left for its owner before the state is consulted; everything else is refused.
-      expect(['refuse', 'awaiting']).toContain(decision.kind);
+      expect(decision.kind).toBe('refuse');
+      if (decision.kind !== 'refuse') continue;
+      expect(decision.reason).toBe('terminal-run');
+      expect(decision.detail).toContain('committed');
     }
   });
+
+  it('quarantines an awaiting command’s file on a terminal run, so no later pass meets it', async () => {
+    const { reconciler } = openReconciler();
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+    await reconciler.runUntilSettled();
+    expect(reconciler.load(accepted.run).state.state).toBe('committed');
+
+    const paths = runPaths(accepted.run, home);
+    writeCommandIntent(
+      paths,
+      newCommandIntent({
+        intentId: mintIntentId(mintRunId()),
+        command: 'pause',
+        run: accepted.run,
+        feature: 'engine-reconciler',
+        principal: { kind: 'user', id: 'deep' },
+        source: 'tui',
+      }),
+    );
+
+    const result = await reconciler.pass();
+    const refused = result.steering.flatMap((entry) => entry.refused);
+    expect(refused.map((entry) => entry.reason)).toStrictEqual(['terminal-run']);
+    expect(readIntentFiles(paths).pending).toStrictEqual([]);
+  });
+});
+
+describe('an intent id is a key for one command, not for any command', () => {
+  it('refuses a different command reusing an id the log already holds', () => {
+    /**
+     * The ledger keys on the id, so without the command beside it a second intent reusing an id was
+     * recognised as "already applied" and dropped: no effect, no refusal, nothing anywhere saying it did
+     * nothing. A reused id is a writer's fault, and being told beats being ignored.
+     */
+    const reused = anIntent('kill');
+    const decision = decideSteering(reused, aState(), {
+      applied: new Map([[reused.intent_id, 'confirm_spec']]),
+    });
+    expect(decision.kind).toBe('refuse');
+    if (decision.kind !== 'refuse') return;
+    expect(decision.reason).toBe('intent-id-reused');
+    expect(decision.detail).toContain('confirm_spec');
+  });
+
+  it('still recognises a redelivery of the same command under the same id', () => {
+    const redelivered = anIntent('kill');
+    const decision = decideSteering(redelivered, aState(), {
+      applied: new Map([[redelivered.intent_id, 'kill']]),
+    });
+    expect(decision.kind).toBe('already-applied');
+  });
+
+  it('recognises a redelivery when the log does not say which command it was', () => {
+    // A `command.applied` whose `command` field is missing or unrecognised: the id was applied, but for
+    // what is unknown, so a later intent carrying it cannot be called a mismatch on evidence nobody has.
+    const redelivered = anIntent('kill');
+    const decision = decideSteering(redelivered, aState(), {
+      applied: new Map([[redelivered.intent_id, null]]),
+    });
+    expect(decision.kind).toBe('already-applied');
+  });
+});
+
+describe('approving needs a gate to approve (CAP-2)', () => {
+  it.each(['drafting', 'confirmed', 'running', 'verifying', 'interrupted', 'degraded'] as const)(
+    'refuses an approve on a %s run, because confirm_spec is the only way into execution',
+    (state) => {
+      /**
+       * `approve` returned `toState: 'running'` for **any** non-terminal state, so an approve on a
+       * `drafting` run put a feature whose acceptance criteria were never confirmed straight into
+       * execution. CAP-2 is "no feature enters execution without user-confirmed acceptance criteria" and
+       * `confirm_spec` is its only gate; `blocked` is the one state `decideAction` answers with
+       * `await-approval`.
+       */
+      const decision = decideSteering(anIntent('approve'), aState({ state }), noneApplied);
+      expect(decision.kind).toBe('refuse');
+      if (decision.kind !== 'refuse') return;
+      expect(decision.reason).toBe('wrong-target-state');
+      expect(decision.detail).toContain(state);
+    },
+  );
+
+  it('is not refused for the one state that has a gate', () => {
+    const decision = decideSteering(anIntent('approve'), aState({ state: 'blocked' }), noneApplied);
+    expect(decision.kind).toBe('apply');
+  });
+});
+
+describe('a stop gesture carries no target-state guard, deliberately', () => {
+  it.each(['kill', 'disengage', 'take_over'] as const)(
+    'applies %s from every non-terminal state, because disengagement is always available',
+    (command) => {
+      // The interface contract says disengagement is "instant, obvious and always available", and a run
+      // parked in `drafting` or waiting at a gate is exactly the run a person most wants to abandon.
+      for (const state of ['drafting', 'confirmed', 'running', 'blocked', 'verifying', 'interrupted'] as const) {
+        expect(decideSteering(anIntent(command), aState({ state }), noneApplied).kind).toBe('apply');
+      }
+    },
+  );
 });
 
 describe('confirming the acceptance criteria', () => {
@@ -324,8 +441,11 @@ describe('approving the gate a step blocked at', () => {
   });
 
   it('never resurrects a killed step', () => {
+    // `blocked`, because that is now the only state an approval has a gate to answer: CAP-2 keeps
+    // `confirm_spec` as the sole way into execution, so an approve on any other state is refused. What is
+    // under test here is unchanged — a killed step is never the step an approval targets.
     const state = aState({
-      state: 'running',
+      state: 'blocked',
       steps: [aStep({ disposition: 'killed', terminated_at: '2026-09-20T10:01:00.000Z' })],
     });
     expect(blockedStepOf(state)).toBeNull();
@@ -493,10 +613,60 @@ describe('the loop applies what the decision decided', () => {
     );
 
     const result = await reconciler.pass();
-    const applied = result.steering[0]?.applied ?? [];
-    expect(applied.map((entry) => entry.intentId)).toStrictEqual(['cmd-first', 'cmd-second']);
-    // Both landed, in order, and the second one's effect is the one that stands.
+    const outcome = result.steering[0];
+    /**
+     * The kill goes first, although it was issued second.
+     *
+     * A stop command outranks everything else in the pass: a person who pressed kill while a confirmation
+     * was still sitting in `commands/` pressed it to override that confirmation, and applying the earlier
+     * one first walked the feature into execution and *then* stopped it. So the kill lands, the run becomes
+     * terminal, and the confirmation it overrode is refused by name rather than applied to a dead run.
+     */
+    expect(outcome?.applied.map((entry) => entry.intentId)).toStrictEqual(['cmd-second']);
+    expect(outcome?.refused.map((entry) => entry.intentId)).toStrictEqual(['cmd-first']);
+    expect(outcome?.refused[0]?.reason).toBe('terminal-run');
     expect(reconciler.load(accepted.run).state.state).toBe('killed');
+  });
+
+  it('applies two intents of equal precedence in issue order, and the later effect stands', async () => {
+    /**
+     * The matrix's "two intents, one run" row, with neither of them a stop command — so the key under test
+     * is the issue time and the precedence rule above cannot perturb it. `continue` is recorded and
+     * changes nothing; `confirm_spec` moves the run. Both land, in order.
+     */
+    const { reconciler } = openReconciler();
+    const accepted = reconciler.acceptFeature(makePlan());
+    const paths = runPaths(accepted.run, home);
+
+    writeCommandIntent(
+      paths,
+      newCommandIntent({
+        intentId: 'cmd-earlier',
+        command: 'continue',
+        run: accepted.run,
+        feature: 'engine-reconciler',
+        principal: { kind: 'user', id: 'deep' },
+        source: 'tui',
+        issuedAt: new Date('2026-09-20T10:00:00.000Z'),
+      }),
+    );
+    writeCommandIntent(
+      paths,
+      newCommandIntent({
+        intentId: 'cmd-later',
+        command: 'confirm_spec',
+        run: accepted.run,
+        feature: 'engine-reconciler',
+        principal: { kind: 'user', id: 'deep' },
+        source: 'tui',
+        issuedAt: new Date('2026-09-20T10:00:01.000Z'),
+      }),
+    );
+
+    const result = await reconciler.pass();
+    const applied = result.steering[0]?.applied ?? [];
+    expect(applied.map((entry) => entry.intentId)).toStrictEqual(['cmd-earlier', 'cmd-later']);
+    expect(reconciler.load(accepted.run).state.state).toBe('confirmed');
   });
 
   it('takes no other action in a pass that applied an intent', async () => {
@@ -527,5 +697,130 @@ describe('the loop applies what the decision decided', () => {
   it('refuses a steering command for a run that has no state at all', () => {
     const { reconciler } = openReconciler();
     expect(() => reconciler.confirm('01K5NQ9ZJ7V3M2P9XQWRTC4BDE')).toThrowError();
+  });
+
+  const writeOne = (run: string, command: Command, argument: string | null = null): string => {
+    const intentId = mintIntentId(mintRunId());
+    writeCommandIntent(
+      runPaths(run, home),
+      newCommandIntent({
+        intentId,
+        command,
+        run,
+        feature: 'engine-reconciler',
+        principal: { kind: 'user', id: 'deep' },
+        source: 'tui',
+        argument,
+      }),
+    );
+    return intentId;
+  };
+
+  const appliedEvents = (run: string): readonly { payload: Record<string, unknown> }[] =>
+    readEventLog(runPaths(run, home).eventLog).filter(
+      (event) => event.type === COMMAND_EVENT_TYPES.Applied,
+    );
+
+  it('leaves an awaiting intent pending, records nothing for it, and reports it as awaiting', async () => {
+    /**
+     * Nothing in the suite asserted `awaiting` at the pass level, so *retiring* such an intent — which
+     * swallows a user's answer or edit before its owner ever sees it — left the whole suite green.
+     */
+    const { reconciler } = openReconciler();
+    const accepted = reconciler.acceptFeature(makePlan());
+    const intentId = writeOne(accepted.run, 'narrow', 'just the refund path');
+
+    const result = await reconciler.pass();
+    const outcome = result.steering.find((entry) => entry.run === accepted.run);
+
+    // Reported, so it is visible rather than invisible...
+    expect(outcome?.awaiting.map((entry) => entry.intentId)).toStrictEqual([intentId]);
+    expect(outcome?.awaiting[0]?.command).toBe('narrow');
+    expect(outcome?.awaiting[0]?.reason).toContain('story 2-9');
+    expect(outcome?.applied).toStrictEqual([]);
+    // ...and still on disk, unconsumed and unrecorded, for the unit that owns it.
+    expect(readIntentFiles(runPaths(accepted.run, home)).pending.map((p) => p.intent.intent_id)).toStrictEqual([
+      intentId,
+    ]);
+    expect(appliedEvents(accepted.run).some((event) => event.payload['intent_id'] === intentId)).toBe(
+      false,
+    );
+    // A second pass does not change its mind about it.
+    await reconciler.pass();
+    expect(readIntentFiles(runPaths(accepted.run, home)).pending).toHaveLength(1);
+  });
+
+  it('records an acknowledged command once, with its principal, and changes no run state', async () => {
+    /**
+     * Skipping the `command.applied` record for an `acknowledge` decision left the suite green — and that
+     * record is the whole of AD-19's "every command records its principal, so an approval is
+     * attributable". `continue` and `just_do_it` are the two commands whose *only* effect is that line.
+     */
+    const { reconciler } = openReconciler();
+    const accepted = reconciler.acceptFeature(makePlan());
+    const before = reconciler.load(accepted.run).state.state;
+    const intentId = writeOne(accepted.run, 'continue');
+
+    const result = await reconciler.pass();
+    const outcome = result.steering.find((entry) => entry.run === accepted.run);
+    expect(outcome?.applied.map((entry) => entry.kind)).toStrictEqual(['acknowledged']);
+
+    const mine = appliedEvents(accepted.run).filter((event) => event.payload['intent_id'] === intentId);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]?.payload['effect']).toBe('acknowledged');
+    expect(mine[0]?.payload['command']).toBe('continue');
+    expect(mine[0]?.payload['principal_kind']).toBe('user');
+    expect(mine[0]?.payload['principal_id']).toBe('deep');
+    // Nothing about the run moved, and nothing claims it did.
+    expect(mine[0]?.payload['to_state']).toBeUndefined();
+    expect(reconciler.load(accepted.run).state.state).toBe(before);
+    // And the file is retired, because there is nothing left for anybody to do with it.
+    expect(readIntentFiles(runPaths(accepted.run, home)).pending).toStrictEqual([]);
+  });
+
+  it('throws rather than handing a caller the old state for a command nothing applied', () => {
+    /**
+     * `steer` returned the *old* state and no error for an `awaiting` decision, so
+     * `reconciler.steer(run, 'pause')` read exactly like a pause that had happened. A caller holding a
+     * control in their hand is owed the reason it did nothing, and "story 2-9 owns this" is a reason.
+     */
+    const { reconciler } = openReconciler();
+    const accepted = reconciler.acceptFeature(makePlan());
+
+    expect(() => reconciler.steer(accepted.run, 'pause')).toThrowError(SteeringRefused);
+    // The file is *not* quarantined: its owner still has to see it, which is the whole point of awaiting.
+    expect(readIntentFiles(runPaths(accepted.run, home)).pending).toHaveLength(1);
+  });
+
+  it('applies a pending intent when a caller drives advance directly', async () => {
+    /**
+     * Only `pass` and `steer` consumed intents, so a caller driving `advance` per run honoured a disengage
+     * only if the mid-step watcher happened to catch it, and an intent written *between* `advance` calls
+     * was never applied at all. AD-19 makes the intent file the only path a command reaches the loop by, so
+     * an entry point that starts a step without reading it can do the thing it was told not to.
+     */
+    const { reconciler, executor } = openReconciler();
+    const accepted = reconciler.acceptFeature(makePlan());
+    writeOne(accepted.run, 'confirm_spec');
+
+    const action = await reconciler.advance(accepted.run);
+    // The confirmation was consumed *before* the action was decided, so the action is the one the confirmed
+    // state calls for rather than the `await-confirmation` the drafting state would have answered with.
+    expect(action.kind).toBe('run-step');
+    expect(action.from).toBe('confirmed');
+    expect(executor.started.map((request) => request.step)).toStrictEqual(['implement']);
+  });
+
+  it('does not consume a run’s intents twice when a pass drives advance for it', async () => {
+    const { reconciler } = openReconciler();
+    const accepted = reconciler.acceptFeature(makePlan());
+    const intentId = writeOne(accepted.run, 'confirm_spec');
+
+    await reconciler.pass();
+    // Exactly one `command.applied` for the gesture: the pass consumed it, and the `advance` it called with
+    // a preloaded snapshot did not read `commands/` again.
+    expect(appliedEvents(accepted.run).filter((event) => event.payload['intent_id'] === intentId)).toHaveLength(
+      1,
+    );
   });
 });

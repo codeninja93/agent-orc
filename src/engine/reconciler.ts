@@ -64,6 +64,7 @@ import type {
 import {
   REDACTION_MARKER,
   Recorder,
+  isStopCommand,
   readEventLog,
   resolveOrchHome,
   runPaths,
@@ -86,9 +87,11 @@ import {
   appliedIntentIds,
   mintIntentId,
   newCommandIntent,
+  pruneRetiredIntents,
   quarantineIntent,
   readIntentFiles,
   retireIntent,
+  sweepCommandTemporaries,
   writeCommandIntent,
 } from './commands.js';
 import type { IntentRefusal, IntentRefusalReason, PendingIntent } from './commands.js';
@@ -110,6 +113,7 @@ import {
   commandAppliedPayload,
   commandRefusedPayload,
   decideSteering,
+  effectTarget,
 } from './steering.js';
 import type { IntentEffect, QuestionSteering } from './steering.js';
 import { DECISION_EVENT_TYPE, decidedQuestionIds, decisionFor, decisionPayload } from './decision.js';
@@ -240,32 +244,42 @@ export const DECLARED_WALL_CLOCK_MS = 60 * 60 * 1000;
 export const STEERING_POLL_INTERVAL_MS = 25;
 
 /**
- * The declared bound on disengagement: the interval within which a stop gesture reaches the live child.
+ * The loop's own share of the disengage latency: gesture on disk to stop delivered.
  *
- * `interface-contract.md` says disengagement is "instant, obvious and always available", and "instant"
- * is a measurable claim, so it gets a number. The budget is the poll interval, one directory read, and
- * the call into the executor's stop — two orders of magnitude of slack over their sum, because the claim
- * must hold on a loaded machine and not only on an idle one.
- *
- * What lands inside the bound is the *stop*: the child is signalled and the step's termination recorded.
- * The run reaching its terminal `killed` state follows immediately afterwards, in the same action, since
- * the intent that caused the stop is applied as soon as the termination is durable.
- *
- * Story 1-4's own `EXECUTOR_KILL_GRACE_MS` governs how long a child that ignores the first signal is
- * given before the second; that is the child's grace, not this loop's latency, and it is deliberately
- * not folded in here.
+ * The budget is the poll interval, one directory read, and the call into the executor's stop — two
+ * orders of magnitude of slack over their sum, because the claim must hold on a loaded machine and not
+ * only on an idle one. **This is the part the loop controls, and it is the only part it can promise.**
+ * Once the stop has been delivered, how long the child takes to die is the executor's business.
  */
-export const DECLARED_DISENGAGE_BOUND_MS = 2_000;
+export const DECLARED_DISENGAGE_OBSERVATION_BOUND_MS = 2_000;
 
 /**
- * The commands that stop work already in flight.
+ * The declared end-to-end bound on disengagement: gesture on disk to the run recorded as halted.
  *
- * A stop gesture must not wait for the current step to finish — that is the whole of CAP-5 — so these
- * are the three the mid-step watcher looks for. `take_over` is one of them because the escape hatch
- * takes the work away from the run: leaving the step running would have the system and a person editing
- * one worktree at the same time.
+ * `interface-contract.md` says disengagement is "instant, obvious and always available", and "instant"
+ * is a measurable claim, so it gets a number. **The number this story declared was wrong**, and it was
+ * wrong by construction rather than by measurement. It was 2s — the loop's share above — while story
+ * 1-4's `EXECUTOR_KILL_GRACE_MS` gives a child that ignores `SIGTERM` a further 5s before `SIGKILL`.
+ * A child that declines the first signal therefore cannot be dead inside 2s no matter what this loop
+ * does, so the production stopper could never have met the bound the story promised.
+ *
+ * **The kill grace is authoritative, and this number is derived from it.** The grace is a decision about
+ * a child process — how long a `claude -p` is given to finish a write and exit cleanly rather than lose
+ * it to a `SIGKILL` — and it is owned by the unit that signals the child. A bound declared here cannot
+ * shorten it; it can only describe the total honestly. So this is the grace, plus the loop's own share
+ * above, plus a second for the termination and the intent's effect to be recorded:
+ *
+ *     5_000 (EXECUTOR_KILL_GRACE_MS, story 1-4) + 2_000 (observation) + 1_000 (record) = 8_000
+ *
+ * The arithmetic is spelled out rather than imported because `src/engine/spawner.ts` is the *adapter*
+ * behind the {@link StepStopper} port and this module deliberately does not depend on it — importing the
+ * constant would drag `node:child_process` into the loop's graph to read a number. The relationship is
+ * asserted in `tests/engine.disengage.test.ts` instead, where a test may import both and does.
+ *
+ * A well-behaved child exits on the first signal in milliseconds, so the *typical* latency is the
+ * observation bound. This is the worst case a user may be promised, not the case they will usually see.
  */
-export const STOP_COMMANDS: readonly Command[] = Object.freeze(['kill', 'disengage', 'take_over']);
+export const DECLARED_DISENGAGE_BOUND_MS = 8_000;
 
 /**
  * The port a steering command stops a live child through.
@@ -283,6 +297,23 @@ export type StepStopper = (target: {
   readonly command: Command;
   readonly reason: string;
 }) => boolean;
+
+/**
+ * The two things the mid-step watcher records, declared here because nothing folds them.
+ *
+ * AD-5 makes the vocabulary open: a reader meeting a type outside the declared list accepts the envelope
+ * and ignores the event. Both of these are *observations about the loop* rather than facts about a run's
+ * state — the state change a stop causes is the `command.applied` the intent produces — so neither is in
+ * `FOLDED_EVENT_TYPES` and a checkpoint rebuilt without them is identical.
+ */
+export const STEERING_EVENT_TYPES = {
+  /** A stop gesture was seen mid-step and the executor was asked to stop the child. */
+  StopDelivered: 'steering.stop_delivered',
+  /** A step ran on an engine with no stopper wired, so CAP-5's mid-step promise could not be kept. */
+  StopperUnwired: 'steering.stopper_unwired',
+} as const;
+
+export type SteeringEventType = (typeof STEERING_EVENT_TYPES)[keyof typeof STEERING_EVENT_TYPES];
 
 /** What the mid-step watcher saw, so the action that owns the step can report and apply it. */
 export interface StopObservation {
@@ -852,6 +883,25 @@ export class Reconciler {
   private readonly recorders = new Map<string, Recorder>();
   private closed = false;
 
+  /**
+   * Runs already told, in the log, that this engine has no stopper wired.
+   *
+   * In memory rather than read back from the log on purpose: the fact is about *this process's* assembly,
+   * so a restart is a different assembly and worth recording again. It is a report, never a decision —
+   * nothing reads it to choose an action.
+   */
+  private readonly reportedMissingStopper = new Set<string>();
+
+  /**
+   * Intent outcomes produced *inside* an action, waiting for the pass to report them.
+   *
+   * The mid-step watcher's consumption happens in the middle of `driveStep`, which returns a step name
+   * and has nowhere to put an `IntentPassOutcome`. Parking it here rather than discarding it is what makes
+   * a mid-step refusal visible in `PassResult.steering` instead of silent. Drained by `pass`, so nothing
+   * accumulates: a caller driving `advance` directly drains it on its next `pass`, and `close` drops it.
+   */
+  private readonly midStepSteering: IntentPassOutcome[] = [];
+
   private constructor(options: ReconcilerOptions, lock: EngineLock | null, ownsLock: boolean) {
     this.orchHome = options.orchHome ?? resolveOrchHome();
     this.executor = options.executor;
@@ -1002,6 +1052,20 @@ export class Reconciler {
       // Already recorded and already quarantined. It is *also* thrown, because a caller holding a
       // control in their hand is owed the reason it did nothing — story 1-3's guard, at its own surface.
       throw new SteeringRefused(run, loaded.state.state, refused.detail);
+    }
+    /**
+     * A command nothing applied is not a command that worked.
+     *
+     * An `awaiting` decision leaves the file in place, unconsumed and unrecorded, for a later story's
+     * unit — which is right for the file and wrong for this caller: it was handed the *old* state and no
+     * error, so `reconciler.steer(run, 'pause')` read exactly like a pause that had happened. A caller
+     * holding a control in their hand is owed the reason it did nothing, and "story 2-9 owns this" is a
+     * reason. The file is deliberately **not** quarantined: its owner still has to see it, and that is the
+     * whole point of `awaiting`.
+     */
+    const parked = outcome.awaiting.find((entry) => entry.intentId === intent.intent_id);
+    if (parked !== undefined) {
+      throw new SteeringRefused(run, loaded.state.state, parked.reason);
     }
     // `consumeIntents` returns `null` only for a run directory carrying no state at all, and `load`
     // above has already refused that case by name, so the fallback is unreachable rather than lenient.
@@ -1195,7 +1259,9 @@ export class Reconciler {
   private consumeIntents(loaded: LoadedState): IntentPassOutcome {
     const { paths, plan } = loaded;
     let state = loaded.state;
-    const applied = new Set(appliedIntentIds(loaded.events));
+    // A map, not a set: the command beside each id is what tells a redelivery from a different command
+    // reusing an id, which the ledger would otherwise swallow as "already applied".
+    const applied = new Map(appliedIntentIds(loaded.events));
     const read = readIntentFiles(paths, { now: this.now, tornGraceMs: this.tornGraceMs });
 
     const appliedOutcomes: IntentOutcome[] = [];
@@ -1282,7 +1348,7 @@ export class Reconciler {
             },
             resolved.reason,
           );
-          applied.add(intent.intent_id);
+          applied.set(intent.intent_id, intent.command);
           state = this.checkpointFromLog(paths, plan);
           this.retire(paths, pending);
           appliedOutcomes.push(outcome('resolved-question', resolved.reason));
@@ -1292,8 +1358,44 @@ export class Reconciler {
         case 'acknowledge':
         case 'apply': {
           const effect = decision.kind === 'apply' ? decision.effect : null;
-          this.applyIntent(paths, plan, state, pending, effect, decision.reason);
-          applied.add(intent.intent_id);
+          try {
+            this.applyIntent(paths, plan, state, pending, effect, decision.reason);
+          } catch (thrown: unknown) {
+            /**
+             * An effect that throws is quarantined, not left pending.
+             *
+             * Left pending it is a poison file with an effect's clothes on: the same intent is decided
+             * again on the next pass, throws again, and again on every 25ms mid-step poll, for ever —
+             * and because the throw used to escape `consumeIntents`, it took the whole run's pass with
+             * it. Nothing was recorded, so the failure was invisible as well as permanent.
+             *
+             * Quarantining it is safe in the direction that matters: `command.applied` is the ledger
+             * entry *and* the effect, so an intent whose emit threw has no effect in the log — there is
+             * nothing half-applied to undo. The refusal below records why, the file leaves `commands/`,
+             * and the pass carries on with the next intent.
+             *
+             * {@link UnrecordedAction} lands here too, and belongs here: a payload AD-21 cannot redact is
+             * the same payload on every pass, so leaving it pending would loop for ever on a line that
+             * will never be written. The refusal itself goes through the recorder directly, which does not
+             * throw, so the explanation survives even when the effect could not.
+             */
+            refused.push(
+              this.refuseIntent(paths, state.feature, {
+                reason: 'effect-failed',
+                fileName: pending.fileName,
+                intentId: intent.intent_id,
+                command: intent.command,
+                detail:
+                  `applying "${intent.command}" failed: ${
+                    thrown instanceof Error ? thrown.message : String(thrown)
+                  } Nothing was applied — the one line that carries an effect never reached the log — ` +
+                  'and the file is moved aside rather than retried on every later pass.',
+                quarantinedTo: null,
+              }),
+            );
+            break;
+          }
+          applied.set(intent.intent_id, intent.command);
           // Re-folded before the next intent is decided: two intents in one pass are applied in order,
           // and the second must see what the first did rather than the state the pass opened with.
           state = this.checkpointFromLog(paths, plan);
@@ -1327,6 +1429,26 @@ export class Reconciler {
     reason: string,
   ): void {
     const recorder = this.recorderFor(state.run, state.feature);
+
+    /**
+     * An effect naming a step the run has no record of is refused, not half-applied.
+     *
+     * `commandAppliedPayload` carries the `to_state` and the `step_disposition` in one line, and the fold
+     * applies each independently: an unknown step means the lifecycle change lands and the step change is
+     * silently dropped. For a kill that is a run recorded as `killed` with the step it named left
+     * unrecorded — the exact shape of the defect story 1-3's review found, arrived at from the other end.
+     * {@link effectTarget} is the check, and throwing here is how the intent reaches the quarantine in
+     * `consumeIntents` rather than leaving a line that applies half of itself.
+     */
+    if (effect !== null && effect.step !== null && effectTarget(state, effect) === null) {
+      throw new Error(
+        `Refusing to apply "${pending.intent.command}" for run ${state.run}: its effect names step ` +
+          `"${effect.step}", which this run has no record of. The one line that carries an effect would ` +
+          'record the state change and drop the step change, leaving a run halted with the step it named ' +
+          'untouched.',
+      );
+    }
+
     let escape: EscapeHatchOutcome | null = null;
 
     if (effect?.escapeHatch === true) {
@@ -1346,10 +1468,34 @@ export class Reconciler {
       this.boundary(`escape-hatch:${escape.preserved ? 'committed' : 'branch-only'}`);
     }
 
-    if (effect?.handoff !== undefined && effect?.handoff !== null) {
+    /**
+     * CAP-23 — the recorded reason is corrected when the escape hatch failed, not only the document.
+     *
+     * The take-over's reason is composed in `decideSteering`, *before* the hatch runs, and it asserts that
+     * "the partial work is put on an ordinary branch". When git fails there is no branch — and only
+     * `HANDOFF.md` used to be told: the `command.applied` payload and the checkpoint the fold builds from
+     * it kept the original claim, so the durable record said the work was on a branch that does not exist.
+     * AD-4 makes the log the only authority, which is exactly why a false sentence in it is worse than a
+     * false sentence in a document a person can compare against the disk.
+     */
+    const corrected: IntentEffect | null =
+      effect?.handoff === undefined || effect.handoff === null || escape === null
+        ? effect
+        : {
+            ...effect,
+            handoff: {
+              code: effect.handoff.code,
+              // The hatch's own `detail` is the one sentence that is true in both directions — it says
+              // "committed on the branch" when it was and "still in the worktree, uncommitted" when it was
+              // not — so it is appended rather than the reason making a claim of its own about a branch.
+              reason: `${effect.handoff.reason} ${escape.detail}`,
+            },
+          };
+
+    if (corrected !== null && corrected.handoff !== null) {
       this.writeHandoff(paths, plan, state, {
-        code: effect.handoff.code,
-        reason: effect.handoff.reason,
+        code: corrected.handoff.code,
+        reason: corrected.handoff.reason,
         escape,
       });
     }
@@ -1372,10 +1518,12 @@ export class Reconciler {
       });
     }
 
+    // The *corrected* effect, so the payload the fold reads and the document a person reads carry the same
+    // sentence about where the work is.
     this.emit(recorder, {
       step: effect === null ? pending.intent.step : effect.step,
       type: COMMAND_EVENT_TYPES.Applied,
-      payload: commandAppliedPayload(pending.intent, { effect, reason }),
+      payload: commandAppliedPayload(pending.intent, { effect: corrected, reason }),
     });
   }
 
@@ -1420,6 +1568,17 @@ export class Reconciler {
     const out: IntentRefusal[] = [];
     for (const found of read.refused) out.push(quarantineIntent(paths, found));
     for (const pending of read.pending) {
+      /**
+       * A *valid* intent gets the same grace a torn one does, and for the same reason.
+       *
+       * `acceptFeature` creates the run directory and then appends `run.created`, so there is a window in
+       * which a perfectly good intent can be written to a run that carries no state *yet*. Quarantining on
+       * sight destroyed exactly that command — a user who pressed a key a millisecond too early lost it,
+       * with no log to record the loss in. A directory that will never carry state still has its intents
+       * quarantined; it just has to be old enough to prove it, which is the discriminator the torn-file
+       * case already uses. An unreadable age counts as old, because waiting on an unreadable age never ends.
+       */
+      if (pending.ageMs !== null && pending.ageMs >= 0 && pending.ageMs < this.tornGraceMs) continue;
       out.push(
         quarantineIntent(paths, {
           reason: 'unknown-run',
@@ -1738,6 +1897,17 @@ export class Reconciler {
   load(run: string): LoadedState {
     const paths = runPaths(run, this.orchHome);
     sweepCheckpointTemporaries(paths);
+    /**
+     * The same sweep for `commands/`, which had none.
+     *
+     * A writer killed between its `write` and its `rename` leaves a `.tmp` the reader already skips — so it
+     * is not a poison file, it is an unbounded leak in the one directory a renderer writes to on every
+     * keystroke. The two quarantine directories are the same shape of leak with the opposite cause: one
+     * file per command, kept for evidence, for the life of a run. Both are bounded here, beside the
+     * checkpoint's sweep, because `load` is the one place every path through the loop passes through.
+     */
+    sweepCommandTemporaries(paths, { now: this.now });
+    pruneRetiredIntents(paths);
     const events = readEventLog(paths.eventLog);
     // An unrecognised `schema_version` throws out of here, per AD-28: this build does not operate on a
     // state file it cannot read, and rebuilding over it would destroy the evidence of who wrote it.
@@ -1959,6 +2129,16 @@ export class Reconciler {
       else refusals.push(refusalFor(run, outcome.reason));
     }
 
+    /**
+     * The intents a step's own action consumed, reported with the pass that ran it.
+     *
+     * Drained rather than read, so nothing accumulates. They are appended *after* the pass's own
+     * consumption because that is the order they happened in: the pass read `commands/` before deciding,
+     * the watcher read it again while the step was in flight, and a reader following `steering` down the
+     * array is following the run's timeline.
+     */
+    steering.push(...this.midStepSteering.splice(0));
+
     return { actions, deferred, refusals, reclaimed, steering, questions };
   }
 
@@ -2011,9 +2191,26 @@ export class Reconciler {
    * The whole of the action is durable before this returns: the events it appended are in the log, and
    * the checkpoint has been rebuilt from that log. A crash at any point inside leaves a state the next
    * call converges from.
+   *
+   * **Called without a preloaded snapshot, it consumes that run's durable intents first.** This is a
+   * deliberate decision rather than an omission, and it was an omission: only `pass` and `steer`
+   * consumed intents, so a caller driving `advance` per run honoured a disengage only if the mid-step
+   * watcher happened to catch it, and an intent written *between* `advance` calls was never applied at
+   * all. AD-19 makes the intent file the only path a command reaches the loop by, so a public entry point
+   * that starts a step without reading it is an entry point that can do the thing it was told not to.
+   *
+   * With a preloaded snapshot it consumes nothing, because the only caller that passes one is `pass`,
+   * which has already consumed them for every run and decided this action from the result. Reading them
+   * again here would fold the log a second time to find nothing.
    */
   async advance(run: string, preloaded?: LoadedState): Promise<PassAction> {
     this.assertOpen();
+    if (preloaded === undefined) {
+      const steered = this.consumeIntents(this.load(run));
+      // Parked for the next `pass` to report, the same way a mid-step consumption is: `PassAction` has no
+      // field for an intent outcome, and dropping it is how a refusal becomes invisible.
+      this.midStepSteering.push(steered);
+    }
     const loaded = preloaded ?? this.load(run);
     const { paths, plan } = loaded;
     let state = loaded.state;
@@ -2125,10 +2322,28 @@ export class Reconciler {
           baselineRef: record.baseline_ref,
         });
 
+        /**
+         * CAP-5 — the same watcher a fresh step gets, for the same reason and for the same window.
+         *
+         * A resumed step is a step in flight. It was started before this process existed, it is the case
+         * a long-running step reaches most often — a crash, a restart, a resume by recorded session id —
+         * and it was the one path with no watcher at all: a disengage written during a resume was not
+         * observed, the child stayed live past the declared bound, the step finished on its own recording
+         * `completed`, and the run was left `interrupted`. CAP-5 failed for exactly the long-running case
+         * it exists for, and no deferral recorded it. The watcher and the post-termination consumption
+         * below are the same two calls `driveStep` makes, deliberately identical: a second, subtly
+         * different mid-step stop path is how one of them drifts.
+         */
+        const watch = this.watchForStopIntents(paths, state, action.step);
+
         let termination: StepTermination;
         try {
           termination = await this.executor.resume({ ...request, sessionId: action.sessionId });
+          watch.stop();
         } catch (thrown: unknown) {
+          // Stopped on both paths rather than in a `finally`, exactly as `driveStep` does: AD-32's rule is
+          // about behaviour on an exit path, and two visible calls read as two calls.
+          watch.stop();
           if (!(thrown instanceof ResumeRefused)) throw thrown;
           // AD-8 — the recorded id is spent. Recording that fact is the whole action: the next pass
           // sees an `interrupted` step with no session id and reaches the reset-and-re-run on its own,
@@ -2142,12 +2357,16 @@ export class Reconciler {
             },
             baselineRef: record.baseline_ref,
           });
+          // A stop that arrived during a refused resume still stopped nothing and still has to be applied:
+          // the gesture is the user's word, and a refused resume is not a reason to lose it.
+          this.applyStopObservation(state, action.step, watch.observed());
           return action.step;
         }
 
         this.recordTermination(state, planStep, record.baseline_ref, termination, {
           transitionTo: action.transitionTo,
         });
+        this.applyStopObservation(state, action.step, watch.observed());
         return action.step;
       }
 
@@ -2321,7 +2540,7 @@ export class Reconciler {
      * drives a step synchronously to termination, so without this a kill could only ever land between
      * passes.
      */
-    const watch = this.watchForStopIntents(paths, state.run, options.step.step);
+    const watch = this.watchForStopIntents(paths, state, options.step.step);
 
     let termination: StepTermination;
     try {
@@ -2339,15 +2558,54 @@ export class Reconciler {
       transitionTo: options.transitionTo,
     });
 
-    if (watch.observed() !== null) {
-      /**
-       * The gesture that stopped this step is still on disk and unapplied — the watcher writes nothing.
-       * It is applied here, inside the same action, so the run reaches its halted state in the pass the
-       * user's gesture arrived in rather than in the next one. That is what makes
-       * {@link DECLARED_DISENGAGE_BOUND_MS} a claim about the run and not only about the child process.
-       */
-      this.consumeIntents(this.load(state.run));
-    }
+    this.applyStopObservation(state, options.step.step, watch.observed());
+  }
+
+  /**
+   * Record and apply what the mid-step watcher saw, once the step's termination is durable.
+   *
+   * Three things happen here and each closes a gap the watcher left:
+   *
+   * 1. **The stop is recorded.** `StopObservation` carried four facts — which intent, which command,
+   *    whether there was a live child to signal, and when — and every one of them was computed and then
+   *    only null-checked. So nothing anywhere said a stop signal had been *delivered*, which is the one
+   *    fact a person asking "did my disengage reach it?" wants. The line is not folded (AD-5), because it
+   *    changes no state: the `command.applied` the intent produces is the state change.
+   * 2. **The intent is applied inside this action.** The watcher writes nothing — it runs inside somebody
+   *    else's action, and a second writer inside one action is how two lines interleave — so the gesture
+   *    is still pending here. Applying it now is what makes {@link DECLARED_DISENGAGE_BOUND_MS} a claim
+   *    about the run rather than only about the child.
+   * 3. **The outcome is kept rather than discarded.** The `IntentPassOutcome` used to be thrown away, so
+   *    an intent applied mid-step never reached `PassResult.steering` and a refusal raised there was
+   *    invisible — which contradicts `steering` being how a refusal becomes visible rather than silent.
+   *    It is parked for `pass` to report.
+   */
+  private applyStopObservation(
+    state: RunState,
+    step: string,
+    observed: StopObservation | null,
+  ): void {
+    if (observed === null) return;
+
+    this.recorderFor(state.run, state.feature).recordResult({
+      feature: state.feature,
+      run: state.run,
+      step,
+      emitter: ENGINE_EMITTER,
+      type: STEERING_EVENT_TYPES.StopDelivered,
+      payload: {
+        intent_id: observed.intentId,
+        command: observed.command,
+        stopped: observed.stopped,
+        observed_at: observed.observedAt,
+        reason: observed.stopped
+          ? 'the executor had a live child for this step and was asked to stop it'
+          : 'the executor had nothing live to stop, so the step had already ended when the gesture arrived',
+      },
+    });
+    this.boundary(`stop-delivered:${observed.command}`);
+
+    this.midStepSteering.push(this.consumeIntents(this.load(state.run)));
   }
 
   /**
@@ -2368,11 +2626,12 @@ export class Reconciler {
    */
   private watchForStopIntents(
     paths: RunPaths,
-    run: string,
+    state: RunState,
     step: string,
   ): { readonly stop: () => void; readonly observed: () => StopObservation | null } {
+    const run = state.run;
     if (this.stopStep === null) {
-      // No stopper wired in: nothing could be stopped, so nothing is watched and the gap is honest.
+      this.recordMissingStopper(state, step);
       return { stop: (): void => undefined, observed: (): StopObservation | null => null };
     }
 
@@ -2380,7 +2639,20 @@ export class Reconciler {
     const poll = (): void => {
       if (observation !== null) return;
       const read = readIntentFiles(paths, { now: this.now, tornGraceMs: this.tornGraceMs });
-      const halting = read.pending.find((pending) => STOP_COMMANDS.includes(pending.intent.command));
+      /**
+       * A stop command, **and one that either names this step or names none**.
+       *
+       * Matching on the command alone made an intent naming a *different* step stop whatever happened to
+       * be running: a person who killed step "verify" while "implement" was still in flight got the wrong
+       * child stopped and the wrong step recorded `killed` — permanently, because AD-8 never re-runs a
+       * killed step. A run-level stop (`step: null`) is the ordinary case and still stops whatever is
+       * live, which is what a disengage means.
+       */
+      const halting = read.pending.find(
+        (pending) =>
+          isStopCommand(pending.intent.command) &&
+          (pending.intent.step === null || pending.intent.step === step),
+      );
       if (halting === undefined) return;
 
       const reason =
@@ -2404,6 +2676,45 @@ export class Reconciler {
       },
       observed: (): StopObservation | null => observation,
     };
+  }
+
+  /**
+   * Record, once per run per engine, that a step ran with no way to stop it.
+   *
+   * CAP-5's mid-step property is inert as this build is assembled: `stopStep` reaches the reconciler only
+   * through `options.stopStep`, and nothing in `src/` constructs a `Reconciler` at all — the production
+   * assembly point is a later story's, the same gap stories 1-5 and 1-6 recorded for their own ports.
+   * Wiring it here would be inventing that assembly point in the wrong story.
+   *
+   * What can be fixed now is the *silence*. Without this line, a run driven by an engine with no stopper
+   * behaved exactly like a run whose disengage was simply slow: the intent sat in `commands/` until the
+   * step ended on its own, and nothing anywhere said the capability was missing. Now the log says so, so
+   * a person reading a run that ignored their disengage finds the reason rather than inferring it.
+   *
+   * Once per run and *per engine process*, not per pass and not per step: the fact is about how this
+   * process was assembled, so it is worth saying once, and a restart with a different assembly is a
+   * different fact worth saying again. It is not folded (AD-5) — it changes no state.
+   */
+  private recordMissingStopper(state: RunState, step: string): void {
+    if (this.reportedMissingStopper.has(state.run)) return;
+    this.reportedMissingStopper.add(state.run);
+
+    this.recorderFor(state.run, state.feature).recordResult({
+      feature: state.feature,
+      run: state.run,
+      step,
+      emitter: ENGINE_EMITTER,
+      type: STEERING_EVENT_TYPES.StopperUnwired,
+      payload: {
+        reason:
+          'This engine was assembled with no step stopper, so a disengage, kill or take-over written ' +
+          'while a step is in flight cannot reach the child. The intent is not lost — it stays in ' +
+          'commands/ and is applied as soon as the step ends on its own — but it does not stop the step, ' +
+          'so CAP-5’s mid-step promise is not being kept by this process.',
+        capability: 'mid-step stop (CAP-5)',
+      },
+    });
+    this.boundary('stopper-unwired');
   }
 
   /** CAP-23 — stop and explain, as its own recorded facts, so every caller hands off identically. */

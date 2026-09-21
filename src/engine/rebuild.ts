@@ -395,11 +395,19 @@ export const rebuildFromLog = (
 
       case COMMAND_EVENT_TYPES.Applied: {
         const intentId = payloadString(event, 'intent_id');
-        if (intentId !== null) {
-          // Exactly-once, and the whole of it: a second line for one intent changes nothing.
-          if (appliedIntents.has(intentId)) break;
-          appliedIntents.add(intentId);
-        }
+        /**
+         * No usable id, no fold. This line's *whole* safety is the id: exactly-once is "skip an id already
+         * seen", so a line carrying no id — absent, empty, not a string, or replaced by the AD-21 marker —
+         * was folded on every replay and applied its state change again each time. An approval folds to
+         * `interrupted`, so a doubled one re-runs a finished step, which is precisely the cost story 1-3's
+         * review measured. A line the ledger cannot key on is therefore ignored rather than trusted: the
+         * writer guards the id at the door (`isLoggableIntentId`), so a line reaching here without one is a
+         * corrupt or foreign line, and ignoring an unrecognised line is what AD-5 already says to do.
+         */
+        if (intentId === null || intentId === '') break;
+        // Exactly-once, and the whole of it: a second line for one intent changes nothing.
+        if (appliedIntents.has(intentId)) break;
+        appliedIntents.add(intentId);
 
         const to = payloadString(event, 'to_state');
         if (isOneOf(FEATURE_STATES, to)) state = to;

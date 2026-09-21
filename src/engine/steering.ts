@@ -211,14 +211,57 @@ const stopEffect = (state: RunState, summary: string): IntentEffect => {
 export const decideSteering = (
   intent: CommandIntent,
   state: RunState,
-  context: { readonly applied: ReadonlySet<string> },
+  context: { readonly applied: ReadonlyMap<string, Command | null> },
 ): SteeringDecision => {
   if (context.applied.has(intent.intent_id)) {
+    /**
+     * The id is spent. Whether that is a *redelivery* or a *reuse* is decided by the command beside it.
+     *
+     * A reuse is refused rather than recognised. The ledger keys on the id, so a second intent carrying
+     * an id the log already holds against a different command would be dropped as "already applied": no
+     * effect, no refusal, nothing recorded — a command that vanished. A writer that reuses an id has
+     * made a mistake, and being told is strictly better than being ignored.
+     */
+    const appliedFor = context.applied.get(intent.intent_id) ?? null;
+    if (appliedFor !== null && appliedFor !== intent.command) {
+      return {
+        kind: 'refuse',
+        reason: 'intent-id-reused',
+        detail:
+          `Intent id ${intent.intent_id} is already in the log against "${appliedFor}", so this ` +
+          `"${intent.command}" is not a redelivery of it but a different command reusing its id. The ` +
+          'id is the exactly-once key (AD-19), so it cannot mean two commands: this one is refused ' +
+          'rather than silently dropped as already applied.',
+      };
+    }
     return {
       kind: 'already-applied',
       reason:
         `Intent ${intent.intent_id} is already in the log, so its effect stands and is not applied ` +
         'again. Delivery is at-least-once; the effect is exactly-once (AD-19, AD-15).',
+    };
+  }
+
+  /**
+   * A terminal run has reached `[*]`: confirming, approving or stopping it would walk a finished run
+   * backwards, and AD-8 is explicit that a killed step is never resumed and never re-run. Checked
+   * before the command is even read, so no command can find a way round it.
+   *
+   * **Before the `awaiting` branch, and that ordering is the fix to a real gap.** With the branch first,
+   * seven of the fourteen commands could never be refused at all: an `answer`, `pause`, `fork`,
+   * `reject`, `narrow`, `inject_note` or `edit_criterion` addressed to a terminal run was neither
+   * refused nor quarantined, so its file was re-read and re-parsed by every pass and every 25ms
+   * mid-step poll for ever — the poison file AD-19 forbids, and a direct contradiction of this story's
+   * own claim that an intent for a run in a terminal state is refused naming the reason. A terminal run
+   * has no owner left to wait for: story 2-9 will not resume a committed feature either.
+   */
+  if (isTerminalFeatureState(state.state)) {
+    return {
+      kind: 'refuse',
+      reason: 'terminal-run',
+      detail:
+        `Run ${state.run} is ${state.state}, which is terminal, so "${intent.command}" is refused ` +
+        'and the terminal state stands.',
     };
   }
 
@@ -230,21 +273,6 @@ export const decideSteering = (
       reason:
         `"${intent.command}" is a declared control whose effect belongs to ${handling.owner}. The ` +
         'file is left where it is, unconsumed and unrecorded, so the unit that owns it still sees it.',
-    };
-  }
-
-  /**
-   * A terminal run has reached `[*]`: confirming, approving or stopping it would walk a finished run
-   * backwards, and AD-8 is explicit that a killed step is never resumed and never re-run. Checked
-   * before the command is even read, so no command can find a way round it.
-   */
-  if (isTerminalFeatureState(state.state)) {
-    return {
-      kind: 'refuse',
-      reason: 'terminal-run',
-      detail:
-        `Run ${state.run} is ${state.state}, which is terminal, so "${intent.command}" is refused ` +
-        'and the terminal state stands.',
     };
   }
 
@@ -313,6 +341,35 @@ export const decideSteering = (
     }
 
     case 'approve': {
+      /**
+       * CAP-2 — an approval is only ever an answer to a gate, and only a `blocked` run has one.
+       *
+       * Without this, `approve` returned `toState: 'running'` for **any** non-terminal state, so an
+       * approve on a `drafting` run put a feature whose acceptance criteria were never confirmed straight
+       * into execution. CAP-2 is "no feature enters execution without user-confirmed acceptance criteria"
+       * and `confirm_spec` is its only gate; `decideAction` says the same thing from the other side —
+       * `drafting` answers `await-confirmation`, and `blocked` is the one state that answers
+       * `await-approval`, "waits for a person, not for another pass (CAP-12)".
+       *
+       * The guard is here rather than at a renderer for the reason AD-19 exists: the intent file is
+       * durable and this function is its sole consumer, so a check anywhere else is a check something can
+       * be written around — which is exactly what "there is no second command path" means.
+       *
+       * Refused rather than `already-satisfied`, because nothing about an approve on a `drafting` run is
+       * satisfied: no gate was approved and none is waiting. `confirm_spec`'s redelivery case is the
+       * different one — there the world really is the way the command asked for.
+       */
+      if (state.state !== 'blocked') {
+        return {
+          kind: 'refuse',
+          reason: 'wrong-target-state',
+          detail:
+            `Run ${state.run} is ${state.state}, and only a "blocked" run has a gate to approve. ` +
+            'CAP-2 lets nothing into execution without user-confirmed acceptance criteria, and ' +
+            '"confirm_spec" is the only command that confirms them — so an approval here would be a ' +
+            'second, unguarded way into execution rather than the answer to a gate (CAP-12).',
+        };
+      }
       const blocked = blockedStepOf(state);
       return {
         kind: 'apply',
@@ -332,6 +389,18 @@ export const decideSteering = (
       };
     }
 
+    /**
+     * `kill`, `disengage` and `take_over` carry **no** target-state guard, and that is a decision rather
+     * than the gap `approve` had.
+     *
+     * Every non-terminal state is a legitimate target for a stop. The interface contract says
+     * disengagement is "instant, obvious and **always available**", and a state-dependent stop is not
+     * always available: a run parked in `drafting` or waiting at a gate is exactly the run a person is
+     * most likely to want to abandon. The only state a stop is refused for is a terminal one, which the
+     * guard above already answers, and the *step* side is guarded by `stopEffect`, which touches only a
+     * step actually in flight. `take_over` is the same gesture with the escape hatch attached, so it
+     * follows the same rule.
+     */
     case 'kill':
       return {
         kind: 'apply',
@@ -359,9 +428,18 @@ export const decideSteering = (
           escapeHatch: true,
           handoff: {
             code: TAKE_OVER_HANDOFF_CODE,
+            /**
+             * Says the run halts, and says **nothing** about where the work ended up.
+             *
+             * This sentence is composed here, before the escape hatch has run, so it cannot know whether
+             * a branch was created — and it used to assert one was. When git failed, only `HANDOFF.md` was
+             * corrected: the `command.applied` payload and the checkpoint folded from it went on claiming
+             * the work was on a branch that does not exist, in the record AD-4 makes the only authority.
+             * The reconciler appends the hatch's own outcome to this sentence once it knows it.
+             */
             reason:
-              `${intent.principal.kind} "${intent.principal.id}" took the work over, so the partial ` +
-              'work is put on an ordinary branch named from the run id and the run halts (CAP-23).',
+              `${intent.principal.kind} "${intent.principal.id}" took the work over, so the run ` +
+              'halts (CAP-23).',
           },
         }),
         reason: 'a person took the work over, so the run hands off rather than continuing (CAP-23)',
@@ -436,8 +514,16 @@ export const commandRefusedPayload = (
 /**
  * The step record an effect names, when the effect names one that exists.
  *
- * A `command.applied` naming a step with no record would fold to nothing, so the caller checks first
- * and records the effect without the step rather than recording a step change that cannot land.
+ * `null` means two different things and the caller has to tell them apart: a run-level effect names no
+ * step, and a step-level effect can name one the run has no record of. The second is an invariant
+ * violation, not a case to smooth over — a `command.applied` carrying an unknown step folds its
+ * `to_state` and silently drops its `step_disposition`, so a kill would halt the run while leaving the
+ * step it named unrecorded. `applyIntent` therefore asks this before it emits, and refuses the intent
+ * rather than emitting a line that applies half of itself.
+ *
+ * Every effect in this module names a step taken from `state.steps` — {@link blockedStepOf} and
+ * `inFlightStep` both read it — so the check is a guard against a future effect built some other way,
+ * which is the only kind of guard that is worth anything.
  */
 export const effectTarget = (state: RunState, effectToApply: IntentEffect): StepRecord | null =>
   effectToApply.step === null ? null : findStepRecord(state, effectToApply.step);

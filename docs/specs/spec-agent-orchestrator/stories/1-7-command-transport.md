@@ -1,96 +1,123 @@
----
-title: 'Command transport — durable intent files, disengage, escape hatch'
-type: 'feature'
+---title: Command transport — durable intent files, disengage, escape hatch
+type: feature
 created: '2026-09-20'
-status: 'done'
-review_loop_iteration: 0
+status: done
+review_loop_iteration: 1
 followup_review_recommended: true
 context:
-  - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/interface-contract.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-3-engine-reconciler.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-4-step-spawner.md'
-warnings: ['oversized'] # 12 files and 15 I/O scenarios; closes both of story 1-3's steering deferrals
+- '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/interface-contract.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-3-engine-reconciler.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-4-step-spawner.md'
+warnings:
+- oversized
 deferred:
-  - summary: >-
-      No review layer ran against this story; the gate and the implementer's own mutation probes are the
-      only scrutiny it received.
-    evidence: |-
-      typecheck, lint, 866 tests and build all pass, and four mutations were confirmed to kill tests
-      (disabling the mid-step watcher fails 5 disengage tests; removing the intent_id check fails the
-      redelivery tests; removing the fold's seen-id skip fails the fold test; removing the failure limit
-      makes the repeated-failure run never settle). That is not a substitute for the four-layer review
-      stories 1-1 and 1-2 had. Read `status: done` as implemented and gated.
-    severity: high
-  - summary: >-
-      Seven declared commands are carried but not honoured, and their files stay in `commands/` until the
-      story that owns them lands.
-    evidence: |-
-      COMMAND_HANDLING marks answer, edit_criterion, reject, narrow, pause, inject_note and fork as
-      `awaiting`: the file is left in place, unconsumed and unrecorded, and reported in
-      PassResult.steering. Acknowledging them instead would swallow a user's answer or edit before story
-      1-8's compare-and-set could see it. The cost is that such a file is re-read (and re-parsed) on
-      every pass until its owner consumes it. `pause` is the one that will read as a gap to a user: the
-      lifecycle has no non-terminal halted state, so a pause that can be resumed needs story 2-9's
-      hibernation.
-    location: src/engine/steering.ts
-    severity: medium
-  - summary: >-
-      `disengage` and `kill` produce the same effect, which is a judgement call a reviewer could
-      reasonably have made the other way.
-    evidence: |-
-      The Always list says "a step stopped by a steering command records `killed` and is never resumed or
-      re-run", and AD-8 says the same, so both gestures stop the step as `killed` and halt the run at the
-      terminal `killed` state. "Halting leaves resumable state on disk" is therefore satisfied by what
-      survives — the checkpoint, the full log, the step's session id and baseline_ref, the typed input and
-      the worktree — not by the run being resumable by a later pass. A reviewer expecting disengage to
-      leave a *resumable run* will find no such state in the lifecycle diagram.
-    location: src/engine/steering.ts
-    severity: medium
-  - summary: >-
-      The declared disengage bound is measured to the stop call, not to the child's death, and never
-      against the real spawner.
-    evidence: |-
-      tests/engine.disengage.test.ts measures from the instant the intent file lands to the instant the
-      pass returns with the step recorded `killed`, driving an executor whose step hangs until stopped.
-      Story 1-4's own EXECUTOR_KILL_GRACE_MS (5s) governs a child that ignores the first signal, and no
-      test spends a real `claude` call, so the end-to-end latency of a real container-wrapped child is
-      unmeasured.
-    location: tests/engine.disengage.test.ts
-    severity: medium
-  - summary: >-
-      Applying an intent does not contend for a territory, so a take-over's git effect touches the run's
-      worktree without holding it.
-    evidence: |-
-      A steering intent is applied before any action is decided and outside admitByTerritory, deliberately
-      — deferring a disengage behind an unrelated feature's territory would make "always available"
-      conditional on unrelated work. The escape hatch is the one intent effect that writes to a worktree,
-      so a take-over on run A and a step of run B sharing one worktree could interleave. Two runs sharing a
-      worktree is already what territory exists to serialise.
-    location: src/engine/reconciler.ts
-    severity: medium
-  - summary: >-
-      The declared failure limit counts only the `failed` disposition, so story 1-3's unbounded resume
-      loop is still unbounded.
-    evidence: |-
-      DECLARED_FAILURE_ATTEMPT_LIMIT hands off after three `failed` attempts, which closes the matrix's
-      repeated-failure row and the retry half of 1-3's EC12. `interrupted` is deliberately excluded: an
-      interruption is the engine's own, and capping it would make a run that is restarted often enough
-      hand itself off for surviving — it would also break the crash-injection suite, whose iterations
-      legitimately reach three attempts. 1-3's EC13 (the same session id resumed every pass) therefore
-      stands until AD-24's ceilings arrive in story 2-9.
-    location: src/engine/reconciler.ts, src/engine/handoff.ts
-    severity: medium
-  - summary: >-
-      A take-over whose git fails halts the run with the work uncommitted in the worktree and no branch.
-    evidence: |-
-      escapeHatch returns a `failure` rather than throwing, the hand-off document says the work is still in
-      the worktree and names the path, and the run still reaches `handed_off`. Nothing is discarded and
-      nothing loops, but the promised branch does not exist in that case, and no test drives a git that
-      fails *midway* — only one that fails at every call.
-    location: src/engine/handoff.ts
-    severity: low
-baseline_revision: '82c53b2deb3be15e3634a4e2906be27200d9826c'
+- summary: 'RESOLVED 2026-09-21: the four-layer review ran. See the Review Triage Log.'
+  evidence: 63 claims filed, 31 triage rows, 23 patched including five high. Suite 1346 -> 1391 tests
+    across 51 files, zero skips. Four mutations that had left the suite green are now each caught by a
+    test.
+  severity: high
+- summary: Seven declared commands are carried but not honoured, and their files stay in `commands/` until
+    the story that owns them lands.
+  evidence: 'COMMAND_HANDLING marks answer, edit_criterion, reject, narrow, pause, inject_note and fork
+    as
+
+    `awaiting`: the file is left in place, unconsumed and unrecorded, and reported in
+
+    PassResult.steering. Acknowledging them instead would swallow a user''s answer or edit before story
+
+    1-8''s compare-and-set could see it. The cost is that such a file is re-read (and re-parsed) on
+
+    every pass until its owner consumes it. `pause` is the one that will read as a gap to a user: the
+
+    lifecycle has no non-terminal halted state, so a pause that can be resumed needs story 2-9''s
+
+    hibernation.'
+  location: src/engine/steering.ts
+  severity: medium
+- summary: '`disengage` and `kill` produce the same effect, which is a judgement call a reviewer could
+    reasonably have made the other way.'
+  evidence: 'The Always list says "a step stopped by a steering command records `killed` and is never
+    resumed or
+
+    re-run", and AD-8 says the same, so both gestures stop the step as `killed` and halt the run at the
+
+    terminal `killed` state. "Halting leaves resumable state on disk" is therefore satisfied by what
+
+    survives — the checkpoint, the full log, the step''s session id and baseline_ref, the typed input
+    and
+
+    the worktree — not by the run being resumable by a later pass. A reviewer expecting disengage to
+
+    leave a *resumable run* will find no such state in the lifecycle diagram.'
+  location: src/engine/steering.ts
+  severity: medium
+- summary: 'RESOLVED: the bound is split and the kill grace is named authoritative.'
+  evidence: The story declared 2s while EXECUTOR_KILL_GRACE_MS is 5s, so the promise was unmeetable by
+    construction. Now an observation bound of 2s (the loop's own share, so no latency assertion weakened)
+    and an end-to-end bound of 8s. The resume path, which had no watcher at all, now starts the same one.
+  location: tests/engine.disengage.test.ts
+  severity: medium
+- summary: Applying an intent does not contend for a territory, so a take-over's git effect touches the
+    run's worktree without holding it.
+  evidence: 'A steering intent is applied before any action is decided and outside admitByTerritory, deliberately
+
+    — deferring a disengage behind an unrelated feature''s territory would make "always available"
+
+    conditional on unrelated work. The escape hatch is the one intent effect that writes to a worktree,
+
+    so a take-over on run A and a step of run B sharing one worktree could interleave. Two runs sharing
+    a
+
+    worktree is already what territory exists to serialise.'
+  location: src/engine/reconciler.ts
+  severity: medium
+- summary: The declared failure limit counts only the `failed` disposition, so story 1-3's unbounded resume
+    loop is still unbounded.
+  evidence: 'DECLARED_FAILURE_ATTEMPT_LIMIT hands off after three `failed` attempts, which closes the
+    matrix''s
+
+    repeated-failure row and the retry half of 1-3''s EC12. `interrupted` is deliberately excluded: an
+
+    interruption is the engine''s own, and capping it would make a run that is restarted often enough
+
+    hand itself off for surviving — it would also break the crash-injection suite, whose iterations
+
+    legitimately reach three attempts. 1-3''s EC13 (the same session id resumed every pass) therefore
+
+    stands until AD-24''s ceilings arrive in story 2-9.'
+  location: src/engine/reconciler.ts, src/engine/handoff.ts
+  severity: medium
+- summary: A take-over whose git fails halts the run with the work uncommitted in the worktree and no
+    branch.
+  evidence: 'escapeHatch returns a `failure` rather than throwing, the hand-off document says the work
+    is still in
+
+    the worktree and names the path, and the run still reaches `handed_off`. Nothing is discarded and
+
+    nothing loops, but the promised branch does not exist in that case, and no test drives a git that
+
+    fails *midway* — only one that fails at every call.'
+  location: src/engine/handoff.ts
+  severity: low
+- summary: '`step.approved` is emitted by nothing, and was deliberately not removed.'
+  evidence: The Spec Change Log records keeping the constant and its fold case as a decision, and two
+    tests assert nothing re-emits it. Removing it would edit a recorded decision, so it is carried rather
+    than reversed — an event vocabulary member nothing writes.
+  location: src/engine/rebuild.ts
+  severity: medium
+- summary: A refusal raised mid-step can reach `PassResult.steering` but only the applied case is asserted.
+  evidence: Constructing a mid-step refusal needs a stop intent that is simultaneously refusable, which
+    the terminal guard makes contradictory. The structure is right; the case is unreachable to a test.
+  location: src/engine/reconciler.ts
+  severity: low
+- summary: Four claims about two engine processes consuming concurrently cannot be settled without violating
+    AD-30, which forbids a second engine per ORCH_HOME.
+  evidence: Triaged maybe-false. What would settle them is a second engine process, which AD-30 says must
+    not exist. Exactly-once survives concurrent consumption today because the fold dedupes on intent id,
+    not because the transport excludes it.
+  severity: medium (unverified)
+baseline_revision: 82c53b2deb3be15e3634a4e2906be27200d9826c
 ---
 
 <intent-contract>
@@ -269,6 +296,53 @@ Three decisions inside the intent contract, recorded because a reviewer could re
 
 ## Review Triage Log
 
+### 2026-09-21 — Review pass (follow-up, on a `done` spec)
+
+- claims filed: 63 across four layers — blind-hunter 22 (16 numbered plus 6 in its closing paragraph),
+  edge-case-hunter 26, verification-gap 5 gap + 2 other, intent-alignment 8 divergences. The edge-case layer
+  filed an enumerated list so its count is exact; the other three wrote prose, so those are my enumeration of
+  the distinct claims each made.
+- grouped into the 31 rows below. 23 patch entries applied, 4 deferred, the rest rejected on their refutation
+  or as cosmetic. No filed claim is without a row.
+- every `high` was verified by me against HEAD before the patch round and again after it. Three were verified
+  empirically by driving the compiled build: the `approve` bypass (`drafting` returned `apply` with
+  `toState: 'running'`, and now refuses), `mintIntentId('')` (returned `"cmd-"`, now refuses its seed), and
+  the two reconciled bounds. The `resume-step` and commit-failure findings arrive pre-verified from the
+  verification-gap layer, which reconstructed the post-story tree with `git archive` plus `git apply` and
+  proved each by mutation against a green suite.
+
+- `[high]` `[patch]` CAP-2 bypass: `approve` had no target-state guard, so `decideSteering` returned `toState: 'running'` for any non-terminal state. I drove it directly — `drafting`, `confirmed` and `blocked` all returned `apply` — so a run whose acceptance criteria were never confirmed entered execution, and the decision's own reason text cited CAP-12 while never noticing the run was unconfirmed. `confirm_spec` was CAP-2's only gate. Now refused unless the run is `blocked`, the one state `decideAction` answers with `await-approval`. Verified after the fix: `drafting` and `confirmed` refuse, `blocked` applies.
+- `[high]` `[patch]` The handoff document told a person to `git checkout` a branch that does not exist. Both the "where the work is" and "next steps" blocks pushed the branch unconditionally inside `if (brief.escape !== null)`, with no check on `escape.failure`. Now gated on `failure === null` at both sites (lines 370 and 397); on failure the document repeats the hatch's own detail, which says where the uncommitted changes actually are. This is CAP-23's entire purpose, so a document that misdirects is the worst available failure.
+- `[high]` `[patch]` A failed `git commit` reported the work as preserved. Neutralising the commit-failure branch left the whole suite green: the failure fell through to the success return with `preserved: true`, `failure: null` and a detail claiming the work was committed. Both previously unreachable branches — checkout failure and commit failure — are now covered by a per-subcommand failing `WorktreeGit` double. Composed with the row above, a take-over whose commit failed told a person their work was on a branch that did not exist while the run reached `handed_off`.
+- `[high]` `[patch]` CAP-5 failed on the resume path: `watchForStopIntents` was called from exactly one place, so `resume-step` had no watcher and no post-termination consumption. A probe showed a `disengage` during a resume was not observed at all — the child was live 2.2s later, past the bound, the step recorded `completed` on its own, and the run was left `interrupted`. A step resumed after a crash is the long-running case where instant disengage matters most, and no deferral recorded it. Both paths now start the same watcher.
+- `[high]` `[patch]` Seven of fourteen commands could never be refused: the `awaiting` branch returned before the terminal-state guard, so an `answer`/`pause`/`fork` intent on a terminal run was neither refused nor quarantined and its file was re-read on every pass and every 25ms poll, forever — contradicting this story's own Always claim. The guard moved above the branch; a new test asserts `terminal-run` for all fourteen commands.
+- `[medium]` `[patch]` The declared disengage bound was smaller than the real kill grace: 2s in `reconciler.ts` against `EXECUTOR_KILL_GRACE_MS = 5_000` in `spawner.ts`, so the promise was unmeetable by construction. Split into an observation bound (2s, the loop's own share — so no existing latency assertion was weakened) and an end-to-end bound of 8s, with the grace named authoritative because it is a decision about a child process owned by the unit that signals it.
+- `[medium]` `[patch]` Nothing wires the stopper, so CAP-5's mid-step property is inert as assembled. Not wired — that belongs to whoever assembles the engine — but made loud: a `steering.stopper_unwired` line is recorded once per run per process, so the missing capability is visible in the log instead of silent.
+- `[medium]` `[patch]` `mintIntentId('')` returned the literal `"cmd-"` and passed the loggable check, so two such intents shared the exactly-once key the whole at-least-once argument rests on and the second was dropped as `already-applied`. Now refuses its seed and asserts its own output. Verified: `''` and `'short'` refuse, a real ULID mints.
+- `[medium]` `[patch]` An intent id reused for a different command was silently swallowed as `already-applied`, because the ledger stored ids without commands. The ledger now carries the command and a mismatch is refused as `intent-id-reused`; an absent logged command still reads as `already-applied`, because a mismatch cannot be called on evidence the log lacks.
+- `[medium]` `[patch]` `applyIntent` throwing left the intent neither retired nor quarantined, so the same failing intent was retried every pass forever. Now quarantined as `effect-failed` and the pass continues — safe because `command.applied` is the ledger entry and the effect in one append, so a throw means nothing landed.
+- `[medium]` `[patch]` `steer()` returned success for a command nothing applied when the decision was `awaiting`, handing the caller the old state and no error. Now throws, carrying the owner's reason, while deliberately leaving the file in place for that owner.
+- `[medium]` `[patch]` Durability gaps in `commands/`: the intent's rename was never followed by a directory `fsync`, so a crash could lose exactly the disengage that at-least-once delivery exists to never lose; `retireIntent` and `quarantineIntent` had the same gap; nothing swept `.tmp` debris; nothing pruned `applied/` or `refused/`. All four closed, with the sweep given a 60s grace because renderers also write here and a sweep-on-sight would race a live writer between its write and its rename.
+- `[medium]` `[patch]` `readIntentFiles` could create the poison file it claimed to exclude: a read failure other than ENOENT was silently skipped, so the file was in neither `pending`, `refused` nor `incomplete` and was met and skipped by every pass forever. Now classified and refused as `unreadable-file`. A future mtime from clock skew had the same effect and is now reported as skew rather than youth.
+- `[medium]` `[patch]` An intent id containing `.` could hide its own file: the id pattern admitted `.`, the file name embedded it, and the reader filtered anything ending `.refusal.json`. The pattern no longer admits `.`, and the sidecar filter — dead in both directions and the mechanism by which such a file vanished — was removed.
+- `[medium]` `[patch]` `orderIntents` gave stop commands no precedence, so an earlier `confirm_spec` was applied before a later `disengage` — including when the user pressed disengage precisely to override it, on a writer-supplied and skewable `issued_at`. Stop commands now sort first.
+- `[medium]` `[patch]` A stop intent naming a different step stopped whatever was running: the watcher matched on command alone. Now matches the step too, with a test that a `kill` naming `verify` leaves `implement` alone.
+- `[medium]` `[patch]` The escape hatch had no defences for the environment it runs in — no `--no-verify` and no committer-identity fallback, so a repo with a pre-commit hook or an unconfigured identity failed the one commit that exists to save a user's work. Now `-c user.name`/`-c user.email` per invocation with `--no-verify`, and the worktree is restored to whatever branch it was on, read back rather than derived.
+- `[medium]` `[patch]` `HANDOFF.md` was the one durable write here that was not atomic — a plain `writeFileSync`, deliberately performed *before* the recorded facts, so a crash mid-write left the human-facing note truncated. Now temp + fsync + rename + directory fsync.
+- `[medium]` `[patch]` A take-over's recorded reason could be false: it was composed before `escapeHatch` ran and asserted the work was on a branch, and when git failed only `HANDOFF.md` was corrected while the `command.applied` payload and the folded checkpoint kept the claim. The reason no longer asserts a branch, and the corrected detail reaches all three.
+- `[medium]` `[patch]` The mid-step gesture's outcome was discarded, so an intent applied mid-step never reached `PassResult.steering` and a refusal raised there was invisible — contradicting the Spec Change Log's own claim about `steering`. The outcome is now parked and drained into the pass result, and the four computed-but-unused `StopObservation` fields are recorded as a `steering.stop_delivered` line.
+- `[medium]` `[patch]` `advance(run)` consumed no intents, so a caller driving it per run honoured a durable intent only if the mid-step watcher happened to catch it — against AD-19 making the file the only command path. `advance` without a preloaded snapshot now consumes first; with one, it does not, because the only such caller is `pass`, which has already consumed.
+- `[medium]` `[patch]` Three mutations that left the suite green, each now covered by a test rather than a code change: replacing the mid-step `STOP_COMMANDS` filter with `read.pending[0]`, which would have let a user's unanswered `answer` kill every subsequent step because `awaiting` files sit in `commands/` by design; retiring an `awaiting` intent, which swallows a user's answer, unasserted because nothing checked `awaiting` at the pass level; and skipping the `command.applied` record for an `acknowledge` decision, which breaks AD-19's attributability for `continue` and `just_do_it`.
+- `[low]` `[patch]` Nine smaller real defects: `effectTarget` was exported dead code whose doc described a guard that did not exist, and an effect naming an unknown step silently applied its `to_state`; `moveAside` named first collisions `.2`, was an unbounded `existsSync`/`rename` TOCTOU on a directory two processes write to, and let a second quarantined file overwrite the first's refusal sidecar; `quarantineOrphanIntents` destroyed *valid* pending intents with no grace, unlike the torn-file case, so an intent written before the first log append was lost; a `command.applied` with no usable `intent_id` was folded on every replay; `isLoggableIntentId`'s bound was a literal rather than the active policy's; `namedFields` printed "the declared shape rejects " with nothing after it.
+- `[medium]` `[defer]` `step.approved` is emitted by nothing — the constant, its `FOLDED_EVENT_TYPES` entry and its fold case are all dead. Deliberately not removed: the Spec Change Log records keeping it as a decision, and two existing tests assert nothing re-emits it, so deleting it would edit a recorded decision. Carried rather than reversed.
+- `[high]` `[defer]` No production caller constructs a `Reconciler` anywhere in `src/`, so none of this transport is on an execution path. Third story in a row with this shape (1-5's containment, 1-6's pool). Owned by stage 2; patch 7 makes the stopper half of it audible in the log.
+- `[low]` `[defer]` `ageMs` returning `null` from a `statSync` failure is handled and commented but untested — there is no portable way to make `stat` fail on a file `readdir` just listed. The analogous read-failure class is now tested through a new injectable seam.
+- `[low]` `[defer]` A refusal raised *mid-step* reaching `PassResult.steering` is now structurally possible but only the applied case is asserted; constructing a mid-step refusal needs a stop intent that is simultaneously refusable, which the terminal guard makes contradictory.
+- `[false]` `[reject]` The `wrong-target-state` refusal is declared but never produced. It **is** produced, at `reconciler.ts:1670`, for a lost question compare-and-set. The real gap behind the claim — that no *target-state* refusal existed for the state-machine commands — was true and is the first row above.
+- `[false]` `[reject]` Five claims about guards being tautological with respect to external input, or about constants being unused, that did not hold at the cited lines once followed to their callers. (5 findings)
+- `[low]` `[reject]` Eleven hardening suggestions on inputs no caller can supply, where each fix adds a branch guarding state never shown reachable. (11 findings)
+- `[maybe-false]` `[defer]` Four claims about behaviour under concurrent consumption by two engine processes, which AD-30 forbids and no test can construct without violating it. Recorded with what would settle them: a second engine, which AD-30 says must not exist. (4 findings)
+
 ## Design Notes
 
 **At-least-once delivery with an exactly-once effect is the crux.** The tempting design is to delete an intent file once read, which makes delivery at-most-once: a crash in the wrong millisecond silently loses a disengage the user already pressed. The opposite — apply first, mark later — can double-apply an approval, and story 1-3's review showed what a doubled approval costs, since `approve` folds to `interrupted` and a re-run follows. The resolution is the one AD-15 already uses for the write surface: make the effect idempotent on a key. Carry `intent_id` into the event the effect appends, and have the fold ignore an id it has already seen. Then losing sleep over delivery stops being necessary.
@@ -296,65 +370,34 @@ export PATH="/Users/deep/.nvm/versions/node/v24.21.0/bin:$PATH"   # node v24.21.
 
 ## Auto Run Result
 
-**REVIEW WAS SKIPPED** for this story; no review layers ran. Read `status: done` as implemented and
-gated, not reviewed.
+**Status: done, reviewed.** The four-layer review ran on 2026-09-21 as a follow-up pass on a `done` spec. 63
+claims filed, 31 triage rows, 23 patched, 4 deferred. Suite 1346 -> 1391 tests across 51 files, zero skips,
+zero failures; the crash-injection suite still converges on every discovered boundary.
 
-Status: done
-Blocking condition: none
+**Five high findings. Three of them compose into one user-facing failure.** A failed `git commit` reported the
+work as `preserved: true`; the handoff document then pushed `git checkout <branch>` unconditionally; and the
+only test of a mid-step take-over ran against `/tmp/no-worktree-needed`, which does not exist, so it drove
+exactly that failure path while asserting nothing about the branch. Together: a take-over whose commit failed
+told a person their work was committed on a branch that was never created, and the run still reached
+`handed_off` — the one outcome CAP-23 exists to prevent. Each third of that was found by a different layer.
 
-**No review layer ran.** The gate, the implementer's mutation probes and story 1-3's crash-injection
-suite are the only scrutiny this story received, so `followup_review_recommended` is true and the first
-deferred entry records it. Read `status: done` as *implemented and gated*.
+The fourth was a CAP-2 bypass: `approve` had no target-state guard, so an unconfirmed `drafting` run entered
+execution. I verified it by driving `decideSteering` directly, and verified the fix the same way. The fifth was
+CAP-5 failing on the resume path, where `watchForStopIntents` was never called — a `disengage` during a resume
+was not observed at all, the child was live past the bound, and the step recorded `completed` on its own.
 
-**Implemented change.** Four new modules and four new suites, plus additive changes to three existing
-files.
+**A constant that was wrong by construction.** The story declared a 2s disengage bound while
+`EXECUTOR_KILL_GRACE_MS` is 5s, so the production stopper could never meet it. Split into a 2s observation
+bound — the loop's own share, keeping every existing latency assertion at the same number — and an 8s
+end-to-end bound, with the grace named authoritative because it is a decision about a child process owned by
+the unit that signals it.
 
-- `src/runtime/paths.ts` — `commands/`, `commands/applied/`, `commands/refused/` and `HANDOFF.md` on
-  `RunPaths`, so the AD-9 layout still has exactly one owner.
-- `src/engine/commands.ts` — the file: an atomic write, an enumeration, a parse against the existing
-  `CommandIntentSchema`, five refusal classes with a sixth for a torn file past its grace, quarantine into
-  `refused/` with a reason sidecar, retirement into `applied/`, a total ordering over a pass's intents, and
-  the `appliedIntentIds` ledger read off the log.
-- `src/engine/steering.ts` — the effect: a total `CommandMap` over the enum, the terminal guard applied
-  once for every command, the five commands this story honours, and the decision that a redelivered or
-  redundant command changes nothing.
-- `src/engine/handoff.ts` — the escape hatch (`orch/takeover/<run-id>`, idempotent, never discarding) and
-  the hand-off document, rendered as prose from a typed brief with field-by-field redaction.
-- `src/engine/reconciler.ts` — intents consumed at the top of every pass as their own action; the mid-step
-  watcher and the `StepStopper` port; `steer`/`confirm`/`approve`/`kill`/`disengage`/`takeOver` all writing
-  a file and consuming it; the declared failure limit; the hand-off document on every hand-off path.
-- `src/engine/rebuild.ts` — the fold of `command.applied`, which is the exactly-once mechanism.
+**Four mutations that had left the whole suite green are now each caught.** The mid-step `STOP_COMMANDS`
+filter, whose loss would have let a user's unanswered `answer` kill every subsequent step; retiring an
+`awaiting` intent, which swallows an answer; skipping the `command.applied` record for an `acknowledge`, which
+breaks AD-19 attributability for `continue` and `just_do_it`; and the commit-failure branch.
 
-**Verification performed** (Node v24.21.0 by absolute path):
-
-- `npm run typecheck`, `npm run lint`, `npm run build` → exit 0; `npm test` → 30 files, **866 passed**,
-  8 skipped (up from 26 files / 793 at baseline `82c53b2`)
-- `npx vitest run tests/engine.crash-injection.test.ts` → 5 passed. The suite now discovers **23**
-  durable boundaries, up from 21: `intent-written:confirm_spec` and `intent-retired:confirm_spec` are new,
-  and the confirmation's `feature.state_changed` is now `command.applied`. Every boundary converges on
-  `committed|implement:completed|verify:completed`, with the same ledger, listing and commit count as the
-  uninterrupted run.
-- Four mutations were confirmed to kill tests, so the new suites are not passing vacuously:
-  disabling the mid-step watcher fails 5 of the 8 disengage tests (they time out, which is the honest
-  failure for a stop that never arrives); removing the `intent_id` check fails the redelivery tests;
-  removing the fold's seen-id skip fails the fold test; removing the failure limit makes the
-  repeated-failure run never settle.
-- `grep -rnE "process\.on|beforeExit|finally \{" src/engine/` → the four pre-existing matches in
-  `cli.ts` and `checkpoint.ts`, all file-descriptor closes; nothing new, and nothing halts, reclaims or
-  cleans up on an exit path. `grep -rniE "docker|podman|containerd" src/engine/` → no match.
-  `src/engine/` still imports only `../contracts/`, `../runtime/` and `node:` builtins.
-
-**The crash-injection suite found the one real defect in this story.** Killed at
-`intent-written:confirm_spec` — after the intent file lands, before its effect is recorded — the restart
-finds the run still `drafting`, writes a *second* confirmation, applies it, and then meets the first file
-still sitting there. Refusing that file made `confirm()` throw on the restart and the run never converged.
-The fix is the `already-satisfied` decision: a command whose outcome is already the state of the world is
-recognised and retired rather than refused, which is the state-level counterpart of the id-level
-exactly-once rule. One keystroke, two files, one effect, no error.
-
-**What the declared bound is a claim about.** `DECLARED_DISENGAGE_BOUND_MS` is 2s, built on a 25ms poll of
-`commands/` held open for exactly as long as a step is in flight. The disengage suite writes the intent
-*after* the executor has reported a step in flight and *before* it terminates, and the step only ever ends
-because the gesture stopped it — so a missing mechanism fails as a timeout rather than as a green test.
-Measured latency covers the poll, the directory read, the stop call, the recorded termination and the
-intent's own effect, so the run is terminal inside the bound and not only the child.
+**Residual risk, and why `followup_review_recommended` is true.** Five high entries were patched. The specific
+unverified risk is that `advance()` now consumes intents where it previously did not, and the stop-precedence
+change reorders when gestures apply — both behavioural changes to a loop no production caller constructs, so
+neither is exercised by anything but tests. That closes when stage 2 assembles the engine.

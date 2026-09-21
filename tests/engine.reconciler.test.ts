@@ -1122,17 +1122,28 @@ describe('a steering command is refused once the run is past taking it', () => {
     expect(executor.resumed).toStrictEqual([]);
   });
 
-  it('approves without rewriting any step when nothing is blocked', async () => {
-    // `approve` finds the step whose failure blocked the run by asking the disposition table, so a run
-    // with no such step gets the state change and no `step.approved` line at all.
+  it('refuses an approve for a run with no gate to approve, and rewrites no step', async () => {
+    /**
+     * CAP-2 — `confirm_spec` is the only gate into execution, and `approve` answers CAP-12's blocked gate.
+     *
+     * A run that is merely `running` has no gate to approve, so the command is refused rather than moving
+     * the run. Without this guard `approve` returned `toState: 'running'` for *any* non-terminal state, so
+     * an approve on a `drafting` run put a feature whose acceptance criteria were never confirmed straight
+     * into execution — a second, unguarded way in, past the one gate CAP-2 has.
+     *
+     * The original assertions stand and say more than they did: no `step.approved` line exists, and the
+     * step the approval would have targeted is still exactly as it was recorded.
+     */
     const { reconciler } = openReconciler({ script: alwaysCompletes });
     const accepted = reconciler.acceptFeature(makePlan());
     reconciler.confirm(accepted.run);
     await reconciler.pass();
+    expect(reconciler.load(accepted.run).state.state).toBe('running');
 
-    reconciler.approve(accepted.run);
+    expect(() => reconciler.approve(accepted.run)).toThrowError(SteeringRefused);
     expect(eventTypes(accepted.run)).not.toContain(ENGINE_EVENT_TYPES.StepApproved);
     expect(reconciler.load(accepted.run).state.steps[0]?.disposition).toBe('completed');
+    expect(reconciler.load(accepted.run).state.state).toBe('running');
   });
 });
 

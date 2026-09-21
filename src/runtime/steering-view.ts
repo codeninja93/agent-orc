@@ -76,6 +76,26 @@ export const COMMAND_HANDLING: CommandMap<CommandHandling> = {
 };
 
 /**
+ * The commands that stop work already in flight.
+ *
+ * A stop gesture must not wait for the current step to finish — that is the whole of CAP-5 — and it must
+ * not wait behind another command either, so two units read this list: the mid-step watcher looks for
+ * these while a step is running, and the pass's ordering applies them before anything else it found.
+ * `take_over` is one of them because the escape hatch takes the work away from the run: leaving the step
+ * running would have the system and a person editing one worktree at the same time.
+ *
+ * It lives here, beside {@link COMMAND_HANDLING}, because the engine's reader and the engine's orderer are
+ * two modules with an import edge in one direction only — the orderer is in `commands.ts` and the watcher
+ * is in `reconciler.ts`, which imports it — so a list declared in the watcher could not be read by the
+ * orderer without a cycle. One list, read by both, is the point: a stop command that sorted last would
+ * make "always available" mean "after whatever else arrived first".
+ */
+export const STOP_COMMANDS: readonly Command[] = Object.freeze(['kill', 'disengage', 'take_over']);
+
+/** True when this command stops work already in flight, and so outranks everything that does not. */
+export const isStopCommand = (command: Command): boolean => STOP_COMMANDS.includes(command);
+
+/**
  * The commands whose effect this build applies.
  *
  * Both `effect` and `question` count, because both do something durable when consumed. Only `awaiting`

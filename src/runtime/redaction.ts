@@ -83,7 +83,15 @@ export interface RedactionPolicy {
   readonly maxSerialisedChars?: number;
 }
 
-const DEFAULT_HIGH_ENTROPY_MIN_LENGTH = 24;
+/**
+ * The shortest token run the high-entropy rule considers when a policy names no length of its own.
+ *
+ * Exported because a second unit has to reason about it rather than guess it: `isLoggableIntentId`
+ * refuses an intent id whose token runs could reach this length, and the exactly-once key depends on
+ * that refusal being computed from the *same* number this pass uses. A literal `23` beside it was a
+ * second spelling of this threshold, and the two would have drifted the day a policy changed it.
+ */
+export const DEFAULT_HIGH_ENTROPY_MIN_LENGTH = 24;
 const DEFAULT_HIGH_ENTROPY_MIN_BITS = 3.5;
 const DEFAULT_MAX_DEPTH = 64;
 const DEFAULT_MAX_SERIALISED_CHARS = 16 * 1024 * 1024;

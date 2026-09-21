@@ -21,11 +21,11 @@
  * whole.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, writeFileSync } from 'node:fs';
 
 import { formatTimestamp, renderCause } from '../contracts/index.js';
 import type { FeatureState, StepRecord } from '../contracts/index.js';
-import { redactValue, takeoverBranchFor } from '../runtime/index.js';
+import { fsyncDirectory, redactValue, takeoverBranchFor } from '../runtime/index.js';
 import type { RedactionPolicy, RunPaths } from '../runtime/index.js';
 
 import { GIT_MAX_BUFFER_BYTES, GIT_TIMEOUT_MS } from './baseline.js';
@@ -79,6 +79,20 @@ export const execFileWorktreeGit: WorktreeGit = (worktree, args) => {
   }
 };
 
+/**
+ * The committer identity a take-over commit falls back to.
+ *
+ * A repository with no `user.name` or `user.email` configured — a container, a CI checkout, a fresh
+ * machine — fails `git commit` outright, and the one commit that fails is the one whose whole purpose is
+ * to save a person's unfinished work. The identity is passed per-invocation with `-c`, so nothing is
+ * written into the repository's config and a repository that *has* an identity keeps using its own.
+ *
+ * It is deliberately not a person's name: this commit was made by the orchestrator on a person's behalf,
+ * and attributing it to them would put a commit in their history they did not make.
+ */
+export const TAKEOVER_COMMITTER_NAME = 'orch';
+export const TAKEOVER_COMMITTER_EMAIL = 'orch@localhost';
+
 /** What the escape hatch did with the partial work. */
 export interface EscapeHatchOutcome {
   readonly branch: string;
@@ -94,8 +108,23 @@ export interface EscapeHatchOutcome {
    * A failure here never discards anything and never retries for ever: the work stays in the worktree
    * exactly as the step left it, the document says so and says where, and the run still halts. Looping
    * on a git failure would turn "the work is never discarded" into "the run never stops".
+   *
+   * Every reader has to branch on it. `preserved`, `commit` and `detail` are all conditional on this
+   * being `null`, and a document that told a person to `git checkout` a branch no `checkout -b` ever
+   * created is the worst failure CAP-23 has — the whole point is the work surviving, and misdirection
+   * costs more than silence.
    */
   readonly failure: string | null;
+  /**
+   * The branch the worktree was on before the take-over, once it has been put back on it.
+   *
+   * `null` when it was never left, or when it could not be restored. Story 1-6 gives the worktree its own
+   * `orch/run/<run-id>` branch and reclaims it by that name, so a worktree abandoned on
+   * `orch/takeover/<run-id>` is a worktree whose pool no longer recognises it. The name is read back out
+   * of git rather than spelled here: AD-22 keeps branch naming in one place per namespace, and the engine
+   * may not import `src/pool/` to borrow its prefix.
+   */
+  readonly restoredBranch: string | null;
 }
 
 /**
@@ -124,9 +153,23 @@ export const escapeHatch = (request: {
         `The work is still in the worktree at ${request.worktree}. It could not be put on a branch ` +
         'because git would not report the worktree state.',
       failure: status.stderr.trim() || 'git status did not answer',
+      restoredBranch: null,
     };
   }
   const dirty = status.stdout.trim() !== '';
+
+  /**
+   * The branch the worktree is on now, read before anything switches it.
+   *
+   * Read rather than derived: story 1-6 names it `orch/run/<run-id>` and story 1-6's pool is what
+   * reclaims it, and the engine may not import `src/pool/` to borrow that prefix. Whatever git says is
+   * also more honest than whatever this module would guess.
+   */
+  const previous = git(request.worktree, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  const previousBranch =
+    previous.status === 0 && previous.stdout.trim() !== '' && previous.stdout.trim() !== 'HEAD'
+      ? previous.stdout.trim()
+      : null;
 
   const exists = git(request.worktree, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
   const switched =
@@ -142,27 +185,56 @@ export const escapeHatch = (request: {
         `The work is still in the worktree at ${request.worktree}, uncommitted and untouched. The ` +
         `branch ${branch} could not be created or checked out.`,
       failure: switched.stderr.trim() || 'git checkout did not answer',
+      restoredBranch: null,
     };
   }
 
+  /**
+   * Put the worktree back where it was, once the work is safely on the take-over branch.
+   *
+   * Best effort, and never a failure of the escape hatch: the work is already committed by the time this
+   * runs, so a worktree left on the take-over branch is untidy rather than lost. Reported either way, so
+   * the untidiness is visible instead of assumed.
+   */
+  const restore = (): string | null => {
+    if (previousBranch === null || previousBranch === branch) return null;
+    return git(request.worktree, ['checkout', previousBranch]).status === 0 ? previousBranch : null;
+  };
+
   if (!dirty) {
     const head = git(request.worktree, ['rev-parse', 'HEAD']);
+    const commit = head.status === 0 ? head.stdout.trim() : null;
     return {
       branch,
-      commit: head.status === 0 ? head.stdout.trim() : null,
+      commit,
       preserved: false,
       detail:
         `Everything the run had done was already committed, and the branch ${branch} now points at it. ` +
         'There was no uncommitted work left to save.',
       failure: null,
+      restoredBranch: restore(),
     };
   }
 
   const staged = git(request.worktree, ['add', '-A']);
+  /**
+   * `--no-verify`, and an identity if the repository has none.
+   *
+   * Both are defences for the environment this actually runs in rather than the one it was written in. A
+   * repository with a `pre-commit` hook — a linter, a test run, a secret scanner — fails this commit for
+   * reasons that have nothing to do with the commit: the hook is there to protect the *project's* history,
+   * and this is not a contribution to it. It is a snapshot of unfinished work on a throwaway branch, made
+   * so a person does not lose it, and a hook that vetoes it destroys exactly what CAP-23 exists to keep.
+   */
   const committed =
     staged.status === 0
       ? git(request.worktree, [
+          '-c',
+          `user.name=${TAKEOVER_COMMITTER_NAME}`,
+          '-c',
+          `user.email=${TAKEOVER_COMMITTER_EMAIL}`,
           'commit',
+          '--no-verify',
           '-m',
           `orch: partial work from run ${request.run} (${request.feature})`,
         ])
@@ -172,10 +244,20 @@ export const escapeHatch = (request: {
       branch,
       commit: null,
       preserved: false,
+      /**
+       * Says where the work is, and does **not** say it is preserved.
+       *
+       * `preserved: false` and a non-null `failure` are what every reader branches on, and they have to
+       * agree with this sentence: the changes are in the worktree, on the take-over branch, uncommitted.
+       * A `git checkout` of that branch elsewhere would not find them, which is why the document must not
+       * offer one.
+       */
       detail:
-        `The work is on the branch ${branch} in the worktree at ${request.worktree} but could not be ` +
-        'committed, so it is there as uncommitted changes. Nothing was discarded.',
+        `The work could not be committed. It is still in the worktree at ${request.worktree}, as ` +
+        `uncommitted changes, with the branch ${branch} checked out. Nothing was discarded, but nothing ` +
+        'is on the branch either — the changes only exist in that directory.',
       failure: committed.stderr.trim() || 'git commit did not answer',
+      restoredBranch: null,
     };
   }
 
@@ -186,6 +268,7 @@ export const escapeHatch = (request: {
     preserved: true,
     detail: `The partial work is committed on the branch ${branch} in ${request.worktree}.`,
     failure: null,
+    restoredBranch: restore(),
   };
 };
 
@@ -274,13 +357,35 @@ export const renderHandoffDocument = (
   );
   const lastError = [...brief.steps].reverse().find((step) => step.error !== null)?.error ?? null;
 
+  /**
+   * CAP-23's one sentence that must never be wrong: where the work is.
+   *
+   * Gated on `failure === null` throughout. When the escape hatch's git sequence failed, no branch was
+   * created and nothing was committed to one — so telling a person to `git checkout` it sends them to a
+   * ref that does not exist, and they conclude their work is gone. A document that says "it is in this
+   * directory, uncommitted" is useful; a document that names a branch that was never created is worse
+   * than no document at all, because it is the only thing they have to go on.
+   */
   const whereTheWorkIs: string[] = [];
-  if (brief.escape !== null) {
+  if (brief.escape !== null && brief.escape.failure === null) {
     whereTheWorkIs.push(brief.escape.detail);
     if (brief.escape.commit !== null) {
       whereTheWorkIs.push(`The branch is at commit \`${brief.escape.commit}\`.`);
     }
     whereTheWorkIs.push(`Pick it up with \`git checkout ${brief.escape.branch}\`.`);
+    if (brief.escape.restoredBranch !== null) {
+      whereTheWorkIs.push(
+        `The worktree itself is back on \`${brief.escape.restoredBranch}\`, where it was before.`,
+      );
+    }
+  } else if (brief.escape !== null && brief.escape.failure !== null) {
+    // The hatch ran and did not succeed. The `detail` already says where the changes actually are; it is
+    // repeated here and nothing is added, because there is no branch to send anybody to.
+    whereTheWorkIs.push(brief.escape.detail);
+    whereTheWorkIs.push(
+      `Git would not cooperate: ${clean(brief.escape.failure, policy)} Nothing was reverted and ` +
+        'nothing was deleted — the changes are the files in that directory, exactly as the run left them.',
+    );
   } else {
     whereTheWorkIs.push(
       `Whatever the run had done is in the worktree at \`${brief.worktree}\`, on whichever branch it ` +
@@ -289,10 +394,17 @@ export const renderHandoffDocument = (
   }
 
   const nextSteps: string[] = [];
-  if (brief.escape !== null) {
+  if (brief.escape !== null && brief.escape.failure === null) {
     nextSteps.push(
       `Look at the branch — \`git checkout ${brief.escape.branch}\` — and decide whether the partial ` +
         'work is worth keeping.',
+    );
+  } else if (brief.escape !== null) {
+    // Same gate as "Where the work is", and it has to be the same: a next step that names a branch that
+    // does not exist is the misdirection this document exists not to commit.
+    nextSteps.push(
+      `Open \`${brief.worktree}\` and look at the uncommitted changes there — that is where the partial ` +
+        'work is. Commit them yourself if they are worth keeping.',
     );
   }
   if (lastError !== null) {
@@ -374,14 +486,46 @@ export const renderHandoffDocument = (
   return lines.join('\n');
 };
 
-/** Write the document, replacing any earlier one whole, so a repeated hand-off is safe. */
+/** The suffix of a partly-written hand-off document, so nothing mistakes one for the document. */
+const HANDOFF_TEMP_SUFFIX = '.tmp';
+
+/** A monotonic per-process counter, so two writes in one millisecond cannot share a temp name. */
+let handoffTempCounter = 0;
+
+/**
+ * Write the document, replacing any earlier one whole, so a repeated hand-off is safe.
+ *
+ * Atomically: temporary file in the same directory, `fsync`, rename, `fsync` the directory — the same
+ * idiom `src/runtime/exclusive-create.ts` and the checkpoint writer use, and for a sharper reason than
+ * either. This document is written *before* the facts that describe it reach the log, deliberately,
+ * because a person having a bad day needs the note whether or not those lines landed. A plain
+ * `writeFileSync` therefore had a window in which a crash left the one human-facing artifact in the
+ * system truncated mid-sentence — and this was the only durable write in the hand-off path that was not
+ * atomic, while being the one whose failure mode is a person concluding their work is gone.
+ */
 export const writeHandoffDocument = (
   paths: RunPaths,
   brief: HandoffBrief,
   policy: RedactionPolicy = {},
 ): string => {
   mkdirSync(paths.runDir, { recursive: true });
-  writeFileSync(paths.handoffDocument, renderHandoffDocument(brief, policy), 'utf8');
+  handoffTempCounter += 1;
+  const temp = `${paths.handoffDocument}.${String(process.pid)}.${String(
+    handoffTempCounter,
+  )}${HANDOFF_TEMP_SUFFIX}`;
+
+  writeFileSync(temp, renderHandoffDocument(brief, policy), 'utf8');
+  const fd = openSync(temp, 'r');
+  try {
+    fsyncSync(fd);
+  } catch {
+    // Unsynced contents are a durability weakness, not a truncated document: the rename is still atomic.
+  }
+  // Closed on both paths without a `finally`: nothing in `src/engine/` may read as cleanup on an exit
+  // path, and AD-32's rule is asserted by a grep over this directory.
+  closeSync(fd);
+  renameSync(temp, paths.handoffDocument);
+  fsyncDirectory(paths.runDir);
   return paths.handoffDocument;
 };
 
