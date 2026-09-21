@@ -1,0 +1,44 @@
+# AD-31's verification floor, run by something other than a person remembering.
+#
+# The four commands are the gate every story in this spec inherits, and they were only ever run by hand:
+# a story could be finished on a machine whose Node, node_modules or lockfile differed from the declared
+# ones and nothing would say so. This workflow is that gate, on a clean checkout, on the pinned Node.
+#
+# Each command is its own step rather than one `&&` chain, because a job whose failure names the command
+# that failed is the difference between "CI is red" and "lint is red". GitHub stops a job at the first
+# failing step, so any one of the four failing fails the job — which is the acceptance criterion.
+name: CI
+
+# Both events, because they answer different questions: `push` says the branch is sound, and
+# `pull_request` says the branch *merged into its target* is sound, which is what is about to ship.
+on:
+  push:
+  pull_request:
+
+# The gate is read-only. Nothing here writes to the repository, so the token gets nothing but contents.
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: typecheck, lint, build, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Node version is read from `.nvmrc`, never written here. AD-28 declares the floor in exactly
+      # two places — `.nvmrc` and `package.json` `engines.node` — and a literal in this file would be a
+      # third, free to drift from both. `npm ci` then enforces `engines` against it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # `ci`, not `install`: it installs the lockfile exactly and fails if the lockfile and the manifest
+      # disagree, so the gate runs against the declared dependency tree rather than a resolved-today one.
+      - run: npm ci
+
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test

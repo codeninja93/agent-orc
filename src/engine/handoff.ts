@@ -42,16 +42,6 @@ import { GIT_MAX_BUFFER_BYTES, GIT_TIMEOUT_MS } from './baseline.js';
  */
 export { TAKEOVER_BRANCH_PREFIX, takeoverBranchFor } from '../runtime/index.js';
 
-/**
- * How many attempts at one step this build makes before it hands off.
- *
- * AD-24's ceilings — step count, wall clock, rate-limit budget — are story 2-9's, and this is not one
- * of them: it is the "repeated failure" row of this story's own matrix, and the alternative to it is
- * the retry loop AD-35 forbids. Named rather than inlined so 2-9 replaces a constant instead of
- * discovering a literal.
- */
-export const DECLARED_FAILURE_ATTEMPT_LIMIT = 3;
-
 /** What one `git` invocation did. A non-zero status is data here, never an exception. */
 export interface GitResult {
   readonly status: number;

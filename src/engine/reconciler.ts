@@ -92,9 +92,14 @@ import {
   writeCommandIntent,
 } from './commands.js';
 import type { IntentRefusal, IntentRefusalReason, PendingIntent } from './commands.js';
-import { routeRefusedResume, routeTermination } from './dispositions.js';
 import {
-  DECLARED_FAILURE_ATTEMPT_LIMIT,
+  DECLARED_STEP_ATTEMPT_LIMIT,
+  attemptBoundReached,
+  returnsToSameStep,
+  routeRefusedResume,
+  routeTermination,
+} from './dispositions.js';
+import {
   escapeHatch,
   execFileWorktreeGit,
   handoffTimestamp,
@@ -2796,30 +2801,6 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
     ) ?? null;
 
   if (pending !== null && pending.disposition !== null) {
-    /**
-     * The declared failure limit: a step that has failed this many times hands off instead of retrying.
-     *
-     * Only the `failed` disposition is counted, and the exclusion matters. An `interrupted` step was
-     * interrupted by the *engine* — a crash, a closed laptop — and AD-8's resume path must not be capped
-     * by something that has nothing to say about the step's own behaviour; a run restarted often enough
-     * would otherwise hand itself off for surviving. `blocked` waits for a person rather than retrying,
-     * so counting it would turn a legitimate escalation into an abandonment.
-     *
-     * This is not one of AD-24's ceilings, which are story 2-9's: it is the "repeated failure" row of
-     * this story's own matrix, and the alternative to it is the retry loop AD-35 forbids.
-     */
-    if (pending.disposition === 'failed' && pending.attempts >= DECLARED_FAILURE_ATTEMPT_LIMIT) {
-      return {
-        kind: 'hand-off',
-        step: pending.step,
-        code: pending.error?.code ?? 'internal.invariant_violated',
-        reason:
-          `Step "${pending.step}" has been attempted ${String(pending.attempts)} times and has still ` +
-          `not completed, which is the declared limit of ${String(DECLARED_FAILURE_ATTEMPT_LIMIT)}. ` +
-          'The run stops and writes a hand-off document rather than retrying for ever (CAP-23, AD-35).',
-      };
-    }
-
     const routing = routeTermination({
       step: pending.step,
       disposition: pending.disposition,
@@ -2828,6 +2809,36 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
       modelTier: pending.model_tier,
       promotions: pending.promotions,
     });
+
+    /**
+     * The attempt bound, applied to every routing that returns to the same step.
+     *
+     * It is asked *after* the routing and not before, which is what makes it one rule rather than a list
+     * of dispositions kept in step by hand. `routeTermination` has already decided whether the loop comes
+     * back to this step — by a resume (AD-8), by a re-run after an AD-26 baseline reset, or by a re-run at
+     * a promoted rung — and the bound applies to exactly that set. A `killed` step is never returned to,
+     * so a user's kill still stops rather than handing off; a `blocked` step escalates to a person, which
+     * is not an attempt at all; and a step that completed never reaches here.
+     *
+     * The count is `attempts`, folded from the log, so a restart does not reset it (AD-4) and the resume
+     * path cannot walk around it. The code carried into the hand-off is the step's own when it reported
+     * one; with none — the interrupted-for-ever case — `internal.invariant_violated` is the honest label:
+     * the system has spent its declared attempts on one step and cannot finish it, which is an
+     * abandon-and-hand-off in the AD-35 table and so is never retried by whoever reads it.
+     */
+    if (returnsToSameStep(routing.action) && attemptBoundReached(pending.attempts)) {
+      return {
+        kind: 'hand-off',
+        step: pending.step,
+        code: pending.error?.code ?? 'internal.invariant_violated',
+        reason:
+          `Step "${pending.step}" has been attempted ${String(pending.attempts)} times — every start, ` +
+          `re-run and resume — and has still not completed, which is the declared limit of ` +
+          `${String(DECLARED_STEP_ATTEMPT_LIMIT)}. The next action would be "${routing.action}", which ` +
+          'returns to the same step, so the run stops and writes a hand-off document rather than ' +
+          'retrying for ever (CAP-23, AD-35).',
+      };
+    }
 
     const target = targetStateFor(plan, pending.step);
     const sessionId = pending.session_id;

@@ -106,7 +106,10 @@ export const CONTROLS: CommandMap<ControlDefinition> = Object.freeze({
     key: 'w',
     label: 'narrow',
     hint: 'narrow the scope rather than stopping',
-    argument: 'optional',
+    // Required, because the contract requires it: a narrowing that names no narrower scope is an intent
+    // its owner can only accept and do nothing about. The suite asserts this table against
+    // ARGUMENT_REQUIRED_COMMANDS, so the two cannot drift.
+    argument: 'required',
     target: 'run',
   },
   [Command.Pause]: {

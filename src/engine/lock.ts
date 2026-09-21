@@ -11,12 +11,12 @@
  * over there, and a reclaim would produce exactly the two-engine interleave AD-30 forbids.
  */
 import { execFileSync } from 'node:child_process';
-import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
+import { mkdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 
 import { formatTimestamp } from '../contracts/index.js';
-import { resolveOrchHome } from '../runtime/index.js';
+import { createFileExclusively, resolveOrchHome } from '../runtime/index.js';
 
 /** The lock file AD-9 places at the root of `ORCH_HOME`. */
 export const ENGINE_LOCK_FILE_NAME = 'engine.lock';
@@ -194,8 +194,12 @@ export class EngineLock {
   /**
    * Claim the `ORCH_HOME` lock, or refuse naming the holder's pid and start time.
    *
-   * The sequence is exclusive-create, then write the claim: a second engine racing on the same
-   * instant loses at the `wx` open rather than at a read-then-write window it could slip through.
+   * The claim is created and populated in one step, by {@link createFileExclusively}: a second engine
+   * racing on the same instant loses at the atomic create rather than at a read-then-write window it
+   * could slip through, *and* the claim it then reads is the winner's whole record. An exclusive create
+   * followed by a write would have published a zero-length file first, which mattered here twice over —
+   * the refusal could not name who held the lock, and a lock reading back as nothing is one no later
+   * engine reclaims, leaving an `ORCH_HOME` held by nobody for ever.
    */
   static acquire(options: EngineLockOptions = {}): EngineLock {
     const orchHome = options.orchHome ?? resolveOrchHome();
@@ -218,14 +222,12 @@ export class EngineLock {
       started_at: processStartedAt(process.pid),
     };
 
+    const claimLine = `${JSON.stringify(claim)}\n`;
     let reclaimed = false;
-    let fd: number;
-    try {
-      fd = openSync(path, 'wx');
-    } catch (thrown: unknown) {
-      // Only "the lock exists" is a held lock. EACCES, ENOSPC, EROFS and ENOTDIR say nothing about a
-      // holder, and reporting them as a held lock would hide the real fault behind the wrong advice.
-      if ((thrown as { code?: string } | null)?.code !== 'EEXIST') throw thrown;
+    // Losing the create is the only thing that means the lock is held. EACCES, ENOSPC, EROFS and
+    // ENOTDIR throw out of the create, because reporting one of them as a held lock would hide the
+    // real fault behind the wrong advice.
+    if (!createFileExclusively(path, claimLine)) {
       const existing = readEngineLockClaim(path);
       /**
        * Two ways a claim is stale, and the second is why the start time is recorded at all: the pid is
@@ -243,35 +245,18 @@ export class EngineLock {
       }
       unlinkSync(path);
       reclaimed = true;
-      try {
-        fd = openSync(path, 'wx');
-      } catch (raced: unknown) {
-        if ((raced as { code?: string } | null)?.code !== 'EEXIST') throw raced;
+      if (!createFileExclusively(path, claimLine)) {
         // Another engine reclaimed the same stale lock first. That engine is the holder now, so this
-        // one is refused by name rather than leaking the raw errno of the losing open.
+        // one is refused by name rather than leaking the raw errno of the losing create.
+        const winner = readEngineLockClaim(path);
         throw new EngineLockHeldError(
           path,
-          readEngineLockClaim(path),
-          `${describeEngineLockHolder(readEngineLockClaim(path))} — it was claimed while this ` +
+          winner,
+          `${describeEngineLockHolder(winner)} — it was claimed while this ` +
             'engine was reclaiming the same stale lock',
         );
       }
     }
-
-    try {
-      writeSync(fd, `${JSON.stringify(claim)}\n`);
-    } catch (thrown: unknown) {
-      // A claim that cannot be written would leave an empty lock naming nobody, which no later engine
-      // could reclaim. Better to give the lock back and report the real fault.
-      closeSync(fd);
-      try {
-        unlinkSync(path);
-      } catch {
-        // Nothing further to do: the next engine's liveness check reclaims it.
-      }
-      throw thrown;
-    }
-    closeSync(fd);
 
     IN_PROCESS_HOLDERS.set(path, claim);
     return new EngineLock(path, claim, orchHome, reclaimed);

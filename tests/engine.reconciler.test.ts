@@ -363,7 +363,10 @@ describe('AD-8 — resume, then re-run from the baseline', () => {
     expect(resetter.resets).toStrictEqual([{ worktree: makePlan().worktree, ref: BASELINE }]);
     expect(eventTypes(accepted.run)).toContain(ENGINE_EVENT_TYPES.StepBaselineReset);
     expect(executor.started.map((request) => request.step)).toStrictEqual(['implement', 'implement']);
-    expect(executor.started[1]?.attempt).toBe(2);
+    // The third engagement of the step: the first start, the refused resume, and now the re-run. A
+    // resume is a hand of the step to the executor, so it counts — which is what makes the attempt
+    // bound cover AD-8's resume path rather than only the failures.
+    expect(executor.started[1]?.attempt).toBe(3);
     expect(reconciler.load(accepted.run).state.steps[0]?.disposition).toBe('completed');
   });
 

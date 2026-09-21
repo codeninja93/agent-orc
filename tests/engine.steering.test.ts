@@ -12,7 +12,13 @@ import { rmSync } from 'node:fs';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { COMMANDS, makeError } from '../src/contracts/index.js';
+import {
+  COMMANDS,
+  CURRENT_SCHEMA_VERSION,
+  CommandIntentSchema,
+  commandRequiresArgument,
+  makeError,
+} from '../src/contracts/index.js';
 import type { CommandIntent, RunState, StepRecord } from '../src/contracts/index.js';
 import { readEventLog, runPaths } from '../src/runtime/index.js';
 import {
@@ -121,8 +127,41 @@ const anIntent = (
     step,
     principal: { kind: 'user', id: 'deep' },
     source: 'tui',
-    argument,
+    /**
+     * Text for the commands that are meaningless without it, and nothing for the rest.
+     *
+     * The contract refuses `answer`, `reject`, `edit_criterion`, `narrow` and `inject_note` with no
+     * argument, so a fixture that handed every command a `null` one could not build those five at all.
+     * Asked of the contract rather than listed here, so this fixture cannot drift from the rule it is
+     * satisfying.
+     */
+    argument: argument ?? (commandRequiresArgument(command) ? `text for ${command}` : null),
   });
+
+/**
+ * An intent built without the contract's own check, for the engine-side guards that stand behind it.
+ *
+ * `decideSteering` takes a `CommandIntent` value, and its blank-argument refusal is defence in depth:
+ * the contract refuses such an intent at every boundary it can be read through, and the engine refuses
+ * it again if one ever arrives another way. Asserting the second guard means handing it a value the
+ * first would have stopped, which is what this builder is for — and the suite asserts the first guard
+ * on the same value, so neither layer can quietly stop holding.
+ */
+const anUnvalidatedIntent = (
+  command: CommandIntent['command'],
+  argument: string | null,
+): CommandIntent => ({
+  schema_version: CURRENT_SCHEMA_VERSION,
+  intent_id: mintIntentId(mintRunId()),
+  command,
+  run: '01K5NQ9ZJ7V3M2P9XQWRTC4BDE',
+  feature: 'engine-reconciler',
+  step: null,
+  principal: { kind: 'user', id: 'deep' },
+  source: 'tui',
+  issued_at: '2026-09-20T10:00:00.000Z',
+  argument,
+});
 
 const noneApplied = { applied: new Set<string>() };
 
@@ -175,7 +214,11 @@ describe('every member of the Command enum has a declared handling', () => {
     // A rejection is one keystroke *plus a reason*, and the reason becomes the ledger entry. An empty one
     // would win the compare-and-set and record that the user said nothing.
     for (const command of ['answer', 'reject', 'edit_criterion'] as const) {
-      const decision = decideSteering(anIntent(command, null, '   '), aState(), noneApplied);
+      const blank = anUnvalidatedIntent(command, '   ');
+      // The contract refuses it first: an intent file carrying this never reaches a consumer at all.
+      expect(CommandIntentSchema.safeParse(blank).success, command).toBe(false);
+      // And the engine refuses it too, so the guard does not rest on the parse alone.
+      const decision = decideSteering(blank, aState(), noneApplied);
       expect(decision.kind, command).toBe('refuse');
       if (decision.kind !== 'refuse') continue;
       expect(decision.reason).toBe('missing-answer');

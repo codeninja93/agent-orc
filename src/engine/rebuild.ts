@@ -90,11 +90,12 @@ export type EngineEventType = (typeof ENGINE_EVENT_TYPES)[keyof typeof ENGINE_EV
 /**
  * Every type the fold acts on. A type outside this set is ignored, per AD-5.
  *
- * `step.resume_attempted` is deliberately absent. It is emitted so the timeline shows that a resume was
- * tried, but it changes no run-state fact: what the checkpoint needs is the *outcome* — a termination, or
- * the `step.resume_refused` that spends the session id — and folding the attempt itself would record a
- * state the run was never in. The constant is enumerated rather than taken from `ENGINE_EVENT_TYPES` so
- * it cannot claim to fold a type the switch below has no case for.
+ * `step.resume_attempted` is folded for exactly one fact: the attempt count. It still changes no
+ * lifecycle state — the *outcome* is what a termination or the `step.resume_refused` that spends the
+ * session id records — but a resume is a hand of the step to the executor, and the attempt bound is a
+ * bound on those. Leaving it out is what made the bound miss AD-8's resume path: a step interrupted and
+ * resumed for ever recorded one attempt and looped. The constant is enumerated rather than taken from
+ * `ENGINE_EVENT_TYPES` so it cannot claim to fold a type the switch below has no case for.
  */
 export const FOLDED_EVENT_TYPES: readonly string[] = Object.freeze([
   ENGINE_EVENT_TYPES.RunCreated,
@@ -103,6 +104,7 @@ export const FOLDED_EVENT_TYPES: readonly string[] = Object.freeze([
   ENGINE_EVENT_TYPES.StepSessionRecorded,
   ENGINE_EVENT_TYPES.StepTerminated,
   ENGINE_EVENT_TYPES.StepApproved,
+  ENGINE_EVENT_TYPES.StepResumeAttempted,
   ENGINE_EVENT_TYPES.StepResumeRefused,
   ENGINE_EVENT_TYPES.StepBaselineReset,
   ENGINE_EVENT_TYPES.StepTierPromoted,
@@ -340,6 +342,22 @@ export const rebuildFromLog = (
           session_id: null,
           error: null,
         });
+        break;
+      }
+
+      case ENGINE_EVENT_TYPES.StepResumeAttempted: {
+        const record = stepOf(event);
+        if (record === null) break;
+        /**
+         * A resume counts as an attempt at the step, and nothing else about the record moves.
+         *
+         * The disposition deliberately stays `interrupted` rather than going back to `null`: an
+         * `interrupted` step whose resume was cut short by a crash is resumed again by the next pass,
+         * which is what AD-8 prescribes, and each of those resumes is one more line here — so the loop
+         * a permanently-interrupted step used to make is now a loop that counts, and the bound in
+         * `decideAction` ends it.
+         */
+        steps.set(record.step, { ...record, attempts: record.attempts + 1 });
         break;
       }
 

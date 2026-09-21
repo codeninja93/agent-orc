@@ -147,7 +147,11 @@ export const StepRecordSchema = z.object({
   model_tier: ModelRungSchema,
   /** Promotions already spent on this step in this run; at most {@link MAX_PROMOTIONS_PER_STEP}. */
   promotions: countField,
-  /** How many times the step has been started, including re-runs. */
+  /**
+   * How many times the step has been handed to the executor: every start, every re-run, and every
+   * resume by session id. It is what the engine's one attempt bound counts, so it covers every
+   * disposition that returns to the same step rather than only the ones that report a failure.
+   */
   attempts: countField,
   /** How many times the worktree was reset to `baseline_ref` for this step. */
   resets: countField,

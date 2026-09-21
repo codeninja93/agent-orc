@@ -6,7 +6,10 @@
  * `tests/contracts.subset-guard.test.ts` rather than left to discipline.
  *
  * Importing this module asserts the AD-28 Node floor, so a process handed a Node below the floor
- * fails with a named version instead of an opaque TypeScript syntax error.
+ * fails with a named version instead of an opaque TypeScript syntax error. It asserts the Stack's
+ * `engines.npm` bound in the same breath and for the same reason: npm 12 disables git-dependency
+ * resolution and install scripts by default, so unasserted it breaks AD-12's delivery path later and
+ * more obscurely than a named refusal at startup would.
  */
 import { assertNodeFloorOrExit } from './node-floor.js';
 

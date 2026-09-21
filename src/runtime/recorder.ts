@@ -39,6 +39,7 @@ import {
 } from '../contracts/index.js';
 import type { EventEnvelope } from '../contracts/index.js';
 
+import { createFileExclusively } from './exclusive-create.js';
 import { runPaths } from './paths.js';
 import type { RunPaths } from './paths.js';
 import { createRedactor, describeThrown, REDACTION_MARKER } from './redaction.js';
@@ -336,6 +337,10 @@ export class Recorder {
    * The claim is an exclusively-created lock file recording pid, host and start time. A second
    * recorder — in this process or another — is refused naming the holder, and the log is never
    * opened for append twice.
+   *
+   * The claim is published whole, by {@link createFileExclusively}: the create and the content are one
+   * step, so a second recorder that loses the race always reads a claim it can name the holder of
+   * rather than a file that exists and says nothing.
    */
   static open(options: RecorderOptions): Recorder {
     const paths = runPaths(options.runId, options.orchHome);
@@ -359,13 +364,11 @@ export class Recorder {
       since: formatTimestamp(),
     };
 
-    let lockFd: number;
-    try {
-      lockFd = openSync(paths.eventLogLock, 'wx');
-    } catch (thrown: unknown) {
-      // Only "the lock exists" is a writer conflict. EACCES, ENOSPC, EROFS and ENOTDIR say nothing
-      // about a holder, and reporting them as "an unreadable lock file" would hide the real fault.
-      if ((thrown as { code?: string } | null)?.code !== 'EEXIST') throw thrown;
+    const claimLine = `${JSON.stringify(claim)}\n`;
+    if (!createFileExclusively(paths.eventLogLock, claimLine)) {
+      // Losing the create is the only thing that means another writer holds the log. Every other
+      // failure — EACCES, ENOSPC, EROFS, ENOTDIR — throws out of the create, because reporting one of
+      // them as "an unreadable lock file" would hide the real fault behind the wrong advice.
       const existing = readClaim(paths.eventLogLock);
       const reclaimable =
         (options.reclaimStaleLock ?? true) &&
@@ -382,20 +385,13 @@ export class Recorder {
       }
       // AD-30's rule: a stale claim is reclaimed only once the recorded pid is verifiably gone.
       unlinkSync(paths.eventLogLock);
-      try {
-        lockFd = openSync(paths.eventLogLock, 'wx');
-      } catch (raced: unknown) {
+      if (!createFileExclusively(paths.eventLogLock, claimLine)) {
         throw new WriterConflictError(
           paths.eventLog,
           readClaim(paths.eventLogLock),
-          `the claim was taken while a stale lock was being reclaimed (${describeThrown(raced)})`,
+          'the claim was taken while a stale lock was being reclaimed',
         );
       }
-    }
-    try {
-      writeSync(lockFd, `${JSON.stringify(claim)}\n`);
-    } finally {
-      closeSync(lockFd);
     }
 
     let nextSeq: number;

@@ -223,3 +223,61 @@ export const routeRefusedResume = (step: string): DispositionRouting =>
 /** True when an action leaves the feature in a terminal state and no further pass acts on it. */
 export const isTerminalAction = (action: StepAction): boolean =>
   action === 'stop' || action === 'hand-off';
+
+/**
+ * True when an action hands the *same* step to the executor again.
+ *
+ * This is the set the attempt bound has to cover, and naming it here rather than listing dispositions
+ * at the call site is the point. The question is not "which disposition failed" but "does the loop come
+ * back to this step" — a resume, a re-run after a baseline reset and a re-run at a promoted rung all do,
+ * and all three spend a subscription-funded model call to do it. Enumerated exhaustively so the compiler
+ * makes a later story answer the question for any action it adds.
+ */
+export const returnsToSameStep = (action: StepAction): boolean => {
+  switch (action) {
+    case 'resume':
+    case 'reset-and-rerun':
+    case 'promote-model-tier':
+      return true;
+    case 'advance':
+    case 'escalate-to-human':
+    case 'hand-off':
+    case 'stop':
+      return false;
+  }
+};
+
+/**
+ * How many times one step may be handed to the executor in a run, whatever sent it back.
+ *
+ * **One bound, one counting rule.** The count is every engagement of the step — a first start, a
+ * re-run after an AD-26 baseline reset, a re-run at a promoted rung, and a resume by session id — and
+ * the bound applies to all of them because all of them return to the same step. The previous bound
+ * counted only the `failed` disposition, which left AD-8's resume path unbounded: a step interrupted
+ * and resumed for ever never records a second failure, so it never reached the limit, and an unbounded
+ * loop spends the subscription budget until a person notices.
+ *
+ * **Why eight and not three.** Three is what the AD-35 retry path needs: `retry-with-backoff` is
+ * reserved for transient conditions, and a condition that has not cleared in three identical attempts
+ * is not transient. But an *interruption* is the engine's own — a crash, a closed laptop — and each one
+ * legitimately costs two further engagements: a resume against the recorded session id, and, when the
+ * CLI rejects that session, the re-run behind it. Capping the sum at three would hand a run off for
+ * having survived two crashes, which is the failure story 1-7 warned about when it excluded
+ * `interrupted` in the first place. Eight leaves room for the three declared attempts plus two such
+ * recoveries, and still stops the loop.
+ *
+ * **This is not one of AD-24's ceilings.** Step count, wall clock and rate-limit budget, with their
+ * degradation and hibernation, are story 2-9's. This is a hard bound on one step's attempts, and the
+ * alternative to it is the retry loop AD-35 forbids.
+ */
+export const DECLARED_STEP_ATTEMPT_LIMIT = 8;
+
+/**
+ * Whether this step has reached the bound: the next engagement would be one too many.
+ *
+ * `attempts` is folded from the event log — every `step.started` and every `step.resume_attempted` — so
+ * the count is reconstructed from the durable truth rather than carried in memory or trusted from the
+ * checkpoint. A restart is therefore not a way to reset it (AD-4).
+ */
+export const attemptBoundReached = (attempts: number): boolean =>
+  attempts >= DECLARED_STEP_ATTEMPT_LIMIT;

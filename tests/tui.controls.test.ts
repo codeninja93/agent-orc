@@ -23,7 +23,13 @@ import { join, relative } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { COMMANDS, Command, CommandIntentSchema } from '../src/contracts/index.js';
+import {
+  ARGUMENT_REQUIRED_COMMANDS,
+  COMMANDS,
+  Command,
+  CommandIntentSchema,
+  commandRequiresArgument,
+} from '../src/contracts/index.js';
 import {
   Reconciler,
   createRecordingResetter,
@@ -98,6 +104,25 @@ describe('the control table is total over the Command enum', () => {
       expect(controlForKey(control.key.toUpperCase())?.command).toBe(control.command);
     }
     expect(controlForKey('?')).toBeNull();
+  });
+
+  /**
+   * The contract decides which controls need text; this table has to agree with it.
+   *
+   * A control the renderer invokes with no argument, for a command the contract refuses without one,
+   * writes an intent file that every reader then rejects — the user presses a key, a file appears, and
+   * nothing happens. Asserted against `ARGUMENT_REQUIRED_COMMANDS` rather than restated as a list here,
+   * so adding a command to the contract's set fails this test until the keystroke asks for text.
+   */
+  it('asks for text for exactly the commands the contract refuses without it', () => {
+    for (const command of ARGUMENT_REQUIRED_COMMANDS) {
+      expect(CONTROLS[command].argument, command).toBe('required');
+    }
+    for (const command of COMMANDS) {
+      if (CONTROLS[command].argument === 'required') {
+        expect(commandRequiresArgument(command), command).toBe(true);
+      }
+    }
   });
 
   it('keeps one gesture that always means stop, and gives it a key of its own', () => {

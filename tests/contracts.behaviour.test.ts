@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  ARGUMENT_REQUIRED_COMMANDS,
   BudgetSchema,
   CURRENT_SCHEMA_VERSION,
   Command,
@@ -19,10 +20,13 @@ import {
   EVENT_TYPES,
   EventEnvelopeSchema,
   OrchErrorSchema,
+  PACKAGE_VERSION,
   QuestionDraftSchema,
   QuestionStateSchema,
+  SCHEMA_VERSION_UNRECOGNISED_CODE,
   SchemaVersionRefusal,
   TimestampSchema,
+  commandRequiresArgument,
   compareEventOrder,
   contractIdsOfKind,
   deflectQuestion,
@@ -43,6 +47,20 @@ import {
   writesToDecisionLedger,
 } from '../src/contracts/index.js';
 import type { CommandMap, QuestionState, StepDisposition } from '../src/contracts/index.js';
+
+/**
+ * The `code` a Zod issue carries in its `params`, or `undefined`.
+ *
+ * Narrowed rather than cast: `params` is present only on a custom issue, so reaching for it on the issue
+ * union is a claim about which member this is. Written as a guard so the assertion below fails by
+ * returning `undefined` rather than by throwing somewhere unrelated.
+ */
+const paramsCodeOf = (issue: unknown): unknown => {
+  if (typeof issue !== 'object' || issue === null || !('params' in issue)) return undefined;
+  const params: unknown = issue.params;
+  if (typeof params !== 'object' || params === null || !('code' in params)) return undefined;
+  return params.code;
+};
 
 const validEnvelope = {
   ts: '2026-09-19T12:34:56.789Z',
@@ -186,6 +204,41 @@ describe('AD-35 — every failure code carries a declared disposition', () => {
       );
     }
   });
+
+  /**
+   * The table is the authority, and the field is on the wire.
+   *
+   * `retryable` reaches the system inside a step agent's structured output, where a model writes whatever
+   * it believes. A payload whose flag disagrees with the code used to parse cleanly, leaving two answers
+   * to one question and a later consumer free to trust the wrong one — which is the drift AD-35 exists to
+   * prevent. Asserted across every declared code rather than for a sample, so a code added to the table
+   * with the wrong disposition cannot slip through with it.
+   */
+  it('refuses an error whose retryable contradicts the table for its code', () => {
+    for (const code of ERROR_CODES) {
+      const contradicting = { ...makeError(code, 'm'), retryable: !isRetryable(code) };
+      const result = OrchErrorSchema.safeParse(contradicting);
+      expect(result.success, code).toBe(false);
+      expect(result.error?.issues.map((issue) => issue.path.join('.')), code).toContain('retryable');
+    }
+  });
+
+  it('accepts every error orchError() builds, unchanged', () => {
+    for (const code of ERROR_CODES) {
+      const built = makeError(code, 'the message', 'the cause');
+      expect(OrchErrorSchema.parse(built), code).toStrictEqual(built);
+    }
+  });
+
+  it('refuses an unknown code claiming to be retryable, because unknown is never retried', () => {
+    const result = OrchErrorSchema.safeParse({
+      code: 'gremlin.unheard_of',
+      message: 'x',
+      retryable: true,
+      cause: null,
+    });
+    expect(result.success).toBe(false);
+  });
 });
 
 describe('AD-28 — schema_version', () => {
@@ -247,6 +300,75 @@ describe('AD-28 — schema_version', () => {
     },
   );
 
+  /**
+   * Matrix 7 — the gate is the schema's, so a bare `.parse()` cannot walk past it.
+   *
+   * Before this, `parseVersionedArtifact` was the only thing that checked, and every other reader of a
+   * versioned artifact holds its schema: `CommandIntentSchema.parse(json)` accepted a version from a
+   * future installer and handed back a typed value, which is exactly what AD-28 says must not happen.
+   */
+  it('refuses an unrecognised version at a bare .parse(), carrying the AD-35 code', () => {
+    const future = { ...artifact, schema_version: CURRENT_SCHEMA_VERSION + 1 };
+    const result = CommandIntentSchema.safeParse(future);
+    expect(result.success).toBe(false);
+    const issue = result.error?.issues.find((entry) => entry.path.join('.') === 'schema_version');
+    expect(issue).toBeDefined();
+    expect(issue?.message).toContain(SCHEMA_VERSION_UNRECOGNISED_CODE);
+    expect(issue?.message).toContain('not recognised');
+    expect(issue?.message).toContain('Re-run the installer');
+    // The code is carried as data as well as in the sentence, so a caller can route it to the table
+    // rather than matching on prose.
+    expect(paramsCodeOf(issue)).toBe(SCHEMA_VERSION_UNRECOGNISED_CODE);
+  });
+
+  /**
+   * Matrix 8 — one behaviour, not two. Both entry points refuse, and they refuse for the same reason
+   * with the same message; the named refusal adds the artifact's name and the installer that wrote it,
+   * which a Zod issue has nowhere to put.
+   */
+  it('refuses it identically through the named helper, naming the artifact', () => {
+    const future = { ...artifact, schema_version: CURRENT_SCHEMA_VERSION + 1 };
+    const bare = CommandIntentSchema.safeParse(future);
+    let named: SchemaVersionRefusal | null = null;
+    try {
+      parseVersionedArtifact(CommandIntentSchema, future, 'a command intent');
+    } catch (error) {
+      named = error instanceof SchemaVersionRefusal ? error : null;
+    }
+    expect(named).not.toBeNull();
+    expect(named?.code).toBe(SCHEMA_VERSION_UNRECOGNISED_CODE);
+    expect(named?.artifact).toBe('a command intent');
+    expect(named?.schemaVersion).toBe(CURRENT_SCHEMA_VERSION + 1);
+    // The same sentence, minus the artifact's name: neither path tells a user something the other does not.
+    expect(named?.message).toContain('is not recognised');
+    expect(bare.error?.issues[0]?.message).toContain('is not recognised');
+    expect(named?.message).toContain(PACKAGE_VERSION);
+  });
+
+  it.each(contractIdsOfKind('artifact'))(
+    '%s refuses an unrecognised schema_version through its own schema',
+    (id) => {
+      const result = getContract(id).schema.safeParse({ schema_version: 99 });
+      expect(result.success).toBe(false);
+      const issue = result.error?.issues.find((entry) => entry.path.join('.') === 'schema_version');
+      expect(issue?.message, id).toContain(SCHEMA_VERSION_UNRECOGNISED_CODE);
+    },
+  );
+
+  it('still accepts a shape problem as a shape problem, not as a version refusal', () => {
+    // A missing field must not be dressed up as an unrecognised version: that would send a reader to the
+    // installer for a fault the installer has nothing to do with.
+    const { intent_id: _omitted, ...withoutIntentId } = artifact;
+    let thrown: unknown = null;
+    try {
+      parseVersionedArtifact(CommandIntentSchema, withoutIntentId, 'a command intent');
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).not.toBeNull();
+    expect(thrown).not.toBeInstanceOf(SchemaVersionRefusal);
+  });
+
   it('states the direction of an unrecognised version, older as well as newer', () => {
     expect(schemaVersionRefusalMessage('a state file', CURRENT_SCHEMA_VERSION + 1)).toContain(
       'newer than',
@@ -296,6 +418,93 @@ describe('AD-3 — one Command enum covering every steering control', () => {
       [Command.JustDoIt]: 'Just do it',
     };
     expect(Object.keys(labels)).toHaveLength(COMMANDS.length);
+  });
+
+  /**
+   * AD-19's two cross-field rules, which are the intent file's shape rather than a consumer's checking.
+   *
+   * An intent file is read by the engine, by both renderers and by any later replay, so a rule enforced at
+   * one reader is a rule the others do not have. Both of these were previously unchecked anywhere: a
+   * `narrow` with no argument was accepted and then silently did nothing, and a timeout's default could be
+   * recorded as a person's decision — which the decision ledger then keeps for ever.
+   */
+  describe('the intent shape refuses what no consumer could act on', () => {
+    const anIntent = (overrides: Record<string, unknown>): Record<string, unknown> => ({
+      schema_version: CURRENT_SCHEMA_VERSION,
+      intent_id: 'intent-1',
+      command: Command.Kill,
+      run: '01JBQZ8Q0000000000000000AA',
+      feature: 'contracts-package',
+      step: 'implementation',
+      principal: { kind: 'user', id: 'deep' },
+      source: 'tui',
+      issued_at: '2026-09-19T12:34:56.789Z',
+      argument: null,
+      ...overrides,
+    });
+
+    it.each([...ARGUMENT_REQUIRED_COMMANDS])(
+      'refuses a %s intent with no argument, rather than accepting one that does nothing',
+      (command) => {
+        const result = CommandIntentSchema.safeParse(anIntent({ command, argument: null }));
+        expect(result.success).toBe(false);
+        expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain('argument');
+      },
+    );
+
+    it.each([...ARGUMENT_REQUIRED_COMMANDS])(
+      'refuses a %s intent whose argument is only whitespace',
+      (command) => {
+        expect(CommandIntentSchema.safeParse(anIntent({ command, argument: '   ' })).success).toBe(
+          false,
+        );
+      },
+    );
+
+    it.each([Command.Pause, Command.Disengage, Command.Kill, Command.Approve, Command.ConfirmSpec])(
+      'accepts a %s intent with no argument, because it means something without text',
+      (command) => {
+        expect(commandRequiresArgument(command)).toBe(false);
+        expect(CommandIntentSchema.safeParse(anIntent({ command, argument: null })).success).toBe(
+          true,
+        );
+      },
+    );
+
+    it('accepts the commands that need text once they carry some', () => {
+      for (const command of ARGUMENT_REQUIRED_COMMANDS) {
+        const parsed = CommandIntentSchema.parse(anIntent({ command, argument: 'the first option' }));
+        // The argument reaches the consumer exactly as written: trimming decides, it never rewrites (Q6).
+        expect(parsed.argument).toBe('the first option');
+      }
+    });
+
+    it('refuses a timeout-sourced intent attributed to a user, because a clock is not a person', () => {
+      const result = CommandIntentSchema.safeParse(
+        anIntent({ source: 'timeout', principal: { kind: 'user', id: 'deep' } }),
+      );
+      expect(result.success).toBe(false);
+      expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain('principal.kind');
+    });
+
+    it('accepts a timeout-sourced intent attributed to the timeout', () => {
+      expect(
+        CommandIntentSchema.safeParse(
+          anIntent({ source: 'timeout', principal: { kind: 'timeout', id: 'question.window' } }),
+        ).success,
+      ).toBe(true);
+    });
+
+    it('leaves every other source free to be a user, which is what they are', () => {
+      for (const source of ['tui', 'web', 'cli'] as const) {
+        expect(
+          CommandIntentSchema.safeParse(
+            anIntent({ source, principal: { kind: 'user', id: 'deep' } }),
+          ).success,
+          source,
+        ).toBe(true);
+      }
+    });
   });
 });
 

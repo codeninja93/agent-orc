@@ -2,17 +2,65 @@
 title: 'Stage-1 defect sweep — bound the retry loop, close the bypasses'
 type: 'feature'
 created: '2026-09-20'
-status: 'drafted'
+status: 'done'
 review_loop_iteration: 0
-followup_review_recommended: false
-baseline_revision: 'db11e4b'
+followup_review_recommended: true
+baseline_revision: 'de025aa'
 context:
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-3-engine-reconciler.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-7-command-transport.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-8-question-lifecycle.md'
 warnings: ['oversized'] # eight independent defects across contracts, runtime, engine and the build
-deferred: []
+deferred:
+  - summary: >-
+      No review layer ran against this story; the gate, the implementer's nine mutations and my own
+      independent re-run of the decisive one are the only scrutiny it received.
+    evidence: |-
+      typecheck, lint, build and 1263 tests across 50 files all pass with zero skips. Read status: done as
+      implemented, gated and mutation-tested, not reviewed.
+    severity: high
+  - summary: >-
+      The attempt bound counts a step's own failure and the engine's crash as the same kind of engagement,
+      and 8 is the compromise that forces.
+    evidence: |-
+      One counting rule was this story's instruction, and it is what closes the unbounded resume path story
+      1-7 left open. But an interruption is the engine's fault, not the step's — a crash or a closed laptop —
+      and charging it to the same allowance is why the number had to rise from 1-7's declared 3 to 8. I
+      verified the constraint rather than accepting it: with the bound at 3, `engine.crash-injection` reports
+      "1 of 25 boundaries did not converge", i.e. a run handed off for having survived two crashes. The
+      consequence accepted is that a persistently failing step now spends 8 attempts before handing off. The
+      clean shape is two counters, or a budget-based bound, and story 2-9 owns the ceilings where that
+      belongs.
+    location: 'src/engine/dispositions.ts'
+    severity: medium
+  - summary: >-
+      Story 1-3's EC15 is only half closed: the engine can no longer create an unreadable lock, but a
+      pre-existing empty or unreadable one is still reclaimable by nothing.
+    evidence: |-
+      The atomic create removes the window in which a zero-length claim is published, so no new one can
+      arise. An existing one — however it arose — still has no reclamation path. Making an unreadable lock
+      reclaimable risks stealing a live one, which is a decision rather than a fix, and was correctly left
+      alone.
+    location: 'src/engine/lock.ts'
+    severity: medium
+  - summary: >-
+      `StepResumeRequest.attempt` carries the pre-resume count, so a resume and the start before it share an
+      attempt number, while `src/container/lifecycle.ts` documents that value as unique per attempt.
+    evidence: |-
+      Pre-existing and unchanged by this story, but newly visible now that a resume is a counted engagement.
+      It touches container naming and story 1-4's fixtures, which is why it was not changed here.
+    location: 'src/engine/reconciler.ts, src/container/lifecycle.ts'
+    severity: medium
+  - summary: >-
+      A new unswept file class: a SIGKILL between the temp write and the `link` leaves a
+      `<name>.<pid>.<n>.tmp` beside the claim, and nothing sweeps it.
+    evidence: |-
+      Harmless — nothing reads an unlinked name — and the identical shape already exists from story 1-8's
+      question outcome. It is debris rather than a defect, and it is the cost of the idiom that closed the
+      torn-read window.
+    location: 'src/runtime/exclusive-create.ts'
+    severity: low
 ---
 
 # Story 1-12 — Stage-1 defect sweep
@@ -149,10 +197,126 @@ times a disposition that returns to a step may do so.
 
 ## Spec Change Log
 
+### Implementation, 2026-09-20 — one declared number changed, and one matrix row contradicted the shipped code
+
+1. **The bound is 8, not story 1-7's 3, and that changes a number another story declared.**
+   `DECLARED_FAILURE_ATTEMPT_LIMIT` (3, in `handoff.ts`) becomes `DECLARED_STEP_ATTEMPT_LIMIT` (8, in
+   `dispositions.ts`). This story required one counting rule covering every disposition that returns to the
+   same step, which is what closes the unbounded resume path; under one rule, 3 is too tight. The arithmetic
+   is in the code: three declared attempts for AD-35's retry path, plus two interruptions costing two
+   engagements each — a resume against the recorded session id, and the re-run behind a refused resume —
+   is seven, and eight leaves one spare. **I verified the constraint rather than taking it on trust:** with
+   the bound set to 3, `tests/engine.crash-injection.test.ts` reports *"1 of 25 boundaries did not
+   converge"*. Story 1-7's warning about capping `interrupted` was empirically right.
+
+2. **Matrix row 10 contradicted the shipped TUI.** The row requires the contract to refuse a `narrow` intent
+   with no argument, and `src/tui/controls.ts` declared `narrow` as `argument: 'optional'`. Left
+   disagreeing, pressing that key would have written an intent file every reader then rejects. `controls.ts`
+   now says `'required'`, and a guard test asserts the TUI table and the contract agree in both directions.
+   This pulled `src/tui/` into a story whose Code Map excluded it.
+
+3. **The Code Map named three test files that do not exist.** `tests/contracts.{schema-version,error,
+   command}.test.ts` were listed as "modify"; story 1-1's AD-28, AD-35 and AD-3 matrices all live in
+   `tests/contracts.behaviour.test.ts`. The rows went there rather than splitting one matrix across four
+   files. Matrix 15, for which the Code Map gave no test row, went into `tests/contracts.node-floor.test.ts`.
+
+4. **`src/runtime/exclusive-create.ts` is new.** The idiom is needed by `src/runtime/recorder.ts` and
+   `src/engine/lock.ts`, which sit in different layers, and the spine permits only engine→runtime — so one
+   shared module in `runtime/` is the only way to avoid a third and fourth copy. Story 1-8's
+   `createOutcomeExclusively` was deliberately *not* refactored onto it: that is 1-8's compare-and-set and
+   out of scope. The new module documents that they are the same shape.
+
+5. **`src/contracts/state.ts`** — `attempts`' docblock said "how many times the step has been started" and
+   now counts resumes too. A field whose comment contradicts the fold is worse than no comment.
+
+6. **Five existing test files changed, no assertion removed or relaxed.** `engine.handoff` renamed the
+   constant it reads, so it still asserts the rule rather than the number. `engine.reconciler` changed one
+   expected attempt number from 2 to 3 in the AD-26 reset test, because a refused resume is now itself a
+   counted engagement; the test is still about the reset. `engine.steering`'s blank-argument test was
+   **strengthened**: it now builds its intent outside the schema and asserts both that
+   `CommandIntentSchema` rejects it and that `decideSteering` still refuses — the engine guard is now
+   explicitly defence in depth behind the contract. `tui.controls` gained the agreement guard.
+   `contracts.behaviour` and `contracts.node-floor` are additions only.
+
+7. **No fixture needed changing for `retryable`.** Every inline error fixture in the suite already agreed
+   with the AD-35 table, which is mild evidence the tightening matches how the code was already being used.
+
 ## Review Triage Log
 
 ## Design Notes
 
+**Task 2 is narrower than the story made it sound, and the honest version is worth recording.** Mutual
+exclusion was never at risk for either claim: the create decides, and creating a file is atomic. What was
+actually broken is smaller and real — the refusal could not name who held the claim, because the file it
+read might still be empty, and a zero-length claim is reclaimable by nothing. The fix removes the window in
+which such a file can be published. It does not make an already-empty lock recoverable, so story 1-3's EC15
+is half closed, not closed.
+
+**Two of the eight were the same defect wearing different clothes.** `schema_version` recognition and
+`retryable` both lived *outside* the schema — one in a helper a caller could skip, one derived correctly by
+`orchError()` while the wire type stayed a free `z.boolean()`. A validation that a caller can decline is not
+a validation, and the fix in both cases was to move the check inside the schema so no `.parse()` reaches a
+value without it. `parseVersionedArtifact` keeps its post-parse assertion as well, because removing it made
+the *pre-existing* named-refusal test depend on another module's refinement.
+
+**The race needed a watcher to be deterministic.** Before one was added, the cross-process test caught the
+old `'wx'`-then-write behaviour only about half the time — a seventh child spinning in `statSync` while the
+claim is published is what makes the empty-file window observable every run. A cross-process test that
+catches a real defect half the time is a flaky test that will eventually be deleted by someone.
+
 ## Verification
 
+Node v24.21.0.
+
+| Check | Result |
+|---|---|
+| `npm run typecheck` / `lint` / `build` | exit 0 |
+| `npm test` | **1263 passed across 50 files**, zero skips, zero failures (baseline 1206 / 48) |
+| `npx vitest run tests/engine.crash-injection.test.ts` | 5 passed — the suite that catches durability mistakes |
+| `grep -rn "'<12'" src/` | no match — the npm bound is declared once, in `package.json` |
+| `grep -rn "from '../engine" src/tui/` | no match |
+| `grep -rn "node:fs" src/tui/` | no match (1-9's guard) |
+| `.github/workflows/ci.yml` | parses; both triggers; the four commands; Node from `.nvmrc` (22.22.0), matching the spine's `>=22.22` with no version literal in the workflow |
+
+CI cannot be executed locally, so it is verified by parse, by its Node source agreeing with the spine, and
+by a test asserting its four steps and both triggers — not by a green run. That distinction is the honest one.
+
+**Nine mutations from the implementer, and I re-ran the one the story's outcome depends on.**
+
+| Mutation | Caught by |
+|---|---|
+| Bound 8 → 9 | 1 test, the deliberate pin; every rule test tracks the constant |
+| `attempts >= LIMIT` → `>= LIMIT - 1` | 9 tests, incl. "succeeds, so the bound is not off by one" |
+| Rebuilt count starts at 1 instead of folding the log | 4 tests, incl. "survives a restart, because the checkpoint is not what the bound reads" |
+| Revert the claim to `'wx'`-then-write | both cross-process races fail, 3/3 runs: "round 0 saw an empty claim" |
+| Remove the argument refinement only | 11 tests |
+| Remove the principal refinement only | exactly 1 test |
+| Stop counting the resume | 3 tests, two as "took 200 passes without settling" — the unbounded loop, visible |
+| Remove the `schema_version` refinement | 7 tests |
+| Remove the `retryable` refinement | 2 tests |
+| Drop `assertNpmCeiling` from startup | 1 test |
+| **Mine:** set the bound to 3, story 1-7's declared number | `engine.crash-injection`: "1 of 25 boundaries did not converge" — which is the evidence that raising it was forced rather than chosen |
+
+The implementer also reported that its first attempt at the `'wx'` mutation was invalid because the mutant
+did not compile, so the children died of a `ReferenceError` rather than of the race. The table reports the
+valid re-run. A mutation that fails for the wrong reason is a false negative, and saying so is the
+difference between a mutation table and a decoration.
+
 ## Auto Run Result
+
+**Status: done.** All eight recorded defects were present and all eight are fixed: the retry loop is bounded
+across every disposition that returns to a step, with the count folded from the log so a restart cannot reset
+it; the torn-read window is closed with the atomic-create idiom, extracted to one shared module; the
+`schema_version` and `retryable` checks moved inside their schemas; the command intent now refuses a missing
+argument and a clock's default attributed to a person; the npm bound is asserted from its single
+declaration; and CI runs the four-command gate on the pinned Node.
+
+1263 tests across 50 files, zero skips. Ten mutations tried, all caught.
+
+**Stage 1 is complete — 12 of 12 stories, and its gate is met** (assessed at story 1-11 against the gate as
+amended on 2026-09-20: containment independently verified, and all six required surfaces reconstructable
+from `events.jsonl` after every other file in the run directory is deleted).
+
+`followup_review_recommended: true` — the story is oversized, no review layer ran, and it changed a failure
+allowance another story declared. Five deferred entries, of which the bound's conflation of a step's failure
+with the engine's crash is the one worth revisiting when story 2-9 builds the ceilings.

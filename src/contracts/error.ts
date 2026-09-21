@@ -107,6 +107,14 @@ export const ERROR_CODES: readonly ErrorCode[] = Object.freeze(
 export const isErrorCode = (code: string): code is ErrorCode =>
   Object.prototype.hasOwnProperty.call(ERROR_DISPOSITIONS, code);
 
+/** The single authority on what to do about a code. Unknown codes are handed off, never retried. */
+export const dispositionFor = (code: string): Disposition =>
+  isErrorCode(code) ? ERROR_DISPOSITIONS[code] : UNKNOWN_CODE_DISPOSITION;
+
+/** Retryability is derived from the table, never asserted independently. */
+export const isRetryable = (code: string): boolean =>
+  dispositionFor(code) === 'retry-with-backoff';
+
 /**
  * The error shape crossing every unit boundary.
  *
@@ -114,25 +122,32 @@ export const isErrorCode = (code: string): code is ErrorCode =>
  * (to `abandon-and-hand-off`) rather than throwing a second failure while handling the first.
  * `cause` is a rendered string rather than a nested error, because AD-2 forbids recursive schemas
  * and this shape appears inside step contracts.
+ *
+ * **`retryable` may not disagree with the table.** The field is on the wire — a step agent's
+ * structured output carries it, and a model will write whatever it believes — while AD-35 makes the
+ * table the one authority on what a code means. A payload claiming `budget.exhausted` is retryable
+ * parses into a value whose own flag argues for the retry the table forbids, and the next reader has
+ * two answers to one question. So the agreement is checked inside the schema: `makeError` derives the
+ * flag from the table and therefore always passes, and there is no parsed `OrchError` anywhere in the
+ * system whose flag contradicts its code.
  */
-export const OrchErrorSchema = z.object({
-  code: z.string(),
-  message: z.string(),
-  retryable: z.boolean(),
-  cause: z.string().nullable(),
-});
+export const OrchErrorSchema = z
+  .object({
+    code: z.string(),
+    message: z.string(),
+    retryable: z.boolean(),
+    cause: z.string().nullable(),
+  })
+  .refine((error) => error.retryable === isRetryable(error.code), {
+    message:
+      'retryable must equal what the AD-35 disposition table says for this code — the table is the ' +
+      'authority and the field may not disagree with it (an unknown code is never retryable)',
+    path: ['retryable'],
+  });
 
 export type OrchError = z.infer<typeof OrchErrorSchema>;
 
-/** The single authority on what to do about a code. Unknown codes are handed off, never retried. */
-export const dispositionFor = (code: string): Disposition =>
-  isErrorCode(code) ? ERROR_DISPOSITIONS[code] : UNKNOWN_CODE_DISPOSITION;
-
 export const dispositionForError = (error: OrchError): Disposition => dispositionFor(error.code);
-
-/** Retryability is derived from the table, never asserted independently. */
-export const isRetryable = (code: string): boolean =>
-  dispositionFor(code) === 'retry-with-backoff';
 
 /**
  * Build an error whose `retryable` flag cannot disagree with the table, which is the drift AD-35

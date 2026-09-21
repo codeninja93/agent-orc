@@ -22,6 +22,7 @@
  * resolver, the compare-and-set and every intent effect are still the engine's.
  */
 export * from './paths.js';
+export * from './exclusive-create.js';
 export * from './branches.js';
 export * from './redaction.js';
 export * from './recorder.js';

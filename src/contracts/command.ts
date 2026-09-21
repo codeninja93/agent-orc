@@ -77,8 +77,35 @@ export const COMMAND_SOURCES = ['tui', 'web', 'cli', 'timeout'] as const;
 export type CommandSource = (typeof COMMAND_SOURCES)[number];
 
 /**
+ * The commands that carry no meaning without text.
+ *
+ * An `answer` with nothing in it is not an answer, a `reject` with no reason writes an empty ledger
+ * entry (CAP-18), an `edit_criterion` with no replacement line amends nothing, a `narrow` names no
+ * narrower scope and an `inject_note` injects nothing. Each of those is an intent the consumer can
+ * only accept and then silently do nothing about, which is the worst of the three possible outcomes:
+ * the user believes they steered the run.
+ *
+ * Declared here beside the enum, rather than as a second list in each consumer, so the renderers'
+ * input handling and the engine's acceptance cannot disagree about which controls need text.
+ */
+export const ARGUMENT_REQUIRED_COMMANDS: readonly Command[] = Object.freeze([
+  Command.Answer,
+  Command.Reject,
+  Command.EditCriterion,
+  Command.Narrow,
+  Command.InjectNote,
+]);
+
+export const commandRequiresArgument = (command: Command): boolean =>
+  ARGUMENT_REQUIRED_COMMANDS.includes(command);
+
+/**
  * A durable steering intent file. The loopback HTTP server is an accelerator that writes these
  * same files; with it down, every control remains available through the file path (AD-19).
+ *
+ * Two cross-field rules are part of the shape rather than of a consumer's checking, because an
+ * intent file is read by the engine, by both renderers and by any later replay: a rule enforced at
+ * one reader is a rule the other readers do not have.
  */
 export const CommandIntentSchema = versioned({
   intent_id: z.string(),
@@ -91,6 +118,34 @@ export const CommandIntentSchema = versioned({
   issued_at: TimestampSchema,
   /** Free text; the system parses. Never impose a format on the human (Q6). */
   argument: z.string().nullable(),
-});
+})
+  /**
+   * Whitespace is not text. A `narrow` carrying `"   "` reaches a consumer as a scope change with
+   * nothing in it, which is the same unactionable intent as `null` wearing a different coat. Trimming
+   * to decide, never to rewrite: Q6's "never impose a format on the human" still holds, so the
+   * argument the consumer reads is exactly what was written.
+   */
+  .refine(
+    (intent) =>
+      !commandRequiresArgument(intent.command) ||
+      (intent.argument !== null && intent.argument.trim() !== ''),
+    {
+      message:
+        'this command is meaningless without text, so an intent carrying no argument is refused ' +
+        'rather than accepted and silently doing nothing',
+      path: ['argument'],
+    },
+  )
+  /**
+   * AD-19 — a command records its principal so approvals are attributable. A clock's default is
+   * nobody's approval: pairing `source: 'timeout'` with a `user` principal would put a person's name
+   * on a decision they never made, and the decision ledger (CAP-18) keeps that attribution for ever.
+   */
+  .refine((intent) => intent.source !== 'timeout' || intent.principal.kind !== 'user', {
+    message:
+      'a timeout-sourced intent is the clock acting, so it is never attributed to a user principal ' +
+      '(AD-19)',
+    path: ['principal', 'kind'],
+  });
 
 export type CommandIntent = z.infer<typeof CommandIntentSchema>;

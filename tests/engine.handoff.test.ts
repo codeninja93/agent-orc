@@ -20,7 +20,7 @@ import { makeError } from '../src/contracts/index.js';
 import type { StepRecord } from '../src/contracts/index.js';
 import { REDACTION_MARKER, runPaths } from '../src/runtime/index.js';
 import {
-  DECLARED_FAILURE_ATTEMPT_LIMIT,
+  DECLARED_STEP_ATTEMPT_LIMIT,
   Reconciler,
   TAKEOVER_BRANCH_PREFIX,
   createRecordingResetter,
@@ -387,13 +387,13 @@ describe('a run that has failed the declared number of times stops and explains 
 
     const state = reconciler.load(accepted.run).state;
     expect(state.state).toBe('handed_off');
-    expect(state.steps[0]?.attempts).toBe(DECLARED_FAILURE_ATTEMPT_LIMIT);
+    expect(state.steps[0]?.attempts).toBe(DECLARED_STEP_ATTEMPT_LIMIT);
 
     const path = runPaths(accepted.run, home).handoffDocument;
     expect(existsSync(path)).toBe(true);
     const document = readFileSync(path, 'utf8');
     expect(document).toContain('refund-flow');
-    expect(document).toContain(`failed on all ${String(DECLARED_FAILURE_ATTEMPT_LIMIT)} attempts`);
+    expect(document).toContain(`failed on all ${String(DECLARED_STEP_ATTEMPT_LIMIT)} attempts`);
     expect(document).not.toMatch(/\n\s+at\s+\S+\s*\(/);
 
     // Never a retry loop: the run is terminal and no later pass acts.
