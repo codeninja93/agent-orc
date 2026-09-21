@@ -9,10 +9,17 @@
     "node": ">=22.22",
     "npm": "<12"
   },
+  "bin": {
+    "orch": "dist/bin/init.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/contracts/index.d.ts",
       "import": "./dist/contracts/index.js"
+    },
+    "./installer": {
+      "types": "./dist/installer/index.d.ts",
+      "import": "./dist/installer/index.js"
     }
   },
   "types": "./dist/contracts/index.d.ts",
@@ -21,7 +28,8 @@
     ".nvmrc"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.bin.json",
+    "prepare": "npm run build",
     "typecheck": "tsc -p tsconfig.json",
     "lint": "eslint .",
     "test": "vitest run"

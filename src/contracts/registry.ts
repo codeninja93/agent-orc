@@ -14,6 +14,12 @@ import { CommandIntentSchema } from './command.js';
 import { EventEnvelopeSchema } from './event.js';
 import { OrchErrorSchema } from './error.js';
 import { FetchRecordSchema } from './fetch.js';
+import {
+  AgentDeclarationSchema,
+  ManifestSchema,
+  PermissionsSchema,
+  ProfileSchema,
+} from './installer.js';
 import { QuestionStateSchema } from './question.js';
 import { RunStateSchema } from './state.js';
 import { StepInputSchema, StepOutputSchema } from './step.js';
@@ -82,6 +88,42 @@ export const CONTRACTS = {
       '(AD-4, AD-7, AD-28).',
     model_produced: false,
     schema: RunStateSchema,
+  },
+  'installer.profile': {
+    id: 'installer.profile',
+    kind: 'artifact',
+    description:
+      'The per-repo profile at <target-repo>/.orch/profile.toml, written by the installer (AD-9, ' +
+      'AD-16, AD-28).',
+    model_produced: false,
+    schema: ProfileSchema,
+  },
+  'installer.agent': {
+    id: 'installer.agent',
+    kind: 'artifact',
+    description:
+      'One agent declaration at <target-repo>/.orch/agents/<agent-id>.toml, referencing a ' +
+      'registered contract id (AD-17, AD-28).',
+    model_produced: false,
+    schema: AgentDeclarationSchema,
+  },
+  'installer.permissions': {
+    id: 'installer.permissions',
+    kind: 'artifact',
+    description:
+      'Granted tools, the reversibility gate table and the egress allowlist at ' +
+      '<target-repo>/.orch/permissions.toml (AD-9, AD-13, AD-28).',
+    model_produced: false,
+    schema: PermissionsSchema,
+  },
+  'installer.manifest': {
+    id: 'installer.manifest',
+    kind: 'artifact',
+    description:
+      'Every file the installer created, at <target-repo>/.orch/manifest.toml, so a half-install ' +
+      'is detectable and recoverable (AD-12, AD-28).',
+    model_produced: false,
+    schema: ManifestSchema,
   },
   'error.shape': {
     id: 'error.shape',

@@ -1,17 +1,52 @@
----
-title: 'Installer — npx init, the interview, .orch/ scaffolding'
-type: 'feature'
+---title: Installer — npx init, the interview, .orch/ scaffolding
+type: feature
 created: '2026-09-21'
-status: 'drafted'
+status: done
 review_loop_iteration: 0
-followup_review_recommended: false
-baseline_revision: 'e7409af'
+followup_review_recommended: true
+baseline_revision: e7409af
 context:
-  - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/build-sequencing.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/interface-contract.md'
-warnings: ['oversized'] # first stage-2 story, first executable entry point, 13 questions and four written artifacts
-deferred: []
+- '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/build-sequencing.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/interface-contract.md'
+warnings:
+- oversized
+deferred:
+- summary: 'SPEC AMENDMENT: the Stack''s Node-floor rationale is factually wrong, verified by probe.'
+  evidence: '`ARCHITECTURE-SPINE.md:306` says 22.18 is the true minimum "being where native TypeScript
+    type stripping lands, which the `bin/init.ts` npx entry point requires". I measured it: a `.ts` file
+    under `node_modules` throws ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING, while the identical file
+    outside strips fine — and `npx` installs into `node_modules`. Node also does not resolve a `./x.js`
+    specifier to `x.ts`, so this codebase could not run un-built regardless. The floor is still right
+    for other reasons; its stated reason is void. The shipped bin is JavaScript: `bin/init.ts` stays where
+    the spine puts it and `prepare` compiles it to `dist/bin/init.js`.'
+  location: ARCHITECTURE-SPINE.md:306
+  severity: medium
+- summary: AD-12's revisit condition is arriving before npm 12, by policy rather than by version.
+  evidence: 'npm 11.19.0 still runs `prepare` but warns: "1 package has install scripts not yet covered
+    by allowScripts". AD-12 frames the condition as npm 12 disabling git-dependency resolution and install
+    scripts; the install-script half is visibly landing early. When the default flips, this delivery path
+    silently produces a package with no `dist/` and a `bin` pointing at nothing. The delivery test would
+    catch it on the day it happens. The options — prebuild and commit `dist/`, ship a build-free bin,
+    or document an allowScripts step — are a spec decision.'
+  severity: high
+- summary: Five interview decisions were taken from the spec's silence and want confirming.
+  evidence: (1) AD-9's ".gitignore runtime paths" are enumerated nowhere and every runtime artifact lives
+    under ORCH_HOME, so one line was appended — `.orch/**/*.tmp`, the debris an interrupted atomic write
+    leaves — as the only thing the runtime can leave in the repository. (2) Question 12 maps to AD-27's
+    RUN_MODES (shadow|live), because the finer AUTONOMY_MODES ladder is folded from the event log and
+    making it a per-repo setting too would put one value in two scopes, which AD-34 forbids. (3) Ceiling
+    units are steps / wall_clock_minutes / rate_limit_budget_percent, since AD-24 gives no currency dimension.
+    (4) An unparseable hand-edited `.orch/` file reads as *no answers* rather than fatally, because refusing
+    would make the half-install AD-12 requires to be recoverable unrecoverable. (5) A project id that
+    is not this repository's first commit is dropped and re-asked rather than written, since it would
+    key the wrong central record.
+  severity: medium
+- summary: No review layer ran against this story.
+  evidence: 'The gate, ten implementer mutations and my own verification of the credential rule, the delivery
+    path and the type-stripping finding are the only scrutiny. Read `status: done` as implemented and
+    gated, not reviewed.'
+  severity: high
 ---
 
 # Story 2-1 — Installer: npx init, the interview, `.orch/` scaffolding
@@ -159,3 +194,43 @@ point: this story installs a project, it does not run one.
 ## Verification
 
 ## Auto Run Result
+
+**Status: done.** `bin/init.ts` and `src/installer/` exist, and the system is installable for the first
+time. Suite 1597 -> 1668 tests across 57 files, zero skips, zero failures.
+
+**The delivery path is exercised, not inferred.** `tests/installer.delivery.test.ts` builds a git repository
+from the working tree, `npm install git+file://<repo>#<sha>` into a scratch consumer — real ref resolution,
+real `prepare`, real pack honouring `files`, real `bin` link — then runs the linked binary: `--help`, a real
+install of a fresh repository asserting `.orch/profile.toml` and `manifest.toml` land, a refusal asserting
+exit 1, and `npm exec`, which is `npx`. Both invocations run with `engine_strict`, so `engines.npm: "<12"` is
+fatal rather than warned. Honestly stated rather than engineered away: the ref is `git+file://` and not
+`github:<owner>/<repo>`, because the code is uncommitted and a network fetch would fail for unrelated
+reasons; everything npm does after resolving the ref is identical. The test is slow-ish and cache-dependent.
+
+That it is real was proved by mutation: dropping `"dist"` from `files` left the other four installer suites —
+50 tests — entirely green, and was caught only by the tests that *execute* the delivered binary. Renaming the
+bin was caught by `ENOENT` on the linked path. A `package.json` text assertion would have caught neither.
+
+**The credential rule has two independent guards, and both are live.** Writing a value into `credential_env`
+is caught by the schema; leaking a value into `branch_pattern`, a free-text field no schema rejects, is
+caught by a byte scan of the written tree; and reading a variable and discarding it — nothing reaching disk —
+is caught by an environment-read proxy that recorded only ten reads in a whole install. The middle arm
+matters: it is the one a field assertion would miss, and it is the one a background security scan flagged
+mid-round while the mutation was in the tree. I ran my own gate before committing: `grep -rn "process\.env"
+src/installer/ bin/` returns only `detect.ts`'s `PATH` and `HOME`, which build the minimal environment handed
+to `git` so the installer's one child process inherits nothing.
+
+**The AD-18 guard recurses, and that is load-bearing rather than decorative.** Making its own walk
+non-recursive fails five tests, including one named for the failure it prevents — stage 1's equivalent guard
+silently stopped covering 44% of its directory the moment a subdirectory appeared.
+
+**Two findings that need a spec decision, both verified rather than reported.** The Stack's Node-floor
+rationale is void: Node refuses to strip types under `node_modules`, which is exactly where `npx` installs,
+so the shipped bin must be JavaScript. And AD-12's revisit condition is arriving ahead of npm 12 — npm
+11.19.0 already warns that `prepare` is "not yet covered by allowScripts", and when that default flips this
+path produces a package with no `dist/` and a `bin` pointing at nothing.
+
+**Residual risk, and why `followup_review_recommended` is true.** No review layer ran. The specific
+unverified risk is the TOML subset written for this story: it is a new parser and serialiser on the path
+every `.orch/` artifact takes, its determinism is what makes byte-level idempotence true, and the only thing
+exercising it is this story's own tests.

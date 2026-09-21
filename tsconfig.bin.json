@@ -1,0 +1,25 @@
+{
+  // AD-12 — `bin/` is compiled separately because it emits somewhere else and resolves the package
+  // differently from `src/`.
+  //
+  // `tsconfig.build.json` has `rootDir: "src"` and produces the package's public output; `bin/` is
+  // not part of that tree and must not shift it. This config emits `bin/init.ts` to `dist/bin/`,
+  // which is where the `package.json` `bin` field points — Node refuses to strip types for a file
+  // under `node_modules`, so the file `npx` runs has to be JavaScript.
+  //
+  // `paths` is cleared, and that is the whole point of a second config. `tsconfig.json` maps the
+  // self-reference `agent-orcastrator/installer` onto `src/` so a typecheck needs no prior build;
+  // here the build has just produced `dist/`, so the same specifier resolves through the package's
+  // own `exports` to the declaration file beside the JavaScript this will import at runtime.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "bin",
+    "outDir": "dist/bin",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": true,
+    "paths": {}
+  },
+  "include": ["bin/**/*.ts"]
+}

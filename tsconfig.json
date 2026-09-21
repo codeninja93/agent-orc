@@ -24,7 +24,22 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
 
-    "noEmit": true
+    "noEmit": true,
+
+    // `bin/init.ts` imports this package by name, which is how one specifier can be correct both
+    // where it is typechecked (against `src/`) and where it runs (against `dist/`, through the
+    // package's own `exports`). Mapping it here keeps `npm run typecheck` independent of whether a
+    // build has happened; `tsconfig.bin.json` clears the mapping, because by then one has.
+    "paths": {
+      "agent-orcastrator/installer": ["./src/installer/index.ts"]
+    }
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vitest.config.ts", "eslint.config.ts"]
+  "include": [
+    "bin/**/*.ts",
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "tests/**/*.ts",
+    "vitest.config.ts",
+    "eslint.config.ts"
+  ]
 }
