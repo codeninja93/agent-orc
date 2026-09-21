@@ -97,6 +97,35 @@ describe('the three ambient values are visible with no command issued', () => {
     expect(later.startsWith('20m00s')).toBe(true);
   });
 
+  /**
+   * R11 is about a decision — "abandoning early is easy" — and the decision is only live while the run is.
+   *
+   * `elapsedMsAt` measured every run against `now`, so a four-second committed run read `elapsed 26h00m`
+   * a day later: a number about the reader's clock rather than about the work, and the figure a person
+   * would judge the next estimate by. A terminal run's elapsed is the span the log recorded; a run still
+   * in flight keeps the live clock, which is what the test above pins.
+   */
+  it('stops the clock once the run has reached a terminal state', () => {
+    const committed = foldEvents(
+      buildLog([
+        runCreated(),
+        stepStarted('implement'),
+        stepTerminated('implement'),
+        featureStateChanged('committed', 'verifying'),
+      ]),
+    );
+    const aDayLater = new Date(FIXTURE_RUN_START_MS + 24 * 60 * 60 * 1_000);
+
+    expect(committed.usage.recordedElapsedMs).toBe(3_000);
+    expect(statusFields(committed, aDayLater).elapsed).toContain('3s');
+    expect(statusFields(committed, aDayLater).elapsed).not.toContain('h');
+    // And the same log before it finished still reads off the wall clock, because that run may be waiting.
+    const running = foldEvents(
+      buildLog([runCreated(), stepStarted('implement'), featureStateChanged('running')]),
+    );
+    expect(statusFields(running, aDayLater).elapsed).toContain('h');
+  });
+
   it('reads an estimate the log states outright, when a later story records one', () => {
     const view = foldEvents(
       buildLog([runCreated({ mode: 'live', step_count: 2, wall_clock_ms_estimate: 900_000 })]),
@@ -146,9 +175,19 @@ describe('cost is subscription usage, never currency (R10, AD-24)', () => {
     expect(formatBudgetShare(0)).toBe('0.00 of 1.00');
     expect(formatBudgetShare(0.815)).toBe('0.81 of 1.00');
     expect(formatBudgetShare(1)).toBe('1.00 of 1.00');
-    // A value outside the declared range is clamped rather than displayed as a number that cannot be.
-    expect(formatBudgetShare(4)).toBe('1.00 of 1.00');
-    expect(formatBudgetShare(-1)).toBe('0.00 of 1.00');
+    /**
+     * A value outside the declared range is *reported*, not clamped into one that looks fine.
+     *
+     * Clamping turned a figure recorded on another scale — 42 meaning 42 parts in a hundred is the
+     * obvious one a later story could emit — into `1.00 of 1.00`: in range, plausible, and false. R12
+     * says uncertainty is surfaced as uncertainty rather than as a confident wrong answer, and this is
+     * the number a person decides whether to abandon a run by. The figure is shown as recorded and said
+     * to be off the scale.
+     */
+    expect(formatBudgetShare(4)).toContain('4.00 of 1.00');
+    expect(formatBudgetShare(4)).toContain('outside the 0 to 1 scale');
+    expect(formatBudgetShare(-1)).toContain('-1.00 of 1.00');
+    expect(formatBudgetShare(-1)).toContain('outside the 0 to 1 scale');
     expect(formatBudgetShare(null)).toBe(STATUS_UNRECORDED);
   });
 });

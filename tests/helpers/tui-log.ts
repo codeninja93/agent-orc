@@ -225,6 +225,67 @@ export const commandApplied = (
   },
 });
 
+/**
+ * `command.refused` as `refuseIntent` records it — the notice channel for a control that did nothing.
+ *
+ * The payload is `commandRefusedPayload`'s: a constant reason, the detail sentence, and the intent it
+ * names. A refusal with no notice is a person watching their keystroke vanish, which is why this builder
+ * exists at all: the branch that renders it had no fixture and no test until story 1-9's review round.
+ */
+export const commandRefused = (
+  command: string,
+  reason = 'wrong-target-state',
+  detail = `"${command}" named a run state that has no gate to approve, so nothing changed`,
+): EventSpec => ({
+  type: 'command.refused',
+  payload: { reason, detail, intent_id: `cmd-${command}-01`, command },
+});
+
+/** `permission.denied` as the spawner records it: the tool, why, and the AD-35 disposition. */
+export const permissionDenied = (
+  tool = 'Bash',
+  reason = 'the command is outside the allowed set',
+): EventSpec => ({
+  type: 'permission.denied',
+  step: 'implement',
+  payload: {
+    tool,
+    tool_use_id: 'toolu-01',
+    reason,
+    reason_type: 'permission_rule',
+    disposition: 'escalate-to-human',
+  },
+});
+
+/** `redaction.failed` as the recorder appends it in place of the artifact it dropped (AD-21). */
+export const redactionFailed = (droppedType = 'step.terminated'): EventSpec => ({
+  type: 'redaction.failed',
+  payload: {
+    reason: 'pattern-unredactable',
+    cause: 'a declared credential pattern could not be replaced',
+    dropped_event_type: droppedType,
+    disposition: 'abandon-and-hand-off',
+    detail:
+      'The artifact was dropped before any append. AD-21 fails closed and records no part of the ' +
+      'value that triggered the failure.',
+  },
+});
+
+/** `question.deflected` (Q4): answered from the repository, with no resolver, because nobody was asked. */
+export const questionDeflected = (
+  questionId: string,
+  answer = 'the repository already answers this: the shell polls',
+): EventSpec => ({
+  type: 'question.deflected',
+  payload: {
+    question_id: questionId,
+    source: 'repository',
+    anchor: 'src/tui/app.tsx',
+    answer,
+    deflected_at: new Date(FIXTURE_RUN_START_MS + 3_000).toISOString(),
+  },
+});
+
 export const budgetDegraded = (consumed: number, wallClockMsRemaining?: number): EventSpec => ({
   type: 'budget.degraded',
   payload: {

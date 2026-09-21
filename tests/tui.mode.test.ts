@@ -231,6 +231,52 @@ describe('the question slot is persistent, and nothing later scrolls it away (R1
     const frame = shellFrameText(RENDER_STATES['mid-step']?.() ?? foldEvents([]), { now: NOW });
     expect(frame).toContain(`${QUESTION_SLOT_LABEL}:`);
   });
+
+  /**
+   * R14 is about a terminal, not only about a list.
+   *
+   * `MAX_NOTICES` bounds the notices, but nothing bounded the *frame* against the terminal's height — so
+   * on a short terminal the frame was taller than the screen, the screen scrolled, and what went off the
+   * top was the problem line, the mode, the status and then the slot, in that order. The frame is bounded
+   * here, and what it gives up is notices: each is something that already happened and is already in the
+   * log, while the slot is the one thing the run is waiting on.
+   */
+  it('bounds the frame to the terminal height, dropping notices rather than the slot', () => {
+    const view = foldEvents(
+      buildLog([
+        runCreated(),
+        featureStateChanged('running'),
+        stepStarted('implement'),
+        questionAsked('q-01'),
+        commandApplied('narrow', { intent_id: 'cmd-narrow-01' }),
+        commandApplied('inject_note', { intent_id: 'cmd-note-01' }),
+        commandApplied('continue', { intent_id: 'cmd-continue-01' }),
+        commandApplied('approve', { intent_id: 'cmd-approve-01' }),
+      ]),
+    );
+    const unbounded = shellFrameLines(view, { now: NOW });
+    expect(unbounded.filter((line) => line.startsWith('- ')).length).toBe(4);
+
+    const rows = 12;
+    const lines = shellFrameLines(view, { now: NOW, rows });
+    expect(lines.length).toBeLessThanOrEqual(rows);
+    // The slot, the mode and the ambient status all survive being bounded.
+    expect(lines.some((line) => line.startsWith(`${QUESTION_SLOT_LABEL}:`))).toBe(true);
+    expect(lines.some((line) => line.startsWith(`${MODE_LABEL} `))).toBe(true);
+    expect(lines.join('\n')).toContain(STATUS_LABELS.Steps);
+    // And the one gesture that always means stop is still on the frame (interface-contract).
+    expect(lines.some((line) => line.startsWith('x stop'))).toBe(true);
+    expect(lines.filter((line) => line.startsWith('- ')).length).toBeLessThan(4);
+  });
+
+  it('says plainly that closing the viewer is not stopping the run', () => {
+    // Ctrl-c is deliberately *not* bound to `disengage` — see `QUIT_IS_NOT_DISENGAGE_HINT` — so the one
+    // thing that must not happen is a person quitting in the belief that they stopped the work.
+    const frame = shellFrameText(RENDER_STATES['mid-step']?.() ?? foldEvents([]), { now: NOW });
+    expect(frame).toContain('ctrl-c');
+    expect(frame).toContain('leaves the run advancing');
+    expect(frame).toContain('x stop');
+  });
 });
 
 describe('a narrow or colourless terminal is still readable', () => {

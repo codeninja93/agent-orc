@@ -22,6 +22,7 @@
 import { hasRecordedUsage } from '../contracts/index.js';
 import type { StepUsage } from '../contracts/index.js';
 
+import { STOPPED_FEATURE_STATES } from './mode.js';
 import { UNRECORDED_PRESENTATION } from './projection.js';
 import type { ShellView } from './projection.js';
 
@@ -35,7 +36,14 @@ export const STATUS_LABELS = {
 /** What the segment says when the log has not recorded a value yet. Uncertainty stays uncertainty (R12). */
 export const STATUS_UNRECORDED = 'not yet recorded';
 
-/** The separator between ambient fields. One character, so a narrow terminal still fits three fields. */
+/**
+ * The separator between ambient fields.
+ *
+ * Three characters wide — a space, a middle dot and a space — and the dot is two bytes in UTF-8. The
+ * comment here used to say "one character, so a narrow terminal still fits three fields", which was
+ * wrong in both halves and mattered in the second: what fits a 40-column terminal is decided by
+ * {@link displayWidth} over the composed line, not by a claim about this constant.
+ */
 export const STATUS_SEPARATOR = ' · ';
 
 const SECOND_MS = 1_000;
@@ -76,8 +84,19 @@ export const formatDuration = (milliseconds: number | null): string => {
  */
 export const formatBudgetShare = (share: number | null): string => {
   if (share === null || !Number.isFinite(share)) return STATUS_UNRECORDED;
-  const bounded = Math.min(Math.max(share, 0), 1);
-  return `${bounded.toFixed(2)} of 1.00`;
+  if (share < 0 || share > 1) {
+    /**
+     * Out of range is reported, not clamped.
+     *
+     * Clamping turned a figure recorded on some other scale — a later story emitting `42` for 42 parts in
+     * a hundred is the obvious one — into `1.00 of 1.00`, a value that is in range, plausible, and a
+     * fiction. R12 is explicit that uncertainty is surfaced as uncertainty rather than as a confident
+     * wrong answer, and this is the ambient number a person decides whether to abandon a run by. The
+     * recorded figure is shown as recorded, and said to be outside the scale AD-24 declares.
+     */
+    return `${share.toFixed(2)} of 1.00 — outside the 0 to 1 scale this is recorded on`;
+  }
+  return `${share.toFixed(2)} of 1.00`;
 };
 
 /**
@@ -147,13 +166,20 @@ export const formatStepCount = (view: ShellView): string => {
 };
 
 /**
- * Elapsed time, measured against the shell's clock rather than the log's last line.
+ * Elapsed time: the shell's clock while the run is in flight, the log's own span once it has finished.
  *
- * A run that is waiting on a question has a log that stopped moving and a wall clock that did not, and
- * R11's purpose — making it easy to abandon early — depends on the number a person reads being the one
- * that is still growing.
+ * Both halves are R11. A run waiting on a question has a log that stopped moving and a wall clock that
+ * did not, and "abandoning early is easy" depends on the number a person reads being the one that is
+ * still growing — so while the run is live the clock wins. A run that has reached a terminal state is
+ * not taking any more time, and measuring it against `now` made a four-second committed run read
+ * `elapsed 26h00m` the next day: an elapsed that keeps growing after the work stopped is not an elapsed,
+ * and it is the figure a person would judge the next run's estimate by.
  */
 export const elapsedMsAt = (view: ShellView, now: Date): number | null => {
+  const finished =
+    view.featureState !== null && STOPPED_FEATURE_STATES.includes(view.featureState);
+  // A terminal run whose log recorded no span at all still says what it can rather than nothing.
+  if (finished && view.usage.recordedElapsedMs !== null) return view.usage.recordedElapsedMs;
   if (view.usage.startedAt === null) return view.usage.recordedElapsedMs;
   const start = Date.parse(view.usage.startedAt);
   if (Number.isNaN(start)) return view.usage.recordedElapsedMs;

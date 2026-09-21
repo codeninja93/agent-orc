@@ -179,6 +179,32 @@ export const mintIntentId = (ulid: string, policy: RedactionPolicy = {}): string
 };
 
 /**
+ * How many characters the time prefix of a minted seed takes.
+ *
+ * Base-36, upper case, zero-padded: ten characters hold every millisecond up to the year 5138, and a
+ * fixed width is what makes a plain string comparison order two seeds by the instant they were minted.
+ */
+const SEED_TIME_CHARS = 10;
+
+/** How many characters the within-process counter takes. Fixed width, for the same reason. */
+const SEED_COUNTER_CHARS = 8;
+
+/**
+ * The count of ids this process has minted, so two minted in the same millisecond still sort in order.
+ *
+ * A process-local counter rather than more randomness: the tiebreak `orderIntents` applies after
+ * `issued_at` is the id itself, and `issued_at` is a millisecond timestamp — so two intents issued
+ * inside one millisecond are ordered by their ids alone. With a random tiebreak that order is a coin
+ * toss rather than the order the person pressed the keys, which is the one order a steering surface
+ * may not get wrong.
+ */
+let mintedSoFar = 0;
+
+/** A number as fixed-width upper-case base 36, so lexicographic order is numeric order. */
+const paddedBase36 = (value: number, width: number): string =>
+  Math.trunc(value).toString(36).toUpperCase().padStart(width, '0').slice(-width);
+
+/**
  * An intent id for a caller that has no ULID minter, which is every renderer.
  *
  * AD-29 gives the engine sole ownership of *run* id minting, and that is the rule this respects by
@@ -186,12 +212,26 @@ export const mintIntentId = (ulid: string, policy: RedactionPolicy = {}): string
  * minter lives in the engine where AD-29 put it. So the randomness comes from `node:crypto` and the
  * grouping is {@link mintIntentId}'s, which is what keeps the id loggable.
  *
- * Ordering is not lost by using randomness rather than a ULID: an intent file is ordered by the
- * `issued_at` it carries first and by its id only as a tiebreak, so two intents issued in the same
- * millisecond are ordered deterministically without the id itself being chronological.
+ * **The seed is chronological, and that is load-bearing rather than cosmetic.** `orderIntents` sorts a
+ * pass's intents by `issued_at` and breaks a tie on the intent id, and `issued_at` has millisecond
+ * resolution — so for two commands issued in the same millisecond the id *is* the order they are
+ * applied in. A seed that was random throughout ordered those two by a coin toss; this one is a
+ * fixed-width millisecond timestamp, then a fixed-width count of what this process has already minted,
+ * then the UUID that carries the uniqueness. Lexicographic order over equal-length seeds is therefore
+ * issue order within a process, and the UUID still makes the id unique across processes and restarts —
+ * which is what the exactly-once key of AD-19 actually needs.
  */
-export const mintRandomIntentId = (uuid: () => string = randomUUID): string =>
-  mintIntentId(uuid().replace(/-/g, '').toUpperCase());
+export const mintRandomIntentId = (
+  uuid: () => string = randomUUID,
+  now: () => number = Date.now,
+): string => {
+  mintedSoFar += 1;
+  const seed =
+    paddedBase36(now(), SEED_TIME_CHARS) +
+    paddedBase36(mintedSoFar, SEED_COUNTER_CHARS) +
+    uuid().replace(/-/g, '').toUpperCase();
+  return mintIntentId(seed);
+};
 
 /** What a caller supplies to build an intent; everything else is filled in here. */
 export interface NewCommandIntent {

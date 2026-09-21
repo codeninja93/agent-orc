@@ -357,3 +357,46 @@ const fakeStdout = (): NodeJS.WriteStream => {
   };
   return stream as unknown as NodeJS.WriteStream;
 };
+
+/**
+ * A ctrl chord is not a control key, and the frame's own hint depends on it.
+ *
+ * `c` confirms a spec — CAP-2's only gate into execution — and `k` kills a run. Without the guard in
+ * `reduceKey`'s controls branch, `controlForKey` saw the bare letter, so ctrl-c wrote a durable
+ * `confirm_spec` intent and ctrl-k a `kill`. Story 1-9's round then added a frame hint reading "ctrl-c
+ * closes this view and leaves the run advancing", which is only true while the reducer declines the chord
+ * and lets the terminal's interrupt through — a hint promising safety over a keystroke that confirms
+ * acceptance criteria is worse than no hint at all.
+ *
+ * The composing branch has refused ctrl-c since story 1-10; this pins the same rule outside a draft.
+ */
+describe('a ctrl chord never reaches a control', () => {
+  it('ignores ctrl-c rather than confirming the spec with it', () => {
+    const outcome = reduceKey(initialInputState, { input: 'c', ctrl: true });
+    expect(outcome.effect.kind).toBe('ignored');
+  });
+
+  it('ignores ctrl-k rather than killing the run with it', () => {
+    const outcome = reduceKey(initialInputState, { input: 'k', ctrl: true });
+    expect(outcome.effect.kind).toBe('ignored');
+  });
+
+  it('still lets the bare letters mean what the control table says', () => {
+    expect(reduceKey(initialInputState, { input: 'c' }).effect).toMatchObject({
+      kind: 'invoke',
+      command: Command.ConfirmSpec,
+    });
+    expect(reduceKey(initialInputState, { input: 'k' }).effect).toMatchObject({
+      kind: 'invoke',
+      command: Command.Kill,
+    });
+  });
+
+  it('still abandons a draft on ctrl-c, which is the one chord the reducer answers', () => {
+    const opened = reduceKey(initialInputState, { input: 'a' }).state;
+    const typed = reduceKey(opened, { input: 'h' }).state;
+    const outcome = reduceKey(typed, { input: 'c', ctrl: true });
+    expect(outcome.effect.kind).toBe('cancelled');
+    expect(outcome.state.draft).toBe('');
+  });
+});

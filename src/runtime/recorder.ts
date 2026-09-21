@@ -229,6 +229,22 @@ const describeHolder = (holder: WriterClaim | null): string =>
     ? 'the claim is held by an unreadable lock file'
     : `the claim is held by pid ${String(holder.pid)} on ${holder.host} since ${holder.since}`;
 
+/** Parse whole lines into envelopes, refusing any line that is not one (AD-5). */
+const parseEventLines = (logPath: string, lines: readonly string[]): EventEnvelope[] =>
+  lines.map((line, index) => {
+    let parsed: unknown;
+    try {
+      parsed = parseJson(line);
+    } catch {
+      throw new EventLogCorruptError(logPath, index + 1, 'is not whole JSON');
+    }
+    const result = EventEnvelopeSchema.safeParse(parsed);
+    if (!result.success) {
+      throw new EventLogCorruptError(logPath, index + 1, 'is not an AD-5 envelope');
+    }
+    return result.data;
+  });
+
 /**
  * Read back the appended lines. A reader orders by `seq` and ignores an unknown `type` rather than
  * erroring (AD-5); a line that is not whole JSON, or is not an envelope, is a corruption report.
@@ -242,19 +258,45 @@ export const readEventLog = (logPath: string): EventEnvelope[] => {
   if (trailing !== '') {
     throw new EventLogCorruptError(logPath, lines.length + 1, 'is not terminated by a newline');
   }
-  return lines.map((line, index) => {
-    let parsed: unknown;
-    try {
-      parsed = parseJson(line);
-    } catch {
-      throw new EventLogCorruptError(logPath, index + 1, 'is not whole JSON');
-    }
-    const result = EventEnvelopeSchema.safeParse(parsed);
-    if (!result.success) {
-      throw new EventLogCorruptError(logPath, index + 1, 'is not an AD-5 envelope');
-    }
-    return result.data;
-  });
+  return parseEventLines(logPath, lines);
+};
+
+/** What {@link readCompleteEventLines} found: the whole lines, and whether one was still arriving. */
+export interface CompleteEventLines {
+  readonly events: EventEnvelope[];
+  /**
+   * True when the file's final line had no newline yet — an append in progress, not a corruption.
+   *
+   * The distinction matters to a reader that is not the recorder: a renderer polls this file while the
+   * recorder appends to it, so meeting a half-written final line is an ordinary race rather than a fault.
+   */
+  readonly incompleteTail: boolean;
+}
+
+/**
+ * Read the lines that are whole, and report separately that the last one was not.
+ *
+ * The same race the engine's intent reader was given `TORN_INTENT_GRACE_MS` for, met from the reading
+ * side: AD-4 makes the log the sole durable truth and every renderer a projection of it, and a renderer
+ * polls the file the recorder appends to. A line without its newline is a line mid-`write`, and every
+ * line before it is complete and immutable (AD-4 forbids mutating an appended line) — so the honest
+ * reading of a torn tail is "everything up to here, and one more is arriving", not "this file cannot be
+ * read".
+ *
+ * Only the *unterminated last line* is tolerated. A complete line that is not whole JSON or not an AD-5
+ * envelope still throws, because no writer produces one of those in the ordinary course and a reader
+ * that swallowed it would hide real corruption.
+ */
+export const readCompleteEventLines = (logPath: string): CompleteEventLines => {
+  if (!existsSync(logPath)) return { events: [], incompleteTail: false };
+  const text = readFileSync(logPath, 'utf8');
+  if (text === '') return { events: [], incompleteTail: false };
+  const lines = text.split('\n');
+  const trailing = lines.pop();
+  return {
+    events: parseEventLines(logPath, lines),
+    incompleteTail: trailing !== '',
+  };
 };
 
 /**

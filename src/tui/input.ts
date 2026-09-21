@@ -151,6 +151,21 @@ export const reduceKey = (state: InputState, key: InputKey): InputStep => {
   if (key.escape === true || key.return === true) return step(state, { kind: 'none' });
   if (key.input === '') return step(state, { kind: 'none' });
 
+  /*
+   * A ctrl chord is never a control key.
+   *
+   * Without this, `controlForKey` sees the bare letter and ctrl-c writes a durable `confirm_spec`
+   * intent — CAP-2's only gate into execution — because `c` is what confirms a spec. Ctrl-k reaches
+   * `kill` the same way. The composing branch above already refuses ctrl-c for the same reason, so the
+   * omission here was the asymmetry, not the rule.
+   *
+   * It is also what makes the frame's own hint true: story 1-9 decided ctrl-c means "close this view and
+   * leave the run advancing" and says so on the frame, which holds only if the reducer declines the chord
+   * and lets the terminal's own interrupt through. A hint that promises safety over a keystroke that
+   * confirms acceptance criteria is worse than no hint.
+   */
+  if (key.ctrl === true) return step(state, { kind: 'ignored', key: key.input });
+
   const control = controlForKey(key.input);
   return control === null
     ? step(state, { kind: 'ignored', key: key.input })

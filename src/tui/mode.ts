@@ -18,7 +18,7 @@
  * Neither is inferred from anything but the log. A renderer holds no authoritative state of its own
  * (AD-4), so the mode a person reads here is the mode the log says the system is in.
  */
-import { Command } from '../contracts/index.js';
+import { Command, TERMINAL_FEATURE_STATES } from '../contracts/index.js';
 import type { CommandMap, FeatureState, RunMode } from '../contracts/index.js';
 
 /**
@@ -111,16 +111,20 @@ export const applyCommandToMode = (mode: AutonomyMode, command: string): Autonom
  * The feature states that force `stopped`, whatever the commands said.
  *
  * A run that has reached a terminal state is advancing nothing, and a mode line still reading
- * `just-do-it` over a killed run is precisely the false belief this module exists to prevent. The
- * list is the spine's four terminal states plus `hibernated`'s sibling reasoning: each is a state the
- * lifecycle draws an arrow to `[*]` from.
+ * `just-do-it` over a killed run is precisely the false belief this module exists to prevent.
+ *
+ * **It is `TERMINAL_FEATURE_STATES` itself, not a second list that happens to agree with it.** The
+ * previous local copy held four states while its own sentence described "four terminal states plus
+ * `hibernated`", which is five — a comment and a list that could only be reconciled by reading the
+ * code. The contract settles it: `hibernated` *is* one of the four states the lifecycle draws an arrow
+ * to `[*]` from, because AD-24 has a run that reaches a ceiling hibernate "writing a handoff note and a
+ * terminal-pending disposition" rather than continuing. So `stopped` — "the system is advancing
+ * nothing" — is the true claim about a hibernated run, and the mode line carries the feature state
+ * beside it, so what a person reads is `mode stopped · hibernated`: stopped, and why, and therefore
+ * what a resume would have to start from. Deriving the list rather than restating it also means a
+ * lifecycle state added to the contract as terminal cannot be left out of this one.
  */
-export const STOPPED_FEATURE_STATES: readonly FeatureState[] = [
-  'committed',
-  'hibernated',
-  'killed',
-  'handed_off',
-];
+export const STOPPED_FEATURE_STATES: readonly FeatureState[] = TERMINAL_FEATURE_STATES;
 
 /** The mode a feature state forces, or `null` when the state leaves the commands' answer standing. */
 export const modeForFeatureState = (state: FeatureState | null): AutonomyMode | null =>

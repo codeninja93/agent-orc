@@ -49,9 +49,15 @@ import {
   budgetDegraded,
   buildLog,
   commandApplied,
+  commandRefused,
   featureStateChanged,
+  handoffRecorded,
   logText,
+  permissionDenied,
   questionAsked,
+  questionDeflected,
+  questionResolved,
+  redactionFailed,
   runCreated,
   stepStarted,
   stepTerminated,
@@ -282,6 +288,233 @@ describe('the fold reads the log a real reconciler wrote', () => {
     // And the run id the engine minted is nowhere in the frame (R6).
     expect(shellFrameText(view, { now: new Date() })).not.toContain(accepted.run);
   });
+
+  /**
+   * The mode and the notice, asserted against a payload the **engine** wrote.
+   *
+   * Every other mode and notice assertion in the repository is driven by `commandApplied()` in
+   * `tests/helpers/tui-log.ts`, a builder written by the same hand as the reader — so the two agreed
+   * with each other and nothing checked that either agreed with the producer. The autonomy mode is
+   * derived from the `command` key of a `command.applied` payload, declared locally as
+   * `TUI_PAYLOAD_KEYS.Command` because `src/tui/` may not import the engine; the one test that folded a
+   * real reconciler's log asserted the feature, the run mode, the planned steps and the step phase, and
+   * never `view.autonomy` or `view.notices`. This closes that: a real `just_do_it` and a real
+   * `disengage`, folded from the file the recorder appended to.
+   */
+  it('reads the autonomy mode and the notices out of payloads the engine wrote', () => {
+    const plan = makePlan({ feature: 'tui-real-mode' });
+    const reconciler = Reconciler.open({
+      orchHome: home,
+      executor: createScriptedExecutor({
+        onStart: (request) => terminated(request.step, 'completed', { sessionId: `sess-${request.step}` }),
+        sessionIdFor: (request) => `sess-${request.step}`,
+      }),
+      plans: planProvider(plan),
+      baseline: createRecordingResetter(BASELINE),
+    });
+    toClose.push(reconciler);
+
+    const principal = { kind: 'user' as const, id: 'deep' };
+    const accepted = reconciler.acceptFeature(plan);
+    const paths = runPaths(accepted.run, home);
+
+    reconciler.steer(accepted.run, 'just_do_it', { principal });
+    const engaged = foldEvents(readEventLog(paths.eventLog));
+    expect(engaged.autonomy).toBe('just-do-it');
+    expect(engaged.notices.map((notice) => notice.text).join('\n')).toContain('just do it applied');
+
+    reconciler.steer(accepted.run, 'disengage', { principal });
+    const stopped = foldEvents(readEventLog(paths.eventLog));
+    expect(stopped.autonomy).toBe('stopped');
+    expect(stopped.notices.map((notice) => notice.text).join('\n')).toContain('disengage applied');
+    // The frame a person reads says it too, which is the whole point of deriving it.
+    expect(shellFrameText(stopped, { now: new Date() })).toContain('mode stopped');
+  });
+});
+
+describe('the "something went wrong" channel says so, for every event that carries one', () => {
+  /**
+   * Five event types reach a person only as a notice, and none of them had a test.
+   *
+   * Guarding all four `notice(...)` calls below with `if (false)` — and collapsing `deflected` into
+   * `resolved` — left the whole repository green. In a system whose stated convention is that silence
+   * means success (R1), a refusal that produces no notice is a person watching their keystroke vanish
+   * with nothing to read, which is the one outcome the interface contract rules out twice.
+   */
+  const noticesOf = (view: ReturnType<typeof foldEvents>): string =>
+    view.notices.map((entry) => entry.text).join('\n');
+
+  it('says a control was refused, and that nothing changed', () => {
+    const view = foldEvents(buildLog([runCreated(), commandRefused('approve')]));
+    const text = noticesOf(view);
+    expect(text).toContain('a control was refused');
+    expect(text).toContain('wrong-target-state');
+    expect(text).toContain('nothing changed');
+    expect(shellFrameText(view, { now: new Date() })).toContain('a control was refused');
+  });
+
+  it('says the run handed off, with the code and the reason the log recorded (CAP-23)', () => {
+    const view = foldEvents(
+      buildLog([runCreated(), handoffRecorded('user.take_over', 'you took the work over')]),
+    );
+    expect(noticesOf(view)).toContain('handed off (user.take_over): you took the work over');
+  });
+
+  it('says a tool was denied and that the step carried on without it', () => {
+    const view = foldEvents(buildLog([runCreated(), stepStarted('implement'), permissionDenied()]));
+    expect(noticesOf(view)).toContain('denied by the permission surface');
+  });
+
+  it('says an artifact was dropped rather than written unredacted (AD-21)', () => {
+    const view = foldEvents(buildLog([runCreated(), redactionFailed()]));
+    expect(noticesOf(view)).toContain('dropped rather than written unredacted');
+  });
+
+  it('distinguishes a deflected question from an answered one, because nobody was asked (Q4)', () => {
+    const view = foldEvents(
+      buildLog([runCreated(), questionAsked('q-01'), questionDeflected('q-01')]),
+    );
+    expect(view.question.state).toBe('deflected');
+    expect(view.question.outcome).toContain('nobody was asked');
+    // And the frame says which of the two happened, rather than only that it is settled.
+    expect(shellFrameText(view, { now: new Date() })).toContain('deflected:');
+  });
+
+  it('keeps the notice list bounded, so nothing can push the question slot off the frame (R14)', () => {
+    const view = foldEvents(
+      buildLog([
+        runCreated(),
+        questionAsked('q-01'),
+        commandRefused('approve'),
+        permissionDenied(),
+        redactionFailed(),
+        handoffRecorded(),
+        commandRefused('pause', 'not-yet-honoured'),
+      ]),
+    );
+    expect(view.notices.length).toBeLessThanOrEqual(4);
+    expect(view.question.state).toBe('pending');
+  });
+});
+
+describe('a second question does not erase the first, because the engine answers the earliest', () => {
+  /**
+   * Story 1-8's review established that the engine targets the *earliest* still-asked question.
+   *
+   * So a slot that showed the later one was actively misleading: it named the question a person's next
+   * answer would not reach, and made the one being answered disappear from the only place that reports
+   * it. The earliest keeps the slot; the later one is announced and inherits it.
+   */
+  const twoQuestions = (): ReturnType<typeof buildLog> =>
+    buildLog([
+      runCreated(),
+      { ...questionAsked('q-01', { prompt: 'Poll the log, or watch it?' }), atMs: 1_000 },
+      { ...questionAsked('q-02', { prompt: 'Squash the branch, or keep it?' }), atMs: 2_000 },
+    ]);
+
+  it('keeps the earlier question in the slot and says another is waiting', () => {
+    const view = foldEvents(twoQuestions());
+    expect(view.question.state).toBe('pending');
+    expect(view.question.prompt).toBe('Poll the log, or watch it?');
+    expect(view.notices.map((notice) => notice.text).join('\n')).toContain(
+      'a second question is waiting',
+    );
+  });
+
+  it('promotes the waiting question once the one in the slot is settled', () => {
+    const view = foldEvents([
+      ...twoQuestions(),
+      ...buildLog([{ ...questionResolved('q-01'), atMs: 3_000 }]).map((event) => ({
+        ...event,
+        seq: 4,
+      })),
+    ]);
+    expect(view.question.state).toBe('pending');
+    expect(view.question.prompt).toBe('Squash the branch, or keep it?');
+    // The outcome of the one that closed is stated rather than vanishing with it.
+    expect(view.notices.map((notice) => notice.text).join('\n')).toContain(
+      'the question in the slot was settled',
+    );
+  });
+
+  it('does not let a later question\'s outcome clear the slot the earlier one holds', () => {
+    const view = foldEvents([
+      ...twoQuestions(),
+      ...buildLog([{ ...questionResolved('q-02'), atMs: 3_000 }]).map((event) => ({
+        ...event,
+        seq: 4,
+      })),
+    ]);
+    expect(view.question.state).toBe('pending');
+    expect(view.question.prompt).toBe('Poll the log, or watch it?');
+    expect(view.notices.map((notice) => notice.text).join('\n')).toContain(
+      'another question was settled',
+    );
+  });
+});
+
+describe('a partly redacted value is presented as redacted, and never leaks the marker into prose', () => {
+  it('flags the marker inside a longer string, not only as the whole of one', () => {
+    const inside = `use ${REDACTION_MARKER} to authenticate`;
+    expect(presentValue(inside)).toContain(REDACTED_PRESENTATION);
+    expect(presentValue(inside)).not.toContain(REDACTION_MARKER);
+    expect(presentValue(inside)).toContain('to authenticate');
+  });
+
+  it('keeps the engine\'s internal marker out of a notice', () => {
+    const view = foldEvents(
+      buildLog([runCreated(), commandApplied('reject', { effect: REDACTION_MARKER })]),
+    );
+    const frame = shellFrameText(view, { now: new Date() });
+    expect(frame).toContain(REDACTED_PRESENTATION);
+    expect(frame).not.toContain(REDACTION_MARKER);
+  });
+});
+
+describe('a log being appended to while it is read does not change the mode (the torn-read race)', () => {
+  /**
+   * The hazard this story exists to prevent, arriving by a race rather than by a disagreement.
+   *
+   * `readEventLog` refuses a file whose last line has no newline yet, and a renderer polls the file the
+   * recorder appends to — so meeting a half-written line is ordinary. The refusal used to reset the
+   * frame to `idleShellView`, whose autonomy is `interactive`: for that frame a stopped run read as
+   * interactive, which `interface-contract.md` names as the primary interface hazard of a system with
+   * autonomy tiers.
+   */
+  const stoppedLogWithTornTail = (): string => {
+    const whole = logText(buildLog([runCreated(), commandApplied('disengage')]));
+    return `${whole}{"ts":"2026-09-20T09:00:02.000Z","seq":3,"feature":"tui-shell"`;
+  };
+
+  it('keeps the mode the whole lines recorded, rather than resetting to interactive', () => {
+    const paths = runPaths(FIXTURE_RUN, home);
+    mkdirSync(paths.runDir, { recursive: true });
+    writeFileSync(paths.eventLog, stoppedLogWithTornTail(), 'utf8');
+
+    const view = loadShellView(paths.eventLog, { feature: FIXTURE_FEATURE });
+    expect(view.autonomy).toBe('stopped');
+
+    const frame = shellFrameText(view, { now: new Date() });
+    expect(frame).toContain('mode stopped');
+    expect(frame).not.toContain('mode interactive');
+    // And says the frame is one line behind, rather than implying it is whole (R12).
+    expect(view.problem).not.toBeNull();
+    expect(frame).toContain('still being appended');
+  });
+
+  it('keeps the last good view when a whole line really is corrupt, mode and all', () => {
+    const paths = runPaths(FIXTURE_RUN, home);
+    mkdirSync(paths.runDir, { recursive: true });
+    writeFileSync(paths.eventLog, logText(buildLog([runCreated(), commandApplied('pause')])), 'utf8');
+    const good = loadShellView(paths.eventLog, { feature: FIXTURE_FEATURE });
+    expect(good.autonomy).toBe('paused');
+
+    writeFileSync(paths.eventLog, '{"ts":"2026-09-20T09:00:00.000Z","seq":1,not json\n', 'utf8');
+    const after = loadShellView(paths.eventLog, { feature: FIXTURE_FEATURE, previous: good });
+    expect(after.autonomy).toBe('paused');
+    expect(after.problem).toContain('could not be read');
+    expect(shellFrameText(after, { now: new Date() })).toContain('mode paused');
+  });
 });
 
 describe('the vocabulary the fold declares still agrees with the engine that writes it', () => {
@@ -319,9 +552,27 @@ describe('the vocabulary the fold declares still agrees with the engine that wri
 
 describe('src/tui/ imports only contracts, runtime and node: builtins', () => {
   const sourceDir = new URL('../src/tui/', import.meta.url);
-  const files = readdirSync(sourceDir).filter(
-    (name) => name.endsWith('.ts') || name.endsWith('.tsx'),
-  );
+  const contractsDir = new URL('../src/contracts/', import.meta.url);
+  const runtimeDir = new URL('../src/runtime/', import.meta.url);
+
+  /**
+   * Every source file under `src/tui/`, **including the ones in subdirectories**.
+   *
+   * A flat `readdirSync` saw nine files while sixteen existed: the seven under `src/tui/cards/` — 44% of
+   * the directory, and the half story 1-10 added — were checked by neither the engine-import rule nor the
+   * writes-no-file rule. The story offers this guard as its substitute for discipline, so a guard that
+   * stops at the first subdirectory is the story's own rule going unenforced over the newest code.
+   */
+  const listSources = (dir: URL, prefix = ''): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+      entry.isDirectory()
+        ? listSources(new URL(`${entry.name}/`, dir), `${prefix}${entry.name}/`)
+        : entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')
+          ? [`${prefix}${entry.name}`]
+          : [],
+    );
+
+  const files = listSources(sourceDir);
 
   /** Statement forms only, so a quoted word after "from" in prose is not read as an import. */
   const IMPORT_PATTERNS = [
@@ -346,8 +597,17 @@ describe('src/tui/ imports only contracts, runtime and node: builtins', () => {
     expect(importsOf(source)).toContain('../runtime/index.js');
   });
 
+  it('descends into every subdirectory, so no part of the renderer is outside the rule', () => {
+    // Named files rather than only a count: a listing that silently stopped recursing would otherwise
+    // still pass both rules below by having nothing left to check.
+    expect(files).toContain('cards/question.ts');
+    expect(files).toContain('cards/handoff.ts');
+    expect(files.filter((file) => file.includes('/')).length).toBeGreaterThan(1);
+  });
+
   it.each(files)('%s never imports src/engine/', (file) => {
-    const source = readFileSync(new URL(file, sourceDir), 'utf8');
+    const from = new URL(file, sourceDir);
+    const source = readFileSync(from, 'utf8');
     for (const specifier of importsOf(source)) {
       expect(specifier.includes('/engine/'), `${file} imports "${specifier}"`).toBe(false);
       if (!specifier.startsWith('.')) {
@@ -357,10 +617,19 @@ describe('src/tui/ imports only contracts, runtime and node: builtins', () => {
         ).toBe(true);
         continue;
       }
+      /**
+       * A relative specifier is resolved against the file that wrote it before it is judged.
+       *
+       * A prefix test cannot work once the directory has subdirectories: `../projection.js` from
+       * `cards/` is inside `src/tui/`, while the identical string from the top level would be outside
+       * it. Resolving asks the question that is actually being asked — does this import leave the three
+       * directories the spine allows.
+       */
+      const target = new URL(specifier, from).href;
       const allowed =
-        specifier.startsWith('./') ||
-        specifier.startsWith('../contracts/') ||
-        specifier.startsWith('../runtime/');
+        target.startsWith(sourceDir.href) ||
+        target.startsWith(contractsDir.href) ||
+        target.startsWith(runtimeDir.href);
       expect(allowed, `${file} imports "${specifier}"`).toBe(true);
     }
   });

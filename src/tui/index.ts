@@ -31,13 +31,16 @@
  * - `fleet` — every run under `runsDir`, folded, so CAP-22's brief is a fold of one log per feature and one
  *   unreadable log costs only its own line;
  * - `input` — the keyboard loop as a pure reducer: a keystroke names an effect, and `invokeControl`
- *   performs the only one a renderer may (AD-19).
+ *   performs the only one a renderer may (AD-19);
+ * - `width` — how wide a string is on a terminal, in cells rather than in UTF-16 units, which is what
+ *   every 40-column guarantee in this directory is actually a guarantee about.
  *
  * What is deliberately absent: the loopback server and the web renderer are story 3-1's; ceilings
  * enforcement is 2-9's, so the kill card displays usage against estimate and acts on nothing; the
  * Interviewer, question compression and quiet hours are 2-8's; the merge a completion notice reports is
  * 2-7's, which is why the notice states it as unrecorded rather than as a pass (R8).
  */
+export * from './width.js';
 export * from './projection.js';
 export * from './mode.js';
 export * from './status.js';

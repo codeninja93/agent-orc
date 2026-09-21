@@ -44,7 +44,11 @@ import {
   CONTROL_KEYS,
   CONTROL_ORDER,
   ControlArgumentRequired,
+  DuplicateControlKey,
   controlForKey,
+  displayWidth,
+  formatControlHints,
+  indexControlsByKey,
   invokeControl,
   invokeControlByKey,
 } from '../src/tui/index.js';
@@ -107,6 +111,44 @@ describe('the control table is total over the Command enum', () => {
   });
 
   /**
+   * The uniqueness check the table's own comment claims, made into one.
+   *
+   * `CONTROL_KEYS` was a list that checked nothing and `controlForKey` resolved by linear search, so two
+   * controls sharing a key made the later one permanently unreachable while the table still typechecked
+   * and this suite still passed — a control a person has and cannot use, which is the same defect as a
+   * missing control wearing a different coat (AD-3). The index now refuses to be built.
+   */
+  it('refuses to build a keystroke index in which one control is unreachable', () => {
+    const clashing = CONTROL_ORDER.map((control) =>
+      control.command === Command.JustDoIt
+        ? { ...control, key: CONTROLS[Command.Kill].key }
+        : control,
+    );
+    expect(() => indexControlsByKey(clashing)).toThrow(DuplicateControlKey);
+    expect(() => indexControlsByKey(clashing)).toThrow(/just_do_it|kill/);
+    // The real table builds, and resolves every key to the control that declared it.
+    expect(indexControlsByKey(CONTROL_ORDER).size).toBe(CONTROL_ORDER.length);
+  });
+
+  it('states that closing the viewer is not the gesture that stops the run', () => {
+    /**
+     * Ctrl-c is deliberately left as "quit the viewer" — see `QUIT_IS_NOT_DISENGAGE_HINT` for why — so
+     * the hint line has to say which of the two it is. A person who quits believing they disengaged has
+     * exactly the false belief about what the system is doing that this shell exists to prevent.
+     */
+    const hints = formatControlHints(80).join('\n');
+    expect(hints).toContain('ctrl-c');
+    expect(hints).toContain('leaves the run advancing');
+    expect(hints.startsWith('x stop')).toBe(true);
+  });
+
+  it('wraps the hints to a narrow terminal, measured in cells rather than code units', () => {
+    for (const line of formatControlHints(40)) {
+      expect(displayWidth(line), line).toBeLessThanOrEqual(40);
+    }
+  });
+
+  /**
    * The contract decides which controls need text; this table has to agree with it.
    *
    * A control the renderer invokes with no argument, for a command the contract refuses without one,
@@ -132,18 +174,28 @@ describe('the control table is total over the Command enum', () => {
   });
 
   it('fails to compile when a command has no entry in the table', () => {
-    // The claim in the acceptance criteria is about `tsc`, so `tsc` is what answers it. The probe is a
-    // `CommandMap` missing exactly one member, compiled by the project's own configuration.
-    const probeDir = join(process.cwd(), '.probe-control-table');
-    const probeConfig = join(process.cwd(), 'tsconfig.control-table-probe.json');
+    /**
+     * The claim in the acceptance criteria is about `tsc`, so `tsc` is what answers it. The probe is a
+     * `CommandMap` missing exactly one member, compiled by the project's own configuration.
+     *
+     * **Both artifacts live under `node_modules/`, and that is the fix rather than the mess.** They used
+     * to be written into the repository root — `.probe-control-table/` and a generated tsconfig beside
+     * it — where neither is git-ignored, so an interrupted run left two untracked paths in `git status`
+     * for somebody to wonder about. `node_modules/` is ignored by the repository and rebuilt by any
+     * install, so debris there costs nothing; the directory holds the generated config too, so teardown
+     * removes one path rather than two. `exclude: []` is needed because TypeScript's default excludes
+     * `node_modules`, and the probe has to be compiled rather than skipped — a skipped probe compiles
+     * cleanly and would assert the opposite of what this test means.
+     */
+    const probeDir = join(process.cwd(), 'node_modules', '.probe-control-table');
+    const probeConfig = join(probeDir, 'tsconfig.probe.json');
     toRemove.push(probeDir);
-    toRemove.push(probeConfig);
     mkdirSync(probeDir, { recursive: true });
     writeFileSync(
       join(probeDir, 'missing-control.ts'),
       [
-        "import { Command } from '../src/contracts/index.js';",
-        "import type { CommandMap } from '../src/contracts/index.js';",
+        "import { Command } from '../../src/contracts/index.js';",
+        "import type { CommandMap } from '../../src/contracts/index.js';",
         '',
         '// Every member but `disengage`, which is the one a renderer must never be able to omit.',
         'export const PARTIAL: CommandMap<string> = {',
@@ -158,7 +210,11 @@ describe('the control table is total over the Command enum', () => {
     writeFileSync(
       probeConfig,
       `${JSON.stringify(
-        { extends: './tsconfig.json', include: ['.probe-control-table/**/*.ts'] },
+        {
+          extends: join(process.cwd(), 'tsconfig.json'),
+          include: [join(probeDir, '**', '*.ts')],
+          exclude: [],
+        },
         null,
         2,
       )}\n`,
@@ -258,6 +314,32 @@ describe('invoking a control writes a durable intent, and nothing else', () => {
       invokeControl(Command.Answer, { paths, feature: FEATURE, principal: PRINCIPAL }, '   '),
     ).toThrow(ControlArgumentRequired);
     expect(existsSync(paths.commandsDir)).toBe(false);
+    // And it claims no AD-35 code: it crosses no unit boundary, and `config.invalid` — whose declared
+    // disposition is `escalate-to-human` — filed a correctable keystroke as a broken installation.
+    const thrown = new ControlArgumentRequired(Command.Answer);
+    expect('code' in thrown).toBe(false);
+    expect(thrown.message).toContain('carries free text');
+  });
+
+  /**
+   * Two intents minted in the same millisecond sort in the order they were issued.
+   *
+   * `orderIntents` breaks a tie on `issued_at` — a millisecond timestamp — with the intent id, so for two
+   * commands issued inside one millisecond the id *is* the order they are applied in. A seed drawn
+   * entirely from `randomUUID` made that a coin toss, which is the one order a steering surface may not
+   * get wrong; the seed now opens with the minting instant and a within-process count.
+   */
+  it('mints ids that sort in the order they were issued', () => {
+    const paths = runPaths(RUN, home);
+    const minted: string[] = [];
+    for (let index = 0; index < 30; index += 1) {
+      minted.push(
+        invokeControl(Command.Pause, { paths, feature: FEATURE, principal: PRINCIPAL }).intentId,
+      );
+    }
+    expect([...minted].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))).toStrictEqual(minted);
+    expect(new Set(minted).size).toBe(minted.length);
+    for (const id of minted) expect(isLoggableIntentId(id), id).toBe(true);
   });
 
   it('invokes by keystroke, and answers null for a key that is not a control', () => {

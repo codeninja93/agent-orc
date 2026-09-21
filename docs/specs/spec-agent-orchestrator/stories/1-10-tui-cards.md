@@ -2,7 +2,7 @@
 title: 'TUI cards — question, spec echo, brief, kill, completion, handoff'
 type: 'feature'
 created: '2026-09-20'
-status: 'done'
+status: 'in-review'
 review_loop_iteration: 0
 followup_review_recommended: true
 baseline_revision: 'dc6b57c'

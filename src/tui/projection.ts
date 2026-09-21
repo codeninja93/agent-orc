@@ -24,9 +24,16 @@
  * while nothing is happening, so the view carries the two instants the log recorded and the shell
  * supplies `now` at the moment it renders. A fold that read the clock would not be a fold.
  */
-import { REDACTION_MARKER, readEventLog } from '../runtime/index.js';
+import { REDACTION_MARKER, readCompleteEventLines } from '../runtime/index.js';
 import { EventLogCorruptError } from '../runtime/index.js';
-import type { EventEnvelope, FeatureState, RunMode, StepPhase, StepUsage } from '../contracts/index.js';
+import type {
+  EventEnvelope,
+  FeatureState,
+  RunMode,
+  StepDisposition,
+  StepPhase,
+  StepUsage,
+} from '../contracts/index.js';
 import { FEATURE_STATES, addUsage, compareEventOrder, usageFromPayload } from '../contracts/index.js';
 
 import { DEFAULT_AUTONOMY_MODE, applyCommandToMode, modeForFeatureState } from './mode.js';
@@ -134,18 +141,57 @@ export const UNRECORDED_PRESENTATION = '(not recorded)';
  *
  * Story 1-2's redaction pass means `[redacted]` is a legitimate value in a log, and a renderer that
  * showed it as the answer, or threw on meeting it, would be wrong in two different directions.
+ *
+ * **The marker is matched anywhere in the value, not only as the whole of it.** `redactString`
+ * substitutes the marker *inside* a longer string — AD-21 replaces the credential it found and leaves
+ * the sentence around it — so `use [redacted] to auth` is a partly redacted value, and testing for
+ * equality read it as ordinary content and leaked the engine's internal marker into prose a person
+ * reads. Every occurrence is presented as redaction, and a value that is nothing but the marker reads
+ * as one phrase rather than as a sentence with a hole in it.
  */
 export const presentValue = (value: string | null): string =>
-  value === null ? UNRECORDED_PRESENTATION : value === REDACTION_MARKER ? REDACTED_PRESENTATION : value;
+  value === null
+    ? UNRECORDED_PRESENTATION
+    : value === REDACTION_MARKER
+      ? REDACTED_PRESENTATION
+      : value.split(REDACTION_MARKER).join(REDACTED_PRESENTATION);
 
-/** Whether a field's value is the redaction marker rather than content. */
-export const isRedacted = (value: string | null): boolean => value === REDACTION_MARKER;
+/** Whether a field's value carries the redaction marker — in whole or in part — rather than content. */
+export const isRedacted = (value: string | null): boolean =>
+  value?.includes(REDACTION_MARKER) === true;
+
+/**
+ * A field presented for a notice: redaction-aware, with a caller's own words when the log has none.
+ *
+ * `presentValue`'s own `(not recorded)` is right inside a slot that names the field; inside a sentence
+ * it is not, which is why each notice keeps the phrase it already read.
+ */
+const presentOr = (value: string | null, fallback: string): string =>
+  value === null ? fallback : presentValue(value);
+
+/**
+ * The disposition that counts a step as done, read from the contract rather than spelled here.
+ *
+ * Typed as a `StepDisposition`, so the literal below and `STEP_DISPOSITIONS` cannot drift: renaming the
+ * member in `src/contracts/` fails this file's typecheck instead of silently zeroing the completed count
+ * in every frame. This is the "read in two places under two spellings" the payload-key table above warns
+ * about, applied to a field's *value*.
+ */
+export const COMPLETED_STEP_DISPOSITION: StepDisposition = 'completed';
 
 /** One step, as the log describes it. Named, never numbered (Consistency Conventions). */
 export interface StepView {
   readonly step: string;
   readonly phase: StepPhase | null;
-  /** `null` while the step is in flight; every termination records one (AD-8). */
+  /**
+   * `null` while the step is in flight; every termination records one (AD-8).
+   *
+   * Deliberately wider than `StepDisposition`: AD-5's ignore-what-you-do-not-know says a newer engine's
+   * value must not break this reader, and narrowing it would mean mapping an unrecognised disposition to
+   * `null` — which in this fold means *in flight*, so a terminated step would read as still running.
+   * Carrying the recorded word is the honest reading; the comparison that matters uses the typed
+   * constant above.
+   */
   readonly disposition: string | null;
   readonly startedAt: string | null;
   readonly terminatedAt: string | null;
@@ -478,7 +524,16 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
   let startedAt: string | null = null;
   let lastActivityAt: string | null = null;
   let question: QuestionSlotView = EMPTY_QUESTION_SLOT;
-  let pendingQuestionId: string | null = null;
+  /**
+   * Every question the log has asked and not yet settled, in the order it asked them.
+   *
+   * A queue rather than one slot, because R14 gives the *active* question a slot and story 1-8's review
+   * established that the engine resolves the **earliest** still-asked question. Overwriting the slot with
+   * a second question therefore showed a person the question their next answer would not go to, and made
+   * the first one — the one actually being answered — disappear from the only place that reports it. The
+   * earliest keeps the slot; a later one is announced and takes the slot when the earlier is settled.
+   */
+  const pendingQuestions: { id: string | null; slot: QuestionSlotView }[] = [];
   let specRequest: string | null = null;
   let specRecorded = false;
   let totalUsageSoFar: StepUsage | null = null;
@@ -572,11 +627,15 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
         if (command !== null) autonomy = applyCommandToMode(autonomy, command);
         state = featureState(text(payload, TUI_PAYLOAD_KEYS.ToState)) ?? state;
         if (command !== null) {
+          // Every interpolated field goes through `presentValue`: AD-21's marker is an *internal* token,
+          // and a notice reading "reject applied: [redacted]" would put it in front of a person as if it
+          // were the effect. What was redacted is said to have been redacted.
           notice(
             event.ts,
-            `${command.replace(/_/g, ' ')} applied: ${
-              text(payload, TUI_PAYLOAD_KEYS.Effect) ?? 'acknowledged'
-            }`,
+            `${command.replace(/_/g, ' ')} applied: ${presentOr(
+              text(payload, TUI_PAYLOAD_KEYS.Effect),
+              'acknowledged',
+            )}`,
           );
         }
         break;
@@ -585,15 +644,16 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
       case TUI_EVENT_TYPES.CommandRefused: {
         notice(
           event.ts,
-          `a control was refused (${text(payload, TUI_PAYLOAD_KEYS.Reason) ?? 'no reason recorded'}) — ` +
-            'nothing changed',
+          `a control was refused (${presentOr(
+            text(payload, TUI_PAYLOAD_KEYS.Reason),
+            'no reason recorded',
+          )}) — nothing changed`,
         );
         break;
       }
 
       case TUI_EVENT_TYPES.QuestionAsked: {
-        pendingQuestionId = text(payload, TUI_PAYLOAD_KEYS.QuestionId);
-        question = {
+        const askedSlot: QuestionSlotView = {
           state: 'pending',
           prompt: text(payload, TUI_PAYLOAD_KEYS.Prompt),
           // Q1–Q3 from the log alone. Each is absent from a log an older engine wrote, and each then
@@ -608,6 +668,18 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
           answer: null,
           outcome: null,
         };
+        pendingQuestions.push({ id: text(payload, TUI_PAYLOAD_KEYS.QuestionId), slot: askedSlot });
+        if (pendingQuestions.length === 1) {
+          question = askedSlot;
+        } else {
+          // Announced rather than swapped in. Silence here would be a question a person never learns is
+          // waiting, and a slot that changed under them would be the question they are mid-answer to.
+          notice(
+            event.ts,
+            'a second question is waiting behind the one in the slot; it takes the slot once this one ' +
+              'is settled',
+          );
+        }
         break;
       }
 
@@ -647,14 +719,6 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
       case TUI_EVENT_TYPES.QuestionDefaultTaken:
       case TUI_EVENT_TYPES.QuestionDeflected: {
         const questionId = text(payload, TUI_PAYLOAD_KEYS.QuestionId);
-        // An outcome for a question this view is not holding is still worth reporting, but it must not
-        // clear a *different* question's pending slot: two questions in one run would otherwise take
-        // turns erasing each other.
-        if (pendingQuestionId !== null && questionId !== null && questionId !== pendingQuestionId) {
-          notice(event.ts, 'another question was settled');
-          break;
-        }
-        pendingQuestionId = null;
         const resolver = text(payload, TUI_PAYLOAD_KEYS.Resolver);
         const answer = text(payload, TUI_PAYLOAD_KEYS.Answer);
         const slotState: QuestionSlotState =
@@ -663,8 +727,8 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
             : event.type === TUI_EVENT_TYPES.QuestionDefaultTaken
               ? 'defaulted'
               : 'resolved';
-        question = {
-          ...question,
+        const settle = (slot: QuestionSlotView): QuestionSlotView => ({
+          ...slot,
           state: slotState,
           resolver,
           answer,
@@ -675,7 +739,39 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
               : slotState === 'deflected'
                 ? 'answered from the repository, history or ledger; nobody was asked'
                 : `answered${resolver === null ? '' : ` by the ${resolver.replace(/_/g, ' ')} resolver`}`,
-        };
+        });
+
+        // An outcome naming no question, or one asked by a log line this view never saw, settles the slot
+        // it is holding; an outcome for a question further down the queue must not clear the slot the
+        // earliest one holds — two questions in one run would otherwise take turns erasing each other.
+        const settledIndex = pendingQuestions.findIndex(
+          (entry) => entry.id === null || questionId === null || entry.id === questionId,
+        );
+        if (settledIndex < 0) {
+          if (pendingQuestions.length > 0) {
+            notice(event.ts, 'another question was settled');
+            break;
+          }
+          question = settle(question);
+          break;
+        }
+        if (settledIndex > 0) {
+          pendingQuestions.splice(settledIndex, 1);
+          notice(event.ts, 'another question was settled');
+          break;
+        }
+
+        const settled = settle(pendingQuestions[0]?.slot ?? question);
+        pendingQuestions.shift();
+        const next = pendingQuestions[0];
+        if (next === undefined) {
+          question = settled;
+        } else {
+          // The slot belongs to the question that is now active (R14), so the outcome of the one that
+          // just closed is stated as a notice rather than disappearing with it.
+          question = next.slot;
+          notice(event.ts, `the question in the slot was settled: ${settled.outcome ?? 'settled'}`);
+        }
         break;
       }
 
@@ -702,8 +798,8 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
       case TUI_EVENT_TYPES.HandoffRecorded: {
         notice(
           event.ts,
-          `handed off (${text(payload, TUI_PAYLOAD_KEYS.Code) ?? 'no code recorded'}): ` +
-            `${text(payload, TUI_PAYLOAD_KEYS.Reason) ?? 'no reason recorded'}`,
+          `handed off (${presentOr(text(payload, TUI_PAYLOAD_KEYS.Code), 'no code recorded')}): ` +
+            `${presentOr(text(payload, TUI_PAYLOAD_KEYS.Reason), 'no reason recorded')}`,
         );
         break;
       }
@@ -753,7 +849,9 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
       currentStepPhase: current?.phase ?? null,
       nextGate: nextGateFor({ question, state, current }),
       stepsStarted: stepViews.filter((step) => step.startedAt !== null).length,
-      stepsCompleted: stepViews.filter((step) => step.disposition === 'completed').length,
+      stepsCompleted: stepViews.filter(
+        (step) => step.disposition === COMPLETED_STEP_DISPOSITION,
+      ).length,
       plannedSteps,
       steps: stepViews,
     },
@@ -772,25 +870,55 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
   };
 };
 
+/** What a shell hands the loader: the feature to fall back on, and the frame it is replacing. */
+export interface LoadShellViewOptions {
+  readonly feature?: string | null;
+  /**
+   * The view this reader last produced, kept rather than discarded when a read fails.
+   *
+   * The mode is the reason. A renderer that reset to {@link idleShellView} on a failed read displayed
+   * `mode interactive` — the idle default — over a run that was `paused`, `stopped` or `taken-over`,
+   * which is exactly the false belief `interface-contract.md` calls the primary interface hazard of a
+   * system with autonomy tiers. What the last good fold said is still the best answer available, and it
+   * is carried with the problem attached rather than replaced by a default that asserts something
+   * untrue.
+   */
+  readonly previous?: ShellView | null;
+}
+
+/** How a frame says its final line was still arriving. Stated, so the person knows it is one behind. */
+export const INCOMPLETE_TAIL_PROBLEM =
+  "The log's last line was still being appended as this frame was read, so one event is not in it " +
+  'yet. Everything below is folded from the lines that are whole.';
+
 /**
  * Read a run's log and fold it, or say plainly why not.
  *
- * The refusal path is the point. `readEventLog` throws on a line that is not whole JSON or not an AD-5
- * envelope, and the matrix is explicit about what a person should then see: the problem stated, the
- * mode still displayed, the shell still up. So the throw is caught here and becomes a field of the
- * view rather than an exception the shell dies of.
+ * Two failure paths, and they are different failures:
+ *
+ * - **The last line has no newline yet.** That is not corruption, it is the recorder mid-`write`: a
+ *   renderer polls the file the recorder appends to (AD-4, AD-29), so meeting a half-written final line
+ *   is an ordinary race — the same one the engine's intent reader was given `TORN_INTENT_GRACE_MS` for.
+ *   The whole lines are folded and the frame says one is arriving. Before this, the throw landed in the
+ *   catch below and the frame reset to an idle view whose autonomy is `interactive`, so a stopped or
+ *   paused run read as interactive for that frame — mode confusion produced by a race rather than by a
+ *   disagreement with the log.
+ * - **A complete line is not whole JSON or not an AD-5 envelope.** Nothing that is still writing
+ *   produces one, so it is reported: the matrix is explicit that a person then sees the problem stated,
+ *   the mode still displayed and the shell still up. The last good view carries the mode if the caller
+ *   has one; only a reader that has never succeeded falls back to idle.
  */
 export const loadShellView = (
   eventLogPath: string,
-  options: { readonly feature?: string | null } = {},
+  options: LoadShellViewOptions = {},
 ): ShellView => {
   const fallbackFeature = options.feature ?? null;
+  const named = (view: ShellView): ShellView =>
+    view.feature === null && fallbackFeature !== null ? { ...view, feature: fallbackFeature } : view;
   try {
-    const events = readEventLog(eventLogPath);
-    const view = foldEvents(events);
-    return view.feature === null && fallbackFeature !== null
-      ? { ...view, feature: fallbackFeature }
-      : view;
+    const read = readCompleteEventLines(eventLogPath);
+    const view = named(foldEvents(read.events));
+    return read.incompleteTail ? { ...view, problem: INCOMPLETE_TAIL_PROBLEM } : view;
   } catch (thrown: unknown) {
     const why =
       thrown instanceof EventLogCorruptError
@@ -798,8 +926,9 @@ export const loadShellView = (
         : thrown instanceof Error
           ? thrown.message
           : 'the log could not be read';
+    const base = options.previous ?? null;
     return {
-      ...idleShellView(fallbackFeature),
+      ...(base === null ? idleShellView(fallbackFeature) : named(base)),
       problem: `This run's event log could not be read, so nothing below is a projection of it: ${why}`,
     };
   }

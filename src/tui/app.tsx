@@ -48,10 +48,39 @@ import { formatModeExplanation, formatModeLine } from './mode.js';
 import { loadShellView, presentValue } from './projection.js';
 import type { ShellView } from './projection.js';
 import { formatStatusSegment } from './status.js';
+import { wrapToWidth } from './width.js';
 
 /** The width assumed when the terminal does not say. 40 columns is the declared narrow case. */
 export const DEFAULT_COLUMNS = 80;
 export const NARROW_COLUMNS = 40;
+
+/**
+ * How often a mounted shell re-reads the log when the caller names no interval.
+ *
+ * A default rather than nothing, because the previous `undefined` meant *no interval at all*: elapsed
+ * froze at the instant of mount unless an embedder called `refresh` itself, while R11 requires
+ * elapsed-versus-estimate to be visible and the story describes the number as "still growing". One
+ * second is the resolution the duration format has — it renders whole seconds — so a shorter interval
+ * would re-read the log to draw the identical frame.
+ */
+export const DEFAULT_POLL_MS = 1_000;
+
+/**
+ * The shortest interval a caller can ask for.
+ *
+ * `0` or a negative number handed to `setInterval` is a continuous re-read of the whole log, which on a
+ * long run is a busy loop holding a file open — so a supplied value is clamped rather than obeyed.
+ */
+export const MIN_POLL_MS = 50;
+
+/**
+ * The rows a frame keeps whatever the terminal's height, so bounding it cannot empty it.
+ *
+ * The problem line, the feature, the two mode lines, the status, the two progress lines and the question
+ * slot are the frame's spine: every one of them is a statement about what is true *now*, and the mode is
+ * a safety property. Nothing here is ever dropped to make room.
+ */
+export const MIN_FRAME_ROWS = 10;
 
 /** The sections of a frame, in the order they are drawn. The question slot is one of them, always. */
 export const SHELL_SECTION_IDS = [
@@ -76,6 +105,17 @@ export interface ShellSection {
 export interface FrameOptions {
   readonly columns?: number;
   readonly now?: Date;
+  /**
+   * How many rows the terminal has, when the caller knows.
+   *
+   * R14 says the active question occupies a slot that does not scroll away, and bounding the notice list
+   * (`MAX_NOTICES`) only bounds one section: a frame is still free to be taller than the terminal, and
+   * the terminal then scrolls, and what scrolls off the top is whatever came first — the problem line,
+   * the mode, the status and the question slot, in that order. So the frame is bounded here too, and the
+   * lines that are given up are notices, which are the only section that is a history rather than a
+   * statement of what is true now.
+   */
+  readonly rows?: number;
 }
 
 /** The label the question slot always carries, so the slot is recognisable when it is empty. */
@@ -87,31 +127,12 @@ export const QUESTION_SLOT_EMPTY = 'none pending — nothing needs you';
 /**
  * Wrap a line to a width, breaking on spaces and never mid-word unless a word is wider than the line.
  *
- * Wrapping rather than truncating, because the 40-column case is a declared state and a mode line cut
- * in half is precisely the mode confusion the interface contract calls an accident class.
+ * The measurement is in terminal *cells* rather than UTF-16 units, which is what `width.ts` exists for:
+ * a line of CJK measured by `String.length` wraps at twice the terminal's width, and one carrying
+ * combining marks wraps early — in both cases breaking the 40-column guarantee the story declares.
  */
-export const wrapLine = (line: string, columns: number): readonly string[] => {
-  const width = Math.max(columns, 20);
-  if (line.length <= width) return [line];
-  const out: string[] = [];
-  let current = '';
-  for (const word of line.split(' ')) {
-    if (current === '') {
-      current = word;
-    } else if (`${current} ${word}`.length <= width) {
-      current = `${current} ${word}`;
-    } else {
-      out.push(current);
-      current = word;
-    }
-    while (current.length > width) {
-      out.push(current.slice(0, width));
-      current = current.slice(width);
-    }
-  }
-  if (current !== '') out.push(current);
-  return out;
-};
+export const wrapLine = (line: string, columns: number): readonly string[] =>
+  wrapToWidth(line, columns);
 
 const wrapAll = (lines: readonly string[], columns: number): readonly string[] =>
   lines.flatMap((line) => wrapLine(line, columns));
@@ -190,7 +211,42 @@ export const shellSections = (view: ShellView, options: FrameOptions = {}): read
     });
   }
   sections.push({ id: 'controls', lines: formatControlHints(columns) });
-  return sections;
+  return boundToRows(sections, options.rows);
+};
+
+/**
+ * Drop lines until the frame fits the terminal, giving up history before anything that is true now.
+ *
+ * The order is the order of what a person loses by not seeing it. Notices go first, oldest first: each
+ * is something that already happened and is already in the log. The control hints go next, from the end
+ * — never the first row, which carries `x stop`, the one gesture the contract requires to be always
+ * available. Everything else stays: a frame that dropped the mode to fit would be the accident class
+ * this shell exists to prevent, and a frame that dropped the question slot would be R14's defect
+ * exactly.
+ */
+const boundToRows = (
+  sections: readonly ShellSection[],
+  rows: number | undefined,
+): readonly ShellSection[] => {
+  if (rows === undefined || !Number.isFinite(rows)) return sections;
+  const limit = Math.max(Math.trunc(rows), MIN_FRAME_ROWS);
+  const draft = sections.map((section) => ({ id: section.id, lines: [...section.lines] }));
+  let total = draft.reduce((count, section) => count + section.lines.length, 0);
+  if (total <= limit) return sections;
+
+  const notices = draft.find((section) => section.id === 'notices');
+  while (total > limit && notices !== undefined && notices.lines.length > 0) {
+    notices.lines.shift();
+    total -= 1;
+  }
+  const controls = draft.find((section) => section.id === 'controls');
+  while (total > limit && controls !== undefined && controls.lines.length > 1) {
+    controls.lines.pop();
+    total -= 1;
+  }
+  return draft
+    .filter((section) => section.lines.length > 0)
+    .map((section) => ({ id: section.id, lines: section.lines }));
 };
 
 /** One frame as lines, for a suite and for anything that is not a terminal. */
@@ -235,22 +291,32 @@ export interface ShellProps extends FrameOptions {
   readonly questionCard?: ReactNode;
 }
 
-/** The persistent question slot (R14). A section of its own, so nothing later can scroll it away. */
+/**
+ * The persistent question slot (R14). A section of its own, so nothing later can scroll it away.
+ *
+ * `lines` are the slot's lines **as the composer already produced them**, not a second derivation. The
+ * module's opening claim is that "the frame a person sees and the frame a suite asserts are the same
+ * strings by construction"; recomputing and re-wrapping here made that untrue for the one section R14
+ * names, and any bound the composer applied to the frame would have been applied to a copy of the slot
+ * that Ink then ignored. `view` remains the fallback for a caller composing the slot on its own.
+ */
 export const QuestionSlot = ({
   view,
   columns,
+  lines,
   children,
 }: {
   readonly view: ShellView;
   readonly columns?: number;
+  readonly lines?: readonly string[];
   readonly children?: ReactNode;
 }): ReactNode => (
   <Box flexDirection="column">
-    {questionSlotLines(view)
-      .flatMap((line) => wrapLine(line, columns ?? DEFAULT_COLUMNS))
-      .map((line, index) => (
+    {(lines ?? questionSlotLines(view).flatMap((line) => wrapLine(line, columns ?? DEFAULT_COLUMNS))).map(
+      (line, index) => (
         <Text key={`question-${String(index)}-${line}`}>{line}</Text>
-      ))}
+      ),
+    )}
     {children}
   </Box>
 );
@@ -259,6 +325,7 @@ export const QuestionSlot = ({
 export const Shell = ({
   view,
   columns,
+  rows,
   now,
   card,
   input,
@@ -267,6 +334,7 @@ export const Shell = ({
 }: ShellProps): ReactNode => {
   const sections = shellSections(view, {
     ...(columns === undefined ? {} : { columns }),
+    ...(rows === undefined ? {} : { rows }),
     ...(now === undefined ? {} : { now }),
   });
   const width = columns ?? DEFAULT_COLUMNS;
@@ -275,7 +343,12 @@ export const Shell = ({
     <Box flexDirection="column">
       {sections.map((section) =>
         section.id === 'question' ? (
-          <QuestionSlot key={section.id} view={view} {...(columns === undefined ? {} : { columns })}>
+          <QuestionSlot
+            key={section.id}
+            view={view}
+            lines={section.lines}
+            {...(columns === undefined ? {} : { columns })}
+          >
             {card === undefined || card === null ? null : (
               <CardView card={card} {...(columns === undefined ? {} : { columns })} />
             )}
@@ -368,7 +441,14 @@ export interface MountShellOptions extends FrameOptions {
   readonly eventLog: string;
   /** The feature name, for the frame a log too young to name it would otherwise leave blank. */
   readonly feature?: string | null;
-  /** How often to re-read the log. `null` for a shell a caller refreshes itself. */
+  /**
+   * How often to re-read the log, in milliseconds.
+   *
+   * Omitted means {@link DEFAULT_POLL_MS}, because a shell that never re-read would freeze elapsed at
+   * the instant of mount and R11 makes elapsed-versus-estimate always visible. `null` — explicitly —
+   * installs no interval, for an embedder that drives `refresh` itself. A supplied value is clamped to
+   * {@link MIN_POLL_MS}.
+   */
   readonly pollMs?: number | null;
   readonly stdout?: NodeJS.WriteStream;
   readonly questionCard?: ReactNode;
@@ -404,9 +484,29 @@ export interface MountShellOptions extends FrameOptions {
  * correct: an answer nobody sent is not a decision, and AD-25 makes a decision durable.
  */
 export const mountShell = (options: MountShellOptions): ShellHandle => {
-  const load = (): ShellView =>
-    loadShellView(options.eventLog, { feature: options.feature ?? null });
-  let view = load();
+  /**
+   * The terminal the frame is drawn to, and the one whose size it is measured against.
+   *
+   * Read from the stream rather than taken as a parameter: `columns` defaulted to 80 whatever the
+   * terminal was, so the 40-column case the story declares was reachable only by a caller that already
+   * knew to pass `columns: 40` — which is to say, by a suite. A real 40-column terminal composed at 80
+   * and the terminal did the cutting, which is the one thing the wrapping exists to prevent.
+   */
+  const screen: NodeJS.WriteStream = options.stdout ?? process.stdout;
+  const columnsNow = (): number =>
+    options.columns ?? screen.columns ?? process.stdout.columns ?? DEFAULT_COLUMNS;
+  const rowsNow = (): number | undefined => options.rows ?? screen.rows ?? process.stdout.rows;
+
+  /**
+   * The previous view is handed to every read, so a failed one keeps the mode it last knew.
+   *
+   * A renderer polls the file the recorder appends to, so a read can meet a line mid-`write`. Resetting
+   * to the idle view on that race displayed `mode interactive` over a run that was paused, stopped or
+   * taken over — mode confusion manufactured by a race rather than by anything the log said.
+   */
+  const load = (previous: ShellView | null): ShellView =>
+    loadShellView(options.eventLog, { feature: options.feature ?? null, previous });
+  let view = load(null);
   let input: InputState = initialInputState;
   let notice: string | null = null;
   let lastControl: ControlOutcome | null = null;
@@ -420,22 +520,30 @@ export const mountShell = (options: MountShellOptions): ShellHandle => {
 
   let card = cardFor(view);
 
-  const frame = (): ReactNode => (
-    <>
-      <Shell
-        view={view}
-        card={card}
-        input={input}
-        keystrokeNotice={notice}
-        {...(options.columns === undefined ? {} : { columns: options.columns })}
-        {...(options.now === undefined ? {} : { now: options.now })}
-        {...(options.questionCard === undefined ? {} : { questionCard: options.questionCard })}
-      />
-      <Keyboard onKey={press} active={options.control !== undefined && options.control !== null} />
-    </>
-  );
+  const frame = (): ReactNode => {
+    const rows = rowsNow();
+    return (
+      <>
+        <Shell
+          view={view}
+          card={card}
+          input={input}
+          keystrokeNotice={notice}
+          columns={columnsNow()}
+          {...(rows === undefined ? {} : { rows })}
+          {...(options.now === undefined ? {} : { now: options.now })}
+          {...(options.questionCard === undefined ? {} : { questionCard: options.questionCard })}
+        />
+        <Keyboard onKey={press} active={options.control !== undefined && options.control !== null} />
+      </>
+    );
+  };
+
+  /** True once `unmount` has run. Every entry point checks it, so nothing draws to a dead instance. */
+  let unmounted = false;
 
   const draw = (): void => {
+    if (unmounted) return;
     card = cardFor(view);
     instance.rerender(frame());
   };
@@ -499,15 +607,30 @@ export const mountShell = (options: MountShellOptions): ShellHandle => {
     ...(options.debug === undefined ? {} : { debug: options.debug }),
   });
 
+  /**
+   * Re-fold the log and redraw. After `unmount` it does nothing.
+   *
+   * Nothing rather than a throw: a poll and a resize both land here, and either can arrive between a
+   * person pressing a key and the process exiting. A viewer that died on its own way out would turn an
+   * ordinary quit into a stack trace over the terminal.
+   */
   const refresh = (): void => {
-    view = load();
+    if (unmounted) return;
+    view = load(view);
     draw();
   };
 
-  const timer =
-    options.pollMs === undefined || options.pollMs === null
+  /** Re-measure and redraw when the terminal is resized, so 40 columns is 40 columns from then on. */
+  const onResize = (): void => {
+    draw();
+  };
+  screen.on('resize', onResize);
+
+  const interval =
+    options.pollMs === null
       ? null
-      : setInterval(refresh, options.pollMs);
+      : Math.max(options.pollMs ?? DEFAULT_POLL_MS, MIN_POLL_MS);
+  const timer = interval === null ? null : setInterval(refresh, interval);
   timer?.unref();
 
   return {
@@ -518,7 +641,10 @@ export const mountShell = (options: MountShellOptions): ShellHandle => {
     lastCard: (): Card | null => card,
     lastView: (): ShellView => view,
     unmount: (): void => {
+      if (unmounted) return;
+      unmounted = true;
       if (timer !== null) clearInterval(timer);
+      screen.off('resize', onResize);
       instance.unmount();
     },
   };

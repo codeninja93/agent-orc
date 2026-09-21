@@ -20,6 +20,8 @@
 import { EventEmitter } from 'node:events';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 
+import { Text } from 'ink';
+import { createElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { runPaths } from '../src/runtime/index.js';
@@ -36,8 +38,10 @@ import {
   buildSpecEchoCard,
   buildBriefCard,
   cardLines,
+  displayWidth,
   foldEvents,
   foldFleet,
+  formatControlHints,
   idleShellView,
   mountShell,
   shellSections,
@@ -195,6 +199,23 @@ describe('every card is readable on a terminal 40 columns wide', () => {
     expect(cardLines(card).join('\n')).not.toMatch(/\u001B\[/);
   });
 
+  it('measures a row in terminal cells, so a wide or combining character keeps the bound honest', () => {
+    /**
+     * The 40-column guarantee is a guarantee about a terminal, and `String.length` counts UTF-16 units.
+     *
+     * A line of CJK measured that way wraps at twice the width a person has, and a line of combining
+     * marks wraps early. Both break the one thing the narrow case exists to protect: a mode line that is
+     * whole.
+     */
+    const wide = '実装ステップ を 検証 します。'.repeat(4);
+    const rows = wrapLine(wide, NARROW_COLUMNS);
+    expect(rows.length).toBeGreaterThan(1);
+    for (const row of rows) expect(displayWidth(row), row).toBeLessThanOrEqual(NARROW_COLUMNS);
+    // A combining acute takes a code unit and no cell, so the two measures disagree by design.
+    expect('e\u0301'.length).toBe(2);
+    expect(displayWidth('e\u0301')).toBe(1);
+  });
+
   it('keeps a branch name whole, because it is a thing a person has to type', () => {
     const card = buildHandoffCard({
       view: handedOffView(),
@@ -269,6 +290,45 @@ describe('the Ink shell draws the card inside the persistent slot', () => {
     }
   });
 
+  it('draws a caller-supplied node in the slot, which is the seam story 1-10 fills', async () => {
+    const paths = runPaths(RUN, home);
+    mkdirSync(paths.runDir, { recursive: true });
+    writeFileSync(
+      paths.eventLog,
+      logText(buildLog([runCreated(), featureStateChanged('running')], { feature: 'tui-cards', run: RUN })),
+      'utf8',
+    );
+
+    const stdout = new FakeStdout();
+    const handle = mountShell({
+      eventLog: paths.eventLog,
+      feature: 'tui-cards',
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      columns: NARROW_COLUMNS,
+      debug: true,
+      now: NOW,
+      // The `questionCard` prop: a node a caller composes itself, drawn inside the persistent slot.
+      // Deleting `{children}` from `QuestionSlot` left every mode test passing, so nothing pinned it.
+      questionCard: createElement(Text, null, 'a card the caller composed'),
+    });
+
+    try {
+      await vi.waitFor(() => {
+        expect(stdout.frame()).toContain(`${MODE_LABEL} `);
+      });
+      const frame = stdout.frame();
+      expect(frame).toContain('a card the caller composed');
+      const rows = frame.split('\n');
+      const slotAt = rows.findIndex((row) => row.startsWith(`${QUESTION_SLOT_LABEL}:`));
+      const nodeAt = rows.findIndex((row) => row.includes('a card the caller composed'));
+      // Inside the slot, not after the frame: the slot's own lines come first and the node follows them.
+      expect(slotAt).toBeGreaterThanOrEqual(0);
+      expect(nodeAt).toBeGreaterThan(slotAt);
+    } finally {
+      handle.unmount();
+    }
+  });
+
   it('shows what is being typed inside the slot, and that it has not been sent', () => {
     const paths = runPaths(RUN, home);
     mkdirSync(paths.runDir, { recursive: true });
@@ -301,6 +361,159 @@ describe('the Ink shell draws the card inside the persistent slot', () => {
       expect(frame).toContain('answer > poll');
       expect(frame).toContain('enter sends it');
       expect(frame).toContain('typed and not yet sent');
+    } finally {
+      handle.unmount();
+    }
+  });
+});
+
+/**
+ * The shell as a *running* thing: it re-reads, it re-measures, and it stops when it is told to.
+ *
+ * None of this was covered. Replacing the body of `mountShell`'s `refresh` with a no-op left all 87 TUI
+ * tests passing — and re-folding is the entire mechanism by which a person watching a run sees anything
+ * after the first frame. `columns` was a parameter that defaulted to 80 whatever the terminal was, so the
+ * 40-column state the story declares was reachable only by a caller that already knew to ask for it.
+ */
+describe('a mounted shell keeps up with the run, and stops when it is unmounted', () => {
+  /** A terminal that can be resized, and that keeps every frame written to it. */
+  class Screen extends EventEmitter {
+    columns = 80;
+    rows = 40;
+    readonly writes: string[] = [];
+
+    write(chunk: string): boolean {
+      this.writes.push(chunk);
+      return true;
+    }
+
+    frame(): string {
+      return this.writes.join('');
+    }
+
+    last(): string {
+      return this.writes.at(-1) ?? '';
+    }
+  }
+
+  const writeLog = (path: string, specs: Parameters<typeof buildLog>[0]): void => {
+    writeFileSync(path, logText(buildLog(specs, { feature: 'tui-shell', run: RUN })), 'utf8');
+  };
+
+  const prepared = (specs: Parameters<typeof buildLog>[0]): string => {
+    const paths = runPaths(RUN, home);
+    mkdirSync(paths.runDir, { recursive: true });
+    writeLog(paths.eventLog, specs);
+    return paths.eventLog;
+  };
+
+  it('shows a step that started after the first frame, once the log is re-read', () => {
+    const eventLog = prepared([runCreated(), featureStateChanged('running')]);
+    const stdout = new Screen();
+    const handle = mountShell({
+      eventLog,
+      feature: 'tui-shell',
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      // No interval: this asserts the re-fold itself, with nothing else able to cause it.
+      pollMs: null,
+      debug: true,
+      now: NOW,
+    });
+
+    try {
+      expect(stdout.frame()).not.toContain('step "implement"');
+      writeLog(eventLog, [runCreated(), featureStateChanged('running'), stepStarted('implement')]);
+      handle.refresh();
+      expect(stdout.last()).toContain('step "implement"');
+      expect(handle.lastView().progress.currentStep).toBe('implement');
+    } finally {
+      handle.unmount();
+    }
+  });
+
+  it('re-reads on its own, and the interval stops at unmount', async () => {
+    const eventLog = prepared([runCreated(), featureStateChanged('running')]);
+    const stdout = new Screen();
+    const handle = mountShell({
+      eventLog,
+      feature: 'tui-shell',
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      pollMs: 20,
+      debug: true,
+      now: NOW,
+    });
+
+    try {
+      writeLog(eventLog, [runCreated(), featureStateChanged('running'), stepStarted('implement')]);
+      // Nothing calls `refresh` here: the interval is what has to find the new line.
+      await vi.waitFor(() => {
+        expect(stdout.frame()).toContain('step "implement"');
+      });
+    } finally {
+      handle.unmount();
+    }
+
+    const afterUnmount = stdout.writes.length;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    // Several intervals' worth of time with nothing drawn: the timer was cleared, not merely unref'd.
+    expect(stdout.writes.length).toBe(afterUnmount);
+  });
+
+  it('treats a refresh after unmount as nothing to do, rather than as a crash', () => {
+    const eventLog = prepared([runCreated()]);
+    const stdout = new Screen();
+    const handle = mountShell({
+      eventLog,
+      feature: 'tui-shell',
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      pollMs: null,
+      debug: true,
+      now: NOW,
+    });
+    handle.unmount();
+    // A poll and a resize both land here and either can arrive on the way out.
+    expect(() => {
+      handle.refresh();
+    }).not.toThrow();
+    expect(() => {
+      handle.unmount();
+    }).not.toThrow();
+  });
+
+  it('measures the terminal it was given, and measures it again when it is resized', () => {
+    const eventLog = prepared([runCreated(), featureStateChanged('running'), stepStarted('implement')]);
+    const stdout = new Screen();
+    const handle = mountShell({
+      eventLog,
+      feature: 'tui-shell',
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      // Deliberately no `columns`: the terminal says how wide it is, which is the point of the patch.
+      pollMs: null,
+      debug: true,
+      now: NOW,
+    });
+
+    /**
+     * Asserted against the *composition*, not only against the row lengths.
+     *
+     * Ink lays its own output out to `stdout.columns`, so a frame composed at 80 and drawn to a
+     * 40-column terminal also comes out in rows of 40 — measuring lengths alone cannot tell the two
+     * apart. The control hints can: they are packed to the width they were composed for, so the row
+     * `formatControlHints(80)` produces is one no 40-column composition contains.
+     */
+    const rowsOf = (frame: string): string[] => frame.split('\n').map((row) => row.trimEnd());
+
+    try {
+      expect(rowsOf(stdout.last())).toContain(formatControlHints(80)[0]);
+
+      stdout.columns = NARROW_COLUMNS;
+      stdout.emit('resize');
+
+      const narrow = rowsOf(stdout.last());
+      expect(narrow).toContain(formatControlHints(NARROW_COLUMNS)[0]);
+      expect(narrow).not.toContain(formatControlHints(80)[0]);
+      for (const row of narrow) expect(row.length, row).toBeLessThanOrEqual(NARROW_COLUMNS);
+      expect(stdout.last()).toContain(`${MODE_LABEL} `);
     } finally {
       handle.unmount();
     }

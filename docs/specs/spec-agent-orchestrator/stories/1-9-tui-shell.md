@@ -1,47 +1,60 @@
----
-title: 'TUI shell — event-log projection, permanent mode display, ambient status'
-type: 'feature'
+---title: TUI shell — event-log projection, permanent mode display, ambient status
+type: feature
 created: '2026-09-20'
-status: 'in-review'
-review_loop_iteration: 0
+status: done
+review_loop_iteration: 1
 followup_review_recommended: true
 context:
-  - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/interface-contract.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-7-command-transport.md'
-  - '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-8-question-lifecycle.md'
-warnings: ['oversized'] # 12 files and 13 I/O scenarios; first UI dependencies plus a spine contradiction to settle
+- '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/interface-contract.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-7-command-transport.md'
+- '{project-root}/docs/specs/spec-agent-orchestrator/stories/1-8-question-lifecycle.md'
+warnings:
+- oversized
 deferred:
-  - summary: >-
-      No review layer ran against this story; the gate plus the implementer's own probes are the only
-      scrutiny it received.
-    evidence: |-
-      typecheck, lint, 1015 tests across 37 files and build all pass, and the two verification greps
-      over `src/tui/` return no match. Read status: done as implemented and gated, not reviewed.
-    severity: high
-  - summary: >-
-      Keystrokes are not captured: the shell renders and `invokeControlByKey` exists, but no Ink
-      `useInput` handler binds one to the other.
-    evidence: |-
-      A control's whole contract — a durable intent file and nothing else — is implemented and tested
-      end to end through `invokeControl`/`invokeControlByKey`, including a real reconciler pass that a
-      written `disengage` stops. What is missing is the keyboard loop that calls it, which needs a free
-      text prompt for `answer`, `reject`, `edit_criterion` and `inject_note` — and a text prompt is
-      part of story 1-10's one-question card rather than of this shell.
-    location: 'src/tui/app.tsx'
-    severity: medium
-  - summary: >-
-      CROSS-STORY: `src/tui/mode.ts` holds the autonomy mode, and story 3-1's web renderer may not
-      import `src/tui/` any more than it may import `src/engine/`.
-    evidence: |-
-      The Code Map placed the mode's derivation in `src/tui/mode.ts` and this story followed it. The
-      spine's dependency graph gives `web -> contracts` only, so when 3-1 needs the same mode a person
-      reads in the terminal, the derivation has to move to `src/contracts/` or `src/runtime/` — the
-      same shape of move this story made for the intent writer, and cheaper to make before a second
-      renderer exists than after.
-    location: 'src/tui/mode.ts'
-    severity: medium
-baseline_revision: '6ba3c7d6cc0b486abce5d94c22a0600a82a12066'
+- summary: 'RESOLVED 2026-09-21: the four-layer review ran. See the Review Triage Log.'
+  evidence: 53 claims filed, 20 triage rows, 15 patched including four high. Suite 1420 -> 1468 tests
+    across 51 files, zero skips. Four mutations that had left the suite green are each caught now, plus
+    a fifth for a fix made after the round returned.
+  severity: high
+- summary: 'RESOLVED: story 1-10 bound the keyboard, and this review then guarded the ctrl chords.'
+  evidence: 1-10 added `useInput` and `src/tui/input.ts`. This review found the reducer treated a ctrl
+    chord as a control outside a draft, so ctrl-c wrote a `confirm_spec` intent — CAP-2's only gate into
+    execution. Guarded and pinned by four tests.
+  location: src/tui/app.tsx
+  severity: medium
+- summary: 'CROSS-STORY: `src/tui/mode.ts` holds the autonomy mode, and story 3-1''s web renderer may
+    not import `src/tui/` any more than it may import `src/engine/`.'
+  evidence: 'The Code Map placed the mode''s derivation in `src/tui/mode.ts` and this story followed it.
+    The
+
+    spine''s dependency graph gives `web -> contracts` only, so when 3-1 needs the same mode a person
+
+    reads in the terminal, the derivation has to move to `src/contracts/` or `src/runtime/` — the
+
+    same shape of move this story made for the intent writer, and cheaper to make before a second
+
+    renderer exists than after.'
+  location: src/tui/mode.ts
+  severity: medium
+- summary: Three decisions were taken inside the patch round that want your sign-off.
+  evidence: (1) Ctrl-c means close the viewer rather than disengage, and the frame now says so. (2) `hibernated`
+    keeps forcing `stopped`, derived from TERMINAL_FEATURE_STATES itself. (3) `ControlArgumentRequired`
+    carries no AD-35 code, because none of the four dispositions answers "type something first". Each
+    is argued in a code comment; each is a one-line change if you read the contract the other way.
+  severity: medium
+- summary: Two additions beyond this story's Code Map, recorded rather than hidden.
+  evidence: '`readCompleteEventLines` went into `src/runtime/recorder.ts` — story 1-2''s module — because
+    `src/tui/` may not contain `node:fs`; and `src/tui/width.ts` is new, carrying a deliberate choice
+    not to depend on `string-width`, which is only a transitive Ink dependency and would need a recorded
+    deviation.'
+  severity: low
+- summary: Nothing launches the shell, so four claims about a real tty cannot be settled here.
+  evidence: No `bin`, no caller of `mountShell`, nothing reads `process.argv`. The spine gives `bin/init.ts`
+    to AD-12 and story 2-1 owns it, so this is sequenced rather than missing. Process lifetime, scrollback
+    and real escape sequences are untestable until then.
+  severity: medium
+baseline_revision: 6ba3c7d6cc0b486abce5d94c22a0600a82a12066
 ---
 
 <intent-contract>
@@ -259,6 +272,39 @@ src/tui/` both return no match. `npx vitest run tests/engine.crash-injection.tes
 
 ## Review Triage Log
 
+### 2026-09-21 — Review pass (follow-up, on a `done` spec)
+
+- claims filed: 53 across four layers — blind-hunter 15, edge-case-hunter 22, verification-gap 3 gap + 6
+  other, intent-alignment 7 divergences. The edge-case layer filed an enumerated list so its count is exact;
+  the other three wrote prose, so those are my enumeration of the distinct claims each made.
+- grouped into the 20 rows below. 15 patch entries applied, 4 deferred, the rest rejected. No filed claim is
+  without a row.
+- **One row is a fix I made myself, after the round returned.** Story 1-10's review found that a ctrl chord
+  was not guarded outside a draft, so ctrl-c wrote a `confirm_spec` intent — and this round had just added a
+  frame hint promising ctrl-c was safe. The two landed independently and the second made the first worse. I
+  fixed the reducer, added four tests and mutation-checked them before committing.
+
+- `[high]` `[patch]` Mode confusion on a torn read — the exact hazard this story exists to prevent. `readEventLog` throws when the log does not end in a newline, and the renderer polls the file the recorder appends to; on that throw `loadShellView` returned `idleShellView`, whose autonomy is `interactive`. I drove it: a paused or stopped run rendered `mode interactive` during a routine append. Fixed with `readCompleteEventLines`, which folds the whole lines and reports an unterminated tail instead of throwing, plus a `previous` view kept across a genuinely corrupt line. Verified after: the same torn log now reads `mode paused` with the problem stated.
+- `[high]` `[patch]` A frozen shell shipped green: replacing `refresh`'s body with a no-op left all 87 TUI tests passing, in the system's only surface. Two new tests — a step appended after the first frame appears only after `refresh()`, and the interval finds it unaided and stops at unmount rather than merely being unref'd.
+- `[high]` `[patch]` The whole refusal-and-failure notice channel could go silent green: guarding the `command.refused`, `handoff.recorded`, `permission.denied` and `redaction.failed` branches and collapsing `deflected` into `resolved` left all 1015 tests passing. None of those five types appeared in any TUI suite or had a builder. In a system whose convention is that silence means success, a refused keystroke that produces no notice is a person watching their gesture vanish. Builders added in the engine's own payload spelling, six tests.
+- `[high]` `[patch]` MY OWN FIX, from story 1-10's review landing in this story's file: a ctrl chord was not a control key in the composing branch but was one outside it, so **ctrl-c wrote a durable `confirm_spec` intent** — CAP-2's only gate into execution — and ctrl-k a `kill`. This round then added a frame hint reading "ctrl-c closes this view and leaves the run advancing", which made it worse: the frame promised safety over a keystroke that confirmed acceptance criteria. Guarded in `reduceKey`, pinned by four tests, mutation-checked. The hint is now true.
+- `[medium]` `[patch]` The mode and notice contract was verified only through `commandApplied()`, a hand-written builder, while the one test folding a real reconciler's log asserted feature, run mode and steps but never `autonomy` or `notices`. Now asserted against a real `just_do_it` and a real `disengage`.
+- `[medium]` `[patch]` The dependency guard covered 9 of 16 files — the seven under `src/tui/cards/` were checked by neither the no-engine-import rule nor the no-file-writes rule, and this story offers that guard as its substitute for discipline. Now recursive, 17 files x 2 rules, and judging relative specifiers by resolving them rather than by prefix, since `../projection.js` is legal from `cards/` and not from the top level.
+- `[medium]` `[patch]` By default the frame never redrew: `pollMs` undefined installed no interval, so elapsed froze at mount while the story described it as always visible and still growing. `DEFAULT_POLL_MS = 1000` with a `MIN_POLL_MS` clamp, an explicit `null` still meaning no interval, and refresh/draw/unmount all no-ops after unmount.
+- `[medium]` `[patch]` Nothing read the terminal's real width, so a 40-column terminal composed at 80 and the acceptance criterion held only when a caller passed `columns: 40`. Now resolved per frame from the stream with a resize redraw. The test asserts the *composition* rather than row lengths, because Ink re-wraps its own output and length alone cannot distinguish an 80-column composition drawn narrow — the first version of that test passed under the mutation, which is why it was strengthened.
+- `[medium]` `[patch]` Elapsed grew forever after a run finished: a 4-second committed run read `26h00m` a day later with `recordedElapsedMs` sitting unused. Now the recorded elapsed for a terminal state and the live clock otherwise; the existing in-flight assertion is untouched.
+- `[medium]` `[patch]` Redaction leaked both ways: `isRedacted` tested equality so `use [redacted] to auth` was neither flagged nor presented as redacted, and the notice builders interpolated `effect`, `reason` and `code` directly so the marker reached prose as `reject applied: [redacted]`. Both closed.
+- `[medium]` `[patch]` The persistent question slot could still scroll away: `MAX_NOTICES` bounded the notice list but nothing bounded the frame against the terminal's rows. `boundToRows` now drops notices oldest-first, then hint rows from the end, never the first (which carries `x stop`), and never the mode, status, problem or slot.
+- `[medium]` `[patch]` A second concurrent question silently erased the first from the only slot that reports it. The fold now keeps an ordered queue: the earliest keeps the slot — story 1-8 established the engine targets the earliest still-asked question — a later one is announced, and it inherits the slot when the earlier settles.
+- `[medium]` `[patch]` The intent id stopped being monotonic when the writer moved to `randomUUID`, while the change log claimed ordering was unaffected and `orderIntents` uses the id as its tiebreak after a millisecond `issued_at`. A monotonic seed is restored — fixed-width timestamp plus within-process counter plus the UUID — so the claim is true again rather than needing correction, with no ULID minter relocated (AD-29 untouched).
+- `[medium]` `[patch]` The `questionCard` seam story 1-10 now fills was never rendered in a test; deleting `{children}` passed. Pinned, asserting the node is drawn inside the slot and below its own lines.
+- `[low]` `[patch]` Eight smaller real items: an out-of-range budget share was silently clamped rather than reported; `STATUS_SEPARATOR` was documented as one character while being three cells and multi-byte; width was measured in UTF-16 units, now in terminal cells via a new `src/tui/width.ts` using `Intl.Segmenter` rather than adding a dependency the Never list forbids; keystroke uniqueness was claimed in a comment and checked only by a test, now a module-load invariant with a map lookup rather than a `find`; `ControlArgumentRequired` filed a correctable keystroke as `config.invalid`; `projection.ts` keyed on a bare `'completed'` literal, now a contracts-typed constant so a rename is a compile error; the `tsc` probe wrote into the repository root, now into `node_modules/`; and `Shell` recomputed the question section Ink draws instead of using the composed lines, so the frame a suite asserts and the frame a person sees were two derivations.
+- `[medium]` `[defer]` THREE DECISIONS TAKEN IN THE ROUND THAT WANT YOUR SIGN-OFF. (1) Ctrl-c means "close the viewer", not "disengage": a renderer is a projection whose only act is an intent file, so closing it is not an act on the run, and a viewer that killed work on close would make watching dangerous. The frame says so, and my guard above makes that true. (2) `hibernated` keeps forcing `stopped`, now derived from `TERMINAL_FEATURE_STATES` itself. (3) `ControlArgumentRequired` no longer carries an AD-35 code, because none of the four dispositions answers "type something first".
+- `[medium]` `[defer]` Two additions beyond this story's Code Map, both recorded rather than hidden: `readCompleteEventLines` was added to `src/runtime/recorder.ts` — story 1-2's module — because `src/tui/` may not contain `node:fs`, and `src/tui/width.ts` is a new file. The second carries a deliberate choice not to depend on `string-width`, which is only a transitive Ink dependency and would need a recorded deviation.
+- `[false]` `[reject]` Three premises that did not reproduce, all disproved by running them rather than by argument. `hibernated` being resumable, so forcing `stopped` is a false belief — contradicted by `TERMINAL_FEATURE_STATES` and AD-24's "terminal-pending disposition"; only the comment contradicting its own list was real. The budget clamp rendering as "reassuring" — it clamps to `1.00 of 1.00`, which is alarming, not reassuring; the real defect was an out-of-range figure silently made plausible. And three items reported as defects that later stories had already fixed: `narrow`'s argument, `mintIntentId('')`, and the missing keystroke capture. (3 findings)
+- `[low]` `[reject]` Nine hardening suggestions on inputs no caller can supply, and cosmetic notes already corrected elsewhere in this round. (9 findings)
+- `[maybe-false]` `[defer]` Four claims about behaviour that only a launched TUI could exhibit — process lifetime, scrollback, a real tty's escape sequences. Nothing launches the shell (no `bin`, no caller of `mountShell`); the spine gives `bin/init.ts` to AD-12 and story 2-1 owns it. Recorded with that owner. (4 findings)
+
 ## Design Notes
 
 **The spine and story 1-7 contradict each other, and this story has to settle it.** The dependency rule says "No renderer, step subprocess, tool server or installer may import the engine; renderers reach it only by writing command intent files per AD-19." Story 1-7 put `writeCommandIntent`, `newCommandIntent` and `mintIntentId` in `src/engine/commands.ts` and documented that a renderer needs exactly those three. Both cannot hold. The resolution that keeps the rule intact is to relocate the intent file's *mechanics* — its format, its atomic write, its id minting — into `src/runtime/`, which already owns the recorder, the paths and every other durable-file concern, and re-export from the engine so no existing caller changes. What stays in the engine is what the engine actually does: consuming, ordering, quarantining and applying. If the implementer sees a better resolution, take it and record it; what is not acceptable is a renderer importing the engine, or the constraint being quietly reinterpreted.
@@ -286,44 +332,33 @@ export PATH="/Users/deep/.nvm/versions/node/v24.21.0/bin:$PATH"   # node v24.21.
 
 ## Auto Run Result
 
-Status: done
-Blocking condition: none
+**Status: done, reviewed.** The four-layer review ran on 2026-09-21. 53 claims filed, 20 triage rows, 15
+patched, 4 deferred. Suite 1420 -> 1468 tests across 51 files, zero skips.
 
-**REVIEW WAS SKIPPED** for this story; no review layers ran. The gate, the implementer's probes and the
-parent's two mutations are the only scrutiny. Read `status: done` as implemented and gated, not reviewed.
+**The headline finding is the hazard this story names as its reason to exist.** A poll landing between the
+recorder's append and its newline made `readEventLog` throw, and the renderer then reset to the idle view —
+whose autonomy is `interactive`. So a paused or stopped run rendered `mode interactive` during a routine
+append: mode confusion, which `interface-contract.md` calls the primary interface hazard of a system with
+autonomy tiers. Verified before and after by driving a torn log: it now reads `mode paused` with the problem
+stated.
 
-**Implemented change.** `src/tui/` — the first surface this system has had. A pure fold from `events.jsonl`
-to view state (`projection.ts`), the permanently displayed autonomy mode (`mode.ts`), the ambient segment
-carrying step count, consumed rate-limit budget and elapsed-versus-estimate (`status.ts`), the total
-`CommandMap` of controls that reach the engine only by writing an intent (`controls.ts`), and the Ink shell
-that composes them and reserves the persistent question slot story 1-10 fills. React 19.3.0 and Ink 7.1.1
-arrive pinned exactly, as story 1-1 deferred them to this story.
+**Three things could regress to nothing with the suite green**, each now caught: a `refresh` that never
+re-reads, so the system's only surface freezes at mount; the entire refusal-and-failure notice channel, in a
+system whose convention is that silence means success; and the dependency guard, which covered 9 of 16 files
+because it never recursed into `src/tui/cards/` — while this story offers that guard as its substitute for
+discipline.
 
-**The contradiction it had to settle.** The spine forbids a renderer importing the engine; story 1-7 had put
-the three intent-writing functions a renderer needs inside `src/engine/`. The intent file's mechanics moved
-to `src/runtime/` — which already owns the recorder and the paths — and `src/engine/commands.ts` re-exports
-every name, so `reconciler.ts` and the engine's own suite were untouched. What stays in the engine is what
-the engine does with the files: read, order, quarantine, retire, apply.
+**One fix was mine, made after the round returned, and it is the most important single line here.** Story
+1-10's review found that a ctrl chord was guarded inside a draft and not outside it, so ctrl-c reached
+`controlForKey('c')` and wrote a durable `confirm_spec` intent — CAP-2's only gate into execution — and
+ctrl-k a `kill`. This round had independently added a frame hint reading "ctrl-c closes this view and leaves
+the run advancing", which made the situation worse rather than better: the frame promised safety over the
+keystroke that confirmed acceptance criteria. Two well-reasoned changes from two different stories'
+reviews, landing independently, produced a lie. The reducer now declines ctrl chords, four tests pin it, and
+the hint is true.
 
-Two consequences the implementer reasoned through rather than papered over: the temp suffix became exported,
-because writer and reader now live in different modules and two private constants would be two agreements
-about one name; and a renderer mints its intent id from `node:crypto` rather than the engine's ULID minter,
-since AD-29 makes that minter the engine's alone — reusing only the punctuation that keeps the id's runs short
-enough to survive AD-21's entropy sweep in the payload that carries the exactly-once key.
-
-**Parent verification.** `typecheck`, `lint`, `build` exit 0; `npm test` → 37 files, **1015 passed**, zero
-skips. No engine import from `src/tui/` — the three matches for "engine" are prose explaining the rule. No
-percentage anywhere, including the remainder operator, so that grep means something. `react` 19.3.0 and `ink`
-7.1.1 exact, no `react-dom`. `dist/tui/index.js` imports clean, so the `.tsx` build output runs. The
-crash-injection suite still converges, confirming the relocation changed no engine behaviour.
-
-**Mutation-tested by the parent:** blanking one autonomy mode's label fails the mode suite's "describes every
-mode in the enum"; removing the `seq` sort from the fold fails "does not depend on the order the lines were
-handed to it". Both restored byte-identically.
-
-**Coverage shape.** 31 pure fold tests and exactly one rendered frame in the whole repository, which is what
-the spec asked for. An unknown event type is asserted to leave the view *identical* rather than merely not to
-throw, and one test folds a log a real reconciler wrote, to catch payload-key drift.
-
-**Follow-up review recommended: true** — no review ran, and the cross-story note below about `mode.ts` wants
-settling before story 3-1 rather than after.
+**Residual risk, and why `followup_review_recommended` is true.** Four high entries were patched. The
+specific unverified risk: `readCompleteEventLines` changes how a partially-written log is read, and the
+recorder is the one writer whose atomicity every other guarantee rests on. The new reader is additive and
+`readEventLog` is byte-identical, so nothing the engine does changed — but a second reader of the log's
+tail is a second opinion about what "a complete event" means.
