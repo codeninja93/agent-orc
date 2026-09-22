@@ -33,7 +33,16 @@
  * - `question-window` — CAP-4's window, and the timeout default taken as a resolver competing in that
  *   same compare-and-set rather than as a special case;
  * - `decision` — the record a resolved question leaves, emitted as events because AD-4 admits no second
- *   durable authority; story 5-3 builds the queryable index over those lines.
+ *   durable authority; story 5-3 builds the queryable index over those lines;
+ * - `conventions` — the repository's own `CLAUDE.md`/`AGENTS.md`, read as text and passed through
+ *   unparsed, plus the one question AD-16's precedence needs of them: do they speak to this anchor;
+ * - `profile` — AD-16's profile loader: mechanics from the profile, conventions from the repository, and
+ *   a knowledge entry the repository speaks to flagged stale rather than applied;
+ * - `roster` — AD-17's discovery by directory read. The engine holds no compiled-in roster, and nothing
+ *   under `src/engine/` may import the installer's `BUILT_IN_AGENTS`, which a recursive import guard in
+ *   `tests/engine.roster.test.ts` asserts;
+ * - `config-snapshot` — AD-9's run-start snapshot and the step-side reader, which are the only two
+ *   callers of a profile there are: a step reads `runs/<run-id>/config/` and never `.orch/`.
  *
  * The steering and command modules are what stories 1-9 and 1-10 write against. A renderer needs
  * `writeCommandIntent`, `newCommandIntent` and `mintIntentId` and nothing else: it never learns the
@@ -68,4 +77,8 @@ export * from './question-window.js';
 export * from './decision.js';
 export * from './steering.js';
 export * from './handoff.js';
+export * from './conventions.js';
+export * from './profile.js';
+export * from './roster.js';
+export * from './config-snapshot.js';
 export * from './reconciler.js';

@@ -21,6 +21,7 @@
  */
 import { z } from 'zod';
 
+import { KnowledgeSectionSchema } from './knowledge.js';
 import { versioned } from './schema-version.js';
 import { MODEL_RUNGS } from './state.js';
 import { REVERSIBILITY_CLASSES, RUN_MODES } from './step.js';
@@ -216,6 +217,19 @@ export const ProfileSchema = versioned({
    */
   autonomy_start: z.enum(RUN_MODES),
   ceilings: CeilingsSchema,
+  /**
+   * AD-16's project knowledge — and the one field of this artifact that is optional.
+   *
+   * Optional because every profile written so far has none: story 2-1's installer writes `project`,
+   * `mechanics`, `risk`, the roster answer and the ceilings, and entries arrive with the bootstrap
+   * agent in stage 5. Requiring the section would make every `.orch/` the installer has ever written
+   * unreadable by the loader that is supposed to read it, which is a migration invented to satisfy a
+   * schema rather than a behaviour anybody asked for.
+   *
+   * The precedence machinery over these entries is `src/engine/profile.ts`: additive only, and flagged
+   * stale rather than applied where the repository's own instructions speak to the same anchor.
+   */
+  knowledge: KnowledgeSectionSchema.optional(),
 });
 
 export type Profile = z.infer<typeof ProfileSchema>;

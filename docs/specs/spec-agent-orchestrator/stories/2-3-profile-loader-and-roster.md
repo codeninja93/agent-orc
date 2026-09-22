@@ -2,16 +2,67 @@
 title: 'Profile loader, precedence rules, and agent roster discovery'
 type: 'feature'
 created: '2026-09-22'
-status: 'drafted'
+status: 'done'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 baseline_revision: 'd913599'
 context:
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-003-built-in-agent-tool-grants.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/memory-design.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/stories/2-1-installer.md'
-deferred: []
+deferred:
+- summary: No review layer ran against this story.
+  evidence: 'The gate, five mutations (four named in the dispatch plus my own against the line-number
+    anchor refusal) and my independent verification of the parser move, the engine-import edge and the
+    step reader''s signature are the only scrutiny. Read `status: done` as implemented and gated, not
+    reviewed.'
+  severity: high
+- summary: 'The TOML codec moved to `src/contracts/toml.ts`; `src/installer/toml.ts` is now a re-export.'
+  evidence: 'Not in the Code Map. The engine must read `profile.toml` and `agents/*.toml`, and
+    `tests/engine.reconciler.test.ts` asserts every `src/engine/` file imports only `../contracts/`,
+    `../runtime/` and `node:` builtins. Verified independently: `parseToml` and `serialiseToml` are each
+    defined exactly once, both in `src/contracts/toml.ts`, and no file under `src/engine/` imports the
+    installer. The alternative — relaxing the engine guard to admit `../installer/toml.js` — was rejected
+    because it opens the edge that makes importing `BUILT_IN_AGENTS` a one-line change.'
+  location: src/contracts/toml.ts
+  severity: medium
+- summary: 'The config snapshot carries no schema of its own; it is a verbatim byte copy.'
+  evidence: 'AD-28 requires every on-disk artifact to be versioned. Rather than invent a
+    `run.config_snapshot` schema, the snapshot copies `profile.toml` and `agents/*.toml` byte for byte —
+    artifacts that already carry `schema_version` — under the same file names as `.orch/`. Verified: the
+    writer only ever `readFileSync`s and writes; it never re-serialises, so the snapshot cannot drift from
+    what was on disk at run start. The consequence is deliberate: one reader serves both scopes, so
+    `loadProfile`/`discoverRoster` cannot tell which scope they were handed, and `readStepConfiguration`
+    has no parameter a repository path could enter through. That is what keeps a step out of `.orch/`
+    structurally rather than by discipline. Whether AD-28 wants the snapshot versioned as a unit anyway is
+    a spine question.'
+  location: src/engine/config-snapshot.ts
+  severity: medium
+- summary: 'A refused roster entry does not fail run start; whether it should is undecided.'
+  evidence: 'Matrix 12 requires the remaining agents to load when one file is malformed, so discovery
+    reports the refusal on `snapshot.roster.refused` and continues. No AD fixes whether a run may begin
+    with an agent the roster could not parse — a run that needs that agent will fail later and further
+    from the cause. The snapshot copies every roster file including the refused one, so the refusal is at
+    least not silently dropped.'
+  location: src/engine/roster.ts
+  severity: medium
+- summary: 'Three encodings were chosen where AD-16 and `memory-design.md` name a vocabulary but not a form.'
+  evidence: '(1) "Both speak to the same anchor" is a whole-token, case-sensitive occurrence of the anchor
+    symbol in the instruction text, with boundaries judged by adjacent characters rather than a regex built
+    from data. It errs toward flagging — a document that merely mentions the anchor wins — which is the only
+    safe direction given AD-16 forbids silently applying a contradicted entry, and it parses no prose.
+    (2) `decay_features` is required and must be 0 unless the policy is `n-features`, so "there is no N" and
+    "nobody recorded one" stay distinguishable. (3) A second `takeConfigSnapshot` copies nothing and returns
+    `already_taken`, and the profile is written last, so a crash mid-snapshot leaves one the next attempt
+    completes rather than one it trusts.'
+  severity: low
+- summary: 'Nothing writes a knowledge entry yet, so the precedence rule is exercised only by fixtures.'
+  evidence: 'The section is optional and story 2-1 writes none — the installer-driven test asserts
+    `resolved.profile.knowledge` is `undefined`. Entries arrive with the bootstrap agent in stage 5, which
+    is the first point at which the stale-flagging path meets an entry a person wrote rather than one a test
+    planted.'
+  severity: low
 ---
 
 # Story 2-3 — Profile loader, precedence rules, and agent roster discovery
@@ -160,4 +211,54 @@ person edits it by hand.
 
 ## Verification
 
+`npm run typecheck && npm run lint && npm run build && npm test`, run by me with the suite's own exit status
+captured to a variable rather than piped: **exit 0, 1839 tests across 66 files, zero failures, zero skips**
+(baseline `d913599` was 1736 across 62). Node pinned to v24.21.0, above the >=22.22 floor.
+
+Five mutations, each applied, run and reverted, with the suite green again afterwards and `grep MUTATION src
+tests` returning nothing:
+
+| Mutation | Caught by |
+|---|---|
+| Roster falls back to the installer's `BUILT_IN_AGENTS` via import | 5 tests, including the pre-existing `engine.reconciler` dependency guard |
+| The same fallback with the list **inlined**, so no import guard can see it | 3 tests — the behavioural matrix-15 tests, not just the import guard |
+| The import guard made non-recursive | exactly 1: `catches a violation in a subdirectory, which a flat listing silently walks past` |
+| A contradicted knowledge entry applied instead of flagged | 7 tests in `engine.profile` |
+| A step re-resolves through `projectConfiguration(profile.project.path)` instead of reading the snapshot | 4 tests, including the structural `offers a step reader with nowhere to pass a repository path` |
+| (mine) `isLineNumberAnchor` always false | 8 tests, one per refused spelling: `:42`, `:42:7`, `#L42`, `#L42-L58`, `42`, `L42`, `line 42`, `lines 42-58` |
+
+What I checked myself rather than taking on report: `parseToml` and `serialiseToml` are defined exactly once
+each, both in `src/contracts/toml.ts`; no file under `src/engine/` imports the installer; the snapshot writer
+never re-serialises; and `readStepConfiguration(runId, options)` takes only an `orchHome` override, so no
+repository path can reach it.
+
 ## Auto Run Result
+
+**Status: done.** The engine reads `.orch/` for the first time — mechanics from the profile, conventions
+deferred to the repository, agents discovered from a directory — and AD-9's run-start snapshot now exists.
+
+**The non-recursive-guard landmine reproduced, in the existing code.** `tests/engine.reconciler.test.ts`'s
+dependency guard is itself flat (`readdirSync(engineDir)`), harmless today only because `src/engine/` has no
+subdirectory. The new guard is recursive and proves it: against a fixture tree containing `nested/sneaky.ts`,
+the recursive walk names the violation twice — the import and the bare symbol — while the flat walk returns
+`['clean.ts']` and finds nothing. Mutation 2 is the sharpest result of the round: making the guard flat broke
+exactly one test, and the test asserting no violation exists under `src/engine/` **stayed green**. That is
+the failure mode in miniature — a guard that still reads as coverage while covering less. The old flat guard
+was left alone: it belongs to another story and is not wrong today.
+
+**Landmine F was handled by testing the premise first.** The precedence fixtures assert
+`CONTRADICTED_ANCHOR !== UNCONTRADICTED_ANCHOR`, and that the fixture `CLAUDE.md` contains one and not the
+other, before any verdict is asserted. This is the twenty-first instance of the recurring
+assertion-adjacent-to-its-claim pattern and the second caught before it shipped.
+
+**The loader parses no prose, by shape rather than by discipline.** `readConventions` passes the instruction
+text through verbatim; `RepositoryConventions` has no field an extracted rule could live in. Precedence is
+decided by the declared anchor, and an entry with a blank anchor or a line-number anchor is refused at parse
+— because an entry nothing can check is an entry nothing can flag, and it would then be applied for ever.
+
+**Residual risk, and why `followup_review_recommended` is true.** No review layer ran. Two decisions here are
+architectural rather than local: moving the TOML codec into `src/contracts/` changes the dependency graph, and
+giving the snapshot no schema of its own is an argument about AD-28 rather than a mechanical choice. Both are
+recorded as deferred entries with the evidence for them. The narrowest unverified risk is the anchor match
+itself: it is a token comparison standing in for "these two sources speak to the same point", it errs toward
+flagging, and nothing has yet written a knowledge entry a person would recognise.

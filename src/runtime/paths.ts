@@ -13,6 +13,15 @@
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
+/**
+ * The two names the AD-9 snapshot shares with `<target-repo>/.orch/`, imported rather than re-spelled.
+ *
+ * `src/contracts/installer.ts` already owns them because three units read what one unit writes; a
+ * second spelling here would let the snapshot and the installer disagree about a file name, which is
+ * the two-on-disk-layouts failure every other name in this module exists to prevent.
+ */
+import { AGENTS_DIR_NAME, PROFILE_FILE_NAME } from '../contracts/index.js';
+
 /** The environment variable AD-9 names. */
 export const ORCH_HOME_ENV_VAR = 'ORCH_HOME';
 
@@ -106,6 +115,48 @@ export const EVENT_LOG_FILE_NAME = 'events.jsonl';
 export const FETCH_RECORD_FILE_NAME = 'fetch-record.json';
 export const EVENT_LOG_LOCK_FILE_NAME = 'events.jsonl.lock';
 export const RUN_CONFIG_DIR_NAME = 'config';
+
+/**
+ * AD-9, AD-34 — what the per-run configuration snapshot under `runs/<run-id>/config/` is made of.
+ *
+ * The snapshot carries the *same file names* as `<target-repo>/.orch/`, plus `conventions/` for the
+ * repository's own instruction files, and that is deliberate rather than convenient: AD-34 makes run
+ * scope "the immutable snapshot at `runs/<run-id>/config/` … the only configuration a step reads", so
+ * one reader has to be able to read either scope. Identical names mean the profile loader and roster
+ * discovery take a directory and cannot tell which scope they were pointed at — the alternative, a
+ * snapshot in a shape of its own, would need a second reader, and a second reader is how a step comes
+ * to read `.orch/` because that was the one the loader supported.
+ *
+ * `conventions/` exists because the instruction files are the one piece of configuration that does not
+ * live in `.orch/`: `CLAUDE.md` and `AGENTS.md` sit at the repository root, and a run that read them
+ * from there would read whatever the feature branch has done to them mid-run.
+ */
+export const RUN_CONFIG_CONVENTIONS_DIR_NAME = 'conventions';
+
+/** Every path inside `runs/<run-id>/config/`, so no caller joins a segment of its own. */
+export interface RunConfigPaths {
+  /** `runs/<run-id>/config/` */
+  readonly dir: string;
+  /** `runs/<run-id>/config/profile.toml` — the snapshotted AD-16 profile. */
+  readonly profile: string;
+  /** `runs/<run-id>/config/agents/` — the snapshotted AD-17 roster, one TOML per agent. */
+  readonly agentsDir: string;
+  /** `runs/<run-id>/config/conventions/` — the repository's instruction files, verbatim. */
+  readonly conventionsDir: string;
+}
+
+/**
+ * The snapshot's paths for one run.
+ *
+ * Takes a {@link RunPaths} rather than a run id, because the run directory has already been validated
+ * by then: a second `assertSafePathSegment` on the same id would be a second place to forget one.
+ */
+export const runConfigPaths = (paths: RunPaths): RunConfigPaths => ({
+  dir: paths.configDir,
+  profile: join(paths.configDir, PROFILE_FILE_NAME),
+  agentsDir: join(paths.configDir, AGENTS_DIR_NAME),
+  conventionsDir: join(paths.configDir, RUN_CONFIG_CONVENTIONS_DIR_NAME),
+});
 
 /**
  * AD-19 — `runs/<run-id>/commands/`, the durable steering intent files.
