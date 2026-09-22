@@ -22,7 +22,9 @@ import {
   CURRENT_SCHEMA_VERSION,
   KnowledgeEntrySchema,
   ORCH_DIR_NAME,
+  PERMISSIONS_FILE_NAME,
   PROFILE_FILE_NAME,
+  PermissionsSchema,
   ProfileSchema,
   serialiseToml,
 } from '../../src/contracts/index.js';
@@ -30,6 +32,7 @@ import type {
   AgentDeclaration,
   KnowledgeEntry,
   KnowledgeSection,
+  Permissions,
   Profile,
   TomlTable,
 } from '../../src/contracts/index.js';
@@ -103,6 +106,30 @@ export const writeRawProfile = (repository: string, table: TomlTable): string =>
   mkdirSync(dir, { recursive: true });
   const path = join(dir, PROFILE_FILE_NAME);
   writeFileSync(path, serialiseToml(table), 'utf8');
+  return path;
+};
+
+/**
+ * The permissions artifact, which AD-9's Rule names beside the profile and the roster.
+ *
+ * A fixture `.orch/` that held only two of the three could not see a snapshot that copied only two of the
+ * three — which is exactly how the missing `permissions.toml` survived the first round.
+ */
+export const fixturePermissions = (overrides: Partial<Permissions> = {}): Permissions =>
+  PermissionsSchema.parse({
+    schema_version: CURRENT_SCHEMA_VERSION,
+    granted_tools: ['Glob', 'Grep', 'Read'],
+    gated_reversibility_classes: ['irreversible'],
+    egress_allowlist: [],
+    ...overrides,
+  });
+
+/** Write `.orch/permissions.toml`. */
+export const writePermissions = (repository: string, permissions: Permissions): string => {
+  const dir = orchDir(repository);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, PERMISSIONS_FILE_NAME);
+  writeFileSync(path, serialiseToml(PermissionsSchema.parse(permissions)), 'utf8');
   return path;
 };
 

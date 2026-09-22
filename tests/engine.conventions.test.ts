@@ -7,12 +7,13 @@
  * test that the returned shape carries no extracted rules at all — because the way that boundary would
  * be crossed is by somebody adding a helpful `rules` field, not by a function announcing itself.
  */
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
 import {
+  ConventionsUnreadable,
   INSTRUCTION_FILE_NAMES,
   conventionsSpeakingTo,
   mentionsSymbol,
@@ -125,6 +126,30 @@ describe('either instruction file will do, and both is not an error (matrix 5)',
   });
 });
 
+describe('an instruction file that is there and cannot be read is a named refusal', () => {
+  it('carries a disposition code instead of escaping as a raw fs error', () => {
+    const repository = workspace();
+    const path = writeInstructionFile(repository, 'CLAUDE.md', CLAUDE_MD);
+    chmodSync(path, 0o000);
+
+    try {
+      readConventions(repository);
+      // A process running as root can read a 000 file, so the refusal cannot be asserted there; the
+      // assertion below keeps the test honest rather than silently passing.
+      expect(process.getuid?.()).toBe(0);
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConventionsUnreadable);
+      const refusal = error as ConventionsUnreadable;
+      expect(refusal.code).toBe('config.invalid');
+      expect(refusal.path).toBe(path);
+      expect(refusal.message).toContain('not the same as absent');
+    } finally {
+      // Restored so the workspace can be removed after the run.
+      chmodSync(path, 0o644);
+    }
+  });
+});
+
 describe('a repository with neither instruction file states no conventions (matrix 6)', () => {
   it('reports them absent rather than failing', () => {
     const repository = workspace();
@@ -174,6 +199,18 @@ describe('an instruction file speaks to an anchor when it names it as a whole to
     // `resolveProject` because of a document that never mentions it.
     expect(mentionsSymbol('Use resolveProjectPath for the pointer.', 'resolveProject')).toBe(false);
     expect(mentionsSymbol('Use resolveProject for the pointer.', 'resolveProject')).toBe(true);
+  });
+
+  it('does not read a kebab-case name as a mention of one of its words', () => {
+    // `migration-review` is an agent id, a feature slug and a directory name in this system: it is one
+    // name, not two. Without the hyphen as an identifier character, a `CLAUDE.md` naming only
+    // `migration-review` flagged an entry anchored on `review` as stale, and a good entry was lost.
+    expect(mentionsSymbol('see migration-review docs', 'review')).toBe(false);
+    expect(mentionsSymbol('see migration_review docs', 'review')).toBe(false);
+    expect(mentionsSymbol('see migration-review docs', 'migration-review')).toBe(true);
+    expect(mentionsSymbol('the review step', 'review')).toBe(true);
+    // Nor a trailing word: `review-notes` is not `review` either.
+    expect(mentionsSymbol('see review-notes', 'review')).toBe(false);
   });
 
   it('is case-sensitive, because a symbol is', () => {

@@ -9,7 +9,7 @@
  * tree; it is demonstrated against a fixture tree that has one, with the flat listing shown failing to
  * see the same violation. A guard that shrinks as the tree grows is worse than none.
  */
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
@@ -243,6 +243,34 @@ describe('an empty or absent agents directory is an empty roster (matrix 15)', (
       expect(rosterAgent(roster, id), `${id} was invented`).toBeNull();
     }
     expect(roster.agents).toHaveLength(0);
+  });
+
+  it('reports an unreadable agents directory as a refusal, never as an empty roster (row 22)', () => {
+    const repository = installed();
+    writeAgentFile(repository, 'analysis.toml', fixtureAgent());
+    const agentsDir = join(repository, '.orch', 'agents');
+    chmodSync(agentsDir, 0o000);
+
+    try {
+      const roster = discoverRoster(projectConfiguration(repository));
+      // Root can list a 000 directory, so the refusal cannot be asserted there; assert *that* rather than
+      // letting the test pass for a reason it does not name.
+      if (roster.refused.length === 0) {
+        expect(process.getuid?.()).toBe(0);
+        return;
+      }
+      // Absent and unreadable are different answers. The old behaviour said "No agents are declared … the
+      // engine holds no built-in list to fall back to" — an AD-17 sentence describing a permission bit.
+      expect(roster.agents).toStrictEqual([]);
+      expect(roster.refused).toHaveLength(1);
+      expect(roster.refused[0]?.path).toBe(agentsDir);
+      expect(roster.refused[0]?.code).toBe('config.invalid');
+      expect(roster.refused[0]?.reason).toContain('Cannot list the agent roster');
+      expect(roster.summary).not.toContain('No agents are declared');
+      expect(roster.summary).toContain('not the same as there being no agents');
+    } finally {
+      chmodSync(agentsDir, 0o755);
+    }
   });
 
   it('discovers a user-defined agent the installer has never heard of', () => {

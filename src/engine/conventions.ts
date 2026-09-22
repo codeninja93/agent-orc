@@ -69,6 +69,32 @@ export interface RepositoryConventions {
   readonly summary: string;
 }
 
+/**
+ * An instruction file that is there and cannot be read.
+ *
+ * The AD-35 code is `config.invalid`, whose declared disposition is `escalate-to-human`: a permission bit
+ * or a file removed between the stat and the read is not something a retry fixes. It exists because the
+ * raw `fs` error crossed three unit boundaries — `readConventions`, `resolveProfile`,
+ * `takeConfigSnapshot` — carrying no code for the AD-35 table to route on, so a run start that failed on
+ * an unreadable `CLAUDE.md` reported an errno to a person and nothing else.
+ */
+export class ConventionsUnreadable extends Error {
+  readonly code = 'config.invalid';
+  readonly path: string;
+
+  constructor(path: string, cause: unknown) {
+    super(
+      `Cannot read ${path}, which is the repository's own instructions and is authoritative for ` +
+        `conventions (AD-16): ${cause instanceof Error ? cause.message : String(cause)}. It is there but ` +
+        'unreadable, which is not the same as absent — a repository with no instruction file states no ' +
+        'conventions and is fine; this one states some that cannot be read.',
+      { cause },
+    );
+    this.name = 'ConventionsUnreadable';
+    this.path = path;
+  }
+}
+
 /** True when the path exists and is a regular file, so a `CLAUDE.md/` directory is not read as one. */
 const isFile = (path: string): boolean => {
   if (!existsSync(path)) return false;
@@ -91,7 +117,15 @@ export const readConventions = (directory: string): RepositoryConventions => {
   for (const name of INSTRUCTION_FILE_NAMES) {
     const path = join(directory, name);
     if (!isFile(path)) continue;
-    files.push({ name, path, text: readFileSync(path, 'utf8') });
+    // Wrapped, because `isFile` and the read are two calls: the file can be removed or its permissions
+    // changed between them, and either way what reaches a caller must carry a disposition code.
+    let text: string;
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch (error) {
+      throw new ConventionsUnreadable(path, error);
+    }
+    files.push({ name, path, text });
   }
   return {
     directory,
@@ -107,8 +141,16 @@ export const readConventions = (directory: string): RepositoryConventions => {
   };
 };
 
-/** Identifier characters: a match bounded by one of these is part of a longer name, not the name. */
-const IDENTIFIER_CHARACTER = /[A-Za-z0-9_$]/;
+/**
+ * Identifier characters: a match bounded by one of these is part of a longer name, not the name.
+ *
+ * **`-` is one of them.** Kebab case is how this system spells an agent id, a feature slug and a
+ * directory, so `migration-review` is a name and not two. Without the hyphen, a document naming only
+ * `migration-review` counted as speaking to `review`, and an entry anchored on `review` was flagged
+ * stale by a file that never mentions it — the person loses a good entry, which is the expensive
+ * direction of this error. The underscore was already excluded for the same reason.
+ */
+const IDENTIFIER_CHARACTER = /[A-Za-z0-9_$-]/;
 
 /**
  * True when `text` mentions `symbol` as a whole token.

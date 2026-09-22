@@ -14,13 +14,13 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
 /**
- * The two names the AD-9 snapshot shares with `<target-repo>/.orch/`, imported rather than re-spelled.
+ * The three names the AD-9 snapshot shares with `<target-repo>/.orch/`, imported rather than re-spelled.
  *
  * `src/contracts/installer.ts` already owns them because three units read what one unit writes; a
  * second spelling here would let the snapshot and the installer disagree about a file name, which is
  * the two-on-disk-layouts failure every other name in this module exists to prevent.
  */
-import { AGENTS_DIR_NAME, PROFILE_FILE_NAME } from '../contracts/index.js';
+import { AGENTS_DIR_NAME, PERMISSIONS_FILE_NAME, PROFILE_FILE_NAME } from '../contracts/index.js';
 
 /** The environment variable AD-9 names. */
 export const ORCH_HOME_ENV_VAR = 'ORCH_HOME';
@@ -141,6 +141,16 @@ export interface RunConfigPaths {
   readonly profile: string;
   /** `runs/<run-id>/config/agents/` — the snapshotted AD-17 roster, one TOML per agent. */
   readonly agentsDir: string;
+  /**
+   * `runs/<run-id>/config/permissions.toml` — the third artifact AD-9's Rule names.
+   *
+   * It is here because AD-9 lists `profile.toml`, `agents/*.toml` **and** `permissions.toml` as what the
+   * installer writes, and calls the snapshot "the only configuration any step of that run reads". A
+   * snapshot holding two of the three leaves a step needing the granted tools, the reversibility gate
+   * table or the egress allowlist with no snapshot path to read them from — so it would read live
+   * `.orch/`, which is the one thing the snapshot exists to prevent.
+   */
+  readonly permissions: string;
   /** `runs/<run-id>/config/conventions/` — the repository's instruction files, verbatim. */
   readonly conventionsDir: string;
 }
@@ -155,6 +165,7 @@ export const runConfigPaths = (paths: RunPaths): RunConfigPaths => ({
   dir: paths.configDir,
   profile: join(paths.configDir, PROFILE_FILE_NAME),
   agentsDir: join(paths.configDir, AGENTS_DIR_NAME),
+  permissions: join(paths.configDir, PERMISSIONS_FILE_NAME),
   conventionsDir: join(paths.configDir, RUN_CONFIG_CONVENTIONS_DIR_NAME),
 });
 

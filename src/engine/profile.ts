@@ -33,12 +33,13 @@ import { join } from 'node:path';
 import {
   AGENTS_DIR_NAME,
   ORCH_DIR_NAME,
+  PERMISSIONS_FILE_NAME,
   PROFILE_FILE_NAME,
   ProfileSchema,
   parseToml,
   parseVersionedArtifact,
 } from '../contracts/index.js';
-import type { KnowledgeEntry, Profile } from '../contracts/index.js';
+import type { KnowledgeEntry, Profile, TomlTable } from '../contracts/index.js';
 
 import { conventionsSpeakingTo, readConventions } from './conventions.js';
 import type { RepositoryConventions } from './conventions.js';
@@ -69,6 +70,14 @@ export interface ConfigurationSource {
   readonly label: string;
   readonly profile: string;
   readonly agentsDir: string;
+  /**
+   * `permissions.toml` in this scope — the third artifact AD-9's Rule names.
+   *
+   * Carried on the source, with no reader in this story, because AD-9 makes the snapshot "the only
+   * configuration any step of that run reads": the artifact has to have a run-scope path before anything
+   * reads it, or the first reader will reach for `.orch/` because that is where the path was.
+   */
+  readonly permissions: string;
   /** Where `CLAUDE.md`/`AGENTS.md` are read from for this scope. */
   readonly conventionsDir: string;
 }
@@ -87,6 +96,7 @@ export const projectConfiguration = (repositoryPath: string): ConfigurationSourc
     label: orchDir,
     profile: join(orchDir, PROFILE_FILE_NAME),
     agentsDir: join(orchDir, AGENTS_DIR_NAME),
+    permissions: join(orchDir, PERMISSIONS_FILE_NAME),
     conventionsDir: repositoryPath,
   };
 };
@@ -109,11 +119,11 @@ export class ProfileNotFound extends Error {
     super(
       source.scope === 'project'
         ? `No profile at ${source.profile}, so this repository has not been onboarded. Run ` +
-            '`npx github:<owner>/<repo> init` in it (AD-12) — or `orch init <path>` where this ' +
-            'package is already installed — which writes .orch/profile.toml, .orch/agents/ and ' +
-            '.orch/permissions.toml. Nothing is defaulted: the profile is authoritative for the test, ' +
-            'lint, build and run commands (AD-16), and an invented one would be a verification gate ' +
-            'nobody declared.'
+            '`orch init` from inside it, or `orch init` with its path as the one argument, which ' +
+            'writes .orch/profile.toml, .orch/agents/ and .orch/permissions.toml (AD-12 delivers that ' +
+            'same installer by npx from the orchestrator\'s own git repository). Nothing is defaulted: ' +
+            'the profile is authoritative for the test, lint, build and run commands (AD-16), and an ' +
+            'invented one would be a verification gate nobody declared.'
         : `No profile at ${source.profile}: this run has no configuration snapshot. AD-9 takes the ` +
             'snapshot once at run start and makes it the only configuration a step reads, so a step ' +
             'that finds none is not permitted to fall back to <target-repo>/.orch/ — that directory ' +
@@ -136,9 +146,41 @@ export class ProfileNotFound extends Error {
  */
 export const loadProfile = (source: ConfigurationSource): Profile => {
   if (!existsSync(source.profile)) throw new ProfileNotFound(source);
-  const table = parseToml(readFileSync(source.profile, 'utf8'));
+  // The read and the parse sit between the existence check and the schema, and both can fail in ways
+  // that are nobody's schema problem: a `profile.toml` that is a directory, one whose permissions changed
+  // since the check, a hand edit the subset refuses. Each was reaching a caller as a raw `fs` or parse
+  // error with no `code` for the AD-35 table to route on — so each is rethrown carrying one and the path.
+  let table: TomlTable;
+  try {
+    table = parseToml(readFileSync(source.profile, 'utf8'));
+  } catch (error) {
+    throw new ProfileUnreadable(source.profile, error);
+  }
   return parseVersionedArtifact(ProfileSchema, table, source.profile);
 };
+
+/**
+ * A profile that is there and cannot be read, or whose bytes are not this TOML subset.
+ *
+ * The AD-35 code is `config.invalid` → `escalate-to-human`: a directory where a file belongs, a
+ * permission bit, or a hand edit the parser refuses are all things a person fixes and no retry does. The
+ * `cause` is kept because `TomlParseError` carries the line number, which is the whole of what a person
+ * needs to repair a hand edit.
+ */
+export class ProfileUnreadable extends Error {
+  readonly code = 'config.invalid';
+  readonly path: string;
+
+  constructor(path: string, cause: unknown) {
+    super(
+      `Cannot read the profile at ${path}: ${cause instanceof Error ? cause.message : String(cause)}. ` +
+        'The profile is authoritative for mechanics (AD-16), so nothing is defaulted in its place.',
+      { cause },
+    );
+    this.name = 'ProfileUnreadable';
+    this.path = path;
+  }
+}
 
 /**
  * A knowledge entry the repository's instructions overrode.

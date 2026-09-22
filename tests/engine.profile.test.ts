@@ -13,7 +13,7 @@
  * "applied" half of the rule unobservable. The two constants are asserted to differ, the instruction file
  * is asserted to name one and not the other, and both verdicts are then taken from one resolution.
  */
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
@@ -22,11 +22,14 @@ import {
   CURRENT_SCHEMA_VERSION,
   KnowledgeEntrySchema,
   ProfileSchema,
+  isLineNumberAnchor,
   parseToml,
 } from '../src/contracts/index.js';
 import {
   ProfileNotFound,
+  ProfileUnreadable,
   loadProfile,
+  mentionsSymbol,
   projectConfiguration,
   resolveKnowledge,
   resolveProfile,
@@ -128,6 +131,29 @@ describe('the profile loads with every AD-16 mechanic available (matrix 1)', () 
   });
 });
 
+describe('a re-run of the installer preserves the profile\'s knowledge entries (matrix 23)', () => {
+  it('carries the entries through a second orch init', async () => {
+    const repository = makeRepository();
+    workspaces.push(repository);
+    const orchHome = workspace('rerun-home');
+    await runInit({ repository, io: scriptedIo(), orchHome });
+
+    // Stage 5's bootstrap agent is what will write these; here a hand edit stands in for it, which is also
+    // AD-16's other author — "the profile is authored by the installer and the bootstrap agent".
+    const first = loadProfile(projectConfiguration(repository));
+    const entry = knowledgeEntry({ anchor: UNCONTRADICTED_ANCHOR });
+    writeProfile(repository, { ...first, knowledge: knowledgeSection([entry]) });
+
+    await runInit({ repository, io: scriptedIo(), orchHome });
+
+    const after = resolveProfile(projectConfiguration(repository));
+    expect(after.profile.knowledge?.entries).toStrictEqual([entry]);
+    expect(after.knowledge.applied).toStrictEqual([entry]);
+    // AD-12 makes an upgrade a re-run, so the rest of the profile is the re-run's own answers, unchanged.
+    expect(after.profile.mechanics.commands.test).toBe(first.mechanics.commands.test);
+  });
+});
+
 describe('a repository with no .orch/ is refused, never defaulted (matrix 2)', () => {
   it('names what creates one, and invents no profile', () => {
     const repository = workspace();
@@ -144,6 +170,39 @@ describe('a repository with no .orch/ is refused, never defaulted (matrix 2)', (
       expect(refusal.message).toContain('init');
       expect(refusal.message).toContain('.orch/profile.toml');
       expect(refusal.message).toContain('Nothing is defaulted');
+    }
+  });
+
+  it('names a command that exists, never a placeholder to type literally', () => {
+    const repository = workspace();
+
+    try {
+      loadProfile(projectConfiguration(repository));
+      expect.unreachable('a repository with no .orch/ must be refused');
+    } catch (error) {
+      const refusal = error as ProfileNotFound;
+      // `npx github:<owner>/<repo> init` is AD-12's *notation*; printing it to a person instructed to run
+      // it hands them a command that cannot work. Everywhere else in the tree that string is in a comment.
+      expect(refusal.message).not.toContain('<owner>');
+      expect(refusal.message).not.toContain('<repo>');
+      expect(refusal.message).toContain('orch init');
+    }
+  });
+
+  it('carries a disposition code when the profile is there and cannot be read', () => {
+    // A directory where the file belongs: the existence check passes and the read fails, and what reached a
+    // caller was a raw `fs` error with no code for the AD-35 table to route on.
+    const repository = workspace();
+    mkdirSync(join(repository, '.orch', 'profile.toml'), { recursive: true });
+
+    try {
+      loadProfile(projectConfiguration(repository));
+      expect.unreachable('an unreadable profile must be refused');
+    } catch (error) {
+      expect(error).toBeInstanceOf(ProfileUnreadable);
+      const refusal = error as ProfileUnreadable;
+      expect(refusal.code).toBe('config.invalid');
+      expect(refusal.path).toBe(join(repository, '.orch', 'profile.toml'));
     }
   });
 
@@ -355,6 +414,14 @@ describe('an entry nothing can check is refused at parse (matrix 9, 10)', () => 
     'L42',
     'line 42',
     'lines 42-58',
+    // The six spellings the end-anchored first version let through. A line number is not made acceptable
+    // by being a range, by being parenthesised, by dropping the `L`, or by having prose after it.
+    'src/runtime/projects.ts:42-58',
+    'projects.ts(42)',
+    'projects.ts#42',
+    'src/runtime/projects.ts:L42',
+    'src/runtime/projects.ts:42 in resolveProject',
+    'projects.ts@42',
   ])('refuses "%s", because a line number is never an anchor', (anchor) => {
     const parsed = KnowledgeEntrySchema.safeParse({ ...knowledgeEntry(), anchor });
 
@@ -362,14 +429,76 @@ describe('an entry nothing can check is refused at parse (matrix 9, 10)', () => 
     expect(JSON.stringify(parsed.error?.issues)).toContain('never a line number');
   });
 
+  /**
+   * The accepted side, which is half of the rule and was the half missing.
+   *
+   * Every one of the refused spellings above was asserted and nothing balanced them, so widening the
+   * patterns to catch six more line forms also began refusing `zod@4` and `timeout:5000` — a person naming
+   * a package version or a settings key was told their anchor was a line number. `memory-design.md` ranks
+   * test names and module names as the strongest anchor kinds, and in this project a test name carrying a
+   * version is an ordinary one. What separates the two is what the number attaches to: a line reference
+   * follows a file extension, a version follows a package name.
+   */
   it.each([
     'resolveProject',
     'src/runtime/projects.ts',
     'runtime.recorder',
     'refuses a foreign fetch record',
     'RunState',
-  ])('accepts "%s", which names a symbol, a module or a test', (anchor) => {
+    // Versions, which the unanchored `@\d+` and `:\d+` used to refuse.
+    'zod@4',
+    'react@18.2.0',
+    'npm@11',
+    'refuses `npm@11` as a git-dependency host',
+    'asserts the Node floor at v24.21.0',
+    'v24.21.0',
+    // A colon that is not a line reference: a settings key, a namespaced id, prose with a status code.
+    'timeout:5000',
+    'engine.reconciler:roster',
+    'parses HTTP 404: 3 retries',
+    // Parentheses and digits that are part of a symbol or a sentence.
+    'Object.create(null)',
+    'toJsonSchema(schema)',
+    'handles 2 of 3 cases',
+    'ADR-003',
+  ])('accepts "%s", which names a symbol, a module, a version or a test', (anchor) => {
     expect(KnowledgeEntrySchema.safeParse({ ...knowledgeEntry(), anchor }).success).toBe(true);
+  });
+
+  it('tells a version from a line reference by the file extension, in both directions', () => {
+    // Stated as one pair so the distinguishing feature is visible rather than inferable from two lists: the
+    // same `@42` shape is a line when it follows `.ts` and a version when it follows a package name.
+    expect(isLineNumberAnchor('session.ts@42')).toBe(true);
+    expect(isLineNumberAnchor('zod@42')).toBe(false);
+    expect(isLineNumberAnchor('src/foo.ts:42')).toBe(true);
+    expect(isLineNumberAnchor('timeout:42')).toBe(false);
+  });
+
+  it.each(['  resolveProject  ', 'resolveProject ', ' resolveProject', '\tresolveProject\n'])(
+    'refuses the padded anchor %j, which nothing could ever match (row 24)',
+    (anchor) => {
+      const parsed = KnowledgeEntrySchema.safeParse({ ...knowledgeEntry(), anchor });
+
+      expect(parsed.success).toBe(false);
+      expect(JSON.stringify(parsed.error?.issues)).toContain('no surrounding whitespace');
+    },
+  );
+
+  it('would have applied a padded anchor for ever, which is what makes row 24 a refusal', () => {
+    // The mechanism, stated as a test so the refusal is not read as tidiness: the anchor is matched
+    // verbatim, and no instruction file contains a symbol with two spaces either side of it. A padded
+    // anchor can never be flagged, so AD-16's "never silently applied" would be violated for ever.
+    expect(mentionsSymbol('we use resolveProject here', '  resolveProject  ')).toBe(false);
+    expect(mentionsSymbol('we use resolveProject here', 'resolveProject')).toBe(true);
+    // And nothing stores a padded anchor, so the profile cannot carry one into the resolver.
+    const repository = workspace();
+    writeInstructionFile(repository, 'CLAUDE.md', 'Never call `resolveProject` from a renderer.\n');
+    writeRawProfile(repository, {
+      ...fixtureProfile(),
+      knowledge: { entries: [{ ...knowledgeEntry(), anchor: '  resolveProject  ' }] },
+    });
+
+    expect(() => loadProfile(projectConfiguration(repository))).toThrowError();
   });
 
   it('refuses an entry with no provenance, which AD-16 requires', () => {

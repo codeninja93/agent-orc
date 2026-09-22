@@ -55,16 +55,39 @@ export const DECAY_POLICIES = ['permanent', 'until-refactor', 'n-features', 'ses
 
 export type DecayPolicy = (typeof DECAY_POLICIES)[number];
 
-/** The forms that name a line rather than a symbol, each refused as an anchor. */
+/**
+ * The forms that name a line rather than a symbol, each refused as an anchor.
+ *
+ * **Not end-anchored, and not unanchored either — a line reference attaches to a file extension.** Two
+ * corrections are folded in here, in opposite directions. The first version ended `:\d+$` and required the
+ * `L` in `#L42`, so six ordinary spellings walked through: a range (`src/foo.ts:42-58`), a parenthesised
+ * line (`foo.ts(42)`), a bare `#42`, an `:L42`, an `@42`, and any of them followed by prose
+ * (`src/a.ts:42 in the handler`) — a line number is not made acceptable by having words after it. The
+ * replacement then over-refused in the other direction: bare `@\d+` and `:\d+` also match `zod@4`,
+ * `react@18.2.0` and `timeout:5000`, so a person naming a package version or a settings key was told their
+ * anchor is a line number.
+ *
+ * What separates the two is what the number is attached to: a line reference follows a **file extension**
+ * (`.ts`, `.tsx`, `.md`), a version follows a package name. `memory-design.md` ranks test names and module
+ * names above file paths, and a version-bearing test name is an ordinary anchor in this project — so the
+ * extension is required in the four positional forms, and the three forms that need no extension are the
+ * ones that cannot be anything but a line: a bare number, the words `line`/`lines`, and an explicit `#L42`.
+ */
 export const LINE_NUMBER_ANCHOR_PATTERNS: readonly RegExp[] = Object.freeze([
-  /** `src/auth/session.ts:42`, and the `:42:7` a compiler prints. */
-  /:\d+(?::\d+)?\s*$/,
-  /** `session.ts#L42`, and GitHub's `#L42-L58`. */
-  /#L\d+/i,
+  /** `src/auth/session.ts:42`, the `:42:7` a compiler prints, `:42-58`, `:L42`, and any of them mid-string. */
+  /\.[A-Za-z][A-Za-z0-9]*:L?\d+/i,
+  /** `session.ts#42` — the bare `#` some tools print, which needs the extension to be distinguishable. */
+  /\.[A-Za-z][A-Za-z0-9]*#L?\d+/i,
+  /** `session.ts(42)`, as a stack trace spells it. */
+  /\.[A-Za-z][A-Za-z0-9]*\(\d+\)/i,
+  /** `session.ts@42`. Distinguished from `zod@4` by the extension, which a package name does not carry. */
+  /\.[A-Za-z][A-Za-z0-9]*@\d+/i,
   /** A bare number, and `L42`. */
   /^\s*L?\d+\s*$/i,
   /** `line 42`, `lines 42-58`. */
   /\blines?\s+\d+/i,
+  /** `session#L42`, and GitHub's `#L42-L58`: the explicit `L` needs no extension to be unambiguous. */
+  /#L\d+/i,
 ]);
 
 /** True when a candidate anchor names a line rather than a symbol (`memory-design.md`). */
@@ -77,10 +100,18 @@ const isBlank = (value: string): boolean => value.trim() === '';
 /**
  * The anchor a knowledge entry speaks to.
  *
- * Two refusals, both structural. A blank anchor is refused because a key left in place with nothing in
+ * Three refusals, all structural. A blank anchor is refused because a key left in place with nothing in
  * it is the same unfalsifiable entry as a key left out — the loader would have nothing to compare the
  * repository's instructions against, and would apply the entry for ever. A line-number anchor is
  * refused per `memory-design.md`.
+ *
+ * **A padded anchor is refused for the blank anchor's reason, not for tidiness.** `"  resolveProject  "`
+ * is stored verbatim and matched verbatim, and no instruction file contains a symbol with two spaces
+ * either side of it — so the anchor can never match, the entry can never be flagged, and it is applied
+ * for ever. That is precisely the outcome AD-16 forbids, reached through the hole the blank refusal
+ * exists to close. Refused rather than trimmed, because a schema that silently rewrote the value would
+ * store something other than what the file says, and because a transform cannot be exported to JSON
+ * Schema (AD-2 exports every contract).
  */
 export const KnowledgeAnchorSchema = z
   .string()
@@ -88,6 +119,11 @@ export const KnowledgeAnchorSchema = z
     message:
       'a knowledge entry must declare the anchor it speaks to: precedence against the repository\'s ' +
       'instructions is decided by that anchor (AD-16), so an entry with none can never be flagged',
+  })
+  .refine((value) => isBlank(value) || value === value.trim(), {
+    message:
+      'an anchor carries no surrounding whitespace: it is matched verbatim against the repository\'s ' +
+      'instructions, so a padded anchor is one nothing can ever match and an entry nothing can ever flag',
   })
   .refine((value) => isBlank(value) || !isLineNumberAnchor(value), {
     message:

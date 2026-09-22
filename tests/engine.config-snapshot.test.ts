@@ -9,7 +9,7 @@
  * configuration again: a step that reached for the repository has nothing to reach for, so the test fails
  * loudly rather than coincidentally.
  */
-import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
@@ -27,10 +27,12 @@ import { runConfigPaths, runPaths } from '../src/runtime/index.js';
 import {
   FIXTURE_PROJECT_ID,
   fixtureAgent,
+  fixturePermissions,
   fixtureProfile,
   makeWorkspace,
   writeAgentFile,
   writeInstructionFile,
+  writePermissions,
   writeProfile,
   writeRawProfile,
 } from './helpers/config-fixture.js';
@@ -47,8 +49,15 @@ afterAll(() => {
   for (const path of workspaces) rmSync(path, { recursive: true, force: true });
 });
 
-/** A ULID-shaped run id, as AD-29 mints. Fixed rather than minted so a failure names the same run. */
-const RUN_ID = '01K5ZQ4RUNIDFIXTUREAA';
+/**
+ * Two real ULIDs, as AD-29 mints: 26 characters of Crockford base32, which excludes `I`, `L`, `O` and `U`.
+ *
+ * The first version used 21-character strings containing `I` and `U` while claiming to be ULIDs. They
+ * passed only because `runPaths` validates a path *segment* and nothing here validated an id, so the suite
+ * could not have caught a reader that did.
+ */
+const RUN_ID = '01K5ZQ4R7N8QME2WD3VXAB6CJT';
+const LATER_RUN_ID = '01K5ZQ4R7N8QME2WD3VXAB6CKZ';
 
 const CLAUDE_MD = '# Conventions\n\nNever call `resolveProject` from a renderer.\n';
 
@@ -75,6 +84,7 @@ const fixture = (label: string): Fixture => {
   const repository = workspace(`${label}-repo`);
   const orchHome = workspace(`${label}-home`);
   writeProfile(repository, profileFor(repository));
+  writePermissions(repository, fixturePermissions());
   writeAgentFile(repository, 'analysis.toml', fixtureAgent());
   writeAgentFile(repository, 'planning.toml', fixtureAgent({ id: 'planning' }));
   writeInstructionFile(repository, 'CLAUDE.md', CLAUDE_MD);
@@ -107,10 +117,12 @@ describe('run start writes the snapshot AD-9 requires (matrix 17)', () => {
 
     expect(snapshot.disposition).toBe('taken');
     expect(snapshot.dir).toBe(runConfigPaths(runPaths(RUN_ID, at.orchHome)).dir);
+    // All three artifacts AD-9's Rule names, plus the conventions text (amended matrix row 17).
     expect([...snapshot.files]).toStrictEqual([
       'agents/analysis.toml',
       'agents/planning.toml',
       'conventions/CLAUDE.md',
+      'permissions.toml',
       'profile.toml',
     ]);
     expect(snapshot.profile.mechanics.commands.test).toBe('npm test');
@@ -134,6 +146,12 @@ describe('run start writes the snapshot AD-9 requires (matrix 17)', () => {
     expect(bytes.get('conventions/CLAUDE.md')).toBe(
       readFileSync(join(at.repository, 'CLAUDE.md'), 'utf8'),
     );
+    expect(bytes.get('permissions.toml')).toBe(
+      readFileSync(join(at.repository, '.orch', 'permissions.toml'), 'utf8'),
+    );
+    // Named through `RunConfigPaths` rather than by joining a segment here, so the snapshot and its
+    // reader cannot disagree about where the third artifact lives.
+    expect(existsSync(runConfigPaths(runPaths(RUN_ID, at.orchHome)).permissions)).toBe(true);
   });
 
   it('snapshots a repository that states no conventions without inventing a file', () => {
@@ -194,6 +212,69 @@ describe('run start writes the snapshot AD-9 requires (matrix 17)', () => {
       join(snapshot.dir, 'agents', 'inventive.toml'),
     );
   });
+
+  it('leaves no profile behind when the copy fails part-way, so the next attempt re-takes (row 19)', () => {
+    const at = fixture('part-way');
+    const paths = runConfigPaths(runPaths(RUN_ID, at.orchHome));
+    /**
+     * A mid-copy failure, injected with `fs` alone: a **directory** where an agent file must land makes
+     * `renameSync` throw, part-way through the copy and before the profile.
+     *
+     * This is what pins "the profile is written last". The earlier test deleted `profile.toml` from a
+     * *complete* snapshot, which passes under any write order — with the profile written first, a part-way
+     * snapshot reports `already_taken` and the run proceeds against zero agents and zero conventions
+     * without a single refusal.
+     */
+    mkdirSync(join(paths.agentsDir, 'analysis.toml'), { recursive: true });
+
+    expect(() =>
+      takeConfigSnapshot({ repository: at.repository, runId: RUN_ID, orchHome: at.orchHome }),
+    ).toThrowError();
+    expect(existsSync(paths.profile)).toBe(false);
+    expect(snapshotBytes(at).has('profile.toml')).toBe(false);
+    // The rest of the partial snapshot is still there — which is the point: its presence is not what marks
+    // a snapshot complete, the profile's is, so the next attempt re-takes rather than trusting this.
+    expect(existsSync(paths.dir)).toBe(true);
+
+    rmSync(join(paths.agentsDir, 'analysis.toml'), { recursive: true, force: true });
+    const second = takeConfigSnapshot({
+      repository: at.repository,
+      runId: RUN_ID,
+      orchHome: at.orchHome,
+    });
+
+    expect(second.disposition).toBe('taken');
+    expect(second.roster.agents.map((entry) => entry.id)).toStrictEqual(['analysis', 'planning']);
+  });
+
+  it('resumes as a snapshot of one moment: a file deleted between attempts is gone from it (row 20)', () => {
+    const at = fixture('resumed');
+    const paths = runConfigPaths(runPaths(RUN_ID, at.orchHome));
+    // Obstructing the *second* agent file, so the first one is genuinely copied before the failure — that
+    // is what makes this a resumed snapshot rather than a first one.
+    mkdirSync(join(paths.agentsDir, 'planning.toml'), { recursive: true });
+    expect(() =>
+      takeConfigSnapshot({ repository: at.repository, runId: RUN_ID, orchHome: at.orchHome }),
+    ).toThrowError();
+    // The first attempt got `analysis` onto disk before it failed — the premise of the row, asserted.
+    expect(snapshotBytes(at).has('agents/analysis.toml')).toBe(true);
+    rmSync(join(paths.agentsDir, 'planning.toml'), { recursive: true, force: true });
+    rmSync(join(at.repository, '.orch', 'agents', 'analysis.toml'));
+    rmSync(join(at.repository, 'CLAUDE.md'));
+
+    const second = takeConfigSnapshot({
+      repository: at.repository,
+      runId: RUN_ID,
+      orchHome: at.orchHome,
+    });
+
+    expect(second.roster.agents.map((entry) => entry.id)).toStrictEqual(['planning']);
+    expect(second.files).not.toContain('agents/analysis.toml');
+    expect(second.files).not.toContain('conventions/CLAUDE.md');
+    expect(snapshotBytes(at).has('agents/analysis.toml')).toBe(false);
+    expect(readStepConfiguration(RUN_ID, { orchHome: at.orchHome }).roster.agents).toHaveLength(1);
+  });
+
 
   it('completes a snapshot a crash left without its profile, because the profile is written last', () => {
     const at = fixture('partial');
@@ -342,7 +423,7 @@ describe('a live run never sees an edit to .orch/ (matrix 18)', () => {
         },
       }),
     );
-    const laterRun = '01K5ZQ4RUNIDFIXTUREBB';
+    const laterRun = LATER_RUN_ID;
 
     takeConfigSnapshot({ repository: at.repository, runId: laterRun, orchHome: at.orchHome });
 
@@ -377,19 +458,50 @@ describe('the snapshot is the only configuration a step can name', () => {
     expect(readdirSync(at.repository).sort()).toStrictEqual(before);
     expect(
       readdirSync(join(at.repository, '.orch'), { recursive: true, encoding: 'utf8' }).sort(),
-    ).toStrictEqual(['agents', 'agents/analysis.toml', 'agents/planning.toml', 'profile.toml']);
+    ).toStrictEqual([
+      'agents',
+      'agents/analysis.toml',
+      'agents/planning.toml',
+      'permissions.toml',
+      'profile.toml',
+    ]);
   });
 
-  it('leaves no temporary behind, so nothing under config/ is debris', () => {
-    const at = fixture('no-debris');
+  it('excludes a stale temporary from the files it reports as configuration (row 21)', () => {
+    const at = fixture('stale-temp');
+    takeConfigSnapshot({ repository: at.repository, runId: RUN_ID, orchHome: at.orchHome });
+    const paths = runConfigPaths(runPaths(RUN_ID, at.orchHome));
+    // The debris a process killed between an atomic write and its rename leaves behind. Planted into a
+    // *complete* snapshot, so nothing clears it: the exclusion has to be doing the work, not a cleanup.
+    const debris = join(paths.agentsDir, 'analysis.toml.99999.1.tmp');
+    writeFileSync(debris, 'half a declaration\n', 'utf8');
 
-    const snapshot = takeConfigSnapshot({
+    const again = takeConfigSnapshot({
       repository: at.repository,
       runId: RUN_ID,
       orchHome: at.orchHome,
     });
 
-    for (const file of snapshot.files) expect(file.endsWith('.tmp')).toBe(false);
-    expect([...snapshotBytes(at).keys()].some((path) => path.endsWith('.tmp'))).toBe(false);
+    expect(again.disposition).toBe('already_taken');
+    expect(again.files).not.toContain('agents/analysis.toml.99999.1.tmp');
+    for (const file of again.files) expect(file.endsWith('.tmp')).toBe(false);
+    // It is still on disk — the claim is that it is not *configuration*, not that this call tidied up.
+    expect(existsSync(debris)).toBe(true);
+    // And the roster is unchanged by it: a `.tmp` was never a roster file.
+    expect(again.roster.agents.map((entry) => entry.id)).toStrictEqual(['analysis', 'planning']);
+  });
+
+  it('removes its own temporary when a write cannot be published', () => {
+    const at = fixture('temp-cleanup');
+    const paths = runConfigPaths(runPaths(RUN_ID, at.orchHome));
+    mkdirSync(join(paths.agentsDir, 'analysis.toml'), { recursive: true });
+
+    expect(() =>
+      takeConfigSnapshot({ repository: at.repository, runId: RUN_ID, orchHome: at.orchHome }),
+    ).toThrowError();
+
+    // The rename threw with the temporary already written; nothing else will ever clean it up, and it sits
+    // in a directory a step reads.
+    expect([...snapshotBytes(at).keys()].filter((path) => path.endsWith('.tmp'))).toStrictEqual([]);
   });
 });

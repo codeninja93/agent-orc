@@ -71,22 +71,52 @@ export interface DiscoveredRoster {
 }
 
 /**
+ * A roster directory that is there and cannot be listed.
+ *
+ * **Absent and unreadable are different answers, and conflating them was the bug.** An `EACCES` on
+ * `.orch/agents/` used to be swallowed into an empty listing, so a person was told "No agents are declared
+ * … the engine holds no built-in list to fall back to" — a sentence about AD-17 describing a permission
+ * problem, and one that reads as though the repository had declared nothing. It also contradicted this
+ * module's own rule that a bad entry is *named* rather than dropped.
+ *
+ * The AD-35 code is `config.invalid` → `escalate-to-human`, like every other malformed-configuration
+ * refusal here.
+ */
+export class RosterDirectoryUnreadable extends Error {
+  readonly code = 'config.invalid';
+  readonly path: string;
+
+  constructor(path: string, cause: unknown) {
+    super(
+      `Cannot list the agent roster at ${path}: ${cause instanceof Error ? cause.message : String(cause)}. ` +
+        'The directory is there and cannot be read, which is not the same as there being no agents — ' +
+        'AD-17 discovers the roster by reading it, so an unreadable one is a refusal and never an empty ' +
+        'roster.',
+      { cause },
+    );
+    this.name = 'RosterDirectoryUnreadable';
+    this.path = path;
+  }
+}
+
+/**
  * Every `*.toml` in the directory, sorted, or nothing at all when there is no directory.
  *
  * Exported because the AD-9 snapshot copies the same set: run scope has to hold *every* roster file,
  * including one discovery refuses, or a step would see a smaller roster than run start did and the
  * snapshot would stop being a faithful copy of the configuration. One answer to "which files are the
  * roster", in the module that owns the question.
+ *
+ * An absent directory answers with nothing, which is matrix row 15's empty roster. A directory that exists
+ * and cannot be listed throws {@link RosterDirectoryUnreadable} instead — row 22.
  */
 export const rosterFileNames = (agentsDir: string): readonly string[] => {
   if (!existsSync(agentsDir)) return [];
   let names: readonly string[];
   try {
     names = readdirSync(agentsDir, { encoding: 'utf8' });
-  } catch {
-    // Unreadable is indistinguishable from absent for the purpose of discovery, and both are an empty
-    // roster rather than an invented one.
-    return [];
+  } catch (error) {
+    throw new RosterDirectoryUnreadable(agentsDir, error);
   }
   return names
     .filter((name) => name.endsWith(AGENT_FILE_EXTENSION))
@@ -192,7 +222,21 @@ const rosterSummary = (
 export const discoverRoster = (source: ConfigurationSource): DiscoveredRoster => {
   const agents: RosterEntry[] = [];
   const refused: RosterRefusal[] = [];
-  for (const fileName of rosterFileNames(source.agentsDir)) {
+  let fileNames: readonly string[];
+  try {
+    fileNames = rosterFileNames(source.agentsDir);
+  } catch (error) {
+    // The directory itself is the refused thing, so it is reported the way a refused entry is: named, with
+    // a code, beside an empty roster rather than as an empty roster.
+    const { code, reason } = reasonOf(error);
+    return {
+      agentsDir: source.agentsDir,
+      agents: [],
+      refused: [{ path: source.agentsDir, code, reason }],
+      summary: reason,
+    };
+  }
+  for (const fileName of fileNames) {
     const result = readDeclaration(source.agentsDir, fileName);
     if (isRefusal(result)) {
       refused.push(result);

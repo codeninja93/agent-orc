@@ -31,9 +31,9 @@
  * `already_taken` — not because writing would be slow, but because writing would be the mid-run edit
  * arriving through the front door.
  */
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import type { Dirent } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 
 import { fsyncDirectory, runConfigPaths, runPaths } from '../runtime/index.js';
 import type { RunConfigPaths } from '../runtime/index.js';
@@ -59,15 +59,24 @@ const writeSnapshotFile = (absolute: string, contents: string): void => {
   mkdirSync(directory, { recursive: true });
   tempCounter += 1;
   const temp = `${absolute}.${String(process.pid)}.${String(tempCounter)}.tmp`;
-  writeFileSync(temp, contents, { encoding: 'utf8', mode: 0o644 });
-  const fd = openSync(temp, 'r');
+  let published = false;
   try {
-    fsyncSync(fd);
-  } catch {
-    // Unsynced contents are a durability weakness, not a torn file: the rename is still atomic.
+    writeFileSync(temp, contents, { encoding: 'utf8', mode: 0o644 });
+    const fd = openSync(temp, 'r');
+    try {
+      fsyncSync(fd);
+    } catch {
+      // Unsynced contents are a durability weakness, not a torn file: the rename is still atomic.
+    }
+    closeSync(fd);
+    renameSync(temp, absolute);
+    published = true;
+  } finally {
+    // A rename that threw leaves the temporary behind, and a snapshot is a directory a step reads: debris
+    // in it is not configuration, so it is removed on the way out rather than left for a sweep that does
+    // not exist. `force` because the failure may have been the write itself, with no temporary to remove.
+    if (!published) rmSync(temp, { force: true });
   }
-  closeSync(fd);
-  renameSync(temp, absolute);
   fsyncDirectory(directory);
 };
 
@@ -98,6 +107,7 @@ export const snapshotConfiguration = (
     label: paths.dir,
     profile: paths.profile,
     agentsDir: paths.agentsDir,
+    permissions: paths.permissions,
     conventionsDir: paths.conventionsDir,
   };
 };
@@ -138,25 +148,114 @@ export interface TakeConfigSnapshotOptions extends ConfigSnapshotOptions {
  * would report a complete snapshot as a single file. Sorted by code unit rather than by locale so two
  * machines report the same snapshot identically.
  */
-const snapshotFiles = (dir: string, prefix = ''): readonly string[] => {
+const snapshotEntries = (dir: string, prefix = ''): readonly string[] => {
+  /**
+   * Absence answers with nothing; anything else is raised.
+   *
+   * The `catch` that used to be here returned `[]`, which reported an unreadable directory as an empty
+   * one — the same conflation `rosterFileNames` was fixed for. There is nothing to translate into a coded
+   * refusal at this level: a `config/` that cannot be read has already failed the profile read, which
+   * raises `ProfileUnreadable` carrying `config.invalid`. So the only case worth answering for is the
+   * directory that is not there.
+   */
+  if (!existsSync(dir)) return [];
   // The encoding is pinned so `readdirSync` resolves to the string-named overload; without it TS picks
   // the Buffer one and `entry.name` comes back as bytes.
-  let listing: Dirent<string>[];
-  try {
-    listing = readdirSync(dir, { withFileTypes: true, encoding: 'utf8' });
-  } catch {
-    return [];
-  }
+  const listing: Dirent<string>[] = readdirSync(dir, { withFileTypes: true, encoding: 'utf8' });
   const found: string[] = [];
   for (const entry of listing) {
-    const relative = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+    const relativePath = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
     if (entry.isDirectory()) {
-      found.push(...snapshotFiles(join(dir, entry.name), relative));
+      found.push(...snapshotEntries(join(dir, entry.name), relativePath));
       continue;
     }
-    found.push(relative);
+    found.push(relativePath);
   }
   return found.sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+};
+
+/** The extension an interrupted atomic write leaves behind. Debris, never configuration. */
+const TEMPORARY_EXTENSION = '.tmp';
+
+/**
+ * The snapshot's *configuration* files: every entry except the debris of an interrupted write.
+ *
+ * A `<name>.<pid>.<n>.tmp` beside the file it was about to become is what a process killed between the
+ * write and the rename leaves; it is never a file a step should be handed, and reporting it inside
+ * `snapshot.files` would list it as part of the run's configuration. The same exclusion
+ * `src/runtime/commands.ts` applies to an intent directory, for the same reason.
+ */
+const snapshotFiles = (dir: string): readonly string[] =>
+  snapshotEntries(dir).filter((path) => !path.endsWith(TEMPORARY_EXTENSION));
+
+/** One file the snapshot copies: where it lands, what it holds, and its path inside `config/`. */
+interface SnapshotCopy {
+  /** Relative to `config/`, with `/` separators on every platform. */
+  readonly relative: string;
+  readonly absolute: string;
+  readonly contents: string;
+}
+
+const insideConfig = (dir: string, absolute: string): string =>
+  relative(dir, absolute).split(sep).join('/');
+
+/**
+ * Everything the snapshot will hold, read from project scope before anything is written.
+ *
+ * Built as a list rather than written as it is read, because the *order* is load-bearing — the profile is
+ * last — and because the set is what decides which existing entries under `config/` are stale.
+ *
+ * All three artifacts AD-9's Rule names are here: `profile.toml`, every `agents/*.toml`, and
+ * `permissions.toml`. The first version carried two of them, which left a step needing the granted tools
+ * or the egress allowlist with no snapshot path and therefore with `.orch/` as its only option.
+ */
+const copiesFor = (
+  projectScope: ConfigurationSource,
+  target: RunConfigPaths,
+  loaded: ResolvedProfile,
+): readonly SnapshotCopy[] => {
+  const copies: SnapshotCopy[] = [];
+  const add = (absolute: string, contents: string): void => {
+    copies.push({ relative: insideConfig(target.dir, absolute), absolute, contents });
+  };
+  // Every roster *file*, not only the ones that loaded: a file discovery refuses is part of this run's
+  // configuration, and a snapshot that quietly dropped it would show a step a smaller roster than run
+  // start saw — and would hide the refusal from whatever reads the snapshot later.
+  for (const fileName of rosterFileNames(projectScope.agentsDir)) {
+    add(join(target.agentsDir, fileName), readFileSync(join(projectScope.agentsDir, fileName), 'utf8'));
+  }
+  for (const file of loaded.conventions.files) {
+    // Verbatim, per AD-16: the conventions a step reads are the repository's own text, and a run reads
+    // them from here because the feature branch can edit the repository's copy while the run is live.
+    add(join(target.conventionsDir, file.name), file.text);
+  }
+  if (existsSync(projectScope.permissions)) {
+    add(target.permissions, readFileSync(projectScope.permissions, 'utf8'));
+  }
+  // Last, as the installer writes its manifest last: the profile's presence is what marks a snapshot
+  // complete, so a process killed part-way leaves one the next attempt re-takes rather than trusts.
+  add(target.profile, readFileSync(projectScope.profile, 'utf8'));
+  return copies;
+};
+
+/**
+ * Remove every file under `config/` the copy about to happen will not replace.
+ *
+ * This is what makes a **resumed** snapshot a snapshot of one moment rather than a hybrid of two. An
+ * attempt that failed part-way leaves files behind; if `.orch/` has since lost an agent, the completing
+ * call would copy what `.orch/` holds now into a directory still holding what it held before, and hand a
+ * step an agent the repository no longer declares.
+ *
+ * Only files the new set does not contain are removed, so a *directory* obstructing a path the copy is
+ * about to write is left exactly where it is — the write fails there, loudly, instead of being cleared
+ * away and silently succeeding.
+ */
+const pruneStaleEntries = (dir: string, copies: readonly SnapshotCopy[]): void => {
+  const keep = new Set(copies.map((copy) => copy.relative));
+  for (const path of snapshotEntries(dir)) {
+    if (keep.has(path)) continue;
+    rmSync(join(dir, ...path.split('/')), { recursive: true, force: true });
+  }
 };
 
 /**
@@ -199,27 +298,30 @@ export const takeConfigSnapshot = (options: TakeConfigSnapshotOptions): ConfigSn
 
   mkdirSync(target.dir, { recursive: true });
 
-  // Every roster *file*, not only the ones that loaded: a file discovery refuses is part of this run's
-  // configuration, and a snapshot that quietly dropped it would show a step a smaller roster than run
-  // start saw — and would hide the refusal from whatever reads the snapshot later.
-  for (const fileName of rosterFileNames(projectScope.agentsDir)) {
-    writeSnapshotFile(
-      join(target.agentsDir, fileName),
-      readFileSync(join(projectScope.agentsDir, fileName), 'utf8'),
-    );
-  }
-  for (const file of loaded.conventions.files) {
-    // Verbatim, per AD-16: the conventions a step reads are the repository's own text, and a run reads
-    // them from here because the feature branch can edit the repository's copy while the run is live.
-    writeSnapshotFile(join(target.conventionsDir, file.name), file.text);
-  }
-  // Last, as the installer writes its manifest last: the profile's presence is what marks a snapshot
-  // complete, so a process killed part-way leaves one that the next attempt completes.
-  writeSnapshotFile(target.profile, readFileSync(projectScope.profile, 'utf8'));
+  const copies = copiesFor(projectScope, target, loaded);
+  pruneStaleEntries(target.dir, copies);
+  for (const copy of copies) writeSnapshotFile(copy.absolute, copy.contents);
   fsyncDirectory(target.dir);
 
-  const profile = resolveProfile(runScope);
-  const roster = discoverRoster(runScope);
+  let profile: ResolvedProfile;
+  let roster: DiscoveredRoster;
+  try {
+    profile = resolveProfile(runScope);
+    roster = discoverRoster(runScope);
+  } catch (error) {
+    /**
+     * The copy produced a snapshot that cannot be read back, so it is removed before the refusal is
+     * rethrown.
+     *
+     * The window is real: `.orch/profile.toml` is validated, then copied, and a hand edit landing between
+     * those two moments is copied unvalidated. Leaving it would be worse than the failure itself —
+     * `profile.toml` now exists, so every later call takes the `already_taken` path, resolves the same bad
+     * bytes and fails identically, with no recovery but deleting `config/` by hand. Removing it means the
+     * next attempt re-takes from whatever `.orch/` holds by then.
+     */
+    rmSync(target.dir, { recursive: true, force: true });
+    throw error;
+  }
   return {
     runId: options.runId,
     dir: target.dir,
@@ -229,7 +331,7 @@ export const takeConfigSnapshot = (options: TakeConfigSnapshotOptions): ConfigSn
     roster,
     summary:
       `Snapshotted the configuration of project ${profile.profile.project.id} for run ` +
-      `${options.runId} into ${target.dir}: the profile, ${String(roster.agents.length)} agent ` +
+      `${options.runId} into ${target.dir}: the profile, permissions, ${String(roster.agents.length)} agent ` +
       `${roster.agents.length === 1 ? 'declaration' : 'declarations'} and ` +
       `${profile.conventions.files.length === 0 ? 'no instruction file' : profile.conventions.files.map((file) => file.name).join(' and ')}` +
       '. It is this run\'s only configuration from now on (AD-9).',

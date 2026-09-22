@@ -60,6 +60,24 @@ export class TomlParseError extends Error {
 /** A bare key needs no quoting; anything else is quoted, so a key is never ambiguous. */
 const BARE_KEY_PATTERN = /^[A-Za-z0-9_-]+$/;
 
+/**
+ * Keys that reach `Object.prototype` rather than the table, and are refused rather than assigned.
+ *
+ * `parseToml('[__proto__]\nx = 1\n')` used to return a table with no own keys and leave `({}).x === 1`
+ * — prototype pollution, process-wide, from one hand edit of `profile.toml`. It was survivable while the
+ * installer was the only reader of its own output; the engine now parses the profile at run start, in the
+ * process that spawns every step, so a profile is untrusted input on a path that matters.
+ *
+ * Both halves of the fix are needed: tables are built with `Object.create(null)`, so an assignment cannot
+ * reach a prototype at all, and these names are refused outright, so a key that would silently vanish into
+ * one is a named refusal carrying its line instead.
+ */
+export const FORBIDDEN_TOML_KEYS: readonly string[] = Object.freeze([
+  '__proto__',
+  'constructor',
+  'prototype',
+]);
+
 const escapeString = (value: string): string =>
   value
     .replace(/\\/g, '\\\\')
@@ -137,8 +155,22 @@ const serialiseTable = (table: TomlTable, path: readonly string[], out: string[]
   if (scalars.length > 0) {
     if (path.length > 0) out.push(`[${formatHeader(path)}]`);
     out.push(...scalars, '');
-  } else if (path.length > 0 && tables.length === 0 && tableArrays.length === 0) {
-    // An empty table still has to appear, or reading the file back loses the fact that it is there.
+  } else if (
+    path.length > 0 &&
+    tables.length === 0 &&
+    tableArrays.length === 0 &&
+    Object.keys(table).length === 0
+  ) {
+    /**
+     * A table deliberately declared empty still has to appear, or reading the file back loses the fact
+     * that it is there.
+     *
+     * The `Object.keys` check is what distinguishes that from a table whose every value is `undefined`,
+     * which is how an absent optional section arrives — `{ knowledge: { entries: undefined } }`. Without
+     * it, the serialiser emitted `[knowledge]` for a section that is not there: the very "empty table"
+     * this file documents as *different from absent*, and one `ProfileSchema` then refuses on read-back,
+     * so the codec could write a file the loader rejects.
+     */
     out.push(`[${formatHeader(path)}]`, '');
   }
 
@@ -195,6 +227,16 @@ const splitKeyPath = (raw: string, line: number): string[] => {
   segments.push(current.trim());
   if (segments.some((segment) => segment === '')) {
     throw new TomlParseError(`"${raw}" is not a key`, line);
+  }
+  // Every key and every table header comes through here, so one check covers `__proto__ = 1`,
+  // `a.__proto__.b = 1`, `[__proto__]` and `[[constructor]]` alike.
+  const forbidden = segments.find((segment) => FORBIDDEN_TOML_KEYS.includes(segment));
+  if (forbidden !== undefined) {
+    throw new TomlParseError(
+      `"${forbidden}" cannot be a key: it names a JavaScript object's prototype rather than a value in ` +
+        'this table, so reading it would change every object in the process instead of this file',
+      line,
+    );
   }
   return segments;
 };
@@ -291,10 +333,13 @@ const parseArray = (body: string, line: number): TomlScalar[] =>
 /** The parser's own table while it is being filled. Mirrors {@link TomlTable}, mutably. */
 type MutableTable = Record<string, TomlValue | undefined>;
 
+/** A table with no prototype, so no assignment into it can ever reach `Object.prototype`. */
+const emptyTable = (): MutableTable => Object.create(null) as MutableTable;
+
 const childTable = (parent: MutableTable, key: string, line: number): MutableTable => {
   const existing = parent[key];
   if (existing === undefined) {
-    const created: MutableTable = {};
+    const created: MutableTable = emptyTable();
     parent[key] = created;
     return created;
   }
@@ -313,7 +358,7 @@ const childTable = (parent: MutableTable, key: string, line: number): MutableTab
  * which is where the *shape* is decided — this only decides what the bytes say.
  */
 export const parseToml = (text: string): TomlTable => {
-  const root: MutableTable = {};
+  const root: MutableTable = emptyTable();
   let current: MutableTable = root;
   const lines = text.split('\n');
 
@@ -329,7 +374,7 @@ export const parseToml = (text: string): TomlTable => {
       for (const segment of path.slice(0, -1)) table = childTable(table, segment, lineNumber);
       const key = path[path.length - 1] ?? '';
       const existing = table[key];
-      const entry: MutableTable = {};
+      const entry: MutableTable = emptyTable();
       if (existing === undefined) {
         table[key] = [entry];
       } else if (isTableArray(existing)) {

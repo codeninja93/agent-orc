@@ -26,6 +26,7 @@ import {
   AGENTS_DIR_NAME,
   AgentDeclarationSchema,
   CURRENT_SCHEMA_VERSION,
+  KnowledgeSectionSchema,
   MANIFEST_FILE_NAME,
   ManifestSchema,
   PERMISSIONS_FILE_NAME,
@@ -34,7 +35,13 @@ import {
   ProfileSchema,
   getContract,
 } from '../contracts/index.js';
-import type { AgentDeclaration, Manifest, Permissions, Profile } from '../contracts/index.js';
+import type {
+  AgentDeclaration,
+  KnowledgeSection,
+  Manifest,
+  Permissions,
+  Profile,
+} from '../contracts/index.js';
 import { fsyncDirectory } from '../runtime/commands.js';
 
 import { orchPaths, relativeOrchPath } from './answers.js';
@@ -42,7 +49,7 @@ import { BUILT_IN_AGENTS } from './interview.js';
 import type { AgentDeclarationInput, Answers } from './interview.js';
 import { buildManifest } from './manifest.js';
 import type { WrittenFile } from './manifest.js';
-import { serialiseToml } from './toml.js';
+import { parseToml, serialiseToml } from './toml.js';
 import type { TomlTable } from './toml.js';
 
 /**
@@ -104,35 +111,64 @@ export const writeFileIfChanged = (absolute: string, contents: string): WriteDis
   return exists ? 'updated' : 'created';
 };
 
+/**
+ * The knowledge section already on disk, so a re-run does not destroy it.
+ *
+ * AD-16 makes the section **additive** and AD-12 makes an upgrade a **re-run**, and those two together are
+ * a requirement on this function: `renderProfile` builds the profile from the interview's answers, the
+ * interview has no question that produces a knowledge entry, and `profile.toml` is rewritten whole — so
+ * without this, every entry the stage-5 bootstrap agent writes is erased by the next `orch init`, and the
+ * half-install check then reports the profile as `altered` and restores the shorter version.
+ *
+ * Read leniently, in the idiom `src/installer/answers.ts` uses for the same file: an unreadable or
+ * unrecognised section carries nothing forward rather than refusing an install. The strict read belongs to
+ * the engine's loader, which is the unit that acts on the entries.
+ */
+export const existingKnowledge = (repositoryPath: string): KnowledgeSection | undefined => {
+  const path = orchPaths(repositoryPath).profile;
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = KnowledgeSectionSchema.safeParse(parseToml(readFileSync(path, 'utf8'))['knowledge']);
+    return parsed.success ? parsed.data : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 /** The profile as a table, in the order it is written. */
-export const renderProfile = (answers: Answers, repositoryPath: string): Profile => ({
-  schema_version: CURRENT_SCHEMA_VERSION,
-  project: {
-    id: answers.project.id,
-    /**
-     * The path the installer actually ran against, not the one the previous profile recorded.
-     *
-     * AD-10 — the id is the first-commit SHA and the filesystem path is "a mutable pointer updated
-     * on mismatch". A repository that moved keeps its id and gets its pointer corrected here.
-     */
-    path: repositoryPath,
-    remote: answers.project.remote,
-  },
-  mechanics: {
-    package_manager: answers.mechanics.package_manager,
-    commands: answers.mechanics.commands,
-    source_layout: [...answers.source_layout],
-    resources: answers.resources,
-  },
-  risk: {
-    high_blast_radius_paths: [...answers.high_blast_radius_paths],
-    conflict_domains: [...answers.conflict_domains],
-  },
-  roster: { builtin_agents: [...answers.builtin_agents] },
-  branch_pattern: answers.branch_pattern,
-  autonomy_start: answers.autonomy_start,
-  ceilings: answers.ceilings,
-});
+export const renderProfile = (answers: Answers, repositoryPath: string): Profile => {
+  const knowledge = existingKnowledge(repositoryPath);
+  return {
+    schema_version: CURRENT_SCHEMA_VERSION,
+    project: {
+      id: answers.project.id,
+      /**
+       * The path the installer actually ran against, not the one the previous profile recorded.
+       *
+       * AD-10 — the id is the first-commit SHA and the filesystem path is "a mutable pointer updated
+       * on mismatch". A repository that moved keeps its id and gets its pointer corrected here.
+       */
+      path: repositoryPath,
+      remote: answers.project.remote,
+    },
+    mechanics: {
+      package_manager: answers.mechanics.package_manager,
+      commands: answers.mechanics.commands,
+      source_layout: [...answers.source_layout],
+      resources: answers.resources,
+    },
+    risk: {
+      high_blast_radius_paths: [...answers.high_blast_radius_paths],
+      conflict_domains: [...answers.conflict_domains],
+    },
+    roster: { builtin_agents: [...answers.builtin_agents] },
+    branch_pattern: answers.branch_pattern,
+    autonomy_start: answers.autonomy_start,
+    ceilings: answers.ceilings,
+    // Carried through rather than rebuilt: no answer produces one, so the copy on disk is the only copy.
+    ...(knowledge === undefined ? {} : { knowledge }),
+  };
+};
 
 /** Every agent the answers enable, built-in and custom, in the order they are written. */
 export const enabledAgents = (answers: Answers): readonly AgentDeclarationInput[] => [
