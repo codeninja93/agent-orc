@@ -14,10 +14,11 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { exportContract } from '../src/contracts/index.js';
+import { dispositionFor, exportContract } from '../src/contracts/index.js';
 import {
   AD1_REQUIRED_FLAGS,
   ADR001_REQUIRED_FLAGS,
+  AddDirNotAbsolute,
   buildStepArgv,
   defaultPromptFor,
   missingRequiredFlags,
@@ -159,5 +160,94 @@ describe('the prompt re-grounds the agent on the request itself (matrix 20)', ()
     expect(prompt).toContain(`step.${phase}`);
     // Two attempts at one step are byte-identical invocations, which is what makes a re-run a re-run.
     expect(defaultPromptFor(requestFor(phase, step))).toBe(prompt);
+  });
+});
+
+/**
+ * Matrix 25 — a flag's presence is not its value.
+ *
+ * This is the guard this story added failing the same way the list it replaced did, one level down. The
+ * AD-20 wrapper is free to rebuild `args`; one that keeps `--tools` while emptying it hands the agent a
+ * grant nobody declared, and a check that asks only whether the *word* appears answers "the contract
+ * holds" for exactly that argv.
+ */
+describe('a flag whose value was rewritten is named, not counted as present (matrix 25)', () => {
+  /** What a wrapper does: keep the flag, change what follows it. */
+  const rewrite = (argv: readonly string[], flag: string, value: string): readonly string[] => {
+    const at = argv.indexOf(flag);
+    return argv.map((argument, index) => (index === at + 1 ? value : argument));
+  };
+
+  it('names --tools when a wrapper empties its value', () => {
+    const argv = rewrite(argvWithGrant({ tools: 'Read,Grep,Glob' }), '--tools', '');
+
+    // The word is still there, which is all the presence-only check ever asked.
+    expect(argv).toContain('--tools');
+    expect(missingRequiredFlags(argv)).toStrictEqual([]);
+    // Against the grant that was actually declared, it is missing.
+    expect(missingRequiredFlags(argv, { tools: 'Read,Grep,Glob' })).toStrictEqual(['--tools']);
+  });
+
+  it('names --tools when a wrapper widens the grant instead of emptying it', () => {
+    const argv = rewrite(argvWithGrant({ tools: 'Read,Grep,Glob' }), '--tools', 'Read,Write,Bash');
+    expect(missingRequiredFlags(argv, { tools: 'Read,Grep,Glob' })).toStrictEqual(['--tools']);
+  });
+
+  it('names --add-dir when a wrapper points it somewhere else', () => {
+    const argv = rewrite(argvWithGrant({ addDir: '/tmp/run-worktree' }), '--add-dir', '/');
+    expect(missingRequiredFlags(argv, { addDir: '/tmp/run-worktree' })).toStrictEqual(['--add-dir']);
+  });
+
+  it('accepts the empty grant an empty declaration composes, which is a value and not an absence', () => {
+    // ADR-003 does not grant nothing to anyone, but AD-17 lets a roster declare it, and the CLI spells
+    // it `--tools ""`. The expected value is `''`, so the argv carrying `''` holds the contract — the
+    // check is equality with what the grant composed, never "is it non-empty".
+    const argv = argvWithGrant({ tools: '' });
+    expect(argv[argv.indexOf('--tools') + 1]).toBe('');
+    expect(missingRequiredFlags(argv, { tools: '' })).toStrictEqual([]);
+    expect(missingRequiredFlags(argv, { tools: 'Read' })).toStrictEqual(['--tools']);
+  });
+
+  it('names a flag left at the very end of the vector with no value at all', () => {
+    const argv = [...without(argvWithGrant(), '--tools'), '--tools'];
+    expect(argv).toContain('--tools');
+    expect(missingRequiredFlags(argv, { tools: 'Read,Grep,Glob' })).toStrictEqual(['--tools']);
+  });
+});
+
+/**
+ * Matrix 26 — `--add-dir` is the absolute run worktree or it is nothing.
+ *
+ * `request.worktree` reaches this flag unchecked, and an empty string is what an unset one arrives as.
+ * Under `--restricted` this is half of what bounds the agent's file tools, so a wrong value is a widening
+ * with no other observable difference — the same failure mode the flag list itself had.
+ */
+describe('the --add-dir value is checked, not merely passed on (matrix 26)', () => {
+  it.each([
+    ['', 'an unset worktree'],
+    ['   ', 'whitespace'],
+    ['worktrees/run-1', 'a relative path'],
+    ['./worktrees/run-1', 'a path relative to somewhere the CLI chooses'],
+  ])('refuses %j, which is %s', (addDir) => {
+    expect(() =>
+      buildStepArgv({
+        schema: {},
+        prompt: 'p',
+        model: 'claude-haiku-4-5',
+        tools: 'Read',
+        addDir,
+      }),
+    ).toThrowError(AddDirNotAbsolute);
+  });
+
+  it('carries config.invalid, so a misconfigured worktree reaches a person rather than a retry', () => {
+    const refusal = new AddDirNotAbsolute('');
+    expect(refusal.code).toBe('config.invalid');
+    expect(dispositionFor(refusal.code)).toBe('escalate-to-human');
+  });
+
+  it('accepts an absolute path, which is what a run worktree is', () => {
+    const argv = argvWithGrant({ addDir: '/tmp/orch/worktrees/run-1' });
+    expect(argv[argv.indexOf('--add-dir') + 1]).toBe('/tmp/orch/worktrees/run-1');
   });
 });

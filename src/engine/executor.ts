@@ -87,6 +87,18 @@ export interface StepTermination {
   /** The session id the attempt ran under, when one was reported. */
   readonly sessionId: string | null;
   readonly output: StepOutput | null;
+  /**
+   * The same output as the step's *own* contract validated it, before it was narrowed to a `StepOutput`.
+   *
+   * `StepOutputSchema` is a subset of a phase-specific contract — `step.analysis` adds claims, a declared
+   * territory and the files read — and parsing through it strips exactly those fields. The loop needs some
+   * of them: the territory an analysis declares is what the engine records as the AD-4 re-declaration, and
+   * a loop reading it off `output` would find it gone. So the port carries both, and which is which is
+   * stated rather than implied: `output` is the shape every step has and the loop can always read;
+   * this is the shape *this* step's contract has, and a reader must parse it against that contract before
+   * trusting a field. `undefined` when the executor validated nothing against a contract of its own.
+   */
+  readonly contractOutput?: unknown;
   readonly error: OrchError | null;
   /**
    * What the attempt cost and consumed, or `null` when the CLI reported nothing.
@@ -158,6 +170,8 @@ export const terminated = (
   extra: {
     readonly sessionId?: string | null;
     readonly output?: StepOutput | null;
+    /** The contract's own parse of the output; see {@link StepTermination.contractOutput}. */
+    readonly contractOutput?: unknown;
     readonly error?: OrchError | null;
     readonly usage?: StepUsage | null;
   } = {},
@@ -166,6 +180,7 @@ export const terminated = (
   disposition,
   sessionId: extra.sessionId ?? null,
   output: extra.output ?? null,
+  ...(extra.contractOutput === undefined ? {} : { contractOutput: extra.contractOutput }),
   error: extra.error ?? null,
   // Absent means unrecorded, never zero: a double that says nothing about usage must not have the loop
   // record that the step was free (R8).

@@ -47,6 +47,7 @@
 import { spawn } from 'node:child_process';
 import { accessSync, constants as fsConstants, statSync } from 'node:fs';
 import { constants as osConstants } from 'node:os';
+import { basename, isAbsolute } from 'node:path';
 
 import {
   exportContract,
@@ -73,6 +74,7 @@ import {
 } from './node-path.js';
 import type { ChildNode } from './node-path.js';
 import { AgentGrantUnresolved, resolveAgentGrant, toolsArgumentFor } from './agents.js';
+import { ProfileNotFound, ProfileUnreadable } from './profile.js';
 import type { AgentGrant } from './agents.js';
 import { createStreamParser } from './stream.js';
 import type { ResultRecord, StreamRecord } from './stream.js';
@@ -118,6 +120,27 @@ export const SPAWNER_EVENT_TYPES = {
 export type SpawnerEventType = (typeof SPAWNER_EVENT_TYPES)[keyof typeof SPAWNER_EVENT_TYPES];
 
 /**
+ * The `agent.spawned` keys carrying the AD-17 grant, spelled once.
+ *
+ * The rest of that payload is spelled inline, and these four are not, for the same reason
+ * `DECLARATION_PAYLOAD_KEYS` exists in `src/contracts/event.ts`: they are the record of a *security*
+ * decision, they are the only fields on this event a reviewer or a later audit reads back, and a key
+ * renamed at the emitter while a reader still looks for the old one loses the grant silently. Declared
+ * here rather than in contracts because no unit outside the engine reads `agent.spawned` yet; the day one
+ * does, this moves there and the emitter does not change.
+ */
+export const SPAWN_GRANT_PAYLOAD_KEYS = {
+  /** Exactly what the roster declared, in the order it declared it. */
+  GrantedTools: 'granted_tools',
+  /** The subset of those that can change something. Never a copy of the grant. */
+  ElevatedTools: 'elevated_tools',
+  /** The agent id the phase resolved to. */
+  AgentId: 'agent_id',
+  /** The declaration file the grant was read from, by name: AD-21 rewrites the path around it. */
+  GrantDeclaredAt: 'grant_declared_file',
+} as const;
+
+/**
  * The four flags ADR-001's accepted decision requires on every spawn, as that decision enumerates them.
  *
  * Quoted so the list can be compared to the ADR rather than to itself: "`--restricted` (which ignores
@@ -155,6 +178,29 @@ export const AD1_REQUIRED_FLAGS = [
   '--add-dir',
   '--tools',
 ] as const;
+
+/**
+ * The `--add-dir` value was not an absolute path, so the spawn cannot be bounded to the run worktree.
+ *
+ * `config.invalid` → `escalate-to-human`, and listed in {@link KEEPS_ITS_OWN_CODE} so it is not relabelled
+ * as a retryable spawn failure: a run whose worktree is empty or relative is misconfigured, and a loop
+ * retrying it would re-spawn the same unbuildable step for ever.
+ */
+export class AddDirNotAbsolute extends Error {
+  readonly code = 'config.invalid';
+  readonly addDir: string;
+
+  constructor(addDir: string) {
+    super(
+      `Refusing to spawn with --add-dir "${addDir}": ADR-001 scopes it to the run worktree, which is an ` +
+        'absolute path. A relative value is resolved against the CLI\u2019s own working directory and an ' +
+        'empty one admits nothing, and under --restricted this flag is half of what bounds the ' +
+        'agent\u2019s file tools \u2014 so a wrong value widens the surface with no other symptom.',
+    );
+    this.name = 'AddDirNotAbsolute';
+    this.addDir = addDir;
+  }
+}
 
 /** The one accepted `--output-format`. The parser in `stream.ts` reads this and only this. */
 export const STREAM_OUTPUT_FORMAT = 'stream-json';
@@ -386,6 +432,17 @@ export interface StepArgvOptions {
  * `.mcp.json` decide.
  */
 export const buildStepArgv = (options: StepArgvOptions): readonly string[] => {
+  /**
+   * `--add-dir` is the absolute run worktree or it is nothing.
+   *
+   * A relative value is resolved by the CLI against *its own* working directory, so `--add-dir ''` or
+   * `--add-dir worktrees/x` admits some directory nobody chose — and an empty string is what an unset
+   * `request.worktree` arrives as. Under `--restricted` this is half of what bounds the agent's file
+   * tools, so a wrong value here is a widening with no other symptom, which is the same class of failure
+   * the flag list itself had. Refused with `config.invalid`: no retry and no model rung fixes a run
+   * configured without a worktree.
+   */
+  if (!isAbsolute(options.addDir)) throw new AddDirNotAbsolute(options.addDir);
   const argv: string[] = [
     '--print',
     options.prompt,
@@ -412,9 +469,55 @@ export const buildStepArgv = (options: StepArgvOptions): readonly string[] => {
   return argv;
 };
 
-/** Which flags of {@link AD1_REQUIRED_FLAGS} an argv is missing. Empty means the contract holds. */
-export const missingRequiredFlags = (argv: readonly string[]): readonly string[] =>
-  AD1_REQUIRED_FLAGS.filter((flag) => !argv.includes(flag));
+/**
+ * The values a caller can require an argv to carry, not merely to mention.
+ *
+ * Both are the ones ADR-001 makes load-bearing, and both are what a wrapper is in a position to rewrite.
+ */
+export interface RequiredFlagValues {
+  /** The `--tools` value the AD-17 grant composed. `''` is a real value: an agent granted nothing. */
+  readonly tools?: string;
+  /** The `--add-dir` value: the absolute run worktree. */
+  readonly addDir?: string;
+}
+
+/** The value an argv carries after a flag, or `null` when the flag is absent or ends the vector. */
+const valueAfter = (argv: readonly string[], flag: string): string | null => {
+  const at = argv.indexOf(flag);
+  if (at === -1 || at + 1 >= argv.length) return null;
+  return argv[at + 1] ?? null;
+};
+
+/**
+ * Which flags of {@link AD1_REQUIRED_FLAGS} an argv is missing. Empty means the contract holds.
+ *
+ * **A flag's presence is not its value, and this guard failed that way once already.** The list it replaced
+ * omitted `--tools` outright and so reported "the contract holds" for an argv with no grant. Checking only
+ * that the *name* appears repeats the shape of that defect one level down: the AD-20 wrapper is free to
+ * rebuild `args`, and one that kept `--tools` while emptying or rewriting its value would hand the agent a
+ * different grant from the one the roster declared, with the guard still answering empty. So when the
+ * caller knows what the values must be — the spawner always does; it composed them — it passes them, and a
+ * flag whose value does not match is reported as missing. It is *missing* rather than "wrong" because the
+ * flag the contract requires is `--tools <the grant>`, and an argv carrying `--tools` with something else
+ * does not carry that flag.
+ *
+ * With no expectations supplied the check is presence-only, which is what a caller holding an argv it did
+ * not build can honestly ask.
+ */
+export const missingRequiredFlags = (
+  argv: readonly string[],
+  expected: RequiredFlagValues = {},
+): readonly string[] =>
+  AD1_REQUIRED_FLAGS.filter((flag) => {
+    if (!argv.includes(flag)) return true;
+    if (flag === '--tools' && expected.tools !== undefined) {
+      return valueAfter(argv, flag) !== expected.tools;
+    }
+    if (flag === '--add-dir' && expected.addDir !== undefined) {
+      return valueAfter(argv, flag) !== expected.addDir;
+    }
+    return false;
+  });
 
 /**
  * Map a result line that is not a usable success onto an AD-35 code.
@@ -438,6 +541,13 @@ const KEEPS_ITS_OWN_CODE = [
   // A phase nothing declares is `config.invalid` → `escalate-to-human`: no model rung and no retry fixes a
   // roster, and relabelling it `retryable` would have the loop re-spawning a step that cannot be built.
   AgentGrantUnresolved,
+  // Resolving that grant reads the run's AD-9 snapshot, so the profile refusals are now on this path too,
+  // and they carry `config.invalid` for the same reason: a run with no snapshot, or one this build cannot
+  // read, is not a condition a retry reaches the other side of.
+  ProfileNotFound,
+  ProfileUnreadable,
+  // A worktree that is not an absolute path is a misconfigured run, not a transient spawn failure.
+  AddDirNotAbsolute,
 ] as const;
 
 /**
@@ -753,12 +863,21 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
      * symptom, which is the entire reason the constant exists. So what is asserted is what is run.
      */
     const observedFlags = AD1_REQUIRED_FLAGS.filter((flag) => plan.args.includes(flag));
-    const missing = missingRequiredFlags(plan.args);
+    // The values as well as the names: the wrapper is free to rebuild `args`, and one that kept `--tools`
+    // while emptying it would hand the agent a grant nobody declared. See `missingRequiredFlags`.
+    const missing = missingRequiredFlags(plan.args, {
+      tools: toolsArgumentFor(plan.grant),
+      // The request's worktree, not the plan's `cwd`: the wrapper may legitimately change where the
+      // process runs, and ADR-001 scopes `--add-dir` to the run worktree either way.
+      addDir: request.worktree,
+    });
     if (missing.length > 0) {
       throw new StepSpawnFailed(
         request.step,
         `the argv that would be executed is missing the AD-1 flags ${missing.join(', ')}, which would ` +
-          'widen the permission surface without any other observable difference',
+          'widen the permission surface without any other observable difference. A flag named with a ' +
+          'value other than the one the grant and the worktree composed counts as missing: the contract ' +
+          'requires the flag and its value, not the word.',
       );
     }
 
@@ -785,10 +904,23 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
          * misconfiguration. `elevated_tools` is the part a reviewer acts on: it names every granted tool
          * that can change something, which for an agent ADR-003 grants read tools is the divergence itself.
          */
-        granted_tools: [...plan.grant.tools],
-        elevated_tools: [...plan.grant.elevated],
-        agent_id: plan.grant.agentId,
-        grant_declared_at: plan.grant.declaredAt,
+        [SPAWN_GRANT_PAYLOAD_KEYS.GrantedTools]: [...plan.grant.tools],
+        [SPAWN_GRANT_PAYLOAD_KEYS.ElevatedTools]: [...plan.grant.elevated],
+        [SPAWN_GRANT_PAYLOAD_KEYS.AgentId]: plan.grant.agentId,
+        /**
+         * The declaration's **file name**, not its path, because AD-21 destroys the path.
+         *
+         * Measured rather than assumed: `/…/.orch/agents/implementation.toml` comes back from the
+         * redaction pass as `/…/.[redacted].toml`. A path segment run with no dot or hyphen —
+         * `orch/agents/implementation`, or a 26-character run ULID — crosses the sweep's 24-character,
+         * 3.5-bits-per-character threshold and is replaced whole, so recording the path would log the
+         * noise and lose the part that locates anything. The file name survives (it is short and carries
+         * a dot), the run id is on the envelope verbatim under AD-5's passthrough allow-list, and the
+         * directory is `runs/<run-id>/config/agents/` for every run — so the two together still name the
+         * file, which the path on its own no longer would. `tests/engine.spawner.test.ts` pins the
+         * post-redaction value so this stays a decision rather than a surprise.
+         */
+        [SPAWN_GRANT_PAYLOAD_KEYS.GrantDeclaredAt]: basename(plan.grant.declaredAt),
         // The flags observed on the executed vector, not the constant that was required: a log that
         // records the requirement rather than the fact cannot be used to audit what actually ran.
         flags: observedFlags,
@@ -1060,7 +1192,7 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
     request: StepStartRequest,
     value: unknown,
   ):
-    | { readonly ok: true; readonly output: StepOutput }
+    | { readonly ok: true; readonly output: StepOutput; readonly contractOutput: unknown }
     | { readonly ok: false; readonly detail: string; readonly code: string } => {
     let contract;
     try {
@@ -1120,7 +1252,15 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
         detail: `the output reports contract "${shaped.data.contract_id}" but was validated against "${contractId}"`,
       };
     }
-    return { ok: true, output: shaped.data };
+    /**
+     * Both values travel: the narrowed one the loop reads, and the one the contract validated.
+     *
+     * `StepOutputSchema.safeParse` *strips* the fields a phase-specific contract adds — `step.analysis`'s
+     * declared territory among them — so returning only `shaped.data` would mean the engine could never
+     * see the territory it is supposed to record. `shaped` stays the proof that the value is a step output
+     * the loop can read; it is no longer the only thing handed back.
+     */
+    return { ok: true, output: shaped.data, contractOutput: first.data };
   };
 
   /** Map one attempt's outcome onto a termination. The whole of AD-8's reachability lives here. */
@@ -1241,7 +1381,11 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
     const output = parsed.output;
     if (output.status === 'completed') {
       record('completed', null);
-      return terminated(request.step, 'completed', { ...withSession, output });
+      return terminated(request.step, 'completed', {
+        ...withSession,
+        output,
+        contractOutput: parsed.contractOutput,
+      });
     }
     // The agent reported its own work blocked or failed. The output is not carried: the port gives
     // `output` only to a `completed` step, and what the AD-35 table is consulted about is the code.

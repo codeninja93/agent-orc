@@ -25,6 +25,7 @@ import {
   DECLARATION_PAYLOAD_KEYS,
   FEATURE_TERRITORY_DECLARED_EVENT_TYPE,
   FeatureTerritoryDeclaredPayloadSchema,
+  isRepositoryRelativePath,
   normaliseTerritory,
   normaliseTerritoryPath,
   pathContains,
@@ -377,7 +378,15 @@ export interface TerritoryRedeclaration {
    * an overlap that cannot exist.
    */
   readonly added: readonly string[];
-  /** Paths the previous declaration claimed that no entry of the new one contains. */
+  /**
+   * Entries of the previous declaration that no entry of the new one contains.
+   *
+   * Containment in the mirror direction, and **entry-level, not file-level** — which makes it a coarse
+   * diff and is worth saying plainly. Narrowing `src/engine` to `src/engine/lock.ts` reports
+   * `removed: ['src/engine']` even though that one file is still claimed, because the *entry*
+   * `src/engine` — the directory as a whole — is not. Read it as "this claim no longer stands", never as
+   * "nothing under here is claimed any more"; {@link declared} is the only statement of what is claimed.
+   */
   readonly removed: readonly string[];
   /** True when anything was added: the case a concurrent feature may already have been writing in. */
   readonly widened: boolean;
@@ -430,14 +439,45 @@ export const territoryRedeclaredPayload = (
     [DECLARATION_PAYLOAD_KEYS.TerritoryWidened]: redeclaration.widened,
   });
 
+/**
+ * A re-declaration that declares nothing.
+ *
+ * `AnalysisOutputSchema` already refuses an empty territory on a completed output, and this is the same
+ * refusal at the other end of the path, because this function is reachable from a caller that did not come
+ * through that schema. An empty territory collides with nothing, so recording one would admit the feature
+ * beside every other one — the genuine fail-open direction, and the reason `WHOLE_REPOSITORY_TERRITORY`
+ * exists for the case where the territory is *unknown*. `config.invalid` → `escalate-to-human`.
+ */
+export class TerritoryDeclaresNothing extends Error {
+  readonly code = 'config.invalid';
+
+  constructor(step: string, detail: string) {
+    super(
+      `Refusing to record the territory step "${step}" declared: ${detail}. An empty territory overlaps ` +
+        'nothing, so the feature would be admitted beside every other one; a feature whose territory is ' +
+        '*unknown* is recorded as the whole repository instead, which collides with everything. The two ' +
+        'are opposite directions and only the second is safe.',
+    );
+    this.name = 'TerritoryDeclaresNothing';
+  }
+}
+
 /** What {@link recordTerritoryRedeclaration} is asked to record. */
 export interface RecordTerritoryOptions {
   /** The run's recorder. The caller owns the AD-29 single-writer claim; this never opens a log. */
   readonly recorder: Recorder;
   /** The step whose output declared this territory, so the line says which one corrected it. */
   readonly step: string;
-  /** The territory currently in force — from the plan, or from the log's last declaration. */
-  readonly previous: readonly string[];
+  /**
+   * The run's log as it stands, which is where the territory being replaced is read from.
+   *
+   * **Not a caller-supplied `previous`.** That is what this took first, and a caller holding a stale value
+   * — a plan read before an earlier correction, or a checkpoint behind the log — would have a real widening
+   * recorded as `widened: false` with `added: []`, which is worse than not recording it at all: the log
+   * would positively assert that nothing was added. AD-4 makes the log the only truth about what this run
+   * has declared, so the comparison is against the log's own last declaration and against nothing else.
+   */
+  readonly events: readonly EventEnvelope[];
   /** The territory the step's output declares. */
   readonly declared: readonly string[];
 }
@@ -462,6 +502,12 @@ export interface RecordedTerritoryRedeclaration extends TerritoryRedeclaration {
  * write to the engine; a step agent that could append to the log would also be a second writer of it,
  * which AD-29 forbids outright. The agent's output *declares*; this records.
  *
+ * The emitter is `ENGINE_EMITTER`, the same name `acceptFeature`'s run-creation declaration carries, and
+ * it is accurate rather than convenient: the sole caller is `Reconciler.recordDeclaredTerritory`, so this
+ * line does originate in the reconciler. A replay reading the two declarations of one run sees one
+ * emitter and two steps — `null` for the run-creation line, the analysis step for the correction — which
+ * is the distinction that matters and the one the envelope already carries.
+ *
  * It returns the comparison so the caller can act on a widening in the same breath it recorded one — and
  * so a caller that ignores the return value has still left the evidence on disk, which is the direction
  * that loses nothing.
@@ -469,7 +515,27 @@ export interface RecordedTerritoryRedeclaration extends TerritoryRedeclaration {
 export const recordTerritoryRedeclaration = (
   options: RecordTerritoryOptions,
 ): RecordedTerritoryRedeclaration => {
-  const redeclaration = territoryRedeclaration(options.previous, options.declared);
+  if (options.declared.length === 0) {
+    throw new TerritoryDeclaresNothing(options.step, 'it names no path at all');
+  }
+  /**
+   * A malformed entry is refused here too, and not left to normalise into `.`.
+   *
+   * `''`, `'   '`, `'/'` and `'src/..'` all normalise to the whole repository, so a declaration made
+   * entirely of them would record a territory that collides with everything — which looks fail-safe and
+   * is not what the step said. It is the same refusal `isRepositoryRelativePath` applies inside
+   * `step.analysis`, applied again at the other end of the path, because this function is reachable from
+   * a caller that did not come through that schema.
+   */
+  const malformed = options.declared.filter((path) => !isRepositoryRelativePath(path));
+  if (malformed.length > 0) {
+    throw new TerritoryDeclaresNothing(
+      options.step,
+      `${malformed.map((path) => JSON.stringify(path)).join(', ')} ${malformed.length === 1 ? 'is not a' : 'are not'} repository-relative ${malformed.length === 1 ? 'path' : 'paths'}`,
+    );
+  }
+  const previous = territoryFromEvents(options.events);
+  const redeclaration = territoryRedeclaration(previous?.territory ?? [], options.declared);
   const recorded = options.recorder.recordResult({
     feature: options.recorder.feature,
     run: options.recorder.paths.runId,

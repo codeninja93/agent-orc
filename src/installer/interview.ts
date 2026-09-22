@@ -162,14 +162,20 @@ const noSuggestion = (): null => null;
  * the installer's list of what it can *write*, not the system's list of what exists. An agent added
  * here becomes an offer at question 10 and nothing else; the implementations are stories 2-3 to 2-7.
  *
- * Every one references `step.output`, the registered contract of AD-17: a roster member that needed a
- * genuinely new contract shape would need an engine change, and none of these does.
+ * Each references a *registered* contract id (AD-17), never an inline schema. Four of the six reference
+ * `step.output`, the shared step envelope: a roster member that needs a genuinely new contract shape needs an
+ * engine change, and those four do not. `analysis` and `planning` do — story 2-4 registered `step.analysis`
+ * and `step.planning`, whose shapes carry per-claim provenance and a declared territory — and they name them
+ * here. A declaration naming `step.output` while its agent's contract pins `contract_id` to its own id is a
+ * pairing that can never both hold: every refusal the new contract adds would be dead for a default install,
+ * with nothing able to notice. `tests/contracts.agent-grants.test.ts` pins the contract id beside the grant
+ * for exactly that reason.
  */
 export const BUILT_IN_AGENTS: readonly AgentDeclarationInput[] = Object.freeze([
   {
     id: 'analysis',
     purpose: 'Read the repository and the request, and state what the work actually is.',
-    contract: 'step.output',
+    contract: 'step.analysis',
     tools: ['Read', 'Grep', 'Glob'],
     mcp_domains: [],
     reversibility: 'reversible',
@@ -178,7 +184,7 @@ export const BUILT_IN_AGENTS: readonly AgentDeclarationInput[] = Object.freeze([
   {
     id: 'planning',
     purpose: 'Turn the analysis into ordered steps with declared file territories.',
-    contract: 'step.output',
+    contract: 'step.planning',
     tools: ['Read', 'Grep', 'Glob'],
     mcp_domains: [],
     reversibility: 'reversible',

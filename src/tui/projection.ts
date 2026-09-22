@@ -528,6 +528,19 @@ interface MutableStep {
 }
 
 /**
+ * What a run in each phase is waiting for, in a person's words.
+ *
+ * A total map over `STEP_PHASES` rather than a conditional, so adding a phase is a type error here and
+ * cannot be answered by whichever branch happens to be the `else`.
+ */
+const NEXT_UP_BY_PHASE: Readonly<Record<StepPhase, string>> = {
+  analysis: 'the analysis to state what the work is',
+  planning: 'the plan the analysis is turned into',
+  implementation: 'verification, once the implementation steps are done',
+  verification: 'the verification gates',
+};
+
+/**
  * What the run is waiting for, in a person's words.
  *
  * This is the "next gate" half of R7, and it is prose rather than a number for the reason R7 gives: a
@@ -570,9 +583,20 @@ const nextGateFor = (facts: {
           ? 'the first step, once the feature is confirmed'
           : 'the next step, which the reconciler claims on its next pass';
       }
-      return facts.current.phase === 'verification'
-        ? 'the verification gates'
-        : 'verification, once the implementation steps are done';
+      /**
+       * What the run is waiting for, said from the phase it is *in* rather than from one of two.
+       *
+       * The branch this replaced read `phase === 'verification' ? … : 'verification, once the
+       * implementation steps are done'`, which was true while a plan held two steps and became a false
+       * statement the moment one held four: an `analysis` step took the else branch and the card told a
+       * person the implementation steps were done before any had started. Derived from the phase so the
+       * next widening of `STEP_PHASES` is a compile error here, not a sentence nobody re-reads.
+       */
+      // A phase this build cannot place folds to `null` in `stepPhase`, and says so rather than picking
+      // a sentence: AD-5's ignore-unknown rule applied to a screen.
+      return facts.current.phase === null
+        ? 'the next step, whose phase this build does not recognise'
+        : NEXT_UP_BY_PHASE[facts.current.phase];
   }
 };
 

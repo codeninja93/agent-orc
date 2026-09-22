@@ -21,7 +21,7 @@ import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { EVENT_TYPES } from '../src/contracts/index.js';
+import { EVENT_TYPES, STEP_PHASES } from '../src/contracts/index.js';
 import {
   COMMAND_EVENT_TYPES,
   ENGINE_EVENT_TYPES,
@@ -120,6 +120,59 @@ describe('a run in progress shows the step name and the next gate, never a share
 
   it('states the next gate as a gate, in words', () => {
     expect(view.progress.nextGate).toBe('verification, once the implementation steps are done');
+  });
+
+  /**
+   * Matrix 32 — every member of `STEP_PHASES`, folded, so the next widening is covered by construction.
+   *
+   * Story 2-4 widened the enum to four and this suite kept passing, because every fixture here starts an
+   * `implementation` or a `verification` step: `stepPhase` was a pair of literals and reverting it to that
+   * pair left all eighty TUI tests green. A phase the projection cannot place renders as no phase at all,
+   * and the next-up line took the `else` branch and told a person the implementation steps were done
+   * before any had started. Driven from the constant so a fifth phase fails here on the day it is added.
+   */
+  describe('every declared phase (matrix 32)', () => {
+    it.each(STEP_PHASES)('reports %s as the phase of the step in flight', (phase) => {
+      const folded = foldEvents(
+        buildLog([
+          runCreated(),
+          featureStateChanged('confirmed'),
+          featureStateChanged('running', 'confirmed'),
+          stepStarted(`step-${phase}`, phase),
+        ]),
+      );
+      expect(folded.progress.currentStepPhase).toBe(phase);
+      expect(folded.progress.currentStep).toBe(`step-${phase}`);
+    });
+
+    it.each(STEP_PHASES)('says what a run in %s is waiting for, without claiming a later phase', (phase) => {
+      const folded = foldEvents(
+        buildLog([
+          runCreated(),
+          featureStateChanged('confirmed'),
+          featureStateChanged('running', 'confirmed'),
+          stepStarted(`step-${phase}`, phase),
+        ]),
+      );
+      expect(folded.progress.nextGate).not.toBe('');
+      if (phase === 'analysis' || phase === 'planning') {
+        // The sentence the two-literal branch produced for these two, which was false.
+        expect(folded.progress.nextGate).not.toContain('once the implementation steps are done');
+      }
+    });
+
+    it('ignores a phase this build does not know, rather than naming one it invented', () => {
+      const folded = foldEvents(
+        buildLog([
+          runCreated(),
+          featureStateChanged('confirmed'),
+          featureStateChanged('running', 'confirmed'),
+          stepStarted('step-future', 'documentation'),
+        ]),
+      );
+      expect(folded.progress.currentStepPhase).toBeNull();
+      expect(folded.progress.nextGate).toContain('does not recognise');
+    });
   });
 
   it('renders no share of a whole anywhere in the frame (R7)', () => {

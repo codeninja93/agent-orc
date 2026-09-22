@@ -40,14 +40,24 @@ export const PLANNING_CONTRACT_ID = 'step.planning';
  * shape. The engine resolves it through `getContract` when it builds the step.
  */
 export const PlannedStepSchema = z.object({
-  step: z.string().describe('The step id: a stable declared name, never a positional index.'),
+  step: z
+    .string()
+    .describe(
+      'The step id: a stable declared name, never a positional index, never blank, and unique within ' +
+        'the plan once surrounding whitespace is ignored.',
+    ),
   phase: z
     .enum(STEP_PHASES)
     .describe('Which phase of the run this step belongs to.'),
   contract_id: z
     .string()
-    .describe('The registered contract id this step’s output will be validated against.'),
-  intent: z.string().describe('What this step is for, in one line that stands alone.'),
+    .describe(
+      'The registered contract id this step’s output will be validated against — one the registry ' +
+        'holds, never an inline schema and never blank.',
+    ),
+  intent: z
+    .string()
+    .describe('What this step is for, in one line that stands alone. Never blank.'),
   territory: z
     .array(z.string())
     .describe(
@@ -66,12 +76,16 @@ const PlanningOutputShape = StepOutputSchema.extend({
   contract_id: z.literal(PLANNING_CONTRACT_ID),
   plan: z
     .array(PlannedStepSchema)
-    .describe('The steps in the order they run. Each carries its own provenance.'),
+    .describe(
+      'The steps in the order they run, each carrying its own provenance. A completed plan orders at ' +
+        'least one; report "blocked" rather than completing with none.',
+    ),
   territory: z
     .array(z.string())
     .describe(
-      'Repository-relative paths this feature touches, covering every step’s territory. Declare at ' +
-        'least one; "." means the whole repository.',
+      'Repository-relative paths this feature touches, covering every step’s territory. A completed ' +
+        'plan declares at least one; "." means the whole repository. Never blank, never absolute, never ' +
+        'climbing out of the worktree.',
     ),
 });
 
@@ -82,18 +96,93 @@ const PlanningOutputShape = StepOutputSchema.extend({
  * unattributed or claimed a path the plan does not.
  */
 export const PlanningOutputSchema = PlanningOutputShape.superRefine((output, ctx) => {
+  // The territory is validated before containment is asked of it, for the reason `step.analysis` gives: a
+  // malformed entry would have every step blamed for the territory's fault.
+  let territoryWellFormed = output.territory.length > 0;
+  output.territory.forEach((path, index) => {
+    if (!isRepositoryRelativePath(path)) {
+      territoryWellFormed = false;
+      ctx.addIssue({
+        code: 'custom',
+        path: ['territory', index],
+        message:
+          `"${path}" is not a repository-relative path, so no run worktree contains it. A blank entry or ` +
+          'a bare "/" normalises to the whole repository and makes every containment check vacuous.',
+      });
+    }
+  });
+
+  /**
+   * A completed plan declares a territory and at least one step; a blocked or failed one need not.
+   *
+   * An empty `plan` is a plan that completed with nothing to execute, and it makes every per-step rule
+   * below pass vacuously — the same defect as an empty territory, one field over. Binding either to
+   * `blocked` or `failed` would refuse an honest refusal and, because `step.schema_invalid_output` is
+   * `escalate-model-tier`, promote the ladder against a step that did its job.
+   */
+  if (output.status === 'completed') {
+    if (output.territory.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['territory'],
+        message:
+          'a completed plan declares at least one path; an empty territory overlaps nothing and would be ' +
+          'admitted beside every other feature. Report "blocked" instead if it cannot be determined.',
+      });
+    }
+    if (output.plan.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['plan'],
+        message:
+          'a completed plan orders at least one step; an empty plan is a completion with nothing to ' +
+          'execute. Report "blocked" instead if no plan can be formed.',
+      });
+    }
+  }
+
+  /**
+   * Step ids are compared trimmed, because `"one"` and `"one "` are one step wearing two spellings.
+   *
+   * Raw equality admits both, and the checkpoint then carries two records for what a person and every log
+   * line call one step — a fault `RunStateSchema`'s own uniqueness refinement raises much later and much
+   * further from its cause.
+   */
   const seen = new Set<string>();
   output.plan.forEach((step, index) => {
-    if (seen.has(step.step)) {
+    const id = step.step.trim();
+    if (id === '') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['plan', index, 'step'],
+        message: 'a step id is a declared name; a blank one names nothing the checkpoint can key on',
+      });
+    } else if (seen.has(id)) {
       ctx.addIssue({
         code: 'custom',
         path: ['plan', index, 'step'],
         message:
-          `step id "${step.step}" appears twice; a step id appears at most once in a run, because a ` +
-          're-run updates its record rather than adding one (AD-26)',
+          `step id "${id}" appears twice; a step id appears at most once in a run, because a re-run ` +
+          'updates its record rather than adding one (AD-26)',
       });
     }
-    seen.add(step.step);
+    seen.add(id);
+    if (step.intent.trim() === '') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['plan', index, 'intent'],
+        message: 'a planned step says what it is for; a blank intent plans nothing',
+      });
+    }
+    if (step.contract_id.trim() === '') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['plan', index, 'contract_id'],
+        message:
+          'a planned step names the registered contract its output is validated against (AD-17); a ' +
+          'blank one names none',
+      });
+    }
     if (!attributesClaim(step.provenance)) {
       ctx.addIssue({
         code: 'custom',
@@ -114,7 +203,7 @@ export const PlanningOutputSchema = PlanningOutputShape.superRefine((output, ctx
         });
         return;
       }
-      if (!territoryContains(output.territory, path)) {
+      if (territoryWellFormed && !territoryContains(output.territory, path)) {
         ctx.addIssue({
           code: 'custom',
           path: ['plan', index, 'territory', pathIndex],
@@ -126,26 +215,6 @@ export const PlanningOutputSchema = PlanningOutputShape.superRefine((output, ctx
       }
     });
   });
-  output.territory.forEach((path, index) => {
-    if (!isRepositoryRelativePath(path)) {
-      ctx.addIssue({
-        code: 'custom',
-        path: ['territory', index],
-        message: `"${path}" is not a repository-relative path, so no run worktree contains it`,
-      });
-    }
-  });
-  if (output.territory.length === 0) {
-    // The same fail-open case `step.analysis` refuses: a territory that overlaps nothing is admitted
-    // beside every other feature.
-    ctx.addIssue({
-      code: 'custom',
-      path: ['territory'],
-      message:
-        'declare at least one path; an empty territory overlaps nothing and would be admitted beside ' +
-        'every other feature',
-    });
-  }
 });
 
 export type PlanningOutput = z.infer<typeof PlanningOutputSchema>;

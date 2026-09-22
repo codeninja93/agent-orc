@@ -17,23 +17,38 @@ import { rmSync } from 'node:fs';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import {
+  ANALYSIS_CONTRACT_ID,
+  AnalysisOutputSchema,
   DECLARATION_PAYLOAD_KEYS,
+  FeatureTerritoryDeclaredPayloadSchema,
+  StepOutputSchema,
+  dispositionFor,
   normaliseTerritory as normaliseTerritoryFromContracts,
 } from '../src/contracts/index.js';
 import type { EventEnvelope } from '../src/contracts/index.js';
 import {
+  Reconciler,
+  STANDARD_PLAN_STEPS,
   TERRITORY_DECLARED_EVENT_TYPE,
   TERRITORY_PATHS_PAYLOAD_KEY,
+  TerritoryDeclaresNothing,
   admitByTerritory,
   normaliseTerritory,
   recordTerritoryRedeclaration,
   territoryDeclaredPayload,
   territoryFromEvents,
+  createScriptedExecutor,
+  terminated,
+  territoriesOverlap,
   territoryRedeclaration,
 } from '../src/engine/index.js';
 import { Recorder, readEventLog, runPaths } from '../src/runtime/index.js';
 
 import { makeWorkspace } from './helpers/config-fixture.js';
+import { makePlan, planProvider } from './helpers/engine-fixture.js';
+
+/** The commit a step's baseline is taken at; this suite never resets a worktree. */
+const BASELINE = 'ddd9bed4d286ac1f8a0f4f7bfef9530046605787';
 
 const homes: string[] = [];
 
@@ -83,7 +98,7 @@ describe('an analysis output re-declares the territory, and replay reads the cor
       const recorded = recordTerritoryRedeclaration({
         recorder: log.recorder,
         step: 'analyse',
-        previous: ['src/engine'],
+        events: log.events(),
         declared: ['src/engine', 'src/contracts'],
       });
       expect(recorded.recorded).toBe(true);
@@ -114,7 +129,7 @@ describe('an analysis output re-declares the territory, and replay reads the cor
       recordTerritoryRedeclaration({
         recorder: log.recorder,
         step: 'analyse',
-        previous: ['.'],
+        events: log.events(),
         declared: ['src/tui'],
       });
       expect(log.declarations()[0]?.step).toBeNull();
@@ -132,7 +147,7 @@ describe('a widening is visible in the log rather than silently applied (matrix 
       const recorded = recordTerritoryRedeclaration({
         recorder: log.recorder,
         step: 'analyse',
-        previous: ['src/engine'],
+        events: log.events(),
         declared: ['src/engine', 'src/tui'],
       });
 
@@ -188,7 +203,7 @@ describe('a narrowing is recorded, and admission recomputes next pass (matrix 7)
       const recorded = recordTerritoryRedeclaration({
         recorder: log.recorder,
         step: 'analyse',
-        previous: ['src/engine', 'src/tui'],
+        events: log.events(),
         declared: ['src/engine'],
       });
 
@@ -231,7 +246,7 @@ describe('a loosely spelled declaration is normalised by the existing normaliser
       recordTerritoryRedeclaration({
         recorder: log.recorder,
         step: 'analyse',
-        previous: ['src/engine'],
+        events: log.events(),
         declared: ['./src/engine/', 'src\\contracts', 'src/engine', 'src/contracts'],
       });
       expect(log.declarations()[1]?.payload[TERRITORY_PATHS_PAYLOAD_KEY]).toStrictEqual([
@@ -256,5 +271,258 @@ describe('a loosely spelled declaration is normalised by the existing normaliser
     const first = territoryDeclaredPayload(declared);
     const corrected = territoryRedeclaration([], declared);
     expect(first[TERRITORY_PATHS_PAYLOAD_KEY]).toStrictEqual([...corrected.declared]);
+  });
+});
+
+describe('a re-declaration compares against the log, not against what a caller remembers (matrix 30)', () => {
+  it('uses the log’s last declaration, so a second correction widens from the first', () => {
+    const log = openLog(['src/engine']);
+    try {
+      recordTerritoryRedeclaration({
+        recorder: log.recorder,
+        step: 'analyse',
+        events: log.events(),
+        declared: ['src/contracts'],
+      });
+      // A caller holding the *plan* still believes the territory is `src/engine`. The comparison is not
+      // its to make: a stale `previous` would record this as widening by `src/contracts` — ground the run
+      // already claimed — and say nothing about `src/tui`, which is the entry that can newly overlap.
+      const second = recordTerritoryRedeclaration({
+        recorder: log.recorder,
+        step: 'analyse-again',
+        events: log.events(),
+        declared: ['src/contracts', 'src/tui'],
+      });
+
+      expect(second.previous).toStrictEqual(['src/contracts']);
+      expect(second.added).toStrictEqual(['src/tui']);
+      expect(second.widened).toBe(true);
+      expect(log.declarations()).toHaveLength(3);
+    } finally {
+      log.close();
+    }
+  });
+
+  it('treats a run whose log declares nothing as having held nothing', () => {
+    const orchHome = makeWorkspace('territory-home');
+    homes.push(orchHome);
+    const recorder = Recorder.open({ runId: RUN, feature: FEATURE, orchHome });
+    try {
+      const recorded = recordTerritoryRedeclaration({
+        recorder,
+        step: 'analyse',
+        events: [],
+        declared: ['src/engine'],
+      });
+      expect(recorded.previous).toStrictEqual([]);
+      expect(recorded.added).toStrictEqual(['src/engine']);
+    } finally {
+      recorder.close();
+    }
+  });
+});
+
+describe('a re-declaration that declares nothing is refused (matrix 31)', () => {
+  it.each([[[] as readonly string[]], [['']], [['   ']]])(
+    'refuses %j rather than recording a territory that overlaps nothing',
+    (declared) => {
+      const log = openLog(['src/engine']);
+      try {
+        expect(() =>
+          recordTerritoryRedeclaration({
+            recorder: log.recorder,
+            step: 'analyse',
+            events: log.events(),
+            declared,
+          }),
+        ).toThrowError(TerritoryDeclaresNothing);
+        // Nothing was appended: the refusal is before the write, so the log still holds one declaration.
+        expect(log.declarations()).toHaveLength(1);
+      } finally {
+        log.close();
+      }
+    },
+  );
+
+  it('carries config.invalid, so the AD-35 table sends it to a person rather than a retry', () => {
+    const refusal = new TerritoryDeclaresNothing('analyse', 'it names no path at all');
+    expect(refusal.code).toBe('config.invalid');
+    expect(dispositionFor(refusal.code)).toBe('escalate-to-human');
+  });
+});
+
+/**
+ * Matrix 22 and 23 — the seam the story is named for, crossed in one test.
+ *
+ * The intent says this story produces "the feature's declared file territory **that the reconciler uses to
+ * serialize overlapping work**". Every part of that chain existed before this test and none of it was
+ * joined: the plan had no analysis step, so no spawn ever carried `phase: 'analysis'`; the re-declaration
+ * had no production caller; and the admission tests were handed literal arrays on both sides.
+ *
+ * So this drives the whole chain and **folds the territory back out of the log it just wrote**, rather
+ * than asserting against the value it passed in. Admission is then asked about *that* — which is the only
+ * way the join can be shown to hold, because a test that hand-assembles both sides would pass with the
+ * two halves wired to nothing.
+ */
+describe('a completed analysis re-declares the territory the next pass serialises on (matrix 22, 23)', () => {
+  const analysisOutputDeclaring = (
+    step: string,
+    territory: readonly string[],
+  ): Record<string, unknown> => ({
+    contract_id: ANALYSIS_CONTRACT_ID,
+    step,
+    status: 'completed',
+    summary: 'read the repository and found what the feature touches',
+    provenance: [`${step}: src/engine/spawner.ts`],
+    decisions: [],
+    artifacts: [],
+    questions: [],
+    write_intents: [],
+    error: null,
+    claims: [
+      {
+        claim: 'the grant reaches the argv from the roster',
+        paths: ['src/engine/spawner.ts'],
+        provenance: { step, source: 'src/engine/spawner.ts' },
+      },
+    ],
+    territory: [...territory],
+    files_read: ['src/engine/spawner.ts'],
+  });
+
+  it('carries an analysis step, records what it declared, and defers the feature it now overlaps', async () => {
+    const orchHome = makeWorkspace('territory-seam');
+    homes.push(orchHome);
+
+    /** What the analysis step declares: wider than the plan, and over ground another feature holds. */
+    const declaredByAnalysis = ['src/engine', 'src/tui'];
+    const phasesSpawned: string[] = [];
+
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(
+        makePlan({ feature: 'grant-wiring', steps: STANDARD_PLAN_STEPS, territory: ['src/engine'] }),
+      ),
+      baseline: { currentRef: () => BASELINE, resetTo: () => undefined },
+      executor: createScriptedExecutor({
+        onStart: (request) => {
+          phasesSpawned.push(request.phase);
+          if (request.phase !== 'analysis') return terminated(request.step, 'completed', {});
+          const raw = analysisOutputDeclaring(request.step, declaredByAnalysis);
+          return terminated(request.step, 'completed', {
+            output: StepOutputSchema.parse(raw),
+            contractOutput: AnalysisOutputSchema.parse(raw),
+          });
+        },
+      }),
+    });
+
+    try {
+      const accepted = reconciler.acceptFeature(
+        makePlan({ feature: 'grant-wiring', steps: STANDARD_PLAN_STEPS, territory: ['src/engine'] }),
+      );
+      reconciler.confirm(accepted.run);
+      // One action per pass, so the analysis step needs a pass of its own to run to termination.
+      await reconciler.pass();
+
+      // Matrix 22: the plan carries the phase, so the spawn did.
+      expect(phasesSpawned).toContain('analysis');
+      expect([...STANDARD_PLAN_STEPS].map((step) => step.phase)).toStrictEqual([
+        'analysis',
+        'planning',
+        'implementation',
+        'verification',
+      ]);
+
+      const events = readEventLog(runPaths(accepted.run, orchHome).eventLog);
+      const declarations = events.filter((event) => event.type === TERRITORY_DECLARED_EVENT_TYPE);
+      // Two: the one `acceptFeature` wrote from the plan, and the correction the completed analysis made.
+      expect(declarations).toHaveLength(2);
+      expect(declarations[1]?.step).toBe('analyse');
+      expect(declarations[1]?.payload[DECLARATION_PAYLOAD_KEYS.TerritoryWidened]).toBe(true);
+      expect(declarations[1]?.payload[DECLARATION_PAYLOAD_KEYS.TerritoryAddedPaths]).toStrictEqual([
+        'src/tui',
+      ]);
+
+      /**
+       * The join: the territory is folded back **out of the log** and admission is asked about that.
+       *
+       * Nothing here repeats `declaredByAnalysis`. If the reconciler had recorded nothing, or had
+       * recorded the plan's territory, this replay would read `src/engine` and the other feature would be
+       * admitted beside it — which is precisely the state that existed before this test.
+       */
+      const replayed = territoryFromEvents(events);
+      expect(replayed?.complete).toBe(true);
+      const holder = { run: accepted.run, feature: 'grant-wiring', territory: replayed?.territory ?? [] };
+      const other = { run: '01ZZZZZZZZZZZZZZZZZZZZZZZZ', feature: 'tui-work', territory: ['src/tui'] };
+
+      const admission = admitByTerritory([holder, other]);
+      expect(admission.admitted.map((entry) => entry.feature)).toStrictEqual(['grant-wiring']);
+      expect(admission.deferred.map((entry) => entry.feature)).toStrictEqual(['tui-work']);
+      expect(admission.deferred[0]?.overlap).toStrictEqual(['src/tui']);
+    } finally {
+      reconciler.close();
+    }
+  });
+
+  it('records nothing for a step whose output declares no territory', async () => {
+    const orchHome = makeWorkspace('territory-seam-none');
+    homes.push(orchHome);
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(makePlan({ feature: 'grant-wiring', steps: STANDARD_PLAN_STEPS })),
+      baseline: { currentRef: () => BASELINE, resetTo: () => undefined },
+      executor: createScriptedExecutor({
+        onStart: (request) => terminated(request.step, 'completed', {}),
+      }),
+    });
+    try {
+      const accepted = reconciler.acceptFeature(
+        makePlan({ feature: 'grant-wiring', steps: STANDARD_PLAN_STEPS }),
+      );
+      reconciler.confirm(accepted.run);
+      await reconciler.pass();
+      const events = readEventLog(runPaths(accepted.run, orchHome).eventLog);
+      // Only the run-creation line. A completed step that declares nothing corrects nothing.
+      expect(events.filter((event) => event.type === TERRITORY_DECLARED_EVENT_TYPE)).toHaveLength(1);
+    } finally {
+      reconciler.close();
+    }
+  });
+});
+
+describe('the payload\u2019s own consistency', () => {
+  it('refuses a line claiming it did not widen beside a non-empty added_paths', () => {
+    // `widened` is a summary of `added_paths`, and a payload where the two disagree says two things: a
+    // replay acting on the flag would read a real widening as none, which is what the keys exist to
+    // prevent. Bound in the schema, because a payload is read by units that never ran the emitter.
+    expect(() =>
+      FeatureTerritoryDeclaredPayloadSchema.parse({
+        [TERRITORY_PATHS_PAYLOAD_KEY]: ['src/engine', 'src/tui'],
+        [DECLARATION_PAYLOAD_KEYS.TerritoryAddedPaths]: ['src/tui'],
+        [DECLARATION_PAYLOAD_KEYS.TerritoryWidened]: false,
+      }),
+    ).toThrowError();
+    expect(() =>
+      FeatureTerritoryDeclaredPayloadSchema.parse({
+        [TERRITORY_PATHS_PAYLOAD_KEY]: ['src/engine'],
+        [DECLARATION_PAYLOAD_KEYS.TerritoryAddedPaths]: [],
+        [DECLARATION_PAYLOAD_KEYS.TerritoryWidened]: true,
+      }),
+    ).toThrowError();
+  });
+
+  it('still accepts a first declaration, which carries neither key', () => {
+    expect(() => territoryDeclaredPayload(['src/engine'])).not.toThrow();
+  });
+
+  it('reports removed entry by entry, which is coarser than file by file', () => {
+    // Narrowing a directory to one file inside it reports the *entry* as removed, because the directory
+    // as a whole is no longer claimed — not because that file stopped being claimed. Pinned so the
+    // coarseness is a documented property rather than a surprise read off a field name.
+    const narrower = territoryRedeclaration(['src/engine'], ['src/engine/lock.ts']);
+    expect(narrower.removed).toStrictEqual(['src/engine']);
+    expect(narrower.declared).toStrictEqual(['src/engine/lock.ts']);
+    expect(territoriesOverlap(narrower.removed, narrower.declared)).toBe(true);
   });
 });

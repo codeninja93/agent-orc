@@ -22,12 +22,19 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { exportContract, StepInputSchema } from '../src/contracts/index.js';
+import { dispositionFor, exportContract, StepInputSchema } from '../src/contracts/index.js';
 import type { StepInput } from '../src/contracts/index.js';
-import { Recorder, readEventLog, runPaths } from '../src/runtime/index.js';
+import {
+  REDACTION_MARKER,
+  Recorder,
+  readEventLog,
+  redactValue,
+  runPaths,
+} from '../src/runtime/index.js';
 import type { EventEnvelope } from '../src/contracts/index.js';
 import {
   AD1_REQUIRED_FLAGS,
+  AgentGrantUnresolved,
   ApiKeyModeRefusedError,
   ClaudeCliVersionError,
   createStepSpawner,
@@ -37,8 +44,10 @@ import {
   signalFromExitCode,
   resolveClaudeCli,
   ResumeRefused,
+  SPAWN_GRANT_PAYLOAD_KEYS,
   SPAWNER_EMITTER,
   SPAWNER_EVENT_TYPES,
+  takeConfigSnapshot,
   StepSpawnFailed,
   STREAM_OUTPUT_FORMAT,
 } from '../src/engine/index.js';
@@ -52,6 +61,12 @@ import type {
 } from '../src/engine/index.js';
 
 import { fixtureGrant } from './helpers/agent-grant.js';
+import {
+  fixtureAgent,
+  fixtureProfile,
+  writeAgentFile,
+  writeProfile,
+} from './helpers/config-fixture.js';
 
 const FAKE_CLI_PATH = fileURLToPath(new URL('./helpers/fake-claude.ts', import.meta.url));
 const FIXTURES = fileURLToPath(new URL('./fixtures/stream-json/', import.meta.url));
@@ -87,6 +102,8 @@ interface Harness {
   readonly run: string;
   readonly feature: string;
   readonly worktree: string;
+  /** The temp `ORCH_HOME` this harness's run lives under, for a case that snapshots configuration. */
+  readonly home: string;
   readonly spawner: StepSpawner;
   /** The same recorder the spawner writes through, for a test that builds a second spawner. */
   readonly recorder: Recorder;
@@ -205,6 +222,7 @@ const open = (
     run,
     feature,
     worktree,
+    home,
     spawner,
     recorder,
     env,
@@ -1183,5 +1201,162 @@ describe('a wrapper that reports its child\'s signal as an exit code', () => {
     const termination = await harness.spawner.start(harness.request());
     expect(termination.disposition).toBe('interrupted');
     expect(termination.sessionId).toBe(REAL_SESSION_ID);
+  });
+});
+
+/**
+ * Matrix 24, 33 and 34 — the parts of the grant path that the injected `grantFor` hides.
+ *
+ * Every other case in this suite passes `grantFor`, so the *default* resolution — read the run's AD-9
+ * snapshot, look the phase up in it, refuse when nothing declares it — was never executed here at all:
+ * changing `phase: request.phase` to `request.step` inside it, or dropping the `orchHome` it is given,
+ * compiled and failed nothing. These build a spawner without one, against a real snapshot on disk.
+ */
+describe('the grant the spawner resolves for itself', () => {
+  const rosterRepository = (
+    agents: readonly { readonly id: string; readonly tools: readonly string[] }[],
+  ): string => {
+    const repository = mkdtempSync(join(tmpdir(), 'orch-spawner-repo-'));
+    writeProfile(repository, fixtureProfile());
+    for (const agent of agents) {
+      writeAgentFile(
+        repository,
+        `${agent.id}.toml`,
+        fixtureAgent({ id: agent.id, tools: [...agent.tools] as never }),
+      );
+    }
+    return repository;
+  };
+
+  it('resolves it from the run snapshot, keyed by the request’s phase (matrix 24)', async () => {
+    const harness = openTracked({ fixture: 'completed.jsonl' });
+    // Deliberately not ADR-003's row for either phase, and different between the two, so the argv can
+    // only match if the lookup used this phase and this snapshot.
+    const repository = rosterRepository([
+      { id: 'analysis', tools: ['Glob', 'Read'] },
+      { id: 'implementation', tools: ['Read', 'Edit'] },
+    ]);
+    takeConfigSnapshot({ repository, runId: harness.run, orchHome: harness.home });
+
+    const spawner = createStepSpawner({
+      recorderFor: () => harness.recorder,
+      cli: fakeCli,
+      node: childNode,
+      env: harness.env,
+      // No `grantFor`. This is the case the default exists for.
+      orchHome: harness.home,
+    });
+    // The step name stays the fixture's, because the recorded transcript's output names it and AD-1's
+    // re-parse refuses an output about another step. The *phase* is what the grant is resolved by, which
+    // is the whole point of the case.
+    const termination = await spawner.start(harness.request({ phase: 'analysis' }));
+
+    expect(termination.disposition).toBe('completed');
+    const argv = harness.argvSeenByChild();
+    expect(argv[argv.indexOf('--tools') + 1]).toBe('Glob,Read');
+    expect(argv[argv.indexOf('--add-dir') + 1]).toBe(harness.worktree);
+    expect(spawner.lastPlan()?.grant.agentId).toBe('analysis');
+    expect(spawner.lastPlan()?.grant.declaredAt).toContain(harness.run);
+  });
+
+  it('refuses a phase the snapshot does not declare, keeping config.invalid (matrix 34)', async () => {
+    const harness = openTracked({ fixture: 'completed.jsonl' });
+    const repository = rosterRepository([{ id: 'analysis', tools: ['Read'] }]);
+    takeConfigSnapshot({ repository, runId: harness.run, orchHome: harness.home });
+
+    const spawner = createStepSpawner({
+      recorderFor: () => harness.recorder,
+      cli: fakeCli,
+      node: childNode,
+      env: harness.env,
+      orchHome: harness.home,
+    });
+
+    await expect(
+      spawner.start(harness.request({ phase: 'planning' })),
+    ).rejects.toThrowError(AgentGrantUnresolved);
+    // The refusal keeps its own AD-35 code rather than being relabelled `step.spawn_failed`, which is
+    // `retry-with-backoff`: a loop retrying a roster would re-spawn an unbuildable step for ever.
+    await expect(
+      spawner.start(harness.request({ phase: 'planning' })),
+    ).rejects.toMatchObject({ code: 'config.invalid' });
+    expect(dispositionFor('config.invalid')).toBe('escalate-to-human');
+  });
+
+  it('refuses a run with no snapshot at all, and does not relabel that either', async () => {
+    const harness = openTracked({ fixture: 'completed.jsonl' });
+    const spawner = createStepSpawner({
+      recorderFor: () => harness.recorder,
+      cli: fakeCli,
+      node: childNode,
+      env: harness.env,
+      orchHome: harness.home,
+    });
+    // AD-9: a step reads the snapshot and is not permitted to fall back to `.orch/`.
+    await expect(spawner.start(harness.request())).rejects.toMatchObject({ code: 'config.invalid' });
+  });
+
+  it('records the grant verbatim on agent.spawned, elevated apart from granted (matrix 33)', async () => {
+    const grant = fixtureGrant();
+    const harness = openTracked({ fixture: 'completed.jsonl', grant });
+    await harness.spawner.start(harness.request());
+
+    const spawned = harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentSpawned)[0];
+    const payload = spawned?.payload ?? {};
+    expect(payload[SPAWN_GRANT_PAYLOAD_KEYS.GrantedTools]).toStrictEqual([
+      'Read',
+      'Write',
+      'Edit',
+      'Grep',
+      'Glob',
+      'Bash',
+    ]);
+    // The elevated subset, not a copy of the grant: the two differ, so recording one for the other is
+    // visible here rather than passing because a fixture made them equal.
+    expect(payload[SPAWN_GRANT_PAYLOAD_KEYS.ElevatedTools]).toStrictEqual(['Write', 'Edit', 'Bash']);
+    expect(payload[SPAWN_GRANT_PAYLOAD_KEYS.ElevatedTools]).not.toStrictEqual(
+      payload[SPAWN_GRANT_PAYLOAD_KEYS.GrantedTools],
+    );
+    expect(payload[SPAWN_GRANT_PAYLOAD_KEYS.AgentId]).toBe('implementation');
+    expect(payload[SPAWN_GRANT_PAYLOAD_KEYS.GrantDeclaredAt]).toBe('implementation.toml');
+    expect(grant.declaredAt.endsWith('implementation.toml')).toBe(true);
+  });
+
+  /**
+   * What AD-21 does to `grant_declared_at`, pinned rather than discovered.
+   *
+   * A snapshot path contains the run's 26-character ULID, which the entropy sweep replaces at its
+   * 24-character threshold. The decision is to record the path anyway: the run id is on the *envelope*
+   * verbatim under AD-5's passthrough allow-list, so the pair still locates the file, and a second,
+   * shorter spelling of a path this system already has one of would be the worse trade.
+   */
+  it('keeps the declaration’s file name after AD-21 rewrites the run id inside the path', async () => {
+    const harness = openTracked({ fixture: 'completed.jsonl' });
+    const repository = rosterRepository([{ id: 'implementation', tools: ['Read'] }]);
+    takeConfigSnapshot({ repository, runId: harness.run, orchHome: harness.home });
+    const spawner = createStepSpawner({
+      recorderFor: () => harness.recorder,
+      cli: fakeCli,
+      node: childNode,
+      env: harness.env,
+      orchHome: harness.home,
+    });
+    await spawner.start(harness.request());
+
+    const spawned = harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentSpawned)[0];
+    const recordedFile = spawned?.payload[SPAWN_GRANT_PAYLOAD_KEYS.GrantDeclaredAt];
+    const declaredFile = typeof recordedFile === 'string' ? recordedFile : '';
+    // The name survives the pass intact — it is short and carries a dot.
+    expect(declaredFile).toBe('implementation.toml');
+    expect(declaredFile).not.toContain(REDACTION_MARKER);
+    // The full path would not have: `orch/agents/implementation` is one unbroken high-entropy run, so
+    // this is what the payload would have carried had the path been recorded instead.
+    const wholePath = spawner.lastPlan()?.grant.declaredAt ?? '';
+    expect(wholePath).toContain('implementation.toml');
+    const passed = redactValue(wholePath);
+    expect(passed.ok).toBe(true);
+    expect(passed.ok ? passed.value : '').not.toContain('implementation.toml');
+    // And the envelope still says which run, verbatim, which is why the pair still locates the file.
+    expect(spawned?.run).toBe(harness.run);
   });
 });

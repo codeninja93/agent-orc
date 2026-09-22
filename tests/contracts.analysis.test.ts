@@ -158,19 +158,44 @@ describe('a claim stays inside the territory the same output declares (matrix 18
       analysisOutput({ territory: ['src/engine'], claims: [claim({ paths: ['src/tui/app.tsx'] })] }),
     );
     expect(result.success).toBe(false);
-    expect(result.error?.issues[0]?.message).toContain('src/tui/app.tsx');
-    expect(result.error?.issues[0]?.message).toContain('src/engine');
+    // Found by its path, not by its position: an issue list is not ordered by anything this test knows,
+    // and `issues[0]` would pass or fail on which refinement happened to run first.
+    const issue = (result.error?.issues ?? []).find(
+      (candidate) => candidate.path.join('.') === 'claims.0.paths.0',
+    );
+    expect(issue?.message).toContain('src/tui/app.tsx');
+    expect(issue?.message).toContain('src/engine');
   });
 
   it.each([
     ['/etc/passwd', 'an absolute path'],
     ['../other-repo/src/engine/lock.ts', 'a path climbing out of the worktree'],
-    ['src/engine/../../escaped.ts', 'a path that only escapes once it is normalised'],
+    ['src/../../escaped.ts', 'a path that only climbs out once it is normalised'],
   ])('refuses %s, which is %s', (path) => {
     const result = AnalysisOutputSchema.safeParse(
       analysisOutput({ territory: ['src/engine'], claims: [claim({ paths: [path] })] }),
     );
     expect(result.success).toBe(false);
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain(
+      'claims.0.paths.0',
+    );
+  });
+
+  it('refuses a path that normalises back inside the repository but outside the territory', () => {
+    // `src/engine/../../escaped.ts` resolves to `escaped.ts` — inside the worktree, so the escape check
+    // has nothing to say, and outside `src/engine`, which is what refuses it. Kept distinct from the
+    // cases above, which used to include this one and so passed for a reason they did not name.
+    const result = AnalysisOutputSchema.safeParse(
+      analysisOutput({
+        territory: ['src/engine'],
+        claims: [claim({ paths: ['src/engine/../../escaped.ts'] })],
+      }),
+    );
+    expect(result.success).toBe(false);
+    const issue = (result.error?.issues ?? []).find(
+      (candidate) => candidate.path.join('.') === 'claims.0.paths.0',
+    );
+    expect(issue?.message).toContain('outside the territory');
   });
 
   it('reads containment in one direction, so a claim wider than the territory is refused', () => {
@@ -200,7 +225,101 @@ describe('a claim stays inside the territory the same output declares (matrix 18
       analysisOutput({ territory: [], claims: [claim({ paths: [] })] }),
     );
     expect(result.success).toBe(false);
-    expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain('territory');
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain('territory');
+  });
+
+  /**
+   * Matrix 27 — a malformed entry is refused rather than quietly meaning the whole repository.
+   *
+   * Every spelling here normalises to `.`, which contains every path — so accepting one makes the
+   * containment rule above vacuous and *any* claim passes. The concurrency consequence is the opposite
+   * and is not the defect: `.` is the documented fail-safe there, which is why the two deliberate
+   * spellings of it stay accepted.
+   */
+  it.each([
+    ['', 'blank'],
+    ['   ', 'whitespace'],
+    ['/', 'the root'],
+    ['//', 'a doubled root'],
+    ['src/..', 'a path that climbs back to the top'],
+  ])('refuses a territory entry spelled %j, which is %s', (path) => {
+    const result = AnalysisOutputSchema.safeParse(
+      analysisOutput({ territory: [path], claims: [claim({ paths: ['src/engine/lock.ts'] })] }),
+    );
+    expect(result.success).toBe(false);
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain('territory.0');
+  });
+
+  it('makes containment vacuous if a malformed entry is admitted, which is why it is not', () => {
+    // The same output with the entry spelled `.` on purpose: every claim now passes, whatever it names.
+    const deliberate = AnalysisOutputSchema.safeParse(
+      analysisOutput({ territory: ['.'], claims: [claim({ paths: ['src/tui/app.tsx'] })] }),
+    );
+    expect(deliberate.success).toBe(true);
+    // And spelled blank, which would mean the same thing and was never asked for.
+    const accidental = AnalysisOutputSchema.safeParse(
+      analysisOutput({ territory: [''], claims: [claim({ paths: ['src/tui/app.tsx'] })] }),
+    );
+    expect(accidental.success).toBe(false);
+  });
+
+  it('blames the territory once, not every claim measured against it', () => {
+    const result = AnalysisOutputSchema.safeParse(
+      analysisOutput({
+        territory: ['/'],
+        claims: [claim({ claim: 'a', paths: ['src/a.ts'] }), claim({ claim: 'b', paths: ['src/b.ts'] })],
+      }),
+    );
+    expect(result.success).toBe(false);
+    const paths = (result.error?.issues ?? []).map((issue) => issue.path.join('.'));
+    expect(paths).toContain('territory.0');
+    // The claims are not collateral: containment is not asked of a territory that did not parse.
+    expect(paths).not.toContain('claims.0.paths.0');
+    expect(paths).not.toContain('claims.1.paths.0');
+  });
+});
+
+/**
+ * Matrix 28 and 29 — an empty collection on a *completed* output, and the exemption for one that is not.
+ *
+ * An empty `claims` is an analysis that completed while asserting nothing, and it also makes every
+ * per-claim refinement above pass vacuously. Binding it to `blocked` or `failed` as well would refuse a
+ * legitimate refusal: `step.schema_invalid_output` is `escalate-model-tier`, so a blocked report that
+ * could not be parsed would promote the ladder against a step that did its job.
+ */
+describe('empty collections, and the statuses they bind on (matrix 28, 29)', () => {
+  it('refuses a completed analysis that makes no claims', () => {
+    const result = AnalysisOutputSchema.safeParse(analysisOutput({ status: 'completed', claims: [] }));
+    expect(result.success).toBe(false);
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain('claims');
+  });
+
+  it.each(['blocked', 'failed'] as const)(
+    'accepts a %s analysis with no claims and no territory, so it can terminate cleanly',
+    (status) => {
+      const result = AnalysisOutputSchema.safeParse(
+        analysisOutput({
+          status,
+          claims: [],
+          territory: [],
+          files_read: [],
+          error: {
+            code: 'question.unanswerable',
+            message: 'the request does not say which service is meant',
+            retryable: false,
+            cause: null,
+          },
+        }),
+      );
+      expect(result.success, JSON.stringify(result.error?.issues ?? [])).toBe(true);
+    },
+  );
+
+  it('still refuses a malformed territory entry on a blocked output, which is a different fault', () => {
+    const result = AnalysisOutputSchema.safeParse(
+      analysisOutput({ status: 'blocked', claims: [], territory: ['/'], files_read: [] }),
+    );
+    expect(result.success).toBe(false);
   });
 
   it('refuses a file_read outside the worktree, which no step could have read', () => {

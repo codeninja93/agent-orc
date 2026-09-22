@@ -72,7 +72,9 @@ export type ClaimProvenance = z.infer<typeof ClaimProvenanceSchema>;
  * makes no assertion about a path rather than asserting a wrong one.
  */
 export const AnalysisClaimSchema = z.object({
-  claim: z.string().describe('One statement about the work, standing on its own.'),
+  claim: z
+    .string()
+    .describe('One statement about the work, standing on its own. Never blank.'),
   paths: z
     .array(z.string())
     .describe(
@@ -101,7 +103,10 @@ const AnalysisOutputShape = StepOutputSchema.extend({
   contract_id: z.literal(ANALYSIS_CONTRACT_ID),
   claims: z
     .array(AnalysisClaimSchema)
-    .describe('Every claim this analysis makes. Each one carries its own provenance.'),
+    .describe(
+      'Every claim this analysis makes, each carrying its own provenance. A completed analysis makes at ' +
+        'least one; report "blocked" rather than completing with none.',
+    ),
   /**
    * The territory analysis found, which is the correction to the one declared at run creation.
    *
@@ -113,8 +118,9 @@ const AnalysisOutputShape = StepOutputSchema.extend({
   territory: z
     .array(z.string())
     .describe(
-      'Repository-relative paths this feature touches. Declare at least one; "." means the whole ' +
-        'repository and serialises this feature against every other one.',
+      'Repository-relative paths this feature touches. A completed analysis declares at least one; "." ' +
+        'means the whole repository and serialises this feature against every other one. Never blank, ' +
+        'never absolute, never climbing out of the worktree. Report "blocked" if it cannot be determined.',
     ),
   files_read: z
     .array(z.string())
@@ -125,10 +131,75 @@ const AnalysisOutputShape = StepOutputSchema.extend({
  * `step.analysis`'s output.
  *
  * Every refinement below is applied per element and names the element it refused, so a refusal says
- * which claim was unattributed rather than that "provenance was invalid".
+ * which claim was unattributed rather than that "provenance was invalid". Each one is also stated in the
+ * `.describe()` of the field it binds, because a refinement emits nothing into the draft-7 export and a rule
+ * the producer cannot see makes `step.schema_invalid_output` the normal outcome rather than the exceptional
+ * one.
  */
 export const AnalysisOutputSchema = AnalysisOutputShape.superRefine((output, ctx) => {
+  /**
+   * The territory is validated **first**, and containment is only asked once it is known to be well formed.
+   *
+   * A malformed entry makes `territoryContains` answer about a territory that is not the declared one, so
+   * checking claims against it raises a second issue blaming the claim for the territory's fault — two
+   * messages, one of them pointing at the wrong line.
+   */
+  let territoryWellFormed = output.territory.length > 0;
+  output.territory.forEach((path, index) => {
+    if (!isRepositoryRelativePath(path)) {
+      territoryWellFormed = false;
+      ctx.addIssue({
+        code: 'custom',
+        path: ['territory', index],
+        message:
+          `"${path}" is not a repository-relative path, so no run worktree contains it. A blank entry, a ` +
+          'bare "/" or a "src/.." would normalise to the whole repository and make every ' +
+          'claim-inside-its-territory check vacuous.',
+      });
+    }
+  });
+
+  /**
+   * A completed analysis declares a territory and makes at least one claim; a blocked or failed one need
+   * not.
+   *
+   * The two halves are one rule seen from both sides. An empty `claims` is an analysis that completed while
+   * asserting nothing, and it also makes every per-claim refinement below pass vacuously — the same defect
+   * as an empty territory, one field over. But binding either requirement to a `blocked` or `failed` report
+   * would refuse the honest refusal: a step that cannot determine the territory has to be able to say so
+   * and terminate, and `step.schema_invalid_output` is `escalate-model-tier`, so refusing it here would
+   * promote the ladder against a step that did its job.
+   */
+  if (output.status === 'completed') {
+    if (output.territory.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['territory'],
+        message:
+          'a completed analysis declares at least one path; an empty territory overlaps nothing and would ' +
+          'be admitted beside every other feature, which is the one failure direction the serialisation ' +
+          'must not have. Report "blocked" instead if the territory cannot be determined.',
+      });
+    }
+    if (output.claims.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['claims'],
+        message:
+          'a completed analysis makes at least one claim; an empty list asserts nothing and makes every ' +
+          'per-claim rule pass vacuously. Report "blocked" instead if there is nothing to state.',
+      });
+    }
+  }
+
   output.claims.forEach((claim, index) => {
+    if (claim.claim.trim() === '') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['claims', index, 'claim'],
+        message: 'a claim states something; a blank one is attributed to a step that said nothing',
+      });
+    }
     if (!attributesClaim(claim.provenance)) {
       ctx.addIssue({
         code: 'custom',
@@ -149,41 +220,19 @@ export const AnalysisOutputSchema = AnalysisOutputShape.superRefine((output, ctx
         });
         return;
       }
-      if (!territoryContains(output.territory, path)) {
+      // Only asked when the territory itself parsed: see the note at the top of this refinement.
+      if (territoryWellFormed && !territoryContains(output.territory, path)) {
         ctx.addIssue({
           code: 'custom',
           path: ['claims', index, 'paths', pathIndex],
           message:
             `"${path}" is outside the territory this output declares (${output.territory.join(', ')}); ` +
-            'a claim about a file the feature does not claim is a claim about another feature’s work',
+            'a claim about a file the feature does not claim is a claim about another feature\u2019s work',
         });
       }
     });
   });
-  output.territory.forEach((path, index) => {
-    if (!isRepositoryRelativePath(path)) {
-      ctx.addIssue({
-        code: 'custom',
-        path: ['territory', index],
-        message: `"${path}" is not a repository-relative path, so no run worktree contains it`,
-      });
-    }
-  });
-  if (output.territory.length === 0) {
-    ctx.addIssue({
-      code: 'custom',
-      path: ['territory'],
-      /**
-       * An empty territory is the one value that fails *open*: it collides with nothing, so the
-       * reconciler would admit this feature beside every other one. `WHOLE_REPOSITORY_TERRITORY` is
-       * what an unreadable declaration becomes for exactly that reason, and a declaration of nothing is
-       * not a statement that the feature touches nothing — it is a missing answer.
-       */
-      message:
-        'declare at least one path; an empty territory overlaps nothing and would be admitted beside ' +
-        'every other feature, which is the one failure direction the serialisation must not have',
-    });
-  }
+
   output.files_read.forEach((path, index) => {
     if (!isRepositoryRelativePath(path)) {
       ctx.addIssue({

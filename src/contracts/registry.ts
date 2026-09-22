@@ -241,3 +241,30 @@ export const toJsonSchema = (schema: z.ZodType): JsonSchema =>
 
 /** The draft-7 JSON Schema for a registered contract id. */
 export const exportContract = (id: string): JsonSchema => toJsonSchema(getContract(id).schema);
+
+/**
+ * Parse a planning output, and refuse a plan naming a contract id the registry does not hold.
+ *
+ * **Why the check is here and not in `PlannedStepSchema`.** `src/contracts/planning.ts` cannot ask the
+ * registry whether an id is registered — the registry imports the schema, so the reverse import would be a
+ * cycle. That is the same reason `AgentDeclarationSchema.contract` is a plain string and
+ * `src/installer/write.ts` resolves it through {@link getContract} on the way in. This module is the one
+ * that already holds both halves, so the check goes here, and the refusal is the registry's own: it names
+ * every registered id, which is what a person needs to fix the plan.
+ *
+ * Without it, `getContract` throws when the engine turns the plan into a step — mid-run, several steps after
+ * the plan was accepted, with the failure a long way from the output that caused it.
+ */
+export const parsePlanningOutput = (value: unknown): z.output<typeof PlanningOutputSchema> => {
+  const parsed = PlanningOutputSchema.parse(value);
+  parsed.plan.forEach((step, index) => {
+    if (!isContractId(step.contract_id)) {
+      throw new Error(
+        `Refusing the plan: step ${String(index)} ("${step.step}") names contract id ` +
+          `"${step.contract_id}", which is not registered. Registered ids: ${CONTRACT_IDS.join(', ')}. ` +
+          'AD-17: a step references a registered contract id, never an inline schema.',
+      );
+    }
+  });
+  return parsed;
+};

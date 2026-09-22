@@ -353,6 +353,27 @@ export const FeatureTerritoryDeclaredPayloadSchema = z.looseObject({
   [DECLARATION_PAYLOAD_KEYS.TerritoryRemovedPaths]: z.array(z.string()).optional(),
   [DECLARATION_PAYLOAD_KEYS.TerritoryWidened]: z.boolean().optional(),
   ...repairedKey,
-});
+}).refine(
+  (payload) => {
+    const widened = payload[DECLARATION_PAYLOAD_KEYS.TerritoryWidened];
+    const added = payload[DECLARATION_PAYLOAD_KEYS.TerritoryAddedPaths];
+    if (widened === undefined || added === undefined) return true;
+    return widened === added.length > 0;
+  },
+  {
+    /**
+     * `widened` is a *summary* of `added_paths`, and a payload where the two disagree says two things.
+     *
+     * The flag is what a reader acts on and the list is what it acts with, so a line claiming
+     * `widened: false` beside a non-empty `added_paths` would have a replay conclude that a real widening
+     * never happened — the exact failure the keys were added to prevent. Bound here rather than trusted to
+     * the emitter, because a payload is read by units that never ran the emitter.
+     */
+    message:
+      'widened is true exactly when added_paths is non-empty; a flag that disagrees with the list it ' +
+      'summarises would have a replay read a real widening as none',
+    path: [DECLARATION_PAYLOAD_KEYS.TerritoryWidened],
+  },
+);
 
 export type FeatureTerritoryDeclaredPayload = z.infer<typeof FeatureTerritoryDeclaredPayloadSchema>;

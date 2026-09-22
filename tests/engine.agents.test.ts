@@ -275,6 +275,18 @@ describe('the roster is authoritative where it disagrees with ADR-003 (matrix 11
  */
 describe('the engine holds no compiled-in grant table', () => {
   const engineDir = new URL('../src/engine/', import.meta.url);
+  const srcDir = new URL('../src/', import.meta.url);
+
+  /**
+   * The one directory a grant table legitimately lives in.
+   *
+   * `src/installer/` *is* the built-in roster — `BUILT_IN_AGENTS` pairs each agent with its tools, which
+   * is the template the installer writes into `.orch/agents/`. AD-17 permits exactly that and forbids the
+   * engine reading it; story 2-3's import guard is what keeps the second half true. Everything else under
+   * `src/` is scanned, because a table in `src/contracts/` or `src/runtime/` would be as much a
+   * compiled-in roster as one in `src/engine/`, and scanning only the engine would have missed it.
+   */
+  const ALLOWED_TO_HOLD_A_GRANT_TABLE = 'installer/';
 
   const listSources = (dir: URL, prefix = ''): string[] =>
     readdirSync(dir, { withFileTypes: true, encoding: 'utf8' }).flatMap((entry) =>
@@ -291,7 +303,14 @@ describe('the engine holds no compiled-in grant table', () => {
    * violation would be unusable — so the claim is about code and the check is about code.
    */
   const codeOf = (source: string): string =>
-    source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
+    source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      // Both forms: a comment on its own line, and one trailing code. The first version matched only the
+      // first, so `const tools = [];  // analysis gets Read, Grep, Glob` stayed in the text the check
+      // read — a comment counted as a violation, which is the direction that makes a guard unusable and
+      // then removed.
+      .replace(/^[ \t]*\/\/.*$/gm, '')
+      .replace(/(^|[^:'"\`\\])\/\/.*$/gm, '$1');
 
   /** The six the built-in roster declares, which are also the phase names. */
   const AGENT_IDS = ['analysis', 'planning', 'implementation', 'testing', 'verification', 'committing'];
@@ -332,6 +351,21 @@ describe('the engine holds no compiled-in grant table', () => {
 
   it('finds no agent id sitting beside a granted tool name under src/engine/', () => {
     expect(grantTableViolationsIn(engineDir, files)).toStrictEqual([]);
+  });
+
+  it('finds none anywhere else under src/ either, the installer\u2019s own roster excepted', () => {
+    const everywhere = listSources(srcDir).filter(
+      (file) => !file.startsWith(ALLOWED_TO_HOLD_A_GRANT_TABLE),
+    );
+    expect(everywhere.length).toBeGreaterThan(files.length);
+    expect(grantTableViolationsIn(srcDir, everywhere)).toStrictEqual([]);
+  });
+
+  it('would find the installer\u2019s own table, so the exemption is doing work and not hiding nothing', () => {
+    const installerFiles = listSources(srcDir).filter((file) =>
+      file.startsWith(ALLOWED_TO_HOLD_A_GRANT_TABLE),
+    );
+    expect(grantTableViolationsIn(srcDir, installerFiles).length).toBeGreaterThan(0);
   });
 
   it.each([

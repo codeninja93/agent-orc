@@ -61,18 +61,37 @@ export const pathsCollide = (a: string, b: string): boolean =>
   pathContains(a, b) || pathContains(b, a);
 
 /**
+ * The spellings that *deliberately* mean the whole repository.
+ *
+ * `.` is the documented fail-safe the engine's `WHOLE_REPOSITORY_TERRITORY` substitutes when it cannot read
+ * a declaration: it collides with everything, so the feature is serialised against every other one. That is
+ * a value worth accepting. What must not be accepted is a *malformed* entry arriving at the same value by
+ * accident.
+ */
+const WHOLE_REPOSITORY_SPELLINGS: readonly string[] = ['.', './', '.\\'];
+
+/**
  * True when a declared path is inside the repository it is declared against.
  *
- * An absolute path, a Windows drive letter and a `..` that climbs out of the tree are each a path the
- * run worktree does not contain, and `--add-dir` scoped to that worktree is what ADR-001 bounds a step
- * by — so a claim naming one is a claim about a file the step was never admitted to. Normalisation
- * happens first, because `src/../../etc` only escapes once it is resolved.
+ * An absolute path, a Windows drive letter and a `..` that climbs out of the tree are each a path the run
+ * worktree does not contain, and `--add-dir` scoped to that worktree is what ADR-001 bounds a step by — so a
+ * claim naming one is a claim about a file the step was never admitted to.
+ *
+ * **The raw spelling is checked before normalisation, not after.** `''`, `'   '`, `'/'`, `'//'` and
+ * `'src/..'` all *normalise* to `.`, so a check written after normalising can only ask "is this the whole
+ * repository", which every one of them answers yes to — and the `normalised === ''` refusal that used to be
+ * here was unreachable for exactly that reason. The consequence is not a concurrency one, since `.` is the
+ * fail-safe direction there; it is **containment**: a territory of `.` contains every path, so every
+ * claim-inside-its-territory refusal becomes vacuous and any path at all passes. A blank or malformed entry
+ * is therefore refused, and the two spellings that say "the whole repository" on purpose are not.
  */
 export const isRepositoryRelativePath = (declared: string): boolean => {
+  const raw = declared.trim();
+  if (raw === '') return false;
+  if (raw.startsWith('/') || raw.startsWith('\\')) return false;
+  if (/^[A-Za-z]:/.test(raw)) return false;
   const normalised = normaliseTerritoryPath(declared);
-  if (normalised === '') return false;
-  if (normalised.startsWith('/')) return false;
-  if (/^[A-Za-z]:/.test(normalised)) return false;
+  if (normalised === '.') return WHOLE_REPOSITORY_SPELLINGS.includes(raw);
   return normalised !== '..' && !normalised.startsWith('../');
 };
 

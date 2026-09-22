@@ -33,8 +33,11 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
+  ANALYSIS_CONTRACT_ID,
+  AnalysisOutputSchema,
   CURRENT_SCHEMA_VERSION,
   DECLARATION_PAYLOAD_KEYS,
+  PLANNING_CONTRACT_ID,
   MODEL_RUNGS,
   REPAIRED_PAYLOAD_KEY,
   SPEC_CRITERION_EDITED_EVENT_TYPE,
@@ -164,6 +167,7 @@ import type { CheckpointDisagreement, FeaturePlan, PlanStep } from './rebuild.js
 import {
   TERRITORY_DECLARED_EVENT_TYPE,
   admitByTerritory,
+  recordTerritoryRedeclaration,
   territoryDeclaredPayload,
 } from './territory.js';
 import type { TerritoryCandidate, TerritoryDeferral } from './territory.js';
@@ -173,6 +177,28 @@ import type { UlidMinter } from './ulid.js';
 
 /** `runs/<run-id>/steps/` — where a step's typed input file lives. */
 export const STEPS_DIR_NAME = 'steps';
+
+/**
+ * The steps a feature runs, one per phase, in the order a run meets them.
+ *
+ * **Why the engine states the sequence and not the grants.** AD-17 forbids the engine a compiled-in list
+ * of *agents* — who exists, and what each may do — because that is declarative configuration a repository
+ * owns. The order the four phases run in is not that: it is the workflow AD-1 and CAP-13 describe, a
+ * feature is analysed before it is planned and verified after it is built, and `FeaturePlan` has always
+ * been the engine's own shape. Each step names a *registered contract id*, which is the reference AD-17
+ * requires, and the grant for each phase is still read from the roster at spawn time and nowhere else.
+ *
+ * Until story 2-4 this list existed only in the test fixtures and held two steps, so no plan ever carried
+ * `phase: 'analysis'` and the analysis contract, the phase vocabulary and the territory re-declaration were
+ * each reachable only by a test constructing them by hand. A caller may still supply its own plan; this is
+ * what a feature gets when nobody does.
+ */
+export const STANDARD_PLAN_STEPS: readonly PlanStep[] = Object.freeze([
+  { step: 'analyse', contract_id: ANALYSIS_CONTRACT_ID, phase: 'analysis' },
+  { step: 'plan', contract_id: PLANNING_CONTRACT_ID, phase: 'planning' },
+  { step: 'implement', contract_id: 'step.output', phase: 'implementation' },
+  { step: 'verify', contract_id: 'step.output', phase: 'verification' },
+]);
 export const STEP_INPUT_FILE_NAME = 'input.json';
 
 // -------------------------------------------------------------------------------------------------
@@ -2961,6 +2987,10 @@ export class Reconciler {
       baselineRef,
     });
 
+    if (termination.disposition === 'completed') {
+      this.recordDeclaredTerritory(state, step, recorder, termination);
+    }
+
     if (termination.disposition === 'interrupted' && context.transitionTo !== 'interrupted') {
       this.emit(recorder, {
         step: step.step,
@@ -2972,6 +3002,46 @@ export class Reconciler {
         },
       });
     }
+  }
+
+  /**
+   * Record the territory a completed step *declared*, when its output is one that declares one.
+   *
+   * This is the join the story is named for: a feature is accepted with the territory its caller guessed,
+   * analysis reads the repository and says which files it actually touches, and the next admission pass
+   * serialises whatever that newly overlaps. Until it existed, `acceptFeature`'s run-creation line was the
+   * only `feature.territory_declared` any production path ever wrote.
+   *
+   * **Keyed on the contract, not on the phase.** The test is whether the output parses as a
+   * `step.analysis` output — which is to say, whether it carries a declared territory at all — and not
+   * whether `step.phase === 'analysis'`. A phase test would be a second place that decides what an
+   * analysis agent is, and a repository that declares its own agent against the same contract would
+   * declare a territory the engine ignored. `contractOutput` is the value that contract validated, before
+   * `StepOutputSchema` narrowed it and stripped the territory out.
+   *
+   * The comparison is against the *log*, inside `recordTerritoryRedeclaration`, never against the plan:
+   * the plan is what the caller declared at run creation and may already be two corrections behind.
+   */
+  private recordDeclaredTerritory(
+    state: RunState,
+    step: PlanStep,
+    recorder: Recorder,
+    termination: StepTermination,
+  ): void {
+    const declared = AnalysisOutputSchema.safeParse(termination.contractOutput);
+    // Not an output that declares a territory. Every other contract reaches here too, and says nothing.
+    if (!declared.success) return;
+
+    const paths = runPaths(state.run, this.orchHome);
+    const recorded = recordTerritoryRedeclaration({
+      recorder,
+      step: step.step,
+      events: readEventLog(paths.eventLog),
+      declared: declared.data.territory,
+    });
+    // AD-4: a correction the log does not carry is one the next pass will not see, so a dropped line is
+    // the same unrecorded action every other emit treats as one rather than something to carry on past.
+    if (!recorded.recorded) throw new UnrecordedAction(TERRITORY_DECLARED_EVENT_TYPE);
   }
 
   /** Build the port's request. Nothing here spawns: that is story 1-4's whole subject. */

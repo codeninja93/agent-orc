@@ -12,18 +12,41 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { AgentDeclarationSchema, GRANTABLE_TOOLS } from '../src/contracts/index.js';
+import {
+  AgentDeclarationSchema,
+  GRANTABLE_TOOLS,
+  getContract,
+  isContractId,
+} from '../src/contracts/index.js';
 import { BUILT_IN_AGENTS } from '../src/installer/interview.js';
 
-/** The table ADR-003 fixes. A row changing here is an architecture change and should arrive as one. */
-const GRANTED: Readonly<Record<string, readonly string[]>> = {
-  analysis: ['Read', 'Grep', 'Glob'],
-  planning: ['Read', 'Grep', 'Glob'],
-  implementation: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'],
-  testing: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'],
-  verification: ['Read', 'Grep', 'Glob', 'Bash'],
-  committing: ['Read', 'Grep', 'Glob'],
+/**
+ * The table ADR-003 fixes, and the contract each agent answers against. A row changing here is an
+ * architecture change and should arrive as one.
+ *
+ * **The contract column is beside the grant because the two failed together.** Story 2-4 registered
+ * `step.analysis` and `step.planning`, whose shapes pin `contract_id` to their own id — and the shipped
+ * declarations still said `step.output`. The pairing could never both hold, so for a default install every
+ * per-claim provenance, territory-containment and `files_read` refusal the new contracts added was dead
+ * code, and nothing in the suite could notice: the grants were pinned and the contract ids were not. A
+ * declaration references a registered contract id (AD-17), and which one is as much a decision as the
+ * grant is.
+ */
+const DECLARED: Readonly<Record<string, { readonly tools: readonly string[]; readonly contract: string }>> = {
+  analysis: { tools: ['Read', 'Grep', 'Glob'], contract: 'step.analysis' },
+  planning: { tools: ['Read', 'Grep', 'Glob'], contract: 'step.planning' },
+  implementation: {
+    tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'],
+    contract: 'step.output',
+  },
+  testing: { tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'], contract: 'step.output' },
+  verification: { tools: ['Read', 'Grep', 'Glob', 'Bash'], contract: 'step.output' },
+  committing: { tools: ['Read', 'Grep', 'Glob'], contract: 'step.output' },
 };
+
+const GRANTED: Readonly<Record<string, readonly string[]>> = Object.fromEntries(
+  Object.entries(DECLARED).map(([id, row]) => [id, row.tools]),
+);
 
 describe('the built-in roster grants exactly what ADR-003 decided', () => {
   it('declares the six built-ins the table names, and no others', () => {
@@ -34,6 +57,51 @@ describe('the built-in roster grants exactly what ADR-003 decided', () => {
     const agent = BUILT_IN_AGENTS.find((candidate) => candidate.id === id);
     expect(agent?.tools).toStrictEqual(GRANTED[id]);
   });
+
+  it.each(Object.keys(DECLARED))('points %s at the contract its output is validated against', (id) => {
+    const agent = BUILT_IN_AGENTS.find((candidate) => candidate.id === id);
+    expect(agent?.contract).toBe(DECLARED[id]?.contract);
+  });
+
+  it('points every built-in at a registered contract, which is what AD-17 requires of a reference', () => {
+    for (const agent of BUILT_IN_AGENTS) {
+      expect(isContractId(agent.contract), `${agent.id} references ${agent.contract}`).toBe(true);
+      expect(getContract(agent.contract).kind, agent.id).toBe('step');
+    }
+  });
+
+  /**
+   * The pairing that could never hold, asserted as a pairing rather than as two facts side by side.
+   *
+   * `step.analysis` and `step.planning` pin `contract_id` to their own id, so an output produced under a
+   * declaration naming `step.output` fails its own contract at AD-1's re-parse — every time, for every
+   * default install. A test that checked only "the id is registered" would pass on exactly that.
+   */
+  it.each(['analysis', 'planning'])(
+    'gives %s a contract whose own pinned id is the one it declares',
+    (id) => {
+      const agent = BUILT_IN_AGENTS.find((candidate) => candidate.id === id);
+      const declared = agent?.contract ?? '';
+      const exported = getContract(declared).schema;
+      const probe = exported.safeParse({
+        contract_id: 'step.output',
+        step: id,
+        status: 'blocked',
+        summary: 's',
+        provenance: [],
+        decisions: [],
+        artifacts: [],
+        questions: [],
+        write_intents: [],
+        error: null,
+        claims: [],
+        plan: [],
+        territory: [],
+        files_read: [],
+      });
+      expect(probe.success, `${id} accepted an output claiming step.output`).toBe(false);
+    },
+  );
 
   /**
    * The row this test exists for. AD-15 makes pull-request creation, `git push`, notes and tags

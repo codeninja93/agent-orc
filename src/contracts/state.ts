@@ -72,9 +72,12 @@ export const isTerminalFeatureState = (state: FeatureState): boolean =>
   TERMINAL_FEATURE_STATES.includes(state);
 
 /**
- * Which phase of the pipeline a step belongs to. CAP-13 runs deterministic gates after the
- * implementation steps, and the lifecycle's `running` → `verifying` → `committed` path is exactly
- * the boundary between the two.
+ * Which phase of the pipeline a step belongs to.
+ *
+ * Four of them, in the order a run meets them: a feature is analysed, planned, implemented and then
+ * verified. CAP-13 runs the deterministic gates in the last of those, and the lifecycle's `running` →
+ * `verifying` → `committed` path is the boundary between `verification` and everything before it — not, as
+ * this comment said while the enum held two members, a boundary between two halves.
  *
  * **The names are the agent ids, deliberately, and this is an enum widening AD-28 covers.** `analysis`
  * and `planning` arrived in story 2-4; the roster's six built-ins and ADR-003's grant table use the same

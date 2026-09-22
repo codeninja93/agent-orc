@@ -26,6 +26,7 @@ import {
   exportContract,
   getContract,
   isContractId,
+  parsePlanningOutput,
   parseVersionedArtifact,
 } from '../src/contracts/index.js';
 import type { PlannedStep, PlanningOutput } from '../src/contracts/index.js';
@@ -289,5 +290,103 @@ describe('the phase vocabulary, widened safely (matrix 14, 15)', () => {
     expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain(
       'steps.0.phase',
     );
+  });
+});
+
+/**
+ * Matrix 28 and 29 for the plan, plus the hygiene the same refinement owns.
+ *
+ * An empty `plan` is a completion with nothing to execute — the same defect as an empty territory, one
+ * field over — and both bind on `completed` only, so a blocked report can terminate cleanly rather than
+ * being refused as a schema-invalid output and promoting the model ladder against a step that did its job.
+ */
+describe('empty collections, blank fields and duplicate ids (matrix 28, 29)', () => {
+  it('refuses a completed plan with no steps', () => {
+    const result = PlanningOutputSchema.safeParse(planningOutput({ status: 'completed', plan: [] }));
+    expect(result.success).toBe(false);
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain('plan');
+  });
+
+  it.each(['blocked', 'failed'] as const)(
+    'accepts a %s plan with no steps and no territory',
+    (status) => {
+      const result = PlanningOutputSchema.safeParse(
+        planningOutput({
+          status,
+          plan: [],
+          territory: [],
+          error: {
+            code: 'question.unanswerable',
+            message: 'the analysis does not determine an order',
+            retryable: false,
+            cause: null,
+          },
+        }),
+      );
+      expect(result.success, JSON.stringify(result.error?.issues ?? [])).toBe(true);
+    },
+  );
+
+  it.each([
+    ['', 'blank'],
+    ['   ', 'whitespace'],
+    ['/', 'the root'],
+    ['src/..', 'a path climbing back to the top'],
+  ])('refuses a territory entry spelled %j, which is %s', (path) => {
+    const result = PlanningOutputSchema.safeParse(planningOutput({ territory: [path] }));
+    expect(result.success).toBe(false);
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain('territory.0');
+  });
+
+  it('reads two spellings of one step id as one step', () => {
+    // Raw equality admits both, and the checkpoint then carries two records for what every log line
+    // calls one step — a fault `RunStateSchema` raises much later and much further from its cause.
+    const result = PlanningOutputSchema.safeParse(
+      planningOutput({ plan: [plannedStep({ step: 'one' }), plannedStep({ step: 'one ' })] }),
+    );
+    expect(result.success).toBe(false);
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain('plan.1.step');
+  });
+
+  it.each([
+    ['step', { step: '  ' }],
+    ['intent', { intent: '' }],
+    ['contract_id', { contract_id: '   ' }],
+  ])('refuses a step whose %s is blank', (field, overrides) => {
+    const result = PlanningOutputSchema.safeParse(
+      planningOutput({ plan: [plannedStep(overrides)] }),
+    );
+    expect(result.success).toBe(false);
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain(
+      `plan.0.${field}`,
+    );
+  });
+});
+
+/**
+ * A plan naming a contract the registry does not hold.
+ *
+ * The check cannot live in `PlannedStepSchema` — the registry imports that schema, so the reverse import
+ * would be a cycle, which is the same reason `AgentDeclarationSchema.contract` is a plain string. It
+ * lives in the registry, which already holds both halves. Without it, `getContract` throws when the
+ * engine turns the plan into a step: mid-run, several steps after the plan was accepted.
+ */
+describe('a planned step references a registered contract id (AD-17)', () => {
+  it('accepts a plan naming registered ids', () => {
+    expect(() => parsePlanningOutput(planningOutput())).not.toThrow();
+    expect(parsePlanningOutput(planningOutput()).plan[0]?.contract_id).toBe('step.output');
+  });
+
+  it('refuses one naming an id the registry does not hold, and names the registered ones', () => {
+    const output = planningOutput({ plan: [plannedStep({ contract_id: 'step.documentation' })] });
+    expect(() => parsePlanningOutput(output)).toThrowError(/step\.documentation/);
+    expect(() => parsePlanningOutput(output)).toThrowError(/step\.analysis/);
+  });
+
+  it('is a refusal the plain schema does not make, which is why the helper exists', () => {
+    // Stated rather than implied: `PlanningOutputSchema` accepts it, so a caller that parses with the
+    // schema alone is the caller that meets `getContract` mid-run.
+    const output = planningOutput({ plan: [plannedStep({ contract_id: 'step.documentation' })] });
+    expect(PlanningOutputSchema.safeParse(output).success).toBe(true);
   });
 });
