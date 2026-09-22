@@ -21,8 +21,11 @@ correction to the table story 2-1 shipped and one new constraint on how a grant 
 ## Why this needed deciding now
 
 ADR-001 moved the containment boundary from the agent process to the commands the agent runs, and in doing so
-made `--tools` load-bearing: a roster entry granting `Bash` grants the ability to run commands — contained,
-but real. It deferred the table to stories 2-3 through 2-7, "where each agent's job is actually defined".
+made `--tools` load-bearing: a roster entry granting `Bash` grants the ability to run commands. This
+paragraph said "contained, but real", and **ADR-004 measured that false** — the agent process runs on the
+host, so its `Bash` runs on the host, and no flag relocates a tool use into a container. Read it as "real,
+and *not* contained": the ADR-004 amendment below follows from exactly that correction. It deferred the
+table to stories 2-3 through 2-7, "where each agent's job is actually defined".
 
 Story 2-1 arrived first and shipped a built-in roster with grants already in it, because the installer has to
 write *something* into `.orch/agents/`. So the question was answered de facto, by an implementation, without
@@ -34,9 +37,9 @@ the decision ever being taken. This ADR takes it.
 |---|---|---|---|
 | `analysis` | `Read`, `Grep`, `Glob` | reversible | It states what the work is. It needs to read the repository and nothing else. |
 | `planning` | `Read`, `Grep`, `Glob` | reversible | It orders steps and declares territories. Same reach as analysis; it produces a plan, not a change. |
-| `implementation` | `Read`, `Write`, `Edit`, `Grep`, `Glob` (**`Bash` removed by ADR-004**) | recoverable | It writes the change in the run worktree. `Bash` is how a gate runs, inside the container per ADR-001. |
-| `testing` | `Read`, `Write`, `Edit`, `Grep`, `Glob` (**`Bash` removed by ADR-004**) | recoverable | **`Write`/`Edit` is deliberate and is broader than ADR-001's sketch.** That sketch said "testing and the committer get `Bash`", which is incomplete: this agent's job is to *write* the tests as well as run them, and a testing agent that cannot author a test is not one. |
-| `verification` | `Read`, `Grep`, `Glob` (**`Bash` removed by ADR-004**) | reversible | It runs the declared gates and reports. It must not be able to edit what it is judging — that is the whole reason it is a separate agent from `testing`. |
+| `implementation` | `Read`, `Write`, `Edit`, `Grep`, `Glob` (**`Bash` removed by ADR-004**) | recoverable | It writes the change in the run worktree. It does not run the gates: ADR-004 makes command execution an MCP tool whose server runs the command inside the container. |
+| `testing` | `Read`, `Write`, `Edit`, `Grep`, `Glob` (**`Bash` removed by ADR-004**) | recoverable | **`Write`/`Edit` is deliberate and is broader than ADR-001's sketch.** That sketch said "testing and the committer get `Bash`", which is incomplete: this agent's job is to *write* the tests as well as run them, and a testing agent that cannot author a test is not one. Running them is ADR-004's command tool, not this grant. |
+| `verification` | `Read`, `Grep`, `Glob` (**`Bash` removed by ADR-004**) | reversible | It reports on the declared gates, which it runs through ADR-004's command tool rather than through a shell of its own. It must not be able to edit what it is judging — that is the whole reason it is a separate agent from `testing`. |
 | `committing` | `Read`, `Grep`, `Glob` | irreversible | **Changed from what story 2-1 shipped.** See below. |
 
 **No built-in agent is granted `Task`**, so no step can spawn an unbounded tree of its own. **None is granted
@@ -87,13 +90,18 @@ decision; discovering one in a TOML is not.
 - **A user-defined agent can be granted anything the declared set contains**, including `Bash`. AD-17 makes
   the roster declarative and question 11 of the installer's interview asks for the grant directly. This ADR
   fixes the built-ins; it does not constrain what a person may declare for their own agent, and the review of
-  a roster entry is the control there.
+  a roster entry is the control there. **Amended by ADR-004:** what such a grant yields is an *uncontained
+  host shell*, not the contained command runner this table assumed — the agent process runs on the host and
+  so does its `Bash`. The grant stays legal and the warning is the control: story 2-4's `elevated` reporting
+  names it on the spawn event, so a person reviewing a roster entry sees what they gave away.
 
 ## What this changes
 
 - **AD-17** gains this table as the built-in roster's grant, and the rule that a granted tool name must be a
   declared name.
-- **Story 2-1's `BUILTIN_AGENTS`** changes in one row: `committing` drops `Bash` and its purpose is reworded.
+- **Story 2-1's `BUILTIN_AGENTS`** changes in one row here: `committing` drops `Bash` and its purpose is
+  reworded. **With ADR-004 it is four rows**, since `implementation`, `testing` and `verification` drop
+  `Bash` too — which leaves no built-in granted it at all.
 - **ADR-001's open question is closed.** What remains open there is nothing.
 - **Stories 2-3 through 2-7** inherit this table rather than each inventing a row of it. A story that needs a
   grant this table does not give is making an architecture change and should say so.

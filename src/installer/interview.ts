@@ -167,7 +167,9 @@ const noSuggestion = (): null => null;
  * engine change, and those three do not. `analysis` and `planning` do — story 2-4 registered `step.analysis`
  * and `step.planning`, whose shapes carry per-claim provenance and a declared territory — and so does
  * `implementation`, whose `step.implementation` (story 2-5) describes the files changed and leaves no field
- * through which a path outside the run worktree can be returned. They name them here. A declaration naming `step.output` while its agent's contract pins `contract_id` to its own id is a
+ * through which a path outside the run worktree can be returned. They name them here.
+ *
+ * A declaration naming `step.output` while its agent's contract pins `contract_id` to its own id is a
  * pairing that can never both hold: every refusal the new contract adds would be dead for a default install,
  * with nothing able to notice. `tests/contracts.agent-grants.test.ts` pins the contract id beside the grant
  * for exactly that reason.
@@ -202,7 +204,10 @@ export const BUILT_IN_AGENTS: readonly AgentDeclarationInput[] = Object.freeze([
     tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob'],
     mcp_domains: [],
     reversibility: 'recoverable',
-    model: { start_tier: 'claude-sonnet-5', promotion_policy: 'on-gate-failure' },
+    // The cheapest rung, because AD-17 makes this a *starting* tier and not an assignment: the ladder
+    // promotes a step that fails its gate, so starting anywhere above the floor spends the expensive
+    // model on the attempts that would have succeeded without it and leaves less ladder to climb.
+    model: { start_tier: 'claude-haiku-4-5', promotion_policy: 'on-gate-failure' },
   },
   {
     id: 'testing',

@@ -35,7 +35,7 @@ import { join } from 'node:path';
 import {
   ANALYSIS_CONTRACT_ID,
   IMPLEMENTATION_CONTRACT_ID,
-  AnalysisOutputSchema,
+  declaredTerritoryIn,
   CURRENT_SCHEMA_VERSION,
   DECLARATION_PAYLOAD_KEYS,
   PLANNING_CONTRACT_ID,
@@ -173,7 +173,8 @@ import {
 } from './territory.js';
 import type { TerritoryCandidate, TerritoryDeferral } from './territory.js';
 import { EngineLock } from './lock.js';
-import { rungForAttempt } from './promotion.js';
+import { resolveAgentGrant } from './agents.js';
+import { ModelRungUnrecognised, rungForAttempt } from './promotion.js';
 import { defaultUlidMinter } from './ulid.js';
 import type { UlidMinter } from './ulid.js';
 
@@ -2663,13 +2664,32 @@ export class Reconciler {
       });
     }
 
-    // The ladder owns the precedence, including that a re-run never drops below the rung the step
-    // already reached (`src/engine/promotion.ts`).
-    let tier: ModelRung = rungForAttempt({
-      promoteTo: options.promoteTo,
-      recorded: existing?.model_tier ?? null,
-      declared: plan.starting_model_tier,
-    });
+    /**
+     * The ladder owns the precedence — a promotion, then the rung the step already reached, then what
+     * was declared for it — so a re-run never drops below a rung it climbed to.
+     *
+     * The declared rung is the *agent's*, from its AD-17 roster entry, with the feature plan's
+     * `starting_model_tier` standing behind it. An unplaceable rung is refused rather than clamped, and
+     * `config.invalid` is `escalate-to-human`, so the refusal blocks the feature for a person instead of
+     * escaping the pass as an uncaught throw and taking every other feature's pass with it — the same
+     * treatment the baseline reset below already gets.
+     */
+    let tier: ModelRung;
+    try {
+      tier = rungForAttempt({
+        promoteTo: options.promoteTo,
+        recorded: existing?.model_tier ?? null,
+        declared: this.declaredStartingRung(state.run, options.step.phase) ?? plan.starting_model_tier,
+      });
+    } catch (thrown: unknown) {
+      if (!(thrown instanceof ModelRungUnrecognised)) throw thrown;
+      this.emit(recorder, {
+        step: options.step.step,
+        type: ENGINE_EVENT_TYPES.FeatureStateChanged,
+        payload: { from: state.state, to: 'blocked', reason: thrown.message },
+      });
+      return;
+    }
     if (options.promoteTo !== null) {
       this.emit(recorder, {
         step: options.step.step,
@@ -2680,7 +2700,6 @@ export class Reconciler {
           ladder: MODEL_RUNGS.join('>'),
         },
       });
-      tier = options.promoteTo;
     }
 
     /**
@@ -3018,6 +3037,28 @@ export class Reconciler {
   }
 
   /**
+   * The rung this phase's agent *declares* it starts on (AD-17), or `null` when nothing declares one.
+   *
+   * Read from the run's AD-9 configuration snapshot, which is the only configuration a step reads, so a
+   * mid-run edit to `.orch/` reaches nothing. A run whose snapshot declares no agent for the phase
+   * answers `null` and the feature plan's tier applies: that is an *absence*, not a default invented
+   * here, and the spawn that follows still refuses for want of a grant (`src/engine/agents.ts`), so
+   * nothing is softened by reading the tier leniently.
+   *
+   * A rung the build cannot place is *not* softened: {@link startingRung} throws inside
+   * `grantFromRoster`, and the caller routes that to a person.
+   */
+  private declaredStartingRung(run: string, phase: string): ModelRung | null {
+    try {
+      return resolveAgentGrant({ run, phase, orchHome: this.orchHome }).startTier;
+    } catch (thrown: unknown) {
+      if (thrown instanceof ModelRungUnrecognised) throw thrown;
+      // No snapshot, no roster, or no entry for this phase: nothing is declared, and nothing is invented.
+      return null;
+    }
+  }
+
+  /**
    * Record the territory a completed step *declared*, when its output is one that declares one.
    *
    * This is the join the story is named for: a feature is accepted with the territory its caller guessed,
@@ -3025,12 +3066,13 @@ export class Reconciler {
    * serialises whatever that newly overlaps. Until it existed, `acceptFeature`'s run-creation line was the
    * only `feature.territory_declared` any production path ever wrote.
    *
-   * **Keyed on the contract, not on the phase.** The test is whether the output parses as a
-   * `step.analysis` output — which is to say, whether it carries a declared territory at all — and not
-   * whether `step.phase === 'analysis'`. A phase test would be a second place that decides what an
-   * analysis agent is, and a repository that declares its own agent against the same contract would
-   * declare a territory the engine ignored. `contractOutput` is the value that contract validated, before
-   * `StepOutputSchema` narrowed it and stripped the territory out.
+   * **Keyed on the field, not on the phase and not on one contract's schema.** The test is whether the
+   * output carries a declared territory at all. A phase test would be a second place that decides what an
+   * analysis agent is; asking `AnalysisOutputSchema.safeParse` — which is what this did until story 2-5 —
+   * is the same defect one level down, because that schema pins `contract_id` to `step.analysis`, so
+   * `step.planning` and `step.implementation` declared territories the engine threw away. `contractOutput`
+   * is the value that contract validated, before `StepOutputSchema` narrowed it and stripped the territory
+   * out, and {@link declaredTerritoryIn} asks it the one question this needs answered.
    *
    * The comparison is against the *log*, inside `recordTerritoryRedeclaration`, never against the plan:
    * the plan is what the caller declared at run creation and may already be two corrections behind.
@@ -3041,16 +3083,16 @@ export class Reconciler {
     recorder: Recorder,
     termination: StepTermination,
   ): void {
-    const declared = AnalysisOutputSchema.safeParse(termination.contractOutput);
+    const declared = declaredTerritoryIn(termination.contractOutput);
     // Not an output that declares a territory. Every other contract reaches here too, and says nothing.
-    if (!declared.success) return;
+    if (declared === null) return;
 
     const paths = runPaths(state.run, this.orchHome);
     const recorded = recordTerritoryRedeclaration({
       recorder,
       step: step.step,
       events: readEventLog(paths.eventLog),
-      declared: declared.data.territory,
+      declared,
     });
     // AD-4: a correction the log does not carry is one the next pass will not see, so a dropped line is
     // the same unrecorded action every other emit treats as one rather than something to carry on past.
@@ -3123,12 +3165,26 @@ export class Reconciler {
 
     if (existsSync(path)) {
       const parsed = StepInputSchema.safeParse(JSON.parse(readFileSync(path, 'utf8')));
-      if (parsed.success && parsed.data.baseline_ref === baselineRef) {
+      if (
+        parsed.success &&
+        parsed.data.baseline_ref === baselineRef &&
+        parsed.data.contract_id === step.contract_id
+      ) {
         return { value: parsed.data, relativePath };
       }
-      // An input that does not parse, or names another baseline, is not this step's input. It is
-      // rewritten rather than trusted: a re-run from the wrong input is worse than a re-run from a
-      // regenerated one.
+      /**
+       * An input that does not parse, names another baseline, **or names another contract** is not this
+       * step's input. It is rewritten rather than trusted: a re-run from the wrong input is worse than a
+       * re-run from a regenerated one.
+       *
+       * The contract comparison is what story 2-5 added, and the case is concrete. A run started before
+       * the plan's `implement` step was repointed has `steps/implement/input.json` on disk saying
+       * `step.output`, while the spawn now hands the child `--json-schema` for `step.implementation` and
+       * AD-1 re-parses the result against the same. The agent would be told one contract by its input
+       * file and judged by another — and the shape it produced would fail at the re-parse as
+       * `step.schema_invalid_output`, which is `escalate-model-tier`, so a stale file would spend the
+       * run's one promotion on a disagreement no model can resolve.
+       */
     }
 
     const completed = state.steps.filter((record) => record.disposition === 'completed').length;

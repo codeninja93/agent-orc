@@ -52,8 +52,21 @@ import type { ErrorCode, ModelRung } from '../contracts/index.js';
  */
 export const LOWEST_MODEL_RUNG: ModelRung = MODEL_RUNGS[0];
 
-/** The rung at the top of the ladder: the one a failure cannot be answered by promoting past. */
-export const HIGHEST_MODEL_RUNG: ModelRung = MODEL_RUNGS[MODEL_RUNGS.length - 1] ?? LOWEST_MODEL_RUNG;
+/**
+ * The rung at the top of the ladder: the one a failure cannot be answered by promoting past.
+ *
+ * Found by *climbing*, not by indexing with a fallback. `MODEL_RUNGS[MODEL_RUNGS.length - 1] ??
+ * LOWEST_MODEL_RUNG` types cleanly and fails in the wrong direction: on an empty ladder the highest rung
+ * would be the lowest, so every step would look as though it were already at the top and no promotion
+ * would ever be granted — the mirror image of the run-backwards bug this module exists to prevent.
+ * Climbing with {@link nextModelRung} asks the same question the ladder answers everywhere else, so
+ * "highest" means "the rung with nothing above it" by construction rather than by arithmetic.
+ */
+export const HIGHEST_MODEL_RUNG: ModelRung = ((): ModelRung => {
+  let rung: ModelRung = LOWEST_MODEL_RUNG;
+  for (let above = nextModelRung(rung); above !== null; above = nextModelRung(rung)) rung = above;
+  return rung;
+})();
 
 /**
  * A rung this build cannot place, met where a rung was required.
@@ -100,16 +113,22 @@ export const PROMOTION_TRIGGER_CODES: readonly ErrorCode[] = Object.freeze(
 export const triggersPromotion = (code: string): boolean =>
   dispositionFor(code) === 'escalate-model-tier';
 
-/** Why a promotion was refused, when it was. `null` when one was granted. */
+/**
+ * Why a promotion was refused, when it was. `null` when one was granted.
+ *
+ * Declared in the order {@link promotionFor} evaluates them, because that order is the specification —
+ * each refusal names the thing that actually stopped the climb — and a list in a different order reads as
+ * though a different one applied.
+ */
 export const PROMOTION_REFUSALS = [
   /** The code does not promote the ladder; the AD-35 table routes it elsewhere. */
   'not-a-trigger',
-  /** This step has already spent its one promotion in this run. */
+  /** The rung the step reports is one this build cannot place, so it cannot be climbed from. */
+  'rung-unrecognised',
+  /** This step has already spent its one promotion in this run, or its count cannot be trusted. */
   'ceiling-reached',
   /** The step already runs on the highest rung; there is nothing above it. */
   'ladder-exhausted',
-  /** The rung the step reports is one this build cannot place, so it cannot be climbed from. */
-  'rung-unrecognised',
 ] as const;
 
 export type PromotionRefusal = (typeof PROMOTION_REFUSALS)[number];
@@ -122,7 +141,12 @@ export interface PromotionRequest {
    * the case the ladder must refuse rather than clamp.
    */
   readonly rung: string;
-  /** Promotions already spent on this step in this run, folded from the log. */
+  /**
+   * Promotions already spent on this step in this run, folded from the log.
+   *
+   * A `number` rather than a checked count because it arrives from a fold over the log, so the ceiling
+   * itself has to survive a value that is not a count: see {@link promotionFor}.
+   */
   readonly promotions: number;
   /** The code the step failed with. */
   readonly code: string;
@@ -171,12 +195,27 @@ export const promotionFor = (request: PromotionRequest): PromotionDecision => {
     );
   }
 
-  if (request.promotions >= MAX_PROMOTIONS_PER_STEP) {
+  /**
+   * A count that is not a count is treated as spent, which is the fail-safe direction.
+   *
+   * `NaN >= 1` is **false**, so a `promotions` of `NaN` — a fold over a truncated log, a payload that
+   * parsed as a number and was not one — would sail past a `>=` ceiling and grant promotion after
+   * promotion, which is the unbounded loop the ceiling exists to stop. A negative or fractional count is
+   * the same fault wearing a different value. None of them can be trusted to say how much is left, and
+   * the only safe reading of "I cannot tell you how many you have spent" is "you have spent them".
+   */
+  const countable =
+    Number.isInteger(request.promotions) && request.promotions >= 0;
+  if (!countable || request.promotions >= MAX_PROMOTIONS_PER_STEP) {
     return refused(
       'ceiling-reached',
-      `Step "${request.step}" has spent ${String(request.promotions)} of ` +
-        `${String(MAX_PROMOTIONS_PER_STEP)} promotions, which is the ceiling of one per step per run, ` +
-        'so a second promotion would be the retry loop AD-35 forbids wearing a model decision.',
+      countable
+        ? `Step "${request.step}" has spent ${String(request.promotions)} of ` +
+            `${String(MAX_PROMOTIONS_PER_STEP)} promotions, which is the ceiling of one per step per ` +
+            'run, so a second promotion would be the retry loop AD-35 forbids wearing a model decision.'
+        : `Step "${request.step}" reports ${String(request.promotions)} promotions spent, which is not ` +
+            'a count. A promotion is refused rather than granted against a number that cannot bound ' +
+            'it: NaN passes every ">=" comparison as false, so trusting it would remove the ceiling.',
     );
   }
 
@@ -205,7 +244,13 @@ export interface AttemptRung {
   readonly promoteTo: ModelRung | null;
   /** The rung this step last ran on, from its checkpoint record, or `null` on a first attempt. */
   readonly recorded: string | null;
-  /** The starting tier the feature's plan declares, or `null` where nothing declares one. */
+  /**
+   * The starting tier declared for this step, or `null` where nothing declares one.
+   *
+   * AD-17 puts that declaration in the *agent's* roster entry — `model.start_tier` — and the caller
+   * resolves it from the run's AD-9 snapshot before calling here. The feature plan's own
+   * `starting_model_tier` stands behind it for a run whose roster declares nothing for the phase.
+   */
   readonly declared: string | null;
 }
 
@@ -220,7 +265,19 @@ export interface AttemptRung {
  * then discards it.
  */
 export const rungForAttempt = (attempt: AttemptRung): ModelRung => {
-  if (attempt.promoteTo !== null) return attempt.promoteTo;
+  if (attempt.promoteTo !== null) {
+    /**
+     * Checked like every other input, though its type says it cannot fail.
+     *
+     * It has the *highest* precedence, so it is the one value whose being wrong is never caught by
+     * anything below it — and it reaches this function from a routing decision that came from a fold
+     * over the event log, where `ModelRung` is a claim the type system takes on trust.
+     */
+    if (!isModelRung(attempt.promoteTo)) {
+      throw new ModelRungUnrecognised(attempt.promoteTo, 'the rung a promotion granted');
+    }
+    return attempt.promoteTo;
+  }
   if (attempt.recorded !== null) {
     if (!isModelRung(attempt.recorded)) {
       throw new ModelRungUnrecognised(attempt.recorded, 'the rung a step last ran on');

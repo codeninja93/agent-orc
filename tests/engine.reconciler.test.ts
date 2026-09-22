@@ -21,7 +21,7 @@ import {
   dispositionFor,
   makeError,
 } from '../src/contracts/index.js';
-import type { OrchError, StepDisposition } from '../src/contracts/index.js';
+import type { ModelRung, OrchError, StepDisposition } from '../src/contracts/index.js';
 import { Recorder, readEventLog, runPaths, runsDir } from '../src/runtime/index.js';
 import {
   BaselineResetError,
@@ -1424,5 +1424,53 @@ describe('the dependency direction is fixed', () => {
     const refusal = new ResumeRefused('implement', 'sess-implement', 'the session is gone');
     expect(refusal.code).toBe('step.resume_failed');
     await expect(Promise.reject(refusal)).rejects.toBeInstanceOf(ResumeRefused);
+  });
+});
+
+/**
+ * Matrix 31 — an unplaceable rung reaches a person, and does not escape the pass.
+ *
+ * `rungForAttempt` refuses a rung the build cannot place rather than clamping it to the cheapest, which
+ * is right — and it refuses by throwing, from inside `driveStep`, where neither call site caught it. An
+ * uncaught throw there does not just fail this feature: `pass` is how *every* feature advances, so one
+ * corrupt declaration would take every other feature's pass down with it, with nothing recorded to say
+ * why. The baseline reset a few lines below has always been wrapped for exactly this reason.
+ *
+ * `config.invalid` is `escalate-to-human` in the AD-35 table, so the feature blocks and waits.
+ */
+describe('a rung the build cannot place blocks the feature rather than crashing the pass', () => {
+  const UNPLACEABLE = 'claude-sonnet-4-5';
+
+  it('records the refusal and blocks, leaving the pass able to return', async () => {
+    const { reconciler } = openReconciler({
+      plan: makePlan({ starting_model_tier: UNPLACEABLE as ModelRung }),
+      script: alwaysCompletes,
+    });
+    const accepted = reconciler.acceptFeature(makePlan({ starting_model_tier: UNPLACEABLE as ModelRung }));
+    reconciler.confirm(accepted.run);
+
+    // The pass returns rather than throwing, which is the whole of the row.
+    await expect(reconciler.pass()).resolves.toBeDefined();
+
+    const state = reconciler.load(accepted.run).state;
+    expect(state.state).toBe('blocked');
+    // Nothing was spawned on a rung nobody can place.
+    expect(state.steps).toStrictEqual([]);
+    // And the reason names the rung and the ladder, so a person can fix the declaration.
+    const reasons = readEventLog(runPaths(accepted.run, home).eventLog)
+      .filter((event) => event.type === ENGINE_EVENT_TYPES.FeatureStateChanged)
+      .map((event) => (typeof event.payload['reason'] === 'string' ? event.payload['reason'] : ''));
+    expect(reasons.join(' ')).toContain(UNPLACEABLE);
+    expect(dispositionFor('config.invalid')).toBe('escalate-to-human');
+  });
+
+  it('runs the same plan normally once the rung is one the ladder holds', async () => {
+    // The positive control: the refusal above is about the value, not about this fixture.
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+    await reconciler.pass();
+
+    expect(reconciler.load(accepted.run).state.steps[0]?.model_tier).toBe('claude-haiku-4-5');
   });
 });

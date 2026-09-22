@@ -41,6 +41,7 @@ import type {
 } from '../contracts/index.js';
 
 import { COMMAND_EVENT_TYPES } from './commands.js';
+import { ModelRungUnrecognised } from './promotion.js';
 
 /** The emitter name every event the reconciler originates carries. */
 export const ENGINE_EMITTER = 'engine.reconciler';
@@ -234,6 +235,30 @@ export const emptyRunState = (options: RebuildOptions): RunState => {
  * The events are folded in `seq` order, which is the only ordering authority (AD-29): timestamps
  * carry none across processes, so the fold sorts by `seq` rather than trusting the file's order.
  */
+/**
+ * The rung a log line names, or the fallback when it names none.
+ *
+ * **A line that names a rung this build cannot place is refused, not replaced.** The fold used to answer
+ * `existing?.model_tier ?? plan.starting_model_tier` for an unplaceable value, which is the exact case
+ * `src/engine/promotion.ts` refuses by name — so the two modules disagreed about the same fact, and the
+ * fold's answer was the more dangerous of the two: it silently put a step back on the starting tier,
+ * which for a step that had been promoted is the ladder running backwards, recorded as history rather
+ * than as a decision. AD-4 makes the log the truth and AD-28 refuses an artifact this build does not
+ * understand; a rung it cannot place is that, and `config.invalid` reaches a person.
+ *
+ * An *absent* value is a different answer and keeps the fallback: older lines, and lines from emitters
+ * that never carried the field, say nothing about the rung rather than saying something wrong. `null` and
+ * `undefined` are both that absence, because `payloadString` spells a missing key one way and a present
+ * non-string the other.
+ */
+const loggedRung = (logged: string | null | undefined, fallback: ModelRung, step: string): ModelRung => {
+  if (logged === undefined || logged === null) return fallback;
+  if (!isOneOf(MODEL_RUNGS, logged)) {
+    throw new ModelRungUnrecognised(logged, `the rung logged for step "${step}"`);
+  }
+  return logged;
+};
+
 export const rebuildFromLog = (
   events: readonly EventEnvelope[],
   options: RebuildOptions,
@@ -309,9 +334,11 @@ export const rebuildFromLog = (
           // A start clears any session id: the previous attempt's is not this attempt's.
           session_id: null,
           baseline_ref: envelopeString(event, 'baseline_ref') ?? existing?.baseline_ref ?? '',
-          model_tier: isOneOf(MODEL_RUNGS, declaredTier)
-            ? declaredTier
-            : (existing?.model_tier ?? options.plan.starting_model_tier),
+          model_tier: loggedRung(
+            declaredTier,
+            existing?.model_tier ?? options.plan.starting_model_tier,
+            id,
+          ),
           promotions: existing?.promotions ?? 0,
           attempts: (existing?.attempts ?? 0) + 1,
           credited_attempts: existing?.credited_attempts ?? 0,
@@ -415,7 +442,7 @@ export const rebuildFromLog = (
         const to = payloadString(event, 'to');
         steps.set(record.step, {
           ...record,
-          model_tier: isOneOf(MODEL_RUNGS, to) ? to : record.model_tier,
+          model_tier: loggedRung(to, record.model_tier, record.step),
           promotions: record.promotions + 1,
         });
         break;

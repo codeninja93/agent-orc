@@ -60,16 +60,21 @@ export type ChangeKind = (typeof CHANGE_KINDS)[number];
  *
  * `path` is the only field in this contract through which the agent names something it *did* to the
  * repository, which is why it carries both refusals: repository-relative (so it is inside the run
- * worktree `--add-dir` scoped the file tools to) and inside the territory this same output declares
- * (so it is inside the conflict domain the reconciler admitted this feature for).
+ * worktree `--add-dir` scoped the file tools to) and inside the territory *this same output* declares.
+ *
+ * **That second refusal is internal consistency, not admission.** A contract sees one artifact and cannot
+ * see the run, so it cannot know the territory the reconciler admitted this feature for; comparing the two
+ * is the engine's, in `recordTerritoryRedeclaration`, which compares a declaration against the log. What
+ * this refusal buys is that an output cannot declare one territory and change files outside it — and it is
+ * worth having because a declaration of `.` is then a visibly wide claim rather than a quiet one.
  */
 export const ImplementedChangeSchema = z.object({
   path: z
     .string()
     .describe(
       'The repository-relative path of the file that changed, inside the declared territory. Never ' +
-        'blank, never absolute, never a home-directory path, never climbing out of the worktree, and ' +
-        'each path appears at most once.',
+        'blank, never absolute, never a home-directory path, never climbing out of the worktree, never ' +
+        '"." — a change names one file, not the whole repository — and each path appears at most once.',
     ),
   kind: z
     .enum(CHANGE_KINDS)
@@ -77,8 +82,18 @@ export const ImplementedChangeSchema = z.object({
   summary: z
     .string()
     .describe('What changed in this file and why, in one line that stands alone. Never blank.'),
+  /**
+   * **`provenance.source` is the one path-shaped field here that is deliberately not refused.**
+   *
+   * ADR-001 accepts that a host-side agent can *read* outside the run worktree though it cannot write
+   * there, so a source naming a file outside is an honest report of something that happened, and refusing
+   * it would refuse the truth. It is safe to leave open because nothing resolves it: it is attribution,
+   * rendered beside the change and never opened, joined or written to. A reader meeting this field should
+   * know that, which is why it is said here and not only in the suite that classifies it.
+   */
   provenance: ClaimProvenanceSchema.describe(
-    'The step that made this change and the source it was read from.',
+    'The step that made this change and the source it was read from. The source is attribution only — ' +
+      'nothing opens it — so it may name a file outside the worktree that was read.',
   ),
 });
 
@@ -101,8 +116,9 @@ const ImplementationOutputShape = StepOutputSchema.extend({
     .array(z.string())
     .describe(
       'Repository-relative paths this step was admitted to and wrote within, covering every changed ' +
-        'file. A completed implementation declares at least one; "." means the whole repository. ' +
-        'Never blank, never absolute, never climbing out of the worktree.',
+        'file. Declare at least one whenever any file changed; "." means the whole repository. Never ' +
+        'blank, never absolute, never climbing out of the worktree, each entry spelled already ' +
+        'normalised (no "./" prefix, no trailing slash) and appearing at most once.',
     ),
 });
 
@@ -119,6 +135,7 @@ export const ImplementationOutputSchema = ImplementationOutputShape.superRefine(
    * declared one, and every change is then blamed for the territory's fault.
    */
   let territoryWellFormed = output.territory.length > 0;
+  const declaredEntries = new Set<string>();
   output.territory.forEach((path, index) => {
     if (!isRepositoryRelativePath(path)) {
       territoryWellFormed = false;
@@ -130,7 +147,34 @@ export const ImplementationOutputSchema = ImplementationOutputShape.superRefine(
           'an absolute path or a "src/.." would normalise to the whole repository and make every ' +
           'change-inside-its-territory check vacuous.',
       });
+      return;
     }
+    /**
+     * Refused rather than rewritten, and for the same reason `changes[].path` refuses a repeat: two
+     * spellings of one path are one entry wearing two faces, and the engine's own territory vocabulary
+     * de-duplicates on the normalised value — so a declaration carrying both is already inconsistent with
+     * what the reconciler will serialise it by. It is refused and not silently normalised because this
+     * schema also re-parses an artifact the recorder wrote, and a parse that rewrote its input would make
+     * the stored output and the parsed one two different documents.
+     */
+    const normalised = normaliseTerritoryPath(path);
+    if (normalised !== path.trim()) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['territory', index],
+        message:
+          `"${path}" is not spelled normalised; declare it as "${normalised}". Two spellings of one ` +
+          'path compare unequal, and an overlap read as disjoint is the direction that corrupts a worktree.',
+      });
+    }
+    if (declaredEntries.has(normalised)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['territory', index],
+        message: `"${path}" is declared twice; one territory entry names one place exactly once`,
+      });
+    }
+    declaredEntries.add(normalised);
   });
 
   /**
@@ -143,8 +187,27 @@ export const ImplementationOutputSchema = ImplementationOutputShape.superRefine(
    * `escalate-model-tier`, refusing it would promote the ladder against a step that correctly said it
    * could not proceed.
    */
+  /**
+   * **A territory is required by the changes, not by the status.** Binding it to `completed` left
+   * `{status: 'blocked', territory: [], changes: [a real change]}` parsing — and with no territory
+   * declared, `territoryWellFormed` was false, so every per-change containment refinement below was
+   * skipped and passed vacuously. A step that blocked halfway still wrote the files it wrote, and those
+   * are exactly the ones whose containment matters: a half-finished step is not a licence to write
+   * anywhere. So the rule is "changed something, said where", whatever disposition it reports.
+   */
+  if (output.changes.length > 0 && output.territory.length === 0) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['territory'],
+      message:
+        'this output changed a file and declared no territory, so every change-inside-its-territory ' +
+        'check would pass vacuously. Declare the paths the step was admitted to, whatever status it ' +
+        'reports.',
+    });
+  }
+
   if (output.status === 'completed') {
-    if (output.territory.length === 0) {
+    if (output.territory.length === 0 && output.changes.length === 0) {
       ctx.addIssue({
         code: 'custom',
         path: ['territory'],
@@ -201,6 +264,21 @@ export const ImplementationOutputSchema = ImplementationOutputShape.superRefine(
       });
       return;
     }
+    /**
+     * `.` is a legal *territory* and never a legal change: it is the whole repository, and a change names
+     * one file. `isRepositoryRelativePath` accepts it deliberately — it is the documented fail-safe a
+     * territory uses to collide with everything — so the narrower rule belongs at the narrower field.
+     */
+    if (normaliseTerritoryPath(change.path) === '.') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['changes', index, 'path'],
+        message:
+          `"${change.path}" is the repository root, not a file. A change names the one file it changed; ` +
+          'the root would report every file in the tree as changed and satisfy every containment check.',
+      });
+      return;
+    }
     // Only asked when the territory itself parsed: see the note at the top of this refinement.
     if (territoryWellFormed && !territoryContains(output.territory, change.path)) {
       ctx.addIssue({
@@ -244,6 +322,18 @@ export const ImplementationOutputSchema = ImplementationOutputShape.superRefine(
           `"${pointer.path}" is not a path inside the run's evidence plane; AD-23 has an artifact ` +
           'referenced by a pointer into that plane, never by an absolute path, a home-directory path ' +
           'or one climbing out of the run directory',
+      });
+      return;
+    }
+    // A pointer resolves against the run directory, so `.` points at the run directory itself rather
+    // than at a piece of evidence — a reader following it gets everything the run holds and no artifact.
+    if (normaliseTerritoryPath(pointer.path) === '.') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['artifacts', index, 'path'],
+        message:
+          `"${pointer.path}" resolves to the run directory itself, not to an artifact in it; an ` +
+          'evidence pointer names the one thing it points at (AD-23)',
       });
     }
   });

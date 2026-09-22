@@ -34,10 +34,11 @@
  * `readStepConfiguration` has no parameter a repository path could arrive in, which is what makes that
  * structural rather than advisory.
  */
-import type { GrantableTool } from '../contracts/index.js';
+import type { GrantableTool, ModelRung } from '../contracts/index.js';
 
 import { readStepConfiguration } from './config-snapshot.js';
 import type { ConfigSnapshotOptions } from './config-snapshot.js';
+import { startingRung } from './promotion.js';
 import { rosterAgent } from './roster.js';
 import type { DiscoveredRoster } from './roster.js';
 
@@ -47,8 +48,14 @@ import type { DiscoveredRoster } from './roster.js';
  * This is not a roster and cannot become one: it is keyed by tool name, it names no agent and no phase,
  * and it answers one question about the declared vocabulary — can this tool change anything. ADR-003
  * argues every grant in its table from that property ("It needs to read the repository and nothing else";
- * "`Bash` is how a gate runs"), and the Boundaries of story 2-4 rest on it: analysis and planning are pure
- * functions *because* there is no tool in their grant with which to cause a side effect.
+ * "It must not be able to edit what it is judging"), and the Boundaries of story 2-4 rest on it: analysis
+ * and planning are pure functions *because* there is no tool in their grant with which to cause a side
+ * effect.
+ *
+ * The example this sentence used to give was ADR-003's "`Bash` is how a gate runs, inside the container
+ * per ADR-001" — a justification **ADR-004 retracted as measured false**, because the agent runs on the
+ * host and so does its shell. Quoting a retracted line as live reasoning is how a refuted claim goes on
+ * being believed, so it is replaced by one the amended table still makes.
  *
  * "Elevated" is the *complement* of this list rather than a list of its own, so a name added to
  * {@link GRANTABLE_TOOLS} counts as elevated until somebody decides otherwise. That is the fail-safe
@@ -82,6 +89,18 @@ export interface AgentGrant {
   readonly elevated: readonly GrantableTool[];
   /** The reversibility class the same declaration claims, for a caller comparing the two. */
   readonly reversibility: string;
+  /**
+   * The rung this agent's declaration says its steps start on (AD-17: "a starting tier and a promotion
+   * policy, never a fixed assignment").
+   *
+   * Carried here because until story 2-5 nothing in `src/engine/` read it: the installer wrote
+   * `model.start_tier` into every `.orch/agents/*.toml`, the reconciler used the feature plan's
+   * `starting_model_tier`, and the declared field was configuration a person could edit with no effect.
+   * A declared value nobody reads is worse than an absent one — it reads as a setting and behaves as a
+   * comment. It is passed through {@link startingRung}, so the ladder is the one authority on what a rung
+   * is and an unplaceable one is refused by name rather than becoming the cheapest.
+   */
+  readonly startTier: ModelRung;
   readonly summary: string;
 }
 
@@ -131,6 +150,7 @@ export const grantFromRoster = (roster: DiscoveredRoster, phase: string): AgentG
     tools,
     elevated,
     reversibility: entry.declaration.reversibility,
+    startTier: startingRung(entry.declaration.model.start_tier),
     summary:
       `Phase "${phase}" runs agent "${entry.id}" declared in ${entry.path}, granted ` +
       `${tools.length === 0 ? 'no tools at all' : tools.join(', ')}` +

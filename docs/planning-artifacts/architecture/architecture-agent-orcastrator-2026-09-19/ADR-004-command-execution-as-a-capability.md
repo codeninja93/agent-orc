@@ -8,6 +8,7 @@ decides:
   - 'ADR-001 item 2 (how a command reaches the container)'
 amends:
   - ADR-003
+  - ADR-001
 raised-by:
   - 'story 2-5 (the first agent that must run a command)'
   - 'ADR-001 line 142 — "this must be settled before 2-5 and 2-6"'
@@ -72,14 +73,32 @@ it grants. After this, the declaration and the reality agree.
   repository needing a command the profile does not declare must declare it.
 - **A per-command container start costs latency**, which ADR-001 already accepted when it chose per-command
   lifetime.
+- **Until the server exists, nothing in the system can execute anything.** This is the plainest consequence
+  and the easiest to leave unsaid. `verification`'s whole job is to run the declared gates, `testing`'s is
+  to run the tests it writes, and after this decision neither has a tool that runs anything — the
+  replacement arrives with story 2-6. Two artefacts still read as though it had not: both purpose strings
+  promise to "run", and both declarations keep `promotion_policy: 'on-gate-failure'`, a policy about the
+  outcome of a gate they cannot currently reach. They are left as they are because they describe the job
+  after 2-6 rather than the gap before it, and the gap is named here instead of being written into the
+  roster twice. So between this ADR and story 2-6 the system can write a change it cannot test, and the
+  walking skeleton has a hole in it that is deliberate, scoped and temporary.
 - **`GRANTABLE_TOOLS` keeps `Bash`**, because AD-17 lets a user-defined agent be granted anything the
   declared set contains. A user who grants `Bash` to their own agent gets a host shell, and that must be
   visible — the `elevated` reporting story 2-4 built already names it.
 
 ## What this changes elsewhere
 
-- **ADR-003** — the grant table's three `Bash` rows change, and its closing note that "a user-defined agent
-  can be granted anything the declared set contains, including `Bash`" now carries the warning above.
+- **ADR-003** — four cells change, not three rows. The three granting `Bash` lose it; each of their
+  justification cells loses the sentence this ADR refutes; the line calling a `Bash` grant "contained, but
+  real" is corrected, since it is the claim measured false above; and the consequence bullet that "a
+  user-defined agent can be granted anything the declared set contains, including `Bash`" gains the warning
+  that what such a grant yields is an *uncontained host shell*. That last one was asserted here before it
+  was made, which is how a document comes to describe an amendment nobody applied.
+- **ADR-001** — this ADR amends it, which is why it is named in `amends:`. Two things there are now
+  wrong or answered. Its sentence that "a roster entry granting `Bash` grants the ability to run commands,
+  contained but real" is the claim disproved above: contained is exactly what such a grant is not. And its
+  note that the question "must be settled before 2-5 and 2-6" is settled by this document, so nothing in
+  ADR-001 is still open.
 - **AD-20** — unchanged in substance. The boundary is the container; what enters it is a command.
 - **Stage-1 gate** — unaffected. "The executor container is verified to hold no push credential" remains
   true and story 1-5's suite still proves it.

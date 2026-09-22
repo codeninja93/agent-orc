@@ -18,6 +18,17 @@
  */
 import { posix, sep } from 'node:path';
 
+import { z } from 'zod';
+
+/**
+ * The shape of "an output that declares a territory": one field, of the right type.
+ *
+ * Loose on purpose — it is a *discriminator*, not a contract. Every declaring output is also validated
+ * against its own registered contract before it reaches here, so this asks only the one question the
+ * recorder needs answered.
+ */
+const TerritoryBearingOutputSchema = z.object({ territory: z.array(z.string()) });
+
 /**
  * Normalise a declared territory entry to a comparable path.
  *
@@ -32,6 +43,19 @@ export const normaliseTerritoryPath = (declared: string): string => {
   const withoutLeadingDot = normalised.startsWith('./') ? normalised.slice(2) : normalised;
   const trimmed = withoutLeadingDot.replace(/\/+$/, '');
   return trimmed === '' || trimmed === '.' ? '.' : trimmed;
+};
+
+/**
+ * The first segment of a path, with separators unified and `.` segments dropped — and `..` left alone.
+ *
+ * Deliberately *not* {@link normaliseTerritoryPath}: that function collapses `..`, which is right for
+ * comparing two paths and wrong for asking what a path *starts* with, since `~/../x` would answer `x`.
+ * The empty string is returned for a path with no segments at all, which the caller has already refused
+ * on other grounds.
+ */
+const firstPathSegment = (declared: string): string => {
+  const slashed = declared.trim().split(sep).join('/').split('\\').join('/');
+  return slashed.split('/').find((segment) => segment !== '' && segment !== '.') ?? '';
 };
 
 /** A declared territory: normalised, de-duplicated, and in a stable order. */
@@ -77,13 +101,29 @@ const WHOLE_REPOSITORY_SPELLINGS: readonly string[] = ['.', './', '.\\'];
  * worktree does not contain, and `--add-dir` scoped to that worktree is what ADR-001 bounds a step by — so a
  * claim naming one is a claim about a file the step was never admitted to.
  *
- * **A leading `~` is refused with them.** It is not a relative path: every shell and most path-joining
- * readers expand it to the home directory, so `~/.ssh/id_rsa` is an absolute path wearing one character of
- * disguise — and it is the one spelling of "outside the tree" that survives the leading-`/` and the `..`
- * checks. `step.implementation` leans on this predicate to show its contract offers no channel out of the
- * worktree, and a channel that a spelling reopens is not closed.
+ * **A leading `~` *segment* is refused with them, and a file whose name merely begins with `~` is not.**
+ * `~/.ssh/id_rsa` is the home directory wearing one character of disguise, and it is the one spelling of
+ * "outside the tree" that survives the leading-`/` and the `..` checks. But `~notes.md`, `~tmp.ts` and
+ * `~$doc.docx` are ordinary files a repository really holds — editors and Office write them — so the
+ * question is whether the *first path segment is exactly* `~`, never whether the string starts with the
+ * character. The two directions failed in opposite ways when this was a `startsWith` on the raw spelling:
+ * `./~/.ssh/id_rsa` was **accepted**, because `./` made the raw string start with a dot, while `~notes.md`
+ * was **refused**, because it starts with a tilde. So the tilde test is the one test here made against the
+ * **normalised** value, where `./~/…` and `~/…` are the same path and a filename is still a filename.
  *
- * **The raw spelling is checked before normalisation, not after.** `''`, `'   '`, `'/'`, `'//'` and
+ * A `~user` spelling is not treated as expansion: nothing in this system hands these paths to a shell, the
+ * escape being closed is a path *join*, and `~backup` is as plausible a directory name as `~notes.md` is a
+ * file name.
+ *
+ * **The tilde is judged on the segments, not on `posix.normalize`'s output, because `..` erases it.**
+ * `~/../etc/passwd` *normalises* to `etc/passwd` — an innocent in-tree path — while to anything that
+ * expands the tilde it means `/etc/passwd`. So the segment test runs on a spelling that has had its
+ * separators unified and its `.` segments dropped but its `..` **not** collapsed, and it asks whether the
+ * first surviving segment is `~`. Collapsing first would let a climb cancel the very segment being looked
+ * for, which is the same class of mistake as testing the raw string: both judge a spelling rather than the
+ * path.
+ *
+ * **Every other check is made on the raw spelling, before normalisation.** `''`, `'   '`, `'/'`, `'//'` and
  * `'src/..'` all *normalise* to `.`, so a check written after normalising can only ask "is this the whole
  * repository", which every one of them answers yes to — and the `normalised === ''` refusal that used to be
  * here was unreachable for exactly that reason. The consequence is not a concurrency one, since `.` is the
@@ -95,8 +135,8 @@ export const isRepositoryRelativePath = (declared: string): boolean => {
   const raw = declared.trim();
   if (raw === '') return false;
   if (raw.startsWith('/') || raw.startsWith('\\')) return false;
-  if (raw.startsWith('~')) return false;
   if (/^[A-Za-z]:/.test(raw)) return false;
+  if (firstPathSegment(declared) === '~') return false;
   const normalised = normaliseTerritoryPath(declared);
   if (normalised === '.') return WHOLE_REPOSITORY_SPELLINGS.includes(raw);
   return normalised !== '..' && !normalised.startsWith('../');
@@ -107,3 +147,25 @@ export const territoryContains = (
   territory: readonly string[],
   path: string,
 ): boolean => normaliseTerritory(territory).some((entry) => pathContains(entry, path));
+
+/**
+ * The territory an output declares, or `null` when it declares none.
+ *
+ * **The discriminator is the field, never a contract's schema.** Story 2-4 moved this recording off the
+ * step's *phase* and onto the contract precisely so there would not be a second place deciding what
+ * declares a territory — and then the engine asked `AnalysisOutputSchema.safeParse`, which pins
+ * `contract_id` to `step.analysis`. That is the same defect wearing the fix's clothes: `step.planning` and
+ * `step.implementation` both carry a declared territory, and both were silently ignored, so the field was
+ * dead for two of the three contracts that have it. Naming the three would keep the defect and only move
+ * its edge; asking whether the output *has* a declared territory covers a contract a later story adds, and
+ * a contract a repository declares for its own agent, without either being listed anywhere.
+ *
+ * An empty list answers `null` rather than an empty array, because "declared nothing" and "declared these"
+ * are different answers and only the second is a correction worth recording — a `blocked` step that could
+ * not determine its territory has not re-declared one.
+ */
+export const declaredTerritoryIn = (output: unknown): readonly string[] | null => {
+  const parsed = TerritoryBearingOutputSchema.safeParse(output);
+  if (!parsed.success || parsed.data.territory.length === 0) return null;
+  return parsed.data.territory;
+};

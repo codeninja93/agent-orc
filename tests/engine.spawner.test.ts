@@ -1317,9 +1317,11 @@ describe('the grant the spawner resolves for itself', () => {
     expect(payload[SPAWN_GRANT_PAYLOAD_KEYS.ElevatedTools]).not.toStrictEqual(
       payload[SPAWN_GRANT_PAYLOAD_KEYS.GrantedTools],
     );
-    expect(payload[SPAWN_GRANT_PAYLOAD_KEYS.AgentId]).toBe('implementation');
-    expect(payload[SPAWN_GRANT_PAYLOAD_KEYS.GrantDeclaredAt]).toBe('implementation.toml');
-    expect(grant.declaredAt.endsWith('implementation.toml')).toBe(true);
+    // A user-defined agent: after ADR-004 no built-in is granted `Bash`, and this case is about the
+    // grant being recorded verbatim rather than corrected, which is exactly what AD-17 leaves possible.
+    expect(payload[SPAWN_GRANT_PAYLOAD_KEYS.AgentId]).toBe('my-own-implementer');
+    expect(payload[SPAWN_GRANT_PAYLOAD_KEYS.GrantDeclaredAt]).toBe('my-own-implementer.toml');
+    expect(grant.declaredAt.endsWith('my-own-implementer.toml')).toBe(true);
   });
 
   /**

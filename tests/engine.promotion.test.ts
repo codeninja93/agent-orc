@@ -20,13 +20,17 @@ import {
   MODEL_RUNGS,
   dispositionFor,
   makeError,
+  nextModelRung,
 } from '../src/contracts/index.js';
+import type { EventEnvelope, ModelRung } from '../src/contracts/index.js';
 import {
   HIGHEST_MODEL_RUNG,
   LOWEST_MODEL_RUNG,
   ModelRungUnrecognised,
+  PROMOTION_REFUSALS,
   PROMOTION_TRIGGER_CODES,
   promotionFor,
+  rebuildFromLog,
   routeTermination,
   rungForAttempt,
   startingRung,
@@ -301,5 +305,145 @@ describe('an unrecognised rung is refused, never treated as the lowest (matrix 1
 
   it('still places every rung it does know, so the refusal is about the value', () => {
     for (const rung of MODEL_RUNGS) expect(startingRung(rung)).toBe(rung);
+  });
+});
+
+/**
+ * Matrix 33 and the ceiling's arithmetic — the inputs whose type says they cannot be wrong.
+ *
+ * Both reach the ladder from a fold over the event log, where `ModelRung` and "a count" are claims the
+ * type system takes on trust rather than facts it checked.
+ */
+describe('every rung input is checked, including the one with the highest precedence (matrix 33)', () => {
+  it('refuses a promoteTo the build cannot place, rather than running the attempt on it', () => {
+    expect(() =>
+      rungForAttempt({
+        // Cast through `unknown`: the whole case is a value the type forbids and a corrupt log supplies.
+        promoteTo: UNRECOGNISED_RUNG as unknown as ModelRung,
+        recorded: 'claude-haiku-4-5',
+        declared: 'claude-haiku-4-5',
+      }),
+    ).toThrowError(ModelRungUnrecognised);
+  });
+
+  it('still honours a promoteTo it can place, so the check is about the value', () => {
+    expect(
+      rungForAttempt({
+        promoteTo: 'claude-opus-5',
+        recorded: 'claude-haiku-4-5',
+        declared: 'claude-haiku-4-5',
+      }),
+    ).toBe('claude-opus-5');
+  });
+
+  /**
+   * `NaN >= 1` is false, so a count that is not a count sails through a `>=` ceiling and grants a
+   * promotion every time it is asked. The fail-safe reading of "I cannot tell you how many you have
+   * spent" is "you have spent them".
+   */
+  it.each([Number.NaN, -1, 0.5, Number.POSITIVE_INFINITY])(
+    'treats a promotions count of %p as spent rather than as room to climb',
+    (promotions) => {
+      const climb = promotion({ promotions });
+      expect(climb.promote).toBe(false);
+      expect(climb.refusal).toBe('ceiling-reached');
+      expect(climb.to).toBeNull();
+    },
+  );
+
+  it('still grants the first promotion for a count of zero, so the guard is about the value', () => {
+    expect(promotion({ promotions: 0 }).promote).toBe(true);
+  });
+});
+
+describe('the top of the ladder is found by climbing, not by indexing with a fallback', () => {
+  it('is the rung with nothing above it, and is not the lowest', () => {
+    expect(nextModelRung(HIGHEST_MODEL_RUNG)).toBeNull();
+    // The failure direction of `MODEL_RUNGS[length - 1] ?? LOWEST`: on an empty ladder the highest rung
+    // would become the lowest, and every step would look as though it were already at the top.
+    expect(HIGHEST_MODEL_RUNG).not.toBe(LOWEST_MODEL_RUNG);
+    expect(nextModelRung(LOWEST_MODEL_RUNG)).not.toBeNull();
+  });
+
+  it('declares its refusals in the order it evaluates them, which is the specification', () => {
+    expect([...PROMOTION_REFUSALS]).toStrictEqual([
+      'not-a-trigger',
+      'rung-unrecognised',
+      'ceiling-reached',
+      'ladder-exhausted',
+    ]);
+    // Each refusal, produced by the case that reaches it, in that same order.
+    expect(promotion({ code: 'step.timed_out' }).refusal).toBe('not-a-trigger');
+    expect(promotion({ rung: UNRECOGNISED_RUNG }).refusal).toBe('rung-unrecognised');
+    expect(promotion({ promotions: 1 }).refusal).toBe('ceiling-reached');
+    expect(promotion({ rung: HIGHEST_MODEL_RUNG }).refusal).toBe('ladder-exhausted');
+  });
+
+  it('names the unplaceable rung before counting a ceiling it cannot count against', () => {
+    // Both faults at once: the refusal names the one that actually stopped the climb.
+    expect(promotion({ rung: UNRECOGNISED_RUNG, promotions: 1 }).refusal).toBe('rung-unrecognised');
+  });
+});
+
+/**
+ * Matrix 32 — the fold refuses an unplaceable logged rung the same way the ladder does.
+ *
+ * It used to substitute the starting tier, which for a step that had been promoted is the ladder
+ * running backwards and recorded as history rather than taken as a decision. Two modules answering one
+ * question differently is the drift AD-4 and AD-35 both exist to prevent.
+ */
+describe('a rung folded from the event log is refused, not replaced (matrix 32)', () => {
+  const startedEvent = (tier: string | null): EventEnvelope => {
+    const envelope = {
+      ts: '2026-09-22T12:00:00.000Z',
+      seq: 1,
+      feature: 'f',
+      run: '01JPROMOTION00000000000000',
+      step: 'implement',
+      emitter: 'engine.reconciler',
+      type: 'step.started',
+      payload:
+        tier === null
+          ? { attempt: 1, phase: 'implementation', contract_id: 'step.implementation' }
+          : {
+              attempt: 1,
+              phase: 'implementation',
+              contract_id: 'step.implementation',
+              model_tier: tier,
+            },
+    };
+    return envelope;
+  };
+
+  const plan = {
+    feature: 'f',
+    mode: 'live',
+    territory: ['src'],
+    steps: [{ step: 'implement', contract_id: 'step.implementation', phase: 'implementation' }],
+    request: 'r',
+    acceptance_criteria: [],
+    starting_model_tier: 'claude-haiku-4-5',
+    worktree: '/tmp/nowhere',
+  } as unknown as Parameters<typeof rebuildFromLog>[1]['plan'];
+
+  const fold = (tier: string | null): unknown =>
+    rebuildFromLog([startedEvent(tier)], {
+      run: '01JPROMOTION00000000000000',
+      plan,
+      now: () => new Date('2026-09-22T12:00:01.000Z'),
+    });
+
+  it('refuses a logged rung the build cannot place', () => {
+    expect(() => fold(UNRECOGNISED_RUNG)).toThrowError(ModelRungUnrecognised);
+  });
+
+  it('folds a rung it can place, so the refusal is about the value', () => {
+    const state = fold('claude-opus-5') as { readonly steps: readonly { readonly model_tier: string }[] };
+    expect(state.steps[0]?.model_tier).toBe('claude-opus-5');
+  });
+
+  it('keeps the fallback for a line that names no rung at all, which says nothing rather than something wrong', () => {
+    const state = fold(null) as { readonly steps: readonly { readonly model_tier: string }[] };
+    expect(state.steps[0]?.model_tier).toBe('claude-haiku-4-5');
   });
 });

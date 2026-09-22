@@ -30,8 +30,8 @@ import { READ_ONLY_TOOLS, isElevatedTool } from '../src/engine/index.js';
 import { BUILT_IN_AGENTS } from '../src/installer/interview.js';
 
 /**
- * The table ADR-003 fixes, and the contract each agent answers against. A row changing here is an
- * architecture change and should arrive as one.
+ * The table ADR-003 fixes and ADR-004 amends, and the contract each agent answers against. A row changing
+ * here is an architecture change and should arrive as one.
  *
  * **The contract column is beside the grant because the two failed together.** Story 2-4 registered
  * `step.analysis` and `step.planning`, whose shapes pin `contract_id` to their own id — and the shipped
@@ -57,7 +57,7 @@ const GRANTED: Readonly<Record<string, readonly string[]>> = Object.fromEntries(
   Object.entries(DECLARED).map(([id, row]) => [id, row.tools]),
 );
 
-describe('the built-in roster grants exactly what ADR-003 decided', () => {
+describe('the built-in roster grants exactly what ADR-003 decided, as ADR-004 amended it', () => {
   it('declares the six built-ins the table names, and no others', () => {
     expect(BUILT_IN_AGENTS.map((agent) => agent.id).sort()).toStrictEqual(Object.keys(GRANTED).sort());
   });

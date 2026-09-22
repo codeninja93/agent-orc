@@ -20,9 +20,15 @@ import { join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { CURRENT_SCHEMA_VERSION, GRANTABLE_TOOLS, exportContract } from '../src/contracts/index.js';
+import {
+  AgentDeclarationSchema,
+  CURRENT_SCHEMA_VERSION,
+  GRANTABLE_TOOLS,
+  exportContract,
+} from '../src/contracts/index.js';
 import {
   AgentGrantUnresolved,
+  LOWEST_MODEL_RUNG,
   buildStepArgv,
   discoverRoster,
   grantFromRoster,
@@ -31,6 +37,7 @@ import {
   projectConfiguration,
   READ_ONLY_TOOLS,
   resolveAgentGrant,
+  rungForAttempt,
   snapshotConfiguration,
   takeConfigSnapshot,
   toolsArgumentFor,
@@ -43,6 +50,7 @@ import {
   writeAgentFile,
   writeProfile,
 } from './helpers/config-fixture.js';
+import { BUILT_IN_AGENTS } from '../src/installer/interview.js';
 
 /**
  * ADR-003's table, as the ADR states it, for the *comparison* — never as a source for the argv.
@@ -434,5 +442,130 @@ describe('the engine holds no compiled-in grant table', () => {
     );
     const fixtureDir = new URL(`file://${fixture}/`);
     expect(grantTableViolationsIn(fixtureDir, listSources(fixtureDir))).toStrictEqual([]);
+  });
+});
+
+/**
+ * Matrix 19 and 20 — the declaration's `model.start_tier` is a value the engine *reads*.
+ *
+ * It was written into every `.orch/agents/*.toml` by the installer and read by nothing: the reconciler
+ * took the feature plan's `starting_model_tier`, so a person editing the field in their roster changed
+ * nothing at all. A declared setting that behaves as a comment is worse than an absent one, because it
+ * invites a change that appears to work — and it let story 2-5's own acceptance criterion pass at the
+ * plan surface while the agent's declaration said something else entirely.
+ */
+describe('a declaration’s starting rung is read, not merely written (matrix 19)', () => {
+  it('carries the rung the declaration names, through the AD-9 snapshot', () => {
+    // Deliberately not the ladder's floor: a grant returning the cheapest rung would be
+    // indistinguishable from `startingRung(null)`, which is what made the field's inertness invisible.
+    const repository = makeWorkspace('agents-tier');
+    workspaces.push(repository);
+    writeProfile(repository, fixtureProfile());
+    writeAgentFile(
+      repository,
+      'implementation.toml',
+      fixtureAgent({
+        id: 'implementation',
+        contract: 'step.implementation',
+        tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob'],
+        reversibility: 'recoverable',
+        model: { start_tier: 'claude-opus-5', promotion_policy: 'on-gate-failure' },
+      }),
+    );
+    const { run, orchHome } = runWithSnapshot(repository);
+
+    const grant = resolveAgentGrant({ run, phase: 'implementation', orchHome });
+    expect(grant.startTier).toBe('claude-opus-5');
+    // Not the floor, and not the plan's: the value came from the file.
+    expect(grant.startTier).not.toBe(LOWEST_MODEL_RUNG);
+  });
+
+  it('is the rung an attempt runs on when no promotion and no earlier attempt outrank it', () => {
+    /**
+     * The chain, end to end: a declaration on disk → the AD-9 snapshot → the grant → the rung the
+     * reconciler runs the attempt on. Asserting `rungForAttempt` against a literal would show the
+     * function works; feeding it the value that came off the file is what shows the field is *read*.
+     */
+    const repository = makeWorkspace('agents-tier-chain');
+    workspaces.push(repository);
+    writeProfile(repository, fixtureProfile());
+    writeAgentFile(
+      repository,
+      'implementation.toml',
+      fixtureAgent({
+        id: 'implementation',
+        contract: 'step.implementation',
+        tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob'],
+        reversibility: 'recoverable',
+        model: { start_tier: 'claude-opus-5', promotion_policy: 'on-gate-failure' },
+      }),
+    );
+    const { run, orchHome } = runWithSnapshot(repository);
+    const declared = resolveAgentGrant({ run, phase: 'implementation', orchHome }).startTier;
+
+    // The precedence the reconciler uses, asserted where the declared value enters it.
+    expect(rungForAttempt({ promoteTo: null, recorded: null, declared })).toBe('claude-opus-5');
+    // And it is outranked by the rung the step already reached, so the ladder never runs backwards.
+    expect(
+      rungForAttempt({ promoteTo: null, recorded: 'claude-sonnet-5', declared: 'claude-opus-5' }),
+    ).toBe('claude-sonnet-5');
+  });
+
+  it('declares the cheapest rung for the built-in implementation agent', () => {
+    const implementation = BUILT_IN_AGENTS.find((agent) => agent.id === 'implementation');
+    expect(implementation?.model.start_tier).toBe(LOWEST_MODEL_RUNG);
+    expect(implementation?.model.start_tier).toBe('claude-haiku-4-5');
+    // A starting tier, not an assignment (AD-17): the policy says it can be promoted from there.
+    expect(implementation?.model.promotion_policy).toBe('on-gate-failure');
+  });
+});
+
+describe('a rung the build cannot place is refused at the declaration surface (matrix 20)', () => {
+  it('refuses the declaration itself, so the value never reaches the ladder', () => {
+    const parsed = AgentDeclarationSchema.safeParse({
+      schema_version: CURRENT_SCHEMA_VERSION,
+      id: 'implementation',
+      purpose: 'p',
+      contract: 'step.implementation',
+      tools: ['Read'],
+      mcp_domains: [],
+      reversibility: 'recoverable',
+      model: { start_tier: 'claude-sonnet-4-5', promotion_policy: 'on-gate-failure' },
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('names the file in the roster’s refusals rather than granting the phase a default', () => {
+    const repository = makeWorkspace('agents-bad-tier');
+    workspaces.push(repository);
+    writeProfile(repository, fixtureProfile());
+    // Written as raw TOML, because the schema refuses to build this declaration at all — which is the
+    // point: the only way such a rung reaches disk is a person editing the file.
+    const agentsDir = join(repository, '.orch', 'agents');
+    mkdirSync(agentsDir, { recursive: true });
+    writeFileSync(
+      join(agentsDir, 'implementation.toml'),
+      [
+        'schema_version = 1',
+        'id = "implementation"',
+        'purpose = "p"',
+        'contract = "step.implementation"',
+        'tools = ["Read"]',
+        'mcp_domains = []',
+        'reversibility = "recoverable"',
+        '',
+        '[model]',
+        'start_tier = "claude-sonnet-4-5"',
+        'promotion_policy = "on-gate-failure"',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const roster = discoverRoster(projectConfiguration(repository));
+    expect(roster.agents.map((entry) => entry.id)).not.toContain('implementation');
+    expect(roster.refused.map((entry) => entry.path).join(' ')).toContain('implementation.toml');
+    // Refused, never defaulted: the phase has no grant at all, which is the AD-17 answer.
+    expect(() => grantFromRoster(roster, 'implementation')).toThrowError(AgentGrantUnresolved);
   });
 });

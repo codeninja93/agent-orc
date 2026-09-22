@@ -19,6 +19,9 @@ import { afterAll, describe, expect, it } from 'vitest';
 import {
   ANALYSIS_CONTRACT_ID,
   AnalysisOutputSchema,
+  IMPLEMENTATION_CONTRACT_ID,
+  ImplementationOutputSchema,
+  declaredTerritoryIn,
   DECLARATION_PAYLOAD_KEYS,
   FeatureTerritoryDeclaredPayloadSchema,
   StepOutputSchema,
@@ -524,5 +527,152 @@ describe('the payload\u2019s own consistency', () => {
     expect(narrower.removed).toStrictEqual(['src/engine']);
     expect(narrower.declared).toStrictEqual(['src/engine/lock.ts']);
     expect(territoriesOverlap(narrower.removed, narrower.declared)).toBe(true);
+  });
+});
+
+/**
+ * Matrix 21, 22 and 23 — the implement step, observed through a real pass.
+ *
+ * Three things were unobserved before this suite ran the standard plan all the way to its third step.
+ *
+ * **The territory field was dead for two of the three contracts that have it.** `recordDeclaredTerritory`
+ * discriminated with `AnalysisOutputSchema.safeParse`, and that schema pins `contract_id` to
+ * `step.analysis` — so a planning or implementation output, both of which declare a territory, returned
+ * early and the declaration was thrown away. The irony is the part worth keeping in view: story 2-4's
+ * review moved this recording off the *phase* and onto the contract precisely so there would not be a
+ * second place deciding what declares a territory, and keying on one contract's schema rebuilt that
+ * defect one level down.
+ *
+ * **Nothing watched the implement step being spawned with its own contract.** Every other reconciler
+ * suite drives a plan of its own spelling `step.output`, and the two that use `STANDARD_PLAN_STEPS` script
+ * an executor that ignores `contractId` — so repointing the plan could break nothing.
+ */
+describe('the standard plan’s implement step declares and is spawned under its own contract', () => {
+  const implementationOutputDeclaring = (step: string, territory: readonly string[]): unknown => ({
+    contract_id: 'step.implementation',
+    step,
+    status: 'completed',
+    summary: 'the grant reaches the argv from the roster',
+    provenance: [`${step}: src/engine/spawner.ts`],
+    decisions: [],
+    artifacts: [],
+    questions: [],
+    write_intents: [],
+    error: null,
+    changes: [
+      {
+        path: 'src/engine/spawner.ts',
+        kind: 'modified',
+        summary: 'the grant is passed to --tools',
+        provenance: { step, source: 'src/engine/agents.ts' },
+      },
+    ],
+    territory: [...territory],
+  });
+
+  it('carries step.implementation to the executor and records the territory it declared', async () => {
+    const orchHome = makeWorkspace('territory-implement');
+    homes.push(orchHome);
+
+    /** Wider than the plan, so the recording is visible as a *correction* and not as an echo. */
+    const declaredByImplementation = ['src/engine', 'src/contracts'];
+    const contractsSeen = new Map<string, string>();
+
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(
+        makePlan({ feature: 'implement-declares', steps: STANDARD_PLAN_STEPS, territory: ['src/engine'] }),
+      ),
+      baseline: { currentRef: () => BASELINE, resetTo: () => undefined },
+      executor: createScriptedExecutor({
+        onStart: (request) => {
+          contractsSeen.set(request.step, request.contractId);
+          if (request.phase !== 'implementation') return terminated(request.step, 'completed', {});
+          const raw = implementationOutputDeclaring(request.step, declaredByImplementation);
+          return terminated(request.step, 'completed', {
+            output: StepOutputSchema.parse(raw),
+            contractOutput: ImplementationOutputSchema.parse(raw),
+          });
+        },
+      }),
+    });
+
+    try {
+      const accepted = reconciler.acceptFeature(
+        makePlan({ feature: 'implement-declares', steps: STANDARD_PLAN_STEPS, territory: ['src/engine'] }),
+      );
+      reconciler.confirm(accepted.run);
+      // One action per pass: analyse, then plan, then implement.
+      await reconciler.pass();
+      await reconciler.pass();
+      await reconciler.pass();
+
+      // Matrix 23: the request the executor received, not the plan the engine holds.
+      expect(contractsSeen.get('implement')).toBe(IMPLEMENTATION_CONTRACT_ID);
+      expect(contractsSeen.get('implement')).not.toBe('step.output');
+      // The other steps are unchanged, so the assertion above is about this step and not about all of them.
+      expect(contractsSeen.get('analyse')).toBe(ANALYSIS_CONTRACT_ID);
+
+      // Matrix 21: the declaration reached the log as a territory line of its own.
+      const events = readEventLog(runPaths(accepted.run, orchHome).eventLog);
+      const declarations = events.filter((event) => event.type === TERRITORY_DECLARED_EVENT_TYPE);
+      const byImplement = declarations.filter((event) => event.step === 'implement');
+      expect(byImplement).toHaveLength(1);
+      expect(byImplement[0]?.payload[TERRITORY_PATHS_PAYLOAD_KEY]).toStrictEqual(
+        [...normaliseTerritoryFromContracts(declaredByImplementation)],
+      );
+      // And it is the territory the next admission pass reads.
+      expect(territoryFromEvents(events)?.territory).toStrictEqual(
+        [...normaliseTerritoryFromContracts(declaredByImplementation)],
+      );
+    } finally {
+      reconciler.close();
+    }
+  });
+});
+
+/**
+ * Matrix 22 — the discriminator recognises a declaring output by its *field*, so a contract nobody
+ * listed still declares.
+ *
+ * Asserted directly on the function, because the property is "any contract with the field", and a test
+ * that could only reach the three contracts that exist today would be pinning the list it is meant to
+ * avoid having.
+ */
+describe('what declares a territory is decided by the field, never by a contract id', () => {
+  const withTerritory = (contractId: string, territory: readonly string[]): unknown => ({
+    contract_id: contractId,
+    territory: [...territory],
+  });
+
+  it.each([ANALYSIS_CONTRACT_ID, 'step.planning', IMPLEMENTATION_CONTRACT_ID])(
+    'reads the territory %s declares',
+    (contractId) => {
+      expect(declaredTerritoryIn(withTerritory(contractId, ['src/engine']))).toStrictEqual([
+        'src/engine',
+      ]);
+    },
+  );
+
+  it('reads one from a contract id no registry holds, which is the point of asking the field', () => {
+    expect(declaredTerritoryIn(withTerritory('step.some-repository-declared-agent', ['docs']))).toStrictEqual(
+      ['docs'],
+    );
+  });
+
+  it('says nothing for an output with no territory field, so step.output records none', () => {
+    expect(declaredTerritoryIn({ contract_id: 'step.output', status: 'completed' })).toBeNull();
+  });
+
+  it('says nothing for an empty declaration, which is not a correction to record', () => {
+    // A blocked step that could not determine its territory has not re-declared one — and recording it
+    // would throw `TerritoryDeclaresNothing` inside a pass rather than pass quietly over it.
+    expect(declaredTerritoryIn(withTerritory(ANALYSIS_CONTRACT_ID, []))).toBeNull();
+  });
+
+  it('says nothing for a territory that is not a list of strings', () => {
+    expect(declaredTerritoryIn({ territory: 'src/engine' })).toBeNull();
+    expect(declaredTerritoryIn({ territory: [1, 2] })).toBeNull();
+    expect(declaredTerritoryIn(null)).toBeNull();
   });
 });

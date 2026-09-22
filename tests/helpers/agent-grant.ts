@@ -8,17 +8,25 @@
  *
  * Every consumer of this helper asserts the argv against a **literal** string rather than against the
  * grant it passed in, so nothing here can make a test compare a value to itself.
+ *
+ * **It models a *user-defined* agent, and that is why it still grants `Bash`.** ADR-004 removed `Bash`
+ * from every built-in, so no built-in has this shape any more — but `GRANTABLE_TOOLS` keeps the name
+ * because AD-17 lets a person grant it to an agent of their own, and these suites exist partly to prove
+ * that such a grant reaches `--tools` verbatim and is reported as elevated rather than silently
+ * corrected. Keeping the shape under a built-in's id would have read as though the built-in roster still
+ * granted a host shell, so the agent is named for what it is.
  */
 import type { AgentGrant } from '../../src/engine/index.js';
 
 export const fixtureGrant = (overrides: Partial<AgentGrant> = {}): AgentGrant => ({
   phase: 'implementation',
-  agentId: 'implementation',
-  declaredAt: '/nowhere/.orch/agents/implementation.toml',
+  agentId: 'my-own-implementer',
+  declaredAt: '/nowhere/.orch/agents/my-own-implementer.toml',
   rosterDir: '/nowhere/.orch/agents',
   tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'],
   elevated: ['Write', 'Edit', 'Bash'],
   reversibility: 'recoverable',
-  summary: 'a fixture grant, declared nowhere a run would read',
+  startTier: 'claude-haiku-4-5',
+  summary: 'a user-defined agent’s grant, declared nowhere a run would read',
   ...overrides,
 });

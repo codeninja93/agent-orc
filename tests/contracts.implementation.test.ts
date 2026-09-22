@@ -310,6 +310,118 @@ describe('no path outside the run worktree can be returned (matrix 10)', () => {
 });
 
 /**
+ * Matrix 24, 25 and 26 — the holes through which a containment check passes without checking.
+ *
+ * Each of these parsed before story 2-5's review. None is an outside path; all three are ways for the
+ * *inside* checks to stop meaning anything, which is the failure mode a suite about "outside" misses.
+ */
+describe('a containment check cannot be made vacuous (matrix 24, 25, 26)', () => {
+  it('refuses changes with no territory whatever status the step reports (matrix 24)', () => {
+    // The case that parsed: blocked, no territory, and a real change — so `territoryWellFormed` was
+    // false and every per-change containment refinement below it was skipped.
+    const result = ImplementationOutputSchema.safeParse(
+      implementationOutput({
+        status: 'blocked',
+        territory: [],
+        changes: [change({ path: 'src/engine/spawner.ts' })],
+      }),
+    );
+    expect(result.success).toBe(false);
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain('territory');
+  });
+
+  it.each(['blocked', 'failed'] as const)(
+    'still lets a %s step that changed nothing declare no territory',
+    (status) => {
+      // The honest refusal stays possible: the rule is "changed something, said where", not "always".
+      expect(
+        ImplementationOutputSchema.safeParse(
+          implementationOutput({ status, territory: [], changes: [] }),
+        ).success,
+      ).toBe(true);
+    },
+  );
+
+  it('proves the refinement it protects actually runs once a territory is declared', () => {
+    // The positive control for the case above: with a territory present, the containment check bites.
+    const result = ImplementationOutputSchema.safeParse(
+      implementationOutput({
+        status: 'blocked',
+        territory: ['src/tui'],
+        changes: [change({ path: 'src/engine/spawner.ts' })],
+      }),
+    );
+    expect(result.success).toBe(false);
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain(
+      'changes.0.path',
+    );
+  });
+
+  it.each(['.', './', '  .  '])('refuses %j as a changed file: a change names one file (matrix 25)', (path) => {
+    const result = ImplementationOutputSchema.safeParse(
+      implementationOutput({ territory: ['.'], changes: [change({ path })] }),
+    );
+    expect(result.success).toBe(false);
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain(
+      'changes.0.path',
+    );
+  });
+
+  it('refuses "." as an evidence pointer, which would resolve to the run directory (matrix 25)', () => {
+    const result = ImplementationOutputSchema.safeParse(
+      implementationOutput({
+        artifacts: [{ kind: 'diff', path: '.', description: 'the diff' }],
+      }),
+    );
+    expect(result.success).toBe(false);
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain(
+      'artifacts.0.path',
+    );
+  });
+
+  it('keeps "." legal as a territory, because that is the documented whole-repository claim', () => {
+    // The narrower rule belongs at the narrower field: a territory of "." collides with every other
+    // feature and is a real, fail-safe answer; a *change* of "." is not.
+    expect(
+      ImplementationOutputSchema.safeParse(
+        implementationOutput({ territory: ['.'], changes: [change({ path: 'src/a.ts' })] }),
+      ).success,
+    ).toBe(true);
+  });
+
+  it('refuses a territory carrying one path twice, however each copy is spelled (matrix 26)', () => {
+    const result = ImplementationOutputSchema.safeParse(
+      implementationOutput({ territory: ['src', 'src'], changes: [change({ path: 'src/a.ts' })] }),
+    );
+    expect(result.success).toBe(false);
+    expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain(
+      'territory.1',
+    );
+  });
+
+  it.each(['./src', 'src/', 'src/engine/../engine'])(
+    'refuses %j, an entry that is not spelled normalised (matrix 26)',
+    (entry) => {
+      const result = ImplementationOutputSchema.safeParse(
+        implementationOutput({ territory: [entry], changes: [change({ path: 'src/engine/a.ts' })] }),
+      );
+      expect(result.success).toBe(false);
+      expect((result.error?.issues ?? []).map((issue) => issue.path.join('.'))).toContain(
+        'territory.0',
+      );
+    },
+  );
+
+  it('accepts the normalised spelling of each of those, so the refusal is about the spelling', () => {
+    expect(
+      ImplementationOutputSchema.safeParse(
+        implementationOutput({ territory: ['src'], changes: [change({ path: 'src/a.ts' })] }),
+      ).success,
+    ).toBe(true);
+  });
+});
+
+/**
  * Matrix 10, the structural half — the enumeration that makes "no other channel" a measurement.
  *
  * Every string-valued leaf of the draft-7 export is found by walking the export itself, so a field
