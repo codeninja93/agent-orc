@@ -119,7 +119,10 @@ describe('a run in progress shows the step name and the next gate, never a share
   });
 
   it('states the next gate as a gate, in words', () => {
-    expect(view.progress.nextGate).toBe('verification, once the implementation steps are done');
+    // Story 2-6 put a `testing` step between the change and the judgement, so the sentence this
+    // pinned — "verification, once the implementation steps are done" — became false the moment the
+    // standard plan ran five steps: what follows an implementation step is the tests.
+    expect(view.progress.nextGate).toBe('the tests the change has to survive');
   });
 
   /**

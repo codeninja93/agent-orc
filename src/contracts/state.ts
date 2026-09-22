@@ -93,6 +93,11 @@ export const STEP_PHASES = [
   'analysis',
   'planning',
   'implementation',
+  // Story 2-6. `testing` was a declared agent with no phase, so nothing could spawn it: the roster
+  // offered it, the installer wrote its TOML, and the one word that lets a step be planned for it was
+  // missing — a member of the built-in roster that could never run. The list is in the order the
+  // standard plan runs them, which is also the order a person reads a run in.
+  'testing',
   'verification',
 ] as const;
 

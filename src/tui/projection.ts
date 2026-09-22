@@ -536,7 +536,8 @@ interface MutableStep {
 const NEXT_UP_BY_PHASE: Readonly<Record<StepPhase, string>> = {
   analysis: 'the analysis to state what the work is',
   planning: 'the plan the analysis is turned into',
-  implementation: 'verification, once the implementation steps are done',
+  implementation: 'the tests the change has to survive',
+  testing: 'verification, once the tests are written',
   verification: 'the verification gates',
 };
 

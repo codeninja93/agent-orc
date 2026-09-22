@@ -20,6 +20,36 @@ export const CURRENT_SCHEMA_VERSION = 1;
 /** The versions this build can read. Anything else is refused. */
 export const SUPPORTED_SCHEMA_VERSIONS: readonly number[] = [CURRENT_SCHEMA_VERSION];
 
+/**
+ * The versions *one* artifact is written at and read at.
+ *
+ * AD-28 binds every on-disk artifact to carry a `schema_version` and makes an unrecognised one a
+ * refusal; it does not say the number advances for all of them at once. Until story 2-6 it did,
+ * because one constant answered for every artifact — and that is wrong in a direction that matters:
+ * `typecheck` joining `mechanics.commands` is a change to the *profile*, and a global bump would have
+ * refused every `state.json`, every lease and every question outcome written before it, so a run in
+ * flight when the installer was upgraded could no longer be read back and AD-8's resume would have
+ * nothing to resume from. One artifact's shape changing is not every artifact's shape changing.
+ *
+ * So a version is per artifact, and {@link DEFAULT_SCHEMA_VERSION_POLICY} is what an artifact whose
+ * shape has never changed uses. `supported` is a list rather than a maximum because reading two
+ * versions is a decision an artifact makes for itself: the profile reads only its current one,
+ * because a v1 profile is missing a field CAP-13's gates need and defaulting it silently is exactly
+ * what AD-28 exists to stop.
+ */
+export interface SchemaVersionPolicy {
+  /** The version this build writes for the artifact. */
+  readonly current: number;
+  /** Every version this build reads for it. Anything else is refused. */
+  readonly supported: readonly number[];
+}
+
+/** What an artifact whose shape this build has never changed is written at and read at. */
+export const DEFAULT_SCHEMA_VERSION_POLICY: SchemaVersionPolicy = {
+  current: CURRENT_SCHEMA_VERSION,
+  supported: SUPPORTED_SCHEMA_VERSIONS,
+};
+
 /** The installer version this build reports as the writer of what it produces (AD-12). */
 export const INSTALLER_VERSION: string = PACKAGE_VERSION;
 
@@ -46,21 +76,27 @@ export const SCHEMA_VERSION_UNRECOGNISED_CODE = 'config.schema_version_unrecogni
 export const installerVersionFor = (schemaVersion: number): string | null =>
   INSTALLER_VERSION_BY_SCHEMA_VERSION[schemaVersion] ?? null;
 
-export const isRecognisedSchemaVersion = (schemaVersion: number): boolean =>
-  SUPPORTED_SCHEMA_VERSIONS.includes(schemaVersion);
+export const isRecognisedSchemaVersion = (
+  schemaVersion: number,
+  policy: SchemaVersionPolicy = DEFAULT_SCHEMA_VERSION_POLICY,
+): boolean => policy.supported.includes(schemaVersion);
 
-export const schemaVersionRefusalMessage = (artifact: string, schemaVersion: number): string => {
+export const schemaVersionRefusalMessage = (
+  artifact: string,
+  schemaVersion: number,
+  policy: SchemaVersionPolicy = DEFAULT_SCHEMA_VERSION_POLICY,
+): string => {
   const writer = installerVersionFor(schemaVersion);
   const provenance =
     writer !== null
       ? `It was written by installer version ${writer}`
-      : schemaVersion > CURRENT_SCHEMA_VERSION
+      : schemaVersion > policy.current
         ? `It was written by an installer newer than ${INSTALLER_VERSION}`
         : `It was written by an installer older than ${INSTALLER_VERSION}`;
   return (
     `Refusing ${artifact}: schema_version ${String(schemaVersion)} is not recognised. ` +
     `${provenance}; installer version ${INSTALLER_VERSION} is reading it. ` +
-    `This build reads schema_version ${SUPPORTED_SCHEMA_VERSIONS.join(', ')}. ` +
+    `This build reads schema_version ${policy.supported.join(', ')}. ` +
     `Re-run the installer to migrate; nothing is upgraded implicitly.`
   );
 };
@@ -87,17 +123,24 @@ const UNNAMED_ARTIFACT = 'this versioned artifact';
  * there is one behaviour, not two. The integrality check is repeated inside the second refinement
  * because Zod runs both: `1.5` would otherwise be reported twice, once for each reason.
  */
-export const schemaVersionField = z
-  .number()
-  .refine(Number.isInteger, { message: 'schema_version must be an integer' })
-  .refine((value) => !Number.isInteger(value) || isRecognisedSchemaVersion(value), {
-    error: (issue): string =>
-      `${SCHEMA_VERSION_UNRECOGNISED_CODE}: ${schemaVersionRefusalMessage(
-        UNNAMED_ARTIFACT,
-        typeof issue.input === 'number' ? issue.input : Number.NaN,
-      )}`,
-    params: { code: SCHEMA_VERSION_UNRECOGNISED_CODE },
-  });
+export const schemaVersionFieldFor = (
+  policy: SchemaVersionPolicy = DEFAULT_SCHEMA_VERSION_POLICY,
+): z.ZodNumber =>
+  z
+    .number()
+    .refine(Number.isInteger, { message: 'schema_version must be an integer' })
+    .refine((value) => !Number.isInteger(value) || isRecognisedSchemaVersion(value, policy), {
+      error: (issue): string =>
+        `${SCHEMA_VERSION_UNRECOGNISED_CODE}: ${schemaVersionRefusalMessage(
+          UNNAMED_ARTIFACT,
+          typeof issue.input === 'number' ? issue.input : Number.NaN,
+          policy,
+        )}`,
+      params: { code: SCHEMA_VERSION_UNRECOGNISED_CODE },
+    });
+
+/** The field for an artifact whose shape this build has never changed. */
+export const schemaVersionField = schemaVersionFieldFor();
 
 /**
  * Wrap an object shape so the artifact carries `schema_version` as its first field.
@@ -118,8 +161,9 @@ export const schemaVersionField = z
  */
 export const versioned = <Shape extends z.ZodRawShape>(
   shape: Shape,
-): z.ZodObject<{ schema_version: typeof schemaVersionField } & Shape> =>
-  z.object({ schema_version: schemaVersionField, ...shape });
+  policy: SchemaVersionPolicy = DEFAULT_SCHEMA_VERSION_POLICY,
+): z.ZodObject<{ schema_version: z.ZodNumber } & Shape> =>
+  z.object({ schema_version: schemaVersionFieldFor(policy), ...shape });
 
 /** Refusal to operate on an artifact whose `schema_version` this build does not recognise. */
 export class SchemaVersionRefusal extends Error {
@@ -138,10 +182,14 @@ export class SchemaVersionRefusal extends Error {
 }
 
 /** Throw a {@link SchemaVersionRefusal} unless the version is one this build reads. */
-export const assertRecognisedSchemaVersion = (schemaVersion: number, artifact: string): void => {
-  if (!isRecognisedSchemaVersion(schemaVersion)) {
+export const assertRecognisedSchemaVersion = (
+  schemaVersion: number,
+  artifact: string,
+  policy: SchemaVersionPolicy = DEFAULT_SCHEMA_VERSION_POLICY,
+): void => {
+  if (!isRecognisedSchemaVersion(schemaVersion, policy)) {
     throw new SchemaVersionRefusal(
-      schemaVersionRefusalMessage(artifact, schemaVersion),
+      schemaVersionRefusalMessage(artifact, schemaVersion, policy),
       artifact,
       schemaVersion,
       installerVersionFor(schemaVersion),
@@ -159,10 +207,19 @@ const declaredSchemaVersion = (value: unknown): number | null => {
 /**
  * Parse a versioned artifact, naming it in the refusal.
  *
- * The schema decides everything, including the version: this adds no gate the field does not already
- * apply. What it adds is the artifact's *name* — `assertRecognisedSchemaVersion` is what produces the
- * typed {@link SchemaVersionRefusal} carrying the artifact, the version and the installer that wrote
- * it, which a caller reporting the problem to a person needs and a Zod issue cannot hold.
+ * **The schema decides, and this reads its answer rather than asking the question again.** Every
+ * versioned artifact's `schema_version` field carries its own {@link SchemaVersionPolicy} — the
+ * profile's is ahead of the rest since story 2-6 — so a helper that re-checked the version against a
+ * policy *it* was given would be a second authority, and the two would disagree for exactly the
+ * artifact whose version had moved. That is not hypothetical: it is the shape of the bug this
+ * function had the moment the profile's version advanced, reporting a v1 profile as a Zod shape
+ * error rather than as `config.schema_version_unrecognised`.
+ *
+ * What it adds is the artifact's *name*. The field-level refusal cannot know which file it came
+ * from, so it says `this versioned artifact`; here the real name is substituted into the same
+ * message, and the typed {@link SchemaVersionRefusal} carries the artifact, the version and the
+ * installer that wrote it — which a caller reporting the problem to a person needs and a Zod issue
+ * cannot hold.
  */
 export const parseVersionedArtifact = <Schema extends z.ZodType<{ schema_version: number }>>(
   schema: Schema,
@@ -170,21 +227,26 @@ export const parseVersionedArtifact = <Schema extends z.ZodType<{ schema_version
   artifact: string,
 ): z.output<Schema> => {
   const parsed = schema.safeParse(value);
-  if (parsed.success) {
-    /**
-     * Unreachable while the field carries the check, and kept anyway.
-     *
-     * This helper is the gate callers *name* when they mean AD-28, and a gate that held only because
-     * another module still had a refinement in it would be lost by one edit somewhere else. Asserting
-     * here costs an array lookup and makes this function's contract true on its own terms.
-     */
-    assertRecognisedSchemaVersion(parsed.data.schema_version, artifact);
-    return parsed.data;
-  }
-  const declared = declaredSchemaVersion(value);
+  if (parsed.success) return parsed.data;
+  const versionIssue = parsed.error.issues.find(
+    (issue) =>
+      issue.path.length === 1 &&
+      issue.path[0] === 'schema_version' &&
+      issue.message.startsWith(`${SCHEMA_VERSION_UNRECOGNISED_CODE}: `),
+  );
   // Only the version is re-raised as the named refusal. Every other parse failure is a shape problem
   // and is reported as one: dressing a missing field as a version refusal would send a reader to the
   // installer for a fault the installer has nothing to do with.
-  if (declared !== null) assertRecognisedSchemaVersion(declared, artifact);
+  if (versionIssue !== undefined) {
+    const declared = declaredSchemaVersion(value);
+    throw new SchemaVersionRefusal(
+      versionIssue.message
+        .slice(`${SCHEMA_VERSION_UNRECOGNISED_CODE}: `.length)
+        .replace(`Refusing ${UNNAMED_ARTIFACT}:`, `Refusing ${artifact}:`),
+      artifact,
+      declared ?? Number.NaN,
+      declared === null ? null : installerVersionFor(declared),
+    );
+  }
   throw parsed.error;
 };

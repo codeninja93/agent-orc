@@ -434,6 +434,9 @@ describe('a completed analysis re-declares the territory the next pass serialise
         'analysis',
         'planning',
         'implementation',
+        // Story 2-6: `testing` was a declared agent with no phase and no step, so the standard plan
+        // went from the change straight to judging it.
+        'testing',
         'verification',
       ]);
 

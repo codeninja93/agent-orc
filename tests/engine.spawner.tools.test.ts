@@ -25,13 +25,17 @@ import {
   AD1_REQUIRED_FLAGS,
   ADR001_REQUIRED_FLAGS,
   AddDirNotAbsolute,
+  McpToolNotPreApproved,
+  allowedToolsFor,
   buildStepArgv,
   defaultPromptFor,
   grantFromRoster,
+  missingPreApprovals,
   missingRequiredFlags,
   toolsArgumentFor,
 } from '../src/engine/index.js';
-import type { DiscoveredRoster, StepStartRequest } from '../src/engine/index.js';
+import type { AgentGrant, DiscoveredRoster, StepStartRequest } from '../src/engine/index.js';
+import { RUNNER_ALLOWED_TOOL } from '../src/runner/index.js';
 import { BUILT_IN_AGENTS } from '../src/installer/interview.js';
 
 /**
@@ -337,5 +341,146 @@ describe('an implementation spawn carries its declared grant, with no Bash (matr
       exportContract(IMPLEMENTATION_CONTRACT_ID),
     );
     expect(IMPLEMENTATION_CONTRACT_ID).toBe('step.implementation');
+  });
+});
+
+/**
+ * ADR-004 — matrix rows 7 and 8: a phase granted the command runner carries the three flags that
+ * make the grant real, and a spawn that would omit the pre-approval fails instead of hanging.
+ *
+ * **Why the omission is the dangerous one.** `--restricted` "lets only a person or the configured
+ * permission tool" approve a tool use, and a `claude -p` run has neither: there is nobody at a
+ * terminal and no permission tool is configured. So a served tool that is not named in
+ * `--allowedTools` is not refused — the step *stops and waits*, until the attempt timeout kills it
+ * and the loop retries it to wait again. Nothing in the log says why. That is what ADR-004 means by
+ * "a step waiting for an answer nobody can give is the worst outcome available", and it is why this
+ * is a refusal at argv-build time rather than a warning.
+ */
+describe('a phase granted the runner carries the served tool (matrix 8)', () => {
+  const grantWith = (tools: readonly string[]): AgentGrant =>
+    grantFromRoster(
+      {
+        agentsDir: '/nowhere/.orch/agents',
+        agents: [
+          {
+            id: 'verification',
+            path: '/nowhere/.orch/agents/verification.toml',
+            declaration: AgentDeclarationSchema.parse({
+              schema_version: CURRENT_SCHEMA_VERSION,
+              id: 'verification',
+              purpose: 'p',
+              contract: 'step.verification',
+              tools: [...tools],
+              mcp_domains: [],
+              reversibility: 'reversible',
+              model: { start_tier: 'claude-haiku-4-5', promotion_policy: 'on-gate-failure' },
+            }),
+          },
+        ],
+        refused: [],
+        summary: 'one declaration',
+      },
+      'verification',
+    );
+
+  const argvFor = (grant: AgentGrant, configs: readonly string[] = ['/tmp/run/mcp.json']) =>
+    buildStepArgv({
+      schema: {},
+      prompt: 'p',
+      model: 'claude-haiku-4-5',
+      tools: toolsArgumentFor(grant),
+      addDir: '/tmp/orch/worktrees/run-1',
+      mcpConfigs: configs,
+      mcpTools: allowedToolsFor(grant),
+      allowedTools: allowedToolsFor(grant),
+    });
+
+  it('carries --mcp-config, --strict-mcp-config and the tool in --allowedTools', () => {
+    const argv = argvFor(grantWith(['Read', 'Grep', 'Glob', 'RunDeclaredCommand']));
+
+    expect(argv).toContain('--mcp-config');
+    expect(argv).toContain('--strict-mcp-config');
+    expect(argv[argv.indexOf('--allowedTools') + 1]).toBe(RUNNER_ALLOWED_TOOL);
+    expect(missingPreApprovals(argv, [RUNNER_ALLOWED_TOOL])).toStrictEqual([]);
+  });
+
+  it('keeps the served tool out of --tools, which names built-ins only', () => {
+    /**
+     * ADR-004 decision 3: "`--tools` continues to name **built-in** tools only — the CLI's help is
+     * explicit that its list comes 'from the built-in set'". A served name passed there is not an
+     * error the CLI reports: it is a name from outside the built-in set, granting nothing, and the
+     * step would run believing it had a gate it could not reach.
+     */
+    const grant = grantWith(['Read', 'Grep', 'Glob', 'RunDeclaredCommand']);
+    expect(toolsArgumentFor(grant)).toBe('Read,Grep,Glob');
+    expect(argvFor(grant)[argvFor(grant).indexOf('--tools') + 1]).not.toContain('RunDeclaredCommand');
+    // And the declaration is not rewritten to match: the roster is authoritative, so the grant still
+    // says what it says and is reported as elevated.
+    expect(grant.tools).toContain('RunDeclaredCommand');
+    expect(grant.elevated).toContain('RunDeclaredCommand');
+  });
+
+  it('passes no --allowedTools at all for a phase granted nothing served', () => {
+    // The flag is absent rather than empty: `--allowedTools ""` is a value, and a value nobody meant
+    // to pass is the kind of thing a later reader has to decide about.
+    const argv = argvFor(grantWith(['Read', 'Grep', 'Glob']));
+    expect(argv).not.toContain('--allowedTools');
+    expect(missingPreApprovals(argv, [])).toStrictEqual([]);
+  });
+});
+
+describe('a spawn that would not pre-approve the runner fails visibly (matrix 7)', () => {
+  const served = [RUNNER_ALLOWED_TOOL];
+
+  const build = (over: { mcpTools?: readonly string[]; allowedTools?: readonly string[]; mcpConfigs?: readonly string[] }) =>
+    buildStepArgv({
+      schema: {},
+      prompt: 'p',
+      model: 'claude-haiku-4-5',
+      tools: 'Read',
+      addDir: '/tmp/orch/worktrees/run-1',
+      mcpConfigs: over.mcpConfigs ?? ['/tmp/run/mcp.json'],
+      ...(over.mcpTools === undefined ? {} : { mcpTools: over.mcpTools }),
+      ...(over.allowedTools === undefined ? {} : { allowedTools: over.allowedTools }),
+    });
+
+  it('refuses rather than building an argv the step would hang on', () => {
+    expect(() => build({ mcpTools: served })).toThrowError(McpToolNotPreApproved);
+    expect(() => build({ mcpTools: served, allowedTools: [] })).toThrowError(McpToolNotPreApproved);
+    // A different tool pre-approved is the same omission wearing a value.
+    expect(() => build({ mcpTools: served, allowedTools: ['mcp__other__thing'] })).toThrowError(
+      McpToolNotPreApproved,
+    );
+  });
+
+  it('refuses a served grant with no server to serve it, which is the other half of the pairing', () => {
+    expect(() => build({ mcpTools: served, allowedTools: served, mcpConfigs: [] })).toThrowError(
+      McpToolNotPreApproved,
+    );
+  });
+
+  it('names the tool and says why waiting is the failure being prevented', () => {
+    let thrown: unknown;
+    try {
+      build({ mcpTools: served });
+    } catch (error: unknown) {
+      thrown = error;
+    }
+    expect((thrown as Error).message).toContain(RUNNER_ALLOWED_TOOL);
+    expect((thrown as Error).message).toContain('wait');
+    expect((thrown as McpToolNotPreApproved).code).toBe('config.invalid');
+    // `escalate-to-human`, so the loop does not retry an argv it would rebuild identically.
+    expect(dispositionFor((thrown as McpToolNotPreApproved).code)).toBe('escalate-to-human');
+  });
+
+  it('names the same omission on a vector a wrapper rebuilt, not only on the one it built', () => {
+    // The guard the spawner applies to the *executed* argv. Everything between the build and the
+    // spawn is free to rewrite `args`, and the symptom of getting this wrong is a step that hangs.
+    const argv = build({ mcpTools: served, allowedTools: served });
+    const rewritten = argv.filter(
+      (argument, index) => argument !== '--allowedTools' && argv[index - 1] !== '--allowedTools',
+    );
+    expect(missingPreApprovals(argv, served)).toStrictEqual([]);
+    expect(missingPreApprovals(rewritten, served)).toStrictEqual(served);
   });
 });

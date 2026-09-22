@@ -34,7 +34,8 @@
  * `readStepConfiguration` has no parameter a repository path could arrive in, which is what makes that
  * structural rather than advisory.
  */
-import type { GrantableTool, ModelRung } from '../contracts/index.js';
+import { MCP_TOOL_CLI_NAMES, isMcpGrantableTool } from '../contracts/index.js';
+import type { GrantableTool, McpGrantableTool, ModelRung } from '../contracts/index.js';
 
 import { readStepConfiguration } from './config-snapshot.js';
 import type { ConfigSnapshotOptions } from './config-snapshot.js';
@@ -160,18 +161,47 @@ export const grantFromRoster = (roster: DiscoveredRoster, phase: string): AgentG
 };
 
 /**
- * The `--tools` argument for a grant: the declared names, comma-separated.
+ * The `--tools` argument for a grant: the declared **built-in** names, comma-separated.
  *
- * The CLI's own form — `--tools "Bash,Edit,Read"` — and the declared order is preserved, because the
+ * The CLI's own form — `--tools "Edit,Read"` — and the declared order is preserved, because the
  * roster is what is authoritative and a re-ordering is a difference between the file and the argv that
  * nobody asked for.
+ *
+ * **An MCP grant is filtered out here, and that is not the engine overruling a declaration.** ADR-004
+ * decision 3: "`--tools` continues to name **built-in** tools only — the CLI's help is explicit that
+ * its list comes 'from the built-in set' — so the MCP tool is granted by being served, and
+ * pre-approved through `--allowedTools`." A served tool's name passed to `--tools` is not an error the
+ * CLI reports; it is a name from outside the built-in set, silently granting nothing, so the step
+ * would run believing it had a gate it could not reach. The same grant still travels — see
+ * {@link allowedToolsFor} — on the flag that carries it.
  *
  * An empty grant is passed as the CLI's explicit empty value rather than refused. `--tools ""` is
  * documented as "disable all tools", so a declaration granting nothing is expressible, and refusing it
  * here would be the engine overruling a declaration AD-17 makes authoritative. The grant is still
  * reported: `summary` says "no tools at all", which is what a reviewer needs to see.
  */
-export const toolsArgumentFor = (grant: AgentGrant): string => grant.tools.join(',');
+export const toolsArgumentFor = (grant: AgentGrant): string =>
+  grant.tools.filter((tool) => !isMcpGrantableTool(tool)).join(',');
+
+/**
+ * The MCP grants in a declaration, as the names `--allowedTools` must pre-approve.
+ *
+ * Two things this is, and one it is not. It is the *translation* of a declared capability into the
+ * CLI's `mcp__<server>__<tool>` spelling, taken from the one table in `src/contracts/` that holds
+ * both halves. It is keyed by tool name and names no agent and no phase, so it is not the compiled-in
+ * roster AD-17 forbids — the same argument `READ_ONLY_TOOLS` above rests on.
+ *
+ * Why it exists at all: under `--restricted` "only a person or the configured permission tool" can
+ * approve a tool use, and a `claude -p` run has neither. A served tool that is not pre-approved is
+ * therefore not a tool that gets refused — it is a step that stops and waits for an answer nobody
+ * can give. `src/engine/spawner.ts` refuses to build such an argv at all.
+ */
+export const mcpGrantsOf = (grant: AgentGrant): readonly McpGrantableTool[] =>
+  grant.tools.filter((tool): tool is McpGrantableTool => isMcpGrantableTool(tool));
+
+/** The `--allowedTools` value for a grant: every served tool, in the CLI's own spelling. */
+export const allowedToolsFor = (grant: AgentGrant): readonly string[] =>
+  mcpGrantsOf(grant).map((tool) => MCP_TOOL_CLI_NAMES[tool]);
 
 export interface ResolveAgentGrantOptions extends ConfigSnapshotOptions {
   readonly run: string;

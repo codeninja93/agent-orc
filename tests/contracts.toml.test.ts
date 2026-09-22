@@ -19,7 +19,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  CURRENT_SCHEMA_VERSION,
+  PROFILE_SCHEMA_VERSION,
   FORBIDDEN_TOML_KEYS,
   ProfileSchema,
   TomlParseError,
@@ -53,11 +53,12 @@ describe('an undefined value is a key that is not there', () => {
     // The round trip is the property that matters: `{ knowledge: undefined }` is what a profile with no
     // knowledge section looks like in memory, and the bytes have to load again.
     const profile = ProfileSchema.parse({
-      schema_version: CURRENT_SCHEMA_VERSION,
+      // The profile's own version, which story 2-6 advanced past the shared one (AD-28).
+      schema_version: PROFILE_SCHEMA_VERSION,
       project: { id: 'abc', path: '/tmp/x', remote: '' },
       mechanics: {
         package_manager: 'npm',
-        commands: { test: 'npm test', lint: '', build: '', run: '' },
+        commands: { test: 'npm test', typecheck: '', lint: '', build: '', run: '' },
         source_layout: ['src'],
         resources: 'none',
       },

@@ -37,6 +37,7 @@ import {
   AgentGrantUnresolved,
   ApiKeyModeRefusedError,
   ClaudeCliVersionError,
+  McpToolNotPreApproved,
   createStepSpawner,
   buildStepArgv,
   errorCodeForResult,
@@ -59,6 +60,8 @@ import type {
   StepSpawner,
   StepStartRequest,
 } from '../src/engine/index.js';
+
+import { RUNNER_ALLOWED_TOOL } from '../src/runner/index.js';
 
 import { fixtureGrant } from './helpers/agent-grant.js';
 import {
@@ -1360,5 +1363,60 @@ describe('the grant the spawner resolves for itself', () => {
     expect(passed.ok ? passed.value : '').not.toContain('implementation.toml');
     // And the envelope still says which run, verbatim, which is why the pair still locates the file.
     expect(spawned?.run).toBe(harness.run);
+  });
+});
+
+/**
+ * ADR-004 — the served tool reaches the *executed* vector, or the spawn does not happen.
+ *
+ * This is the wiring `buildStepArgv`'s own suite cannot see: that suite is handed the grant's served
+ * tools and the pre-approval as two arguments, and asserts what it does with them. What decides
+ * whether a real spawn passes them at all is `planFor`, and nothing asserted it — a mutation making
+ * it pass `[]` for both left every test in this repository green while the step that was granted the
+ * command runner would have been unable to reach it. Asserted here against the argv the child
+ * actually received, for the same reason story 1-4 asserts every other flag that way.
+ */
+describe('a spawn for a phase granted the runner carries it (ADR-004, matrix 8)', () => {
+  const grantWithRunner = (): AgentGrant => ({
+    ...fixtureGrant(),
+    phase: 'verification',
+    agentId: 'verification',
+    tools: ['Read', 'Grep', 'Glob', 'RunDeclaredCommand'],
+    elevated: ['RunDeclaredCommand'],
+  });
+
+  it('names the served tool in --allowedTools on the vector the child received', async () => {
+    const harness = openTracked({
+      fixture: 'completed.jsonl',
+      grant: grantWithRunner(),
+      mcpConfigs: ['/tmp/run/mcp.json'],
+    });
+    await harness.spawner.start(harness.request());
+
+    const argv = harness.argvSeenByChild();
+    expect(argv).toContain('--mcp-config');
+    expect(argv).toContain('--strict-mcp-config');
+    expect(argv[argv.indexOf('--allowedTools') + 1]).toBe(RUNNER_ALLOWED_TOOL);
+    // And `--tools` still names built-ins only: the served name travels on the other flag, never
+    // this one, where the CLI would silently drop it as a name outside the built-in set.
+    expect(argv[argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob');
+
+    // The grant is recorded as it was declared, with the pre-approval beside it, so an audit can see
+    // both what was granted and whether the step could actually reach it.
+    const spawnedEvent = harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentSpawned)[0];
+    expect(spawnedEvent?.payload?.[SPAWN_GRANT_PAYLOAD_KEYS.GrantedTools]).toContain(
+      'RunDeclaredCommand',
+    );
+    expect(spawnedEvent?.payload?.['pre_approved_tools']).toStrictEqual([RUNNER_ALLOWED_TOOL]);
+  });
+
+  it('refuses the spawn when no server would be started, rather than granting a tool that cannot exist', async () => {
+    // No `--mcp-config`, so nothing serves the tool the roster granted. The refusal is loud and
+    // keeps `config.invalid`; a spawn that went ahead would leave the step asking for a tool that
+    // does not exist, which under `--restricted` is a wait nobody can end.
+    const harness = openTracked({ fixture: 'completed.jsonl', grant: grantWithRunner() });
+    await expect(harness.spawner.start(harness.request())).rejects.toThrowError(
+      McpToolNotPreApproved,
+    );
   });
 });

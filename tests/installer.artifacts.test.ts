@@ -20,6 +20,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
   CURRENT_SCHEMA_VERSION,
+  PROFILE_SCHEMA_VERSION,
   ManifestSchema,
   PermissionsSchema,
   ProfileSchema,
@@ -222,10 +223,23 @@ describe('everything written carries a schema_version and appears in the manifes
     const repo = repository();
     await runInit({ repository: repo, io: scriptedIo() });
 
+    /**
+     * Every artifact carries the version **its own schema** declares, which since story 2-6 is not
+     * one number for all of them.
+     *
+     * The profile's advanced when `mechanics.commands` gained `typecheck`, and AD-28 makes that a
+     * version change for the artifact whose shape changed and for no other — a shared bump would
+     * have refused every `state.json` and every lease written before the upgrade, so a run in
+     * flight could not be read back. What must not weaken is the rule: every artifact still carries
+     * a version and every one of them is still checked, which is what this loop asserts by reading
+     * the expected value *per artifact* rather than by dropping the assertion.
+     */
     const tree = readTree(join(repo, '.orch'));
     for (const [path, contents] of tree) {
       const table = parseToml(contents);
-      expect(table['schema_version'], path).toBe(CURRENT_SCHEMA_VERSION);
+      expect(table['schema_version'], path).toBe(
+        path === 'profile.toml' ? PROFILE_SCHEMA_VERSION : CURRENT_SCHEMA_VERSION,
+      );
       const schema = path.startsWith('agents/')
         ? AgentDeclarationSchema
         : path === 'profile.toml'
@@ -272,9 +286,13 @@ describe('an .orch/ from an unrecognised schema_version is refused, never read a
 
     const profilePath = join(repo, '.orch', 'profile.toml');
     const future = readFileSync(profilePath, 'utf8').replace(
-      'schema_version = 1',
-      `schema_version = ${String(CURRENT_SCHEMA_VERSION + 1)}`,
+      `schema_version = ${String(PROFILE_SCHEMA_VERSION)}`,
+      `schema_version = ${String(PROFILE_SCHEMA_VERSION + 1)}`,
     );
+    // The substitution has to have happened, or the file is unchanged and the refusal below would be
+    // asserting nothing — which is how this test would have silently stopped testing anything when
+    // the profile's version moved.
+    expect(future).not.toBe(readFileSync(profilePath, 'utf8'));
     writeFileSync(profilePath, future, 'utf8');
 
     await expect(runInit({ repository: repo, io: scriptedIo() })).rejects.toThrow(

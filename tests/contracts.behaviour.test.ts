@@ -24,6 +24,9 @@ import {
   QuestionDraftSchema,
   QuestionStateSchema,
   SCHEMA_VERSION_UNRECOGNISED_CODE,
+  PROFILE_SCHEMA_VERSION,
+  ProfileSchema,
+  RunStateSchema,
   SchemaVersionRefusal,
   TimestampSchema,
   commandRequiresArgument,
@@ -386,6 +389,81 @@ describe('AD-28 — schema_version', () => {
       expect(issue?.message, id).toContain(SCHEMA_VERSION_UNRECOGNISED_CODE);
     },
   );
+
+  /**
+   * Story 2-6 made the version **per artifact**, and this is the guard that the split did not weaken
+   * the rule it splits.
+   *
+   * The reason for the split is that one constant answered for every artifact: the profile's shape
+   * changed when `mechanics.commands` gained `typecheck`, and advancing a shared number would have
+   * refused every `state.json`, every lease and every question outcome written before it — so a run
+   * in flight when the installer was upgraded could no longer be read back and AD-8's resume would
+   * have had nothing to resume from. What AD-28 requires is that every artifact carries a version and
+   * that an unrecognised one is refused, and both still hold for every one of them.
+   */
+  describe('versions advance per artifact, and none of them stops being checked', () => {
+    it.each(contractIdsOfKind('artifact'))('%s refuses a version below its own', (id) => {
+      // The direction the profile's bump created: a *lower* version is as unrecognised as a higher
+      // one, because this build cannot read the shape that wrote it either way.
+      const result = getContract(id).schema.safeParse({ schema_version: 0 });
+      expect(result.success, id).toBe(false);
+      const issue = result.error?.issues.find((entry) => entry.path.join('.') === 'schema_version');
+      expect(issue?.message, id).toContain(SCHEMA_VERSION_UNRECOGNISED_CODE);
+    });
+
+    it.each(contractIdsOfKind('artifact'))('%s refuses an artifact carrying no version at all', (id) => {
+      const result = getContract(id).schema.safeParse({});
+      expect(result.success, id).toBe(false);
+      expect(
+        result.error?.issues.map((issue) => issue.path.join('.')),
+        id,
+      ).toContain('schema_version');
+    });
+
+    it('advances the profile without refusing an artifact whose shape did not change', () => {
+      /**
+       * The premise the split rests on, demonstrated rather than asserted.
+       *
+       * The profile reads only version 2; a `state.json` at version 1 — the version every run in
+       * flight carries — still parses. Had the number been shared, the second of these would be a
+       * refusal, and the run would be unreadable because a *profile* field was added.
+       */
+      expect(PROFILE_SCHEMA_VERSION).toBeGreaterThan(CURRENT_SCHEMA_VERSION);
+      expect(
+        ProfileSchema.safeParse({ schema_version: CURRENT_SCHEMA_VERSION }).error?.issues.some(
+          (issue) => issue.path.join('.') === 'schema_version',
+        ),
+      ).toBe(true);
+      expect(
+        RunStateSchema.safeParse({ schema_version: CURRENT_SCHEMA_VERSION }).error?.issues.some(
+          (issue) => issue.path.join('.') === 'schema_version',
+        ),
+      ).toBe(false);
+    });
+
+    it('names the artifact in the refusal a per-artifact policy raises', () => {
+      // `parseVersionedArtifact` reads the schema's *own* answer rather than re-checking against a
+      // policy it was handed — which is what it did until story 2-6, and why a v1 profile came back
+      // as a Zod shape error instead of `config.schema_version_unrecognised`.
+      let thrown: unknown = null;
+      try {
+        parseVersionedArtifact(
+          ProfileSchema,
+          { schema_version: CURRENT_SCHEMA_VERSION },
+          '.orch/profile.toml',
+        );
+      } catch (error: unknown) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(SchemaVersionRefusal);
+      const named = thrown as SchemaVersionRefusal;
+      expect(named.code).toBe(SCHEMA_VERSION_UNRECOGNISED_CODE);
+      expect(named.artifact).toBe('.orch/profile.toml');
+      expect(named.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+      // And the supported list in the message is the *profile's*, not the shared one.
+      expect(named.message).toContain(`schema_version ${String(PROFILE_SCHEMA_VERSION)}`);
+    });
+  });
 
   it('still accepts a shape problem as a shape problem, not as a version refusal', () => {
     // A missing field must not be dressed up as an unrecognised version: that would send a reader to the

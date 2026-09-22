@@ -27,6 +27,8 @@ import { ProjectRegistrationSchema } from './project.js';
 import { QuestionStateSchema } from './question.js';
 import { RunStateSchema } from './state.js';
 import { StepInputSchema, StepOutputSchema } from './step.js';
+import { TESTING_CONTRACT_ID, TestingOutputSchema } from './testing.js';
+import { VERIFICATION_CONTRACT_ID, VerificationOutputSchema } from './verification.js';
 
 /**
  * What a contract is for, which decides what is asserted about it:
@@ -200,6 +202,33 @@ export const CONTRACTS = {
       'lying inside the declared territory, plus the write intents the engine executes (AD-15).',
     model_produced: true,
     schema: ImplementationOutputSchema,
+  },
+  /**
+   * Story 2-6's two, registered for the reason the three above are — AD-17 has a roster entry
+   * reference a contract by id, and `step.output` cannot tell a testing agent from a verifying one,
+   * which is exactly the pair that must be told apart: one may write files and the other may not.
+   *
+   * The shapes differ from each other as much as from the envelope: `step.testing` reports the tests
+   * written and the territory they were written in, and `step.verification` reports what the
+   * deterministic gates did and then what was judged against the criteria the run was accepted with.
+   */
+  [TESTING_CONTRACT_ID]: {
+    id: TESTING_CONTRACT_ID,
+    kind: 'step',
+    description:
+      'The testing agent\'s output: the test files it wrote, each carrying its provenance and the ' +
+      'behaviour it pins, inside the declared territory.',
+    model_produced: true,
+    schema: TestingOutputSchema,
+  },
+  [VERIFICATION_CONTRACT_ID]: {
+    id: VERIFICATION_CONTRACT_ID,
+    kind: 'step',
+    description:
+      'The verification agent\'s output: what each deterministic gate CAP-13 names did, and the ' +
+      'verdict on each acceptance criterion the run was accepted with.',
+    model_produced: true,
+    schema: VerificationOutputSchema,
   },
 } as const satisfies Readonly<Record<string, ContractEntry>>;
 

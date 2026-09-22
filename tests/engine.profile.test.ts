@@ -76,7 +76,7 @@ const CLAUDE_MD_NAMING_ONE_ANCHOR =
   `Renderers must not call \`${CONTRADICTED_ANCHOR}\`; they write a command intent instead.\n`;
 
 describe('the profile loads with every AD-16 mechanic available (matrix 1)', () => {
-  it('answers with the four commands, the package manager, the layout, resources and the risk tiers', () => {
+  it('answers with the declared commands, the package manager, the layout, resources and the risk tiers', () => {
     const repository = workspace();
     writeProfile(repository, fixtureProfile());
 
@@ -84,6 +84,9 @@ describe('the profile loads with every AD-16 mechanic available (matrix 1)', () 
 
     expect(resolved.mechanics.commands).toStrictEqual({
       test: 'npm test',
+      // Story 2-6: CAP-13 names typecheck as one of the deterministic gates, and until the profile
+      // could carry it the gate had nowhere to be declared.
+      typecheck: 'npm run typecheck',
       lint: 'npm run lint',
       build: 'npm run build',
       run: 'npm start',
@@ -232,6 +235,79 @@ describe('an unrecognised schema_version is refused as every versioned artifact 
       // The artifact is named, which is what distinguishes this from the field-level refusal.
       expect(refusal.message).toContain('profile.toml');
     }
+  });
+
+  /**
+   * Matrix rows 9 and 10 — the profile CAP-13's gate needed, and the consequence AD-28 attaches.
+   *
+   * `typecheck` is a new required field on an artifact the installer writes, so a profile written
+   * before it exists is not a profile with one field missing: it is a profile this build cannot
+   * read. The difference matters because the empty string is a *legitimate* value meaning "this
+   * repository has no typecheck step", so a defaulted field and a declared absence would be
+   * indistinguishable once written — and every repository upgraded rather than re-interviewed would
+   * silently report CAP-13's typecheck gate as skipped.
+   */
+  it('refuses a profile written before typecheck existed, rather than defaulting it (matrix 10)', () => {
+    const repository = workspace();
+    const { typecheck: _dropped, ...beforeTypecheck } = fixtureProfile().mechanics.commands;
+    writeRawProfile(repository, {
+      ...fixtureProfile(),
+      schema_version: CURRENT_SCHEMA_VERSION,
+      mechanics: { ...fixtureProfile().mechanics, commands: beforeTypecheck },
+    });
+
+    let thrown: unknown = null;
+    try {
+      loadProfile(projectConfiguration(repository));
+    } catch (error: unknown) {
+      thrown = error;
+    }
+    const refusal = thrown as Error & { code?: string };
+    expect(refusal.code).toBe('config.schema_version_unrecognised');
+    expect(refusal.message).toContain('profile.toml');
+    // Named as a version problem rather than as a missing field, which is the point: a reader is
+    // sent to the installer, which is the thing that can fix it.
+    expect(refusal.message).toContain('Re-run the installer');
+  });
+
+  it('requires typecheck at the profile\u2019s current version, rather than defaulting it (matrix 9)', () => {
+    /**
+     * The half the version bump does not cover, and it was missed until a mutation found it.
+     *
+     * Refusing a *v1* profile is the version check's work. What this asserts is the other direction:
+     * that a profile at the **current** version cannot omit the field either. Making `typecheck`
+     * optional with a default of `''` passes every other test in this repository — and it is exactly
+     * the silent default AD-28 is invoked to prevent, because `''` is a legitimate declared answer
+     * meaning "this repository has no typecheck step" and a defaulted one is indistinguishable from
+     * it once written.
+     */
+    const { typecheck: _dropped, ...withoutTypecheck } = fixtureProfile().mechanics.commands;
+    const result = ProfileSchema.safeParse({
+      ...fixtureProfile(),
+      mechanics: { ...fixtureProfile().mechanics, commands: withoutTypecheck },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain(
+      'mechanics.commands.typecheck',
+    );
+    // And the empty string still parses, because declaring that there is none is a real answer.
+    expect(
+      ProfileSchema.safeParse({
+        ...fixtureProfile(),
+        mechanics: {
+          ...fixtureProfile().mechanics,
+          commands: { ...withoutTypecheck, typecheck: '' },
+        },
+      }).success,
+    ).toBe(true);
+  });
+
+  it('carries typecheck on a profile this build wrote (matrix 9)', () => {
+    const repository = workspace();
+    writeProfile(repository, fixtureProfile());
+    expect(loadProfile(projectConfiguration(repository)).mechanics.commands.typecheck).toBe(
+      'npm run typecheck',
+    );
   });
 
   it('refuses a hand edit that does not parse, naming the line', () => {

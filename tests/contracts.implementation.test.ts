@@ -127,9 +127,12 @@ describe('the standard plan points its implement step at this contract (matrix 8
     expect(schema.safeParse(claimingTheEnvelope).success).toBe(false);
   });
 
-  it('leaves verify on the generic envelope, which is story 2-6’s to change', () => {
+  it('points verify at step.verification, which is what story 2-6 changed it to', () => {
+    // This read `step.output` until story 2-6, with a comment saying so. The pairing failure story
+    // 2-4 found in the roster is the same one here: a plan naming the generic envelope has every
+    // refusal the phase's own contract adds validated against nothing.
     const verify = STANDARD_PLAN_STEPS.find((step) => step.phase === 'verification');
-    expect(verify?.contract_id).toBe('step.output');
+    expect(verify?.contract_id).toBe('step.verification');
   });
 });
 

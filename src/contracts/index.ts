@@ -31,6 +31,8 @@ export * from './registry.js';
 export * from './schema-version.js';
 export * from './state.js';
 export * from './step.js';
+export * from './testing.js';
 export * from './territory.js';
 export * from './toml.js';
+export * from './verification.js';
 export * from './usage.js';

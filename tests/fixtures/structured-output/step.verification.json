@@ -1,0 +1,65 @@
+{
+  "contract_id": "step.verification",
+  "step": "verify",
+  "status": "completed",
+  "summary": "The three deterministic gates ran first — typecheck and lint passed, and this repository declares no separate test command for the worktree, so that gate is skipped — and both acceptance criteria are met by the change as written.",
+  "provenance": [
+    "verify: evidence/typecheck-1.log",
+    "verify: evidence/lint-1.log",
+    "verify: src/runner/index.ts"
+  ],
+  "decisions": [],
+  "artifacts": [
+    {
+      "kind": "log",
+      "path": "evidence/typecheck-1.log",
+      "description": "The typecheck gate's output, written to the evidence plane rather than returned."
+    }
+  ],
+  "questions": [],
+  "write_intents": [],
+  "error": null,
+  "gates": [
+    {
+      "command": "typecheck",
+      "declared": "npm run typecheck",
+      "outcome": "passed",
+      "exit_status": 0,
+      "evidence": "evidence/typecheck-1.log"
+    },
+    {
+      "command": "lint",
+      "declared": "npm run lint",
+      "outcome": "passed",
+      "exit_status": 0,
+      "evidence": "evidence/lint-1.log"
+    },
+    {
+      "command": "test",
+      "declared": "",
+      "outcome": "skipped",
+      "exit_status": null,
+      "evidence": ""
+    }
+  ],
+  "judgements": [
+    {
+      "criterion": "the runner takes the name of a declared command and never a command string",
+      "verdict": "met",
+      "grounds": "The tool's input schema is a closed enum of the profile's declared names with additionalProperties false, so an arbitrary command cannot be expressed in a well-formed call.",
+      "provenance": {
+        "step": "verify",
+        "source": "src/runner/commands.ts"
+      }
+    },
+    {
+      "criterion": "a gate with no declared command is reported as skipped rather than failed",
+      "verdict": "met",
+      "grounds": "An empty declaration returns outcome \"skipped\" with a null exit status and starts no container, and the contract refuses a skipped gate that carries a status.",
+      "provenance": {
+        "step": "verify",
+        "source": "src/runner/index.ts"
+      }
+    }
+  ]
+}

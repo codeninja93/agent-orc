@@ -84,6 +84,29 @@ export const ENGINE_EVENT_TYPES = {
   StepApproved: 'step.approved',
   /** A run stopped and explained itself rather than thrashing (CAP-23, AD-35). */
   HandoffRecorded: 'handoff.recorded',
+  /**
+   * One deterministic gate ran, was skipped, or failed — CAP-13's first tier, recorded per gate.
+   *
+   * Three types rather than one with an `outcome` field, because a reader asking "did anything fail"
+   * should not have to parse a payload to find out, and because `gate.skipped` is the one a person
+   * most needs to see: a repository that declares no tests is not a repository whose tests pass, and
+   * the difference has to be legible in the log and not only in the artifact.
+   *
+   * None of the three folds into the checkpoint. They are the record of what the *engine* did before
+   * a spawn, and the spawn's own outcome is what the fold already tracks; a gate line that changed
+   * step state would be a second authority on a step's disposition (AD-4).
+   */
+  GatePassed: 'gate.passed',
+  GateFailed: 'gate.failed',
+  GateSkipped: 'gate.skipped',
+  /**
+   * The model-based review was not spawned, and why — CAP-13's economics, said out loud.
+   *
+   * The *absence* of `agent.spawned` is what proves no review was spent (a counter can read zero
+   * because nothing incremented it), and this is the positive statement beside it: absence alone
+   * cannot say whether a review was skipped or the run never got that far.
+   */
+  ReviewSkipped: 'verification.review_skipped',
 } as const;
 
 export type EngineEventType = (typeof ENGINE_EVENT_TYPES)[keyof typeof ENGINE_EVENT_TYPES];

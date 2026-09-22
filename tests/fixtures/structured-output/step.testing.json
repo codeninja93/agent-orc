@@ -1,0 +1,45 @@
+{
+  "contract_id": "step.testing",
+  "step": "test",
+  "status": "completed",
+  "summary": "Three suites cover story 2-6's command runner: that it takes a declared name and nothing else, that an undeclared name is refused naming what is declared, and that a gate with no declared command is reported skipped rather than passed.",
+  "provenance": [
+    "test: src/runner/commands.ts",
+    "test: src/runner/index.ts",
+    "test: docs/specs/spec-agent-orchestrator/stories/2-6-testing-and-verification.md"
+  ],
+  "decisions": [],
+  "artifacts": [
+    {
+      "kind": "log",
+      "path": "evidence/test-1.log",
+      "description": "The output of the declared test command, run inside the container."
+    }
+  ],
+  "questions": [],
+  "write_intents": [],
+  "error": null,
+  "tests": [
+    {
+      "path": "tests/runner.command.test.ts",
+      "kind": "added",
+      "covers": "The runner takes the name of a declared command and never a command line: an arbitrary string fails the tool's own input schema before any code decides anything.",
+      "provenance": {
+        "step": "test",
+        "source": "src/runner/commands.ts"
+      }
+    },
+    {
+      "path": "tests/engine.gate-economics.test.ts",
+      "kind": "added",
+      "covers": "A declared command that is the empty string is reported as skipped with no exit status and no container started, which is distinguishable from a gate that ran and passed.",
+      "provenance": {
+        "step": "test",
+        "source": "src/runner/index.ts"
+      }
+    }
+  ],
+  "territory": [
+    "tests"
+  ]
+}

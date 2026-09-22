@@ -36,10 +36,12 @@ import {
   RESOURCE_NEEDS,
   REVERSIBILITY_CLASSES,
   RUN_MODES,
+  DEFAULT_SCHEMA_VERSION_POLICY,
+  PROFILE_SCHEMA_VERSION_POLICY,
   assertRecognisedSchemaVersion,
   parseVersionedArtifact,
 } from '../contracts/index.js';
-import type { Manifest } from '../contracts/index.js';
+import type { Manifest, SchemaVersionPolicy } from '../contracts/index.js';
 
 import { BUILT_IN_AGENT_IDS } from './interview.js';
 import type { AgentDeclarationInput, PartialAnswers } from './interview.js';
@@ -99,10 +101,20 @@ const readTomlFile = (path: string): TomlTable | null => {
  * A file with no `schema_version` at all is not refused here: it is not this build's artifact, and
  * every answer read from it goes through its own schema anyway. What must never happen is reading a
  * *declared* version this build does not know as though it were current.
+ *
+ * **The policy is per artifact, and the caller passes the one that belongs to the file it read.**
+ * Since story 2-6 the profile's version is ahead of the others, because `mechanics.commands` gained
+ * `typecheck` and AD-28 makes that a version change for the artifact whose shape changed and for no
+ * other. A single policy here would either refuse every v1 permissions file or accept a v1 profile
+ * whose typecheck gate nobody declared — and the second is the silent one.
  */
-const assertReadableVersion = (table: TomlTable, artifact: string): void => {
+const assertReadableVersion = (
+  table: TomlTable,
+  artifact: string,
+  policy: SchemaVersionPolicy = DEFAULT_SCHEMA_VERSION_POLICY,
+): void => {
   const declared = table['schema_version'];
-  if (typeof declared === 'number') assertRecognisedSchemaVersion(declared, artifact);
+  if (typeof declared === 'number') assertRecognisedSchemaVersion(declared, artifact, policy);
 };
 
 /** Take one answer, or `undefined` when the file does not carry it in a shape this build reads. */
@@ -230,7 +242,11 @@ export const readExistingInstall = (repository: string): ExistingInstall => {
 
   const profile = readTomlFile(paths.profile);
   if (profile !== null) {
-    assertReadableVersion(profile, relativeOrchPath(PROFILE_FILE_NAME));
+    assertReadableVersion(
+      profile,
+      relativeOrchPath(PROFILE_FILE_NAME),
+      PROFILE_SCHEMA_VERSION_POLICY,
+    );
     answers = { ...answers, ...answersFromProfile(profile) };
   }
 

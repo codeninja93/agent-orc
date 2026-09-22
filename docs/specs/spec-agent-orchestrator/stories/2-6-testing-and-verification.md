@@ -2,16 +2,63 @@
 title: 'Step agents — testing and verification with two-tier gate economics'
 type: 'feature'
 created: '2026-09-22'
-status: 'drafted'
+status: 'done'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 baseline_revision: '5f2bf0c'
 context:
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-001-tier-2-execution.md'
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-004-command-execution-as-a-capability.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/stories/2-5-implementation-agent.md'
-deferred: []
+deferred:
+- summary: No review layer ran against this story.
+  evidence: 'The gate, seven implementer mutations (two of which initially caught nothing and were
+    reported rather than hidden) and my own verification are the only scrutiny. I re-ran the gate
+    (exit 0, 2338/79, zero skips), confirmed the AD-31 suite and Dockerfile are untouched, verified the
+    engine imports neither the runner nor the container, and independently reproduced the per-artifact
+    version split. Read `status: done` as implemented and gated, not reviewed.'
+  severity: high
+- summary: 'Per-artifact `schema_version` is a deviation large enough to be an architecture change.'
+  evidence: 'ADR-005 is written and `proposed`, not accepted — it needs the user. The premise was verified
+    rather than asserted: with one shared constant advanced, a v1 `state.json`, question state and command
+    intent are each refused, so a run in flight across an installer upgrade could not be read back and
+    AD-8''s resume would have nothing to resume from. I reproduced the split independently: `ProfileSchema`
+    refuses v1 on version and accepts v2, while `RunStateSchema` still accepts v1 and refuses v2.'
+  location: docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-005-per-artifact-schema-versions.md
+  severity: medium
+- summary: 'There is still no production assembly point for a run.'
+  evidence: 'Nothing under `src/` or `bin/` constructs a `Reconciler` with a real spawner, runner and
+    recorder. This story makes that assembly possible for the first time — `recorderFor` exists because
+    AD-29''s exclusive claim means the loop and the spawner cannot each open a recorder, and nothing had
+    ever assembled the two. Who owns that assembly is a story that does not exist in `stories.yaml`.'
+  severity: high
+- summary: 'The MCP server has a handler and a transport but no executable entry point.'
+  evidence: '`commandRunnerMcpConfig` builds the config and the caller writes it, which the spawner''s own
+    comment assigns to story 2-10. So the runner is reachable through its port and exercised against a real
+    container, but a real `claude -p` has never spoken to it over stdio.'
+  severity: medium
+- summary: 'Two surfaces were not exercised against a real container runtime.'
+  evidence: 'Docker 29.8.0 was reachable and the runner was driven through it end to end — a passing gate,
+    a gate preserving exit 7, and an empty command skipping without starting a container. Not exercised:
+    the reconciler-to-runner gate sequencing (driven through the port with an injected invoker) and the MCP
+    stdio transport under a real `claude -p`. A second daemon-dependent suite was deliberately not added,
+    because a silently-skipping container suite is the guard-that-cannot-fail pattern and AD-31''s marker
+    discipline exists to prevent exactly that. **Open:** whether the AD-31 marker grows a seventh check
+    covering the runner.'
+  severity: medium
+- summary: 'The Dockerfile''s closing comment is stale and was deliberately left alone.'
+  evidence: 'It still says "the wrapper composes the image''s own CLI plus story 1-4''s unchanged AD-1
+    argv", which ADR-004 made false. Editing it changes the content hash, invalidating the AD-31 marker and
+    forcing a rebuild of roughly twenty minutes. `IMAGE_CLI_PATH` is kept and the image still ships the CLI
+    because the AD-31 suite executes it from inside and must pass unchanged.'
+  location: docker/Dockerfile
+  severity: low
+- summary: '`INSTALLER_VERSION_BY_SCHEMA_VERSION` maps two profile versions to one installer version.'
+  evidence: 'Both map to `0.1.0`, so a v1 profile''s refusal reads "written by installer version 0.1.0;
+    installer version 0.1.0 is reading it" — accurate and confusing. The package version should be bumped
+    before release, which is a release decision rather than this story''s.'
+  severity: low
 ---
 
 # Story 2-6 — Testing and verification, with two-tier gate economics
@@ -170,4 +217,65 @@ declared commands; it does not write files on the agent's behalf.
 
 ## Verification
 
+Run by me, exit status captured to a variable and output kept in a file:
+`npm run typecheck && npm run lint && npm run build && npm test` — **exit 0, 2338 tests across 79 files, zero
+failures, zero skips.** Baseline `441ac9c` was 2213/75.
+
+**Seven mutations, two of which initially caught nothing — reported rather than hidden.**
+
+| Mutation | Caught by |
+|---|---|
+| The runner accepts an arbitrary command string | 3 tests, including one over the wire |
+| `--allowedTools` omits the served tool | 2 tests |
+| **`planFor` stops wiring the grant into the flags at all** | **nothing** — `buildStepArgv`'s suite is handed both values, so nothing asserted the spawner passes them. A test on the argv the child actually received was added; then caught |
+| A failing gate still spawns the review | 4 tests, including the absence assertion and a real-runner case |
+| An empty declared command reports as passed | 2 tests, one distinguishing skipped from passed |
+| A container start planted at `src/pool/warmup/prefetch.ts`, aliased and nested | the boundary guard |
+| **`typecheck` made optional with a silent default** | **nothing** — the version check covers an *old* profile; nothing stopped a *current* profile omitting the field. Landmine F's exact failure. A test was added; then caught |
+| Profile version advance | a v1 `state.json`, question state and command intent each refused under one shared constant; none refused under the split |
+
+**Verified by me directly.** Gate exit 0 at 2338/79. `tests/container.assertion.test.ts`,
+`tests/container.gate.test.ts` and `docker/Dockerfile` are untouched, so story 1-5's AD-31 suite passes
+unchanged as ADR-001 requires. `src/engine/` imports neither `../runner/` nor `../container/`. The runner's
+request is a `z.strictObject` over the declared command names, so an arbitrary command is structurally
+inexpressible rather than merely refused. And I reproduced the version split independently: `ProfileSchema`
+refuses v1 **on version** and accepts v2, while `RunStateSchema` still accepts v1 and refuses v2.
+
+**Against a real container runtime** (Docker 29.8.0): the AD-31 containment suite ran unchanged, and the
+runner was driven end to end — a passing gate, a gate preserving exit 7 exactly, and an empty command
+skipping without starting a container.
+
 ## Auto Run Result
+
+**Status: done.** The command-runner exists, so steps can execute again; testing and verification have their
+phases and contracts; the profile can express the typecheck gate CAP-13 requires; and a run failing its
+deterministic gates spawns no model-based review.
+
+**Two defects were found only because the runner was driven against a real container**, and no seam test
+could have found either. First, a container-name collision across runner instances: attempts were counted
+within one instance, so a re-run composed the name the previous attempt's container still held — which is
+precisely the defect story 1-5 fixed for the wrapper, inherited by the runner. Second, a container that would
+not start was reported as a *failing gate*, telling a person their tests are broken when nothing ran; status
+125 now raises `container.start_failed` and routes through AD-35 instead.
+
+**The two mutations that caught nothing are the most valuable results in the round.** One showed that
+`buildStepArgv`'s suite is handed both the grant and the tool list, so nothing asserted the spawner actually
+passes them — the assertion sat on the wrong side of the seam. The other showed that the version check
+guarded an *old* profile while nothing stopped a *current* one omitting `typecheck` — the exact failure the
+brief's landmine F named, found by mutation rather than by reading.
+
+**One decision was taken by measurement rather than assumption.** Adding `typecheck` to the profile forced
+the question of whether `schema_version` is one number. It was, and advancing it would have refused every
+`state.json`, question outcome and command intent written before the upgrade — verified, not argued — so a
+run in flight across an installer upgrade could not be read back. Versions now advance per artifact. ADR-005
+records it and is **proposed, not accepted**: it wants the user.
+
+**Follow-up review recommended: true.** No review layer ran. The specific unverified risk: the
+reconciler-to-runner gate sequencing is driven through the port with an injected invoker, and the MCP stdio
+transport has never been spoken to by a real `claude -p` — the server has a handler and a transport but no
+executable entry point, which the spawner's own comment assigns to story 2-10.
+
+**Residual risks.** Seven deferred entries, two `high`: no review layer has run, and there is still no
+production assembly point — nothing under `src/` or `bin/` constructs a `Reconciler` with a real spawner,
+runner and recorder. This story makes that assembly possible for the first time, and who owns it is a story
+that does not exist in `stories.yaml`.

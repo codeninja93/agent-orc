@@ -85,16 +85,25 @@ const packageScripts = (repositoryPath: string): Readonly<Record<string, string>
   }
 };
 
-/** The script names each of the four commands is looked for under, in order of preference. */
+/**
+ * The script names each command is looked for under, in order of preference.
+ *
+ * `typecheck` carries three because the ecosystem has not settled on one: `typecheck` and
+ * `type-check` are both common and `tsc` is what a repository that never wrote a script calls it.
+ * Offering the wrong one is cheap — every detected value is a *default* a person overrides at the
+ * interview (matrix row 12) — and offering none at all is what leaves CAP-13's typecheck gate
+ * declared empty on a repository that has one.
+ */
 const SCRIPT_CANDIDATES: Readonly<Record<string, readonly string[]>> = {
   test: ['test'],
+  typecheck: ['typecheck', 'type-check', 'tsc'],
   lint: ['lint'],
   build: ['build'],
   run: ['start', 'dev', 'serve'],
 };
 
 /**
- * The four commands of AD-16, as the repository's own scripts already spell them.
+ * The commands of AD-16, as the repository's own scripts already spell them.
  *
  * Empty string where there is none — the answer "this repository has no lint command" is a fact the
  * profile has to be able to carry, and a missing key would read as "nobody was asked".
@@ -112,6 +121,7 @@ export const detectCommands = (
   }
   return {
     test: commands['test'] ?? '',
+    typecheck: commands['typecheck'] ?? '',
     lint: commands['lint'] ?? '',
     build: commands['build'] ?? '',
     run: commands['run'] ?? '',

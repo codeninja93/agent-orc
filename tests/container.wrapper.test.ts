@@ -1,15 +1,25 @@
 /**
- * The seam, the lifecycle and the dependency direction.
+ * The boundary, the lifecycle and the dependency direction.
  *
- * Three things are proven here that nothing else can prove:
+ * Four things are proven here that nothing else can prove:
  *
- * - the wrapper is usable as story 1-4's `SpawnWrapper` — asserted by *assigning* it to one, so the
- *   typechecker is the assertion and a shape change breaks the build rather than a comment;
+ * - **matrix 21** — the wrapper places a *command* inside the container and not `claude -p`, with
+ *   the flag set, the image and the mount allow-list unchanged. "Unchanged" is asserted against
+ *   `composeRunArgs`, which is the one composer, rather than against a second list written here;
+ * - the wrapper is **no longer** assignable to story 1-4's `SpawnWrapper`, asserted the only way a
+ *   negative type claim can be — with a `@ts-expect-error` that fails the build if the assignment
+ *   ever starts working again. That is ADR-004's change stated where it is enforced: a wrapper the
+ *   spawner could still be handed is one that would put an agent process back inside a container it
+ *   cannot authenticate from;
  * - a tier-0 or tier-1 plan comes back as the same object, so "identical to the input" is true by
  *   reference rather than by a field-by-field comparison that could miss a field nobody listed;
  * - `src/container/` imports only `src/contracts/`, `src/runtime/` and `node:` builtins, and the
  *   runtime is named in exactly one file — which is the AD-20 invariant the whole package exists to
  *   make true.
+ *
+ * **matrix 22** is asserted by `tests/container.assertion.test.ts`, unchanged by this story: it
+ * drives `composeRunArgs` directly and never touched the wrapper, which is exactly why ADR-001 could
+ * say the AD-31 suite "is unchanged and still correct" while the argv inside the boundary changed.
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -49,10 +59,8 @@ import type {
   ContainerRunRequest,
   ContainerRuntime,
 } from '../src/container/index.js';
-import type { Recorder } from '../src/runtime/index.js';
-import type { SpawnPlan, SpawnWrapper, StepSpawnerOptions } from '../src/engine/index.js';
-
-import { fixtureGrant } from './helpers/agent-grant.js';
+import type { ContainedCommandPlan } from '../src/container/index.js';
+import type { SpawnWrapper } from '../src/engine/index.js';
 
 const RUN = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 /**
@@ -73,20 +81,20 @@ afterAll(() => {
 });
 const RUNTIME: ContainerRuntime = { command: '/usr/local/bin/orch-runtime', name: 'runtime', source: 'path' };
 
-/** A plan exactly as story 1-4 builds one: host Node, host CLI entry, and the CLI argv on its own. */
-const plan = (overrides: Partial<SpawnPlan> = {}): SpawnPlan => ({
-  command: '/usr/local/bin/node',
-  args: ['/opt/claude/cli.js', '--print', 'do the thing', '--strict-mcp-config', '--restricted'],
+/**
+ * A plan as ADR-004's runner builds one: a declared command to place inside the boundary.
+ *
+ * The environment carries a credential-shaped name on purpose — the container must not receive it,
+ * and a fixture with nothing to drop would let that assertion pass vacuously.
+ */
+const plan = (overrides: Partial<ContainedCommandPlan> = {}): ContainedCommandPlan => ({
+  command: '/usr/local/bin/orch-runtime',
+  args: [],
   cwd: WORKTREE,
   env: { PATH: '/usr/bin', ORCH_NODE: '/usr/local/bin/node', GITHUB_TOKEN: 'ghp_notreal' },
-  cliArgs: ['--print', 'do the thing', '--strict-mcp-config', '--restricted'],
-  cli: { path: '/opt/claude/cli.js', version: '2.1.278', auth: 'subscription', interpreter: 'node' },
-  node: { path: '/usr/local/bin/node', version: '24.21.0', source: 'path' },
-  step: 'implement',
+  contained: ['/bin/sh', '-c', 'npm test'],
+  step: 'verify',
   run: RUN,
-  // Story 2-4: every plan carries the AD-17 grant its `--tools` was built from. The wrapper contains the
-  // commands the agent runs and never rewrites the grant, which is what the assertions here rely on.
-  grant: fixtureGrant(),
   ...overrides,
 });
 
@@ -99,24 +107,37 @@ const presentImage = (): ((invocation: ContainerInvocation) => ContainerResult) 
   });
 };
 
-describe('the SpawnWrapper story 1-4 left unfilled', () => {
-  it('is assignable to the seam\'s own type, without this package importing it', () => {
-    // The assignment is the assertion: `createContainerWrapper` returns a generic identity-preserving
-    // function, which satisfies `(plan: SpawnPlan) => SpawnPlan` structurally. If the shape drifts,
-    // `npm run typecheck` fails here — which is the only place that drift is catchable at all, since
-    // `src/container/` may not import `src/engine/`.
+describe('the boundary ADR-004 repointed at a command', () => {
+  it('is no longer assignable to the spawner\'s seam, which is the change and not an omission', () => {
+    /**
+     * A negative type claim, asserted the only way one can be: if this assignment ever compiles
+     * again, `@ts-expect-error` itself becomes the error and the build fails.
+     *
+     * It matters because the assignment *used* to be the point of this file. Under ADR-001 the
+     * wrapper filled story 1-4's `wrap` seam and put `claude -p` inside the container — and ADR-004
+     * measured that impossible: the subscription credential is in the macOS keychain, no mount can
+     * carry it inside, and AD-1 refuses API-key mode. Leaving the two structurally compatible would
+     * leave the mistake one line of wiring away, and a comment saying "do not do this" is not the
+     * same as a compiler that will not let you.
+     */
+    // @ts-expect-error — a command wrapper is not a spawn wrapper: ADR-004 put a command inside the
+    // container and the agent process on the host, and the types now say so.
     const wrapper: SpawnWrapper = createContainerWrapper({ tier: 1 });
     expect(typeof wrapper).toBe('function');
   });
 
-  it('is what the spawner takes as its `wrap` option, with nothing adapting between them', () => {
-    // The seam is "supplied", not reshaped: the wrapper goes in as `wrap` exactly as it comes out of
-    // this package. An adapter here would be a second place the invocation is defined.
-    const options: StepSpawnerOptions = {
-      recorderFor: (): Recorder => ({}) as Recorder,
-      wrap: createContainerWrapper({ tier: 2, invoke: presentImage(), runtime: RUNTIME }),
-    };
-    expect(typeof options.wrap).toBe('function');
+  it('refuses a plan carrying no argv, rather than running the image\'s own CMD', () => {
+    // A container started with no command runs the image's `CMD`, which is `claude --version`: it
+    // exits 0 having done nothing, and the gate that "ran" reports a pass. It is the one wrong
+    // outcome that is indistinguishable from the right one.
+    const wrapper = createContainerWrapper({
+      tier: 2,
+      runtime: RUNTIME,
+      image: 'orch-executor:0123456789abcdef',
+      invoke: presentImage(),
+      orchHome: ORCH_HOME,
+    });
+    expect(() => wrapper(plan({ contained: [] }))).toThrow(TierTwoUnconfinableError);
   });
 
   it('returns a tier-0 and a tier-1 plan unchanged, with no container involved', () => {
@@ -152,16 +173,15 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
     expect(output.args[0]).toBe(CONTAINER_SUBCOMMANDS.run[0]);
     expect(missingAd20Flags(output.args)).toStrictEqual([]);
 
-    // Everything the engine put on the plan rides through untouched.
+    // Everything the caller put on the plan rides through untouched.
     expect(output.cwd).toBe(input.cwd);
     expect(output.env).toStrictEqual(input.env);
-    expect(output.cli).toBe(input.cli);
-    expect(output.node).toBe(input.node);
+    expect(output.contained).toStrictEqual(input.contained);
     expect(output.step).toBe(input.step);
     expect(output.run).toBe(input.run);
   });
 
-  it('runs the image\'s own CLI with story 1-4\'s argv, dropping the host interpreter', () => {
+  it('places the command inside, not claude -p (matrix 21)', () => {
     const wrapper = createContainerWrapper({
       tier: 2,
       runtime: RUNTIME,
@@ -172,16 +192,55 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
     const output = wrapper(plan());
     const image = output.args.indexOf('orch-executor:0123456789abcdef');
 
-    expect(output.args[image + 1]).toBe(IMAGE_CLI_PATH);
-    // The AD-1 argv, byte for byte. Story 1-4 validates its flag set against the *executed* vector,
-    // so dropping --restricted or --strict-mcp-config here would fail its suite, not just this one.
-    expect(output.args.slice(image + 2)).toStrictEqual(plan().cliArgs);
-    expect(output.cliArgs).toStrictEqual(plan().cliArgs);
-    expect(output.args).toContain('--restricted');
-    expect(output.args).toContain('--strict-mcp-config');
-    // The host's Node and the host's CLI entry do not exist in the image, so neither is the command.
-    expect(output.args).not.toContain('/opt/claude/cli.js');
-    expect(output.args.slice(0, image)).not.toContain('/usr/local/bin/node');
+    // Everything after the image is the container's own command line, and it is the declared
+    // command byte for byte — the program first, its arguments after, nothing appended.
+    expect(output.args.slice(image + 1)).toStrictEqual(['/bin/sh', '-c', 'npm test']);
+    // Not the image's CLI, which is what this wrapper substituted before ADR-004. The path is still
+    // exported and the image still ships it — the AD-31 suite executes it from inside — but no step
+    // of a run runs it in there any more, because the credential it would need cannot be mounted.
+    expect(output.args).not.toContain(IMAGE_CLI_PATH);
+    expect(output.args).not.toContain('--print');
+    // And the caller's own copy of the argv is untouched, so an assertion about what will run inside
+    // has something to compare the composed vector against.
+    expect(output.contained).toStrictEqual(['/bin/sh', '-c', 'npm test']);
+  });
+
+  it('composes the flag set, the image reference and the mounts from src/container/, unchanged', () => {
+    /**
+     * Matrix 21's other half, and the one a rewrite would fail.
+     *
+     * ADR-001: "the image, the flag set, the mount allow-list, the `--rm` rule and the AD-31
+     * assertion suite are all unchanged". Asserted by composing the *same* request through
+     * `executionPlan` — which is `composeRunArgs`, the one composer — and requiring the wrapper's
+     * vector to equal it. A wrapper that re-derived even one flag would differ here, and a test that
+     * instead re-listed the expected flags would pass on exactly that rewrite.
+     */
+    const wrapper = createContainerWrapper({
+      tier: 2,
+      runtime: RUNTIME,
+      image: 'orch-executor:0123456789abcdef',
+      invoke: presentImage(),
+      orchHome: ORCH_HOME,
+    });
+    const output = wrapper(plan());
+    const composed = executionPlan({
+      image: 'orch-executor:0123456789abcdef',
+      run: RUN,
+      step: 'verify',
+      attempt: 1,
+      containerName: containerNameFor(RUN, 'verify', 1),
+      worktree: WORKTREE,
+      sessionDir: sessionDirFor(RUN, ORCH_HOME),
+      command: '/bin/sh',
+      commandArgs: ['-c', 'npm test'],
+      env: { PATH: '/usr/bin', ORCH_NODE: IMAGE_NODE_PATH, GITHUB_TOKEN: 'ghp_notreal' },
+      orchHome: ORCH_HOME,
+    });
+    expect(output.args).toStrictEqual([...CONTAINER_SUBCOMMANDS.run, ...composed.args]);
+    expect(missingAd20Flags(output.args)).toStrictEqual([]);
+    // The rules that are refusals rather than flags, restated over the executed vector.
+    expect(output.args).not.toContain('--rm');
+    expect(mountsOf(output.args)).toHaveLength(2);
   });
 
   it('does not rewrite the exit code, because it cannot: the invocation is in the foreground', () => {
@@ -274,7 +333,7 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
     });
     wrapper(plan());
     wrapper(plan());
-    expect(names).toStrictEqual([containerNameFor(RUN, 'implement', 1), containerNameFor(RUN, 'implement', 2)]);
+    expect(names).toStrictEqual([containerNameFor(RUN, 'verify', 1), containerNameFor(RUN, 'verify', 2)]);
     expect(new Set(names).size).toBe(2);
     // A caller that tracks attempts itself still wins.
     const fixed: (string | null)[] = [];
@@ -288,7 +347,7 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
       onWrap: (record) => fixed.push(record.containerName),
     });
     explicit(plan());
-    expect(fixed).toStrictEqual([containerNameFor(RUN, 'implement', 7)]);
+    expect(fixed).toStrictEqual([containerNameFor(RUN, 'verify', 7)]);
   });
 
   it('refuses a worktree that is not the run\'s, rather than mounting it writable', () => {
@@ -322,7 +381,7 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
   it('reports what it did for the event log, wrapped or not', () => {
     const records: { readonly tier: number; readonly wrapped: boolean }[] = [];
     const wrapper = createContainerWrapper({
-      tier: (candidate) => (candidate.step === 'implement' ? 2 : 1),
+      tier: (candidate) => (candidate.step === 'verify' ? 2 : 1),
       runtime: RUNTIME,
       image: 'orch-executor:0123456789abcdef',
       invoke: presentImage(),
@@ -330,7 +389,7 @@ describe('the SpawnWrapper story 1-4 left unfilled', () => {
       onWrap: (record) => records.push({ tier: record.tier, wrapped: record.wrapped }),
     });
     wrapper(plan());
-    wrapper(plan({ step: 'review' }));
+    wrapper(plan({ step: 'analyse' }));
     expect(records).toStrictEqual([
       { tier: 2, wrapped: true },
       { tier: 1, wrapped: false },

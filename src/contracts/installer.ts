@@ -23,6 +23,7 @@ import { z } from 'zod';
 
 import { KnowledgeSectionSchema } from './knowledge.js';
 import { versioned } from './schema-version.js';
+import type { SchemaVersionPolicy } from './schema-version.js';
 import { MODEL_RUNGS } from './state.js';
 import { REVERSIBILITY_CLASSES, RUN_MODES } from './step.js';
 
@@ -72,13 +73,27 @@ export const RESOURCE_NEEDS = ['none', 'postgres', 'redis', 'both'] as const;
 export type ResourceNeed = (typeof RESOURCE_NEEDS)[number];
 
 /**
- * The four commands AD-16 makes the profile authoritative for.
+ * The commands AD-16 makes the profile authoritative for.
  *
  * A total record rather than an optional bag: a repository with no lint command records the empty
  * string for it, so a reader distinguishes "there is none" from "nobody was asked".
+ *
+ * **`typecheck` is here because CAP-13 names it and the profile could not express it.** CAP-13's
+ * success criterion is "deterministic gates (typecheck, lint, tests) run before any model-based
+ * review", and until story 2-6 this record held four commands, none of them a typecheck — so one
+ * third of the gate CAP-13 requires was unrunnable for want of anywhere to declare it. The empty
+ * string is as legitimate an answer for it as it already is for `lint`: a repository with no
+ * typecheck step records that it has none, and a gate with no command is *skipped* rather than
+ * failed, because a repository that cannot fail a gate it does not have must not be reported as
+ * having passed one.
+ *
+ * Adding it is a change to the shape of an artifact the installer writes, so the profile's
+ * `schema_version` advances with it ({@link PROFILE_SCHEMA_VERSION}) and a profile written before it
+ * is refused rather than read with a defaulted field (AD-28).
  */
 export const MechanicsCommandsSchema = z.object({
   test: z.string(),
+  typecheck: z.string(),
   lint: z.string(),
   build: z.string(),
   run: z.string(),
@@ -86,10 +101,28 @@ export const MechanicsCommandsSchema = z.object({
 
 export type MechanicsCommands = z.infer<typeof MechanicsCommandsSchema>;
 
-/** The four command names, in the order `build-sequencing.md` question 3 states them. */
-export const MECHANICS_COMMAND_NAMES = ['test', 'lint', 'build', 'run'] as const;
+/**
+ * The command names, in the order `build-sequencing.md` question 3 states them, with `typecheck`
+ * placed beside the two other gates CAP-13 names rather than appended after `run`.
+ *
+ * The order is the interview's field order and the order gates run in, which is why it is a list and
+ * not an alphabetisation of the record's keys.
+ */
+export const MECHANICS_COMMAND_NAMES = ['typecheck', 'lint', 'test', 'build', 'run'] as const;
 
 export type MechanicsCommandName = (typeof MECHANICS_COMMAND_NAMES)[number];
+
+/**
+ * The commands CAP-13 calls the deterministic gates, in the order they run.
+ *
+ * Cheapest and most specific first: a typecheck that fails tells a person which symbol is wrong in
+ * seconds, and running the whole test suite before it spends minutes to say the same thing less
+ * clearly. `build` and `run` are deliberately absent — they are mechanics AD-16 records for other
+ * purposes, and CAP-13 names exactly these three.
+ */
+export const DETERMINISTIC_GATE_NAMES = ['typecheck', 'lint', 'test'] as const;
+
+export type DeterministicGateName = (typeof DETERMINISTIC_GATE_NAMES)[number];
 
 /**
  * AD-24 — three ceilings and no currency dimension, which R10 restates as "cost is subscription
@@ -148,9 +181,51 @@ export type AgentModel = z.infer<typeof AgentModelSchema>;
  * record, and a step reaching the network directly would leave that record incomplete. Adding a name here is
  * a decision; finding one in a TOML is not.
  */
-export const GRANTABLE_TOOLS = ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'] as const;
+export const BUILT_IN_GRANTABLE_TOOLS = ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'] as const;
+
+export type BuiltInGrantableTool = (typeof BUILT_IN_GRANTABLE_TOOLS)[number];
+
+/**
+ * The grants that are **not** built-in tools, and so may never reach `--tools`.
+ *
+ * ADR-004 decision 3: "`--tools` continues to name **built-in** tools only — the CLI's help is
+ * explicit that its list comes 'from the built-in set' — so the MCP tool is granted by being served,
+ * and pre-approved through `--allowedTools`". A name in this list therefore travels a different
+ * wire from a name in {@link BUILT_IN_GRANTABLE_TOOLS}, and the split is a list rather than a
+ * convention because the two wires cannot be told apart by looking at a name: `RunDeclaredCommand`
+ * passed to `--tools` is silently dropped by the CLI as an unknown built-in, which is a step that
+ * runs with a gate it believes it has and cannot reach.
+ *
+ * It is declared here, beside the built-ins, because AD-17 requires a granted tool name to be "a
+ * name declared in `src/contracts/`" — the declaration is what makes a typo a refusal at parse
+ * rather than a grant that silently does nothing.
+ */
+export const MCP_GRANTABLE_TOOLS = ['RunDeclaredCommand'] as const;
+
+export type McpGrantableTool = (typeof MCP_GRANTABLE_TOOLS)[number];
+
+/**
+ * How each MCP grant is spelled in `--allowedTools`, which is the CLI's `mcp__<server>__<tool>` form.
+ *
+ * Two names for one capability, and both belong here rather than one of them in the server: the
+ * roster declares the capability and the argv pre-approves the tool, and a server that owned its own
+ * CLI spelling would be a second place the pair could disagree — with the disagreement showing up as
+ * a step that hangs on a permission prompt nobody can answer, which is the outcome ADR-004 calls the
+ * worst available. `src/runner/` imports these rather than spelling them.
+ */
+export const MCP_SERVER_NAME = 'orch';
+
+export const MCP_TOOL_CLI_NAMES: Readonly<Record<McpGrantableTool, string>> = {
+  RunDeclaredCommand: `mcp__${MCP_SERVER_NAME}__run_declared_command`,
+};
+
+export const GRANTABLE_TOOLS = [...BUILT_IN_GRANTABLE_TOOLS, ...MCP_GRANTABLE_TOOLS] as const;
 
 export type GrantableTool = (typeof GRANTABLE_TOOLS)[number];
+
+/** True when a granted name is served as an MCP tool rather than passed to `--tools`. */
+export const isMcpGrantableTool = (tool: string): tool is McpGrantableTool =>
+  (MCP_GRANTABLE_TOOLS as readonly string[]).includes(tool);
 
 export const GrantableToolSchema = z.enum(GRANTABLE_TOOLS);
 
@@ -172,65 +247,91 @@ export type AgentDeclaration = z.infer<typeof AgentDeclarationSchema>;
  * `project.id` is the first-commit SHA per AD-10; `project.path` is the mutable pointer that AD-10
  * calls updatable on mismatch, and it is recorded rather than trusted as identity.
  */
-export const ProfileSchema = versioned({
-  project: z.object({
-    id: z.string(),
-    path: z.string(),
+/**
+ * The profile's own `schema_version`, ahead of every other artifact's.
+ *
+ * Story 2-6 added `mechanics.commands.typecheck`, and AD-28 gives a shape change exactly one honest
+ * consequence: a profile written before it is **refused** with `config.schema_version_unrecognised`,
+ * naming the installer that wrote it, rather than read with the field defaulted to the empty string.
+ * The difference matters because an empty command means "this repository has no typecheck step" and
+ * a defaulted one would mean "nobody was asked" — and the two are indistinguishable once written, so
+ * the gate CAP-13 requires would be reported as skipped on every repository upgraded rather than
+ * re-interviewed.
+ *
+ * Only the profile advances. See {@link SchemaVersionPolicy}: a global bump would refuse every run's
+ * `state.json` too, and a run in flight across an upgrade has done nothing wrong.
+ */
+export const PROFILE_SCHEMA_VERSION = 2;
+
+export const PROFILE_SCHEMA_VERSION_POLICY: SchemaVersionPolicy = {
+  current: PROFILE_SCHEMA_VERSION,
+  // Only the current one. A v1 profile is missing a field the gates read, and there is nothing to
+  // read it as: reading two versions here would be the silent default this bump exists to refuse.
+  supported: [PROFILE_SCHEMA_VERSION],
+};
+
+export const ProfileSchema = versioned(
+  {
+    project: z.object({
+      id: z.string(),
+      path: z.string(),
+      /**
+       * Empty means "this repository has no remote", which is a real answer.
+       *
+       * Not `null`: TOML has no null, and the Consistency Conventions make human-edited configuration
+       * TOML. A key left out instead would be indistinguishable from an answer nobody has given yet,
+       * which is exactly the distinction a re-run depends on.
+       */
+      remote: z.string(),
+    }),
+    mechanics: z.object({
+      package_manager: z.enum(PACKAGE_MANAGERS),
+      commands: MechanicsCommandsSchema,
+      source_layout: z.array(z.string()),
+      resources: z.enum(RESOURCE_NEEDS),
+    }),
+    risk: z.object({
+      high_blast_radius_paths: z.array(z.string()),
+      conflict_domains: z.array(z.string()),
+    }),
     /**
-     * Empty means "this repository has no remote", which is a real answer.
+     * Which built-in agents question 10 enabled.
      *
-     * Not `null`: TOML has no null, and the Consistency Conventions make human-edited configuration
-     * TOML. A key left out instead would be indistinguishable from an answer nobody has given yet,
-     * which is exactly the distinction a re-run depends on.
+     * Recorded here as well as written out as one TOML each, because the two facts are not the same
+     * one: `.orch/agents/` is the roster the engine discovers (AD-17), and this is the *answer* a
+     * re-run must not ask for again. Without it, a built-in's file deleted between two writes would
+     * read back as "that agent was never enabled" — a half-install silently reinterpreted as an
+     * answer, which is precisely what AD-12's manifest exists to prevent.
+     *
+     * A *custom* agent's declaration is not duplicated here: it lives only in its own file, which is
+     * the one AD-17 makes authoritative, and it is not regenerable from anything else.
      */
-    remote: z.string(),
-  }),
-  mechanics: z.object({
-    package_manager: z.enum(PACKAGE_MANAGERS),
-    commands: MechanicsCommandsSchema,
-    source_layout: z.array(z.string()),
-    resources: z.enum(RESOURCE_NEEDS),
-  }),
-  risk: z.object({
-    high_blast_radius_paths: z.array(z.string()),
-    conflict_domains: z.array(z.string()),
-  }),
-  /**
-   * Which built-in agents question 10 enabled.
-   *
-   * Recorded here as well as written out as one TOML each, because the two facts are not the same
-   * one: `.orch/agents/` is the roster the engine discovers (AD-17), and this is the *answer* a
-   * re-run must not ask for again. Without it, a built-in's file deleted between two writes would
-   * read back as "that agent was never enabled" — a half-install silently reinterpreted as an
-   * answer, which is precisely what AD-12's manifest exists to prevent.
-   *
-   * A *custom* agent's declaration is not duplicated here: it lives only in its own file, which is
-   * the one AD-17 makes authoritative, and it is not regenerable from anything else.
-   */
-  roster: z.object({ builtin_agents: z.array(z.string()) }),
-  branch_pattern: z.string(),
-  /**
-   * AD-27 — shadow is an ordinary run carrying a mode flag, so the autonomy a project starts at is
-   * that flag's default and nothing else. The finer autonomy ladder a person steers through at
-   * runtime is folded from the event log by `src/tui/mode.ts`; it is not a per-repo setting, and
-   * declaring it twice would be the two-sources-of-truth failure AD-34 forbids.
-   */
-  autonomy_start: z.enum(RUN_MODES),
-  ceilings: CeilingsSchema,
-  /**
-   * AD-16's project knowledge — and the one field of this artifact that is optional.
-   *
-   * Optional because every profile written so far has none: story 2-1's installer writes `project`,
-   * `mechanics`, `risk`, the roster answer and the ceilings, and entries arrive with the bootstrap
-   * agent in stage 5. Requiring the section would make every `.orch/` the installer has ever written
-   * unreadable by the loader that is supposed to read it, which is a migration invented to satisfy a
-   * schema rather than a behaviour anybody asked for.
-   *
-   * The precedence machinery over these entries is `src/engine/profile.ts`: additive only, and flagged
-   * stale rather than applied where the repository's own instructions speak to the same anchor.
-   */
-  knowledge: KnowledgeSectionSchema.optional(),
-});
+    roster: z.object({ builtin_agents: z.array(z.string()) }),
+    branch_pattern: z.string(),
+    /**
+     * AD-27 — shadow is an ordinary run carrying a mode flag, so the autonomy a project starts at is
+     * that flag's default and nothing else. The finer autonomy ladder a person steers through at
+     * runtime is folded from the event log by `src/tui/mode.ts`; it is not a per-repo setting, and
+     * declaring it twice would be the two-sources-of-truth failure AD-34 forbids.
+     */
+    autonomy_start: z.enum(RUN_MODES),
+    ceilings: CeilingsSchema,
+    /**
+     * AD-16's project knowledge — and the one field of this artifact that is optional.
+     *
+     * Optional because every profile written so far has none: story 2-1's installer writes `project`,
+     * `mechanics`, `risk`, the roster answer and the ceilings, and entries arrive with the bootstrap
+     * agent in stage 5. Requiring the section would make every `.orch/` the installer has ever written
+     * unreadable by the loader that is supposed to read it, which is a migration invented to satisfy a
+     * schema rather than a behaviour anybody asked for.
+     *
+     * The precedence machinery over these entries is `src/engine/profile.ts`: additive only, and flagged
+     * stale rather than applied where the repository's own instructions speak to the same anchor.
+     */
+    knowledge: KnowledgeSectionSchema.optional(),
+  },
+  PROFILE_SCHEMA_VERSION_POLICY,
+);
 
 export type Profile = z.infer<typeof ProfileSchema>;
 

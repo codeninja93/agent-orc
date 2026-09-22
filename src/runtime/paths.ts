@@ -220,6 +220,18 @@ export const QUESTION_OUTCOME_FILE_NAME = 'outcome.json';
  */
 export const HANDOFF_DOCUMENT_FILE_NAME = 'HANDOFF.md';
 
+/**
+ * AD-23 — `runs/<run-id>/evidence/`, where the evidence plane's files land.
+ *
+ * Story 2-6 is the first unit with evidence to write: a declared command's output. AD-23 keeps that
+ * output out of the control plane entirely — "the control plane is the typed step input and output
+ * plus the state checkpoint and nothing else" — so what travels is a pointer, and a pointer needs a
+ * place to point at. It is a directory under the run rather than beside the worktree because it
+ * outlives the worktree: AD-32 reclaims a worktree at a terminal disposition and the record of why
+ * a gate failed must survive that.
+ */
+export const EVIDENCE_DIR_NAME = 'evidence';
+
 /** Every path inside `runs/<run-id>/` that this story's units touch. */
 export interface RunPaths {
   /** The resolved `ORCH_HOME` these paths were built under. */
@@ -243,6 +255,8 @@ export interface RunPaths {
   readonly commandsRefusedDir: string;
   /** `runs/<run-id>/questions/` — the AD-25 question state files, one directory per question. */
   readonly questionsDir: string;
+  /** `runs/<run-id>/evidence/` — the AD-23 evidence plane, referenced from the control plane by pointer. */
+  readonly evidenceDir: string;
   /** `runs/<run-id>/HANDOFF.md` — the CAP-23 document, written when the system gives up. */
   readonly handoffDocument: string;
 }
@@ -263,6 +277,7 @@ export const runPaths = (runId: string, orchHome: string = resolveOrchHome()): R
     commandsAppliedDir: join(dir, COMMANDS_DIR_NAME, COMMANDS_APPLIED_DIR_NAME),
     commandsRefusedDir: join(dir, COMMANDS_DIR_NAME, COMMANDS_REFUSED_DIR_NAME),
     questionsDir: join(dir, QUESTIONS_DIR_NAME),
+    evidenceDir: join(dir, EVIDENCE_DIR_NAME),
     handoffDocument: join(dir, HANDOFF_DOCUMENT_FILE_NAME),
   };
 };

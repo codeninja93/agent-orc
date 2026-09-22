@@ -26,6 +26,7 @@ import {
   AGENTS_DIR_NAME,
   AgentDeclarationSchema,
   CURRENT_SCHEMA_VERSION,
+  PROFILE_SCHEMA_VERSION,
   KnowledgeSectionSchema,
   MANIFEST_FILE_NAME,
   ManifestSchema,
@@ -139,7 +140,10 @@ export const existingKnowledge = (repositoryPath: string): KnowledgeSection | un
 export const renderProfile = (answers: Answers, repositoryPath: string): Profile => {
   const knowledge = existingKnowledge(repositoryPath);
   return {
-    schema_version: CURRENT_SCHEMA_VERSION,
+    // The profile's own version, which is ahead of the others: story 2-6 added
+    // `mechanics.commands.typecheck`, and AD-28 makes a shape change a version change for the
+    // artifact whose shape changed and for no other.
+    schema_version: PROFILE_SCHEMA_VERSION,
     project: {
       id: answers.project.id,
       /**

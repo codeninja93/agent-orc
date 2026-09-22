@@ -162,12 +162,14 @@ const noSuggestion = (): null => null;
  * the installer's list of what it can *write*, not the system's list of what exists. An agent added
  * here becomes an offer at question 10 and nothing else; the implementations are stories 2-3 to 2-7.
  *
- * Each references a *registered* contract id (AD-17), never an inline schema. Three of the six reference
- * `step.output`, the shared step envelope: a roster member that needs a genuinely new contract shape needs an
- * engine change, and those three do not. `analysis` and `planning` do — story 2-4 registered `step.analysis`
- * and `step.planning`, whose shapes carry per-claim provenance and a declared territory — and so does
- * `implementation`, whose `step.implementation` (story 2-5) describes the files changed and leaves no field
- * through which a path outside the run worktree can be returned. They name them here.
+ * Each references a *registered* contract id (AD-17), never an inline schema. One of the six still
+ * references `step.output`, the shared step envelope: a roster member that needs a genuinely new contract
+ * shape needs an engine change, and `committing` does not. The other five do. Story 2-4 registered
+ * `step.analysis` and `step.planning`, whose shapes carry per-claim provenance and a declared territory;
+ * story 2-5 registered `step.implementation`, which describes the files changed and leaves no field through
+ * which a path outside the run worktree can be returned; and story 2-6 registered `step.testing` and
+ * `step.verification`, which are the pair that most needed telling apart — one may write files and the
+ * other may not, and under one shared id nothing the engine reads could say which was which.
  *
  * A declaration naming `step.output` while its agent's contract pins `contract_id` to its own id is a
  * pairing that can never both hold: every refusal the new contract adds would be dead for a default install,
@@ -212,10 +214,13 @@ export const BUILT_IN_AGENTS: readonly AgentDeclarationInput[] = Object.freeze([
   {
     id: 'testing',
     // ADR-004 — no `Bash`, for the reason `implementation` has none. `Write`/`Edit` stay: ADR-003 is
-    // explicit that a testing agent that cannot author a test is not one.
-    purpose: 'Write and run the tests that decide whether the change did what was asked.',
-    contract: 'step.output',
-    tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob'],
+    // explicit that a testing agent that cannot author a test is not one. `RunDeclaredCommand` is
+    // story 2-6's replacement for the `Bash` this row lost: it runs the commands the profile
+    // declares, inside the container, and nothing else — which is what ADR-004 says a step may do.
+    // Until it existed this agent's purpose promised to "run" with no tool that runs anything.
+    purpose: 'Write the tests that decide whether the change did what was asked, and run them.',
+    contract: 'step.testing',
+    tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'RunDeclaredCommand'],
     mcp_domains: [],
     reversibility: 'recoverable',
     model: { start_tier: 'claude-sonnet-5', promotion_policy: 'on-gate-failure' },
@@ -223,10 +228,13 @@ export const BUILT_IN_AGENTS: readonly AgentDeclarationInput[] = Object.freeze([
   {
     id: 'verification',
     // ADR-004 — no `Bash`. It still has no `Write` or `Edit` either, and that is ADR-003's reason for
-    // separating it from `testing`: it must not be able to change what it judges.
-    purpose: 'Run the declared gates and report what was verified and what was not.',
-    contract: 'step.output',
-    tools: ['Read', 'Grep', 'Glob'],
+    // separating it from `testing`: it must not be able to change what it judges. `RunDeclaredCommand`
+    // does not weaken that: it runs a command the *profile* declares and has no parameter through
+    // which a path could be named, so a gate this agent can run is not a file it can write.
+    purpose:
+      'Judge the change against the acceptance criteria it was accepted with, once the declared gates have passed.',
+    contract: 'step.verification',
+    tools: ['Read', 'Grep', 'Glob', 'RunDeclaredCommand'],
     mcp_domains: [],
     reversibility: 'reversible',
     model: { start_tier: 'claude-haiku-4-5', promotion_policy: 'on-gate-failure' },
@@ -385,8 +393,15 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
             'built by something else; the four commands beside it are free text.',
         );
       }
+      /**
+       * Read field by field rather than folded over the name list, so the record is total by
+       * construction: a name added to `MECHANICS_COMMAND_NAMES` without a line here is a type error
+       * at this literal, which is where a missing command should be noticed — and not at a run
+       * whose gate turns out to have nothing declared for it.
+       */
       const commands: MechanicsCommands = {
         test: field(raw, 'test'),
+        typecheck: field(raw, 'typecheck'),
         lint: field(raw, 'lint'),
         build: field(raw, 'build'),
         run: field(raw, 'run'),

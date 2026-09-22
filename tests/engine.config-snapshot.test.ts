@@ -306,7 +306,7 @@ describe('a live run never sees an edit to .orch/ (matrix 18)', () => {
       profileFor(at.repository, {
         mechanics: {
           package_manager: 'pnpm',
-          commands: { test: 'pnpm vitest --run', lint: 'x', build: 'y', run: 'z' },
+          commands: { test: 'pnpm vitest --run', typecheck: 'w', lint: 'x', build: 'y', run: 'z' },
           source_layout: ['app'],
           resources: 'postgres',
         },
@@ -417,7 +417,7 @@ describe('a live run never sees an edit to .orch/ (matrix 18)', () => {
       profileFor(at.repository, {
         mechanics: {
           package_manager: 'bun',
-          commands: { test: 'bun test', lint: 'x', build: 'y', run: 'z' },
+          commands: { test: 'bun test', typecheck: 'w', lint: 'x', build: 'y', run: 'z' },
           source_layout: ['src'],
           resources: 'none',
         },

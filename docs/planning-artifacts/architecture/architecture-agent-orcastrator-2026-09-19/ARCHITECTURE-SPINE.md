@@ -39,6 +39,7 @@ companions:
   - ./ADR-002-question-compare-and-set-artifact.md
   - ./ADR-003-built-in-agent-tool-grants.md
   - ./ADR-004-command-execution-as-a-capability.md
+  - ./ADR-005-per-artifact-schema-versions.md
   - ../../../specs/spec-agent-orchestrator/architecture.md
   - ../../../specs/spec-agent-orchestrator/interface-contract.md
   - ../../../specs/spec-agent-orchestrator/memory-design.md

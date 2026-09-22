@@ -50,6 +50,7 @@ import { constants as osConstants } from 'node:os';
 import { basename, isAbsolute } from 'node:path';
 
 import {
+  criteriaNotAccepted,
   exportContract,
   getContract,
   makeError,
@@ -73,7 +74,12 @@ import {
   resolveChildNodeOnce,
 } from './node-path.js';
 import type { ChildNode } from './node-path.js';
-import { AgentGrantUnresolved, resolveAgentGrant, toolsArgumentFor } from './agents.js';
+import {
+  AgentGrantUnresolved,
+  allowedToolsFor,
+  resolveAgentGrant,
+  toolsArgumentFor,
+} from './agents.js';
 import { ProfileNotFound, ProfileUnreadable } from './profile.js';
 import type { AgentGrant } from './agents.js';
 import { createStreamParser } from './stream.js';
@@ -203,6 +209,37 @@ export class AddDirNotAbsolute extends Error {
 }
 
 /** The one accepted `--output-format`. The parser in `stream.ts` reads this and only this. */
+/**
+ * A served MCP tool was granted and the argv would not pre-approve it, so the step would hang.
+ *
+ * **This is the refusal ADR-004 asks for by name.** Under `--restricted` the CLI "lets only a person
+ * or the configured permission tool" approve a tool use, and a `claude -p` run has neither: there is
+ * no person at a terminal and no permission tool is configured. So a served tool that is not named
+ * in `--allowedTools` does not produce a denial the step can report — it produces a step waiting for
+ * an answer that will never come, until the attempt timeout kills it thirty minutes later and the
+ * loop retries it to wait again. ADR-004: "a run that omits it does not hang — it must fail visibly,
+ * because a step waiting for an answer nobody can give is the worst outcome available."
+ *
+ * `config.invalid` → `escalate-to-human`, and in {@link KEEPS_ITS_OWN_CODE} so it is not relabelled
+ * as a retryable spawn failure: retrying an argv built the same way produces the same argv.
+ */
+export class McpToolNotPreApproved extends Error {
+  readonly code = 'config.invalid';
+  readonly tools: readonly string[];
+
+  constructor(tools: readonly string[], detail: string) {
+    super(
+      `Refusing to spawn: the roster grants ${tools.join(', ')}, which is served over --mcp-config ` +
+        `rather than being a built-in, and ${detail}. Under --restricted only a person or a ` +
+        'configured permission tool may approve a tool use, and a `claude -p` run has neither \u2014 so ' +
+        'the step would not be refused the tool, it would stop and wait for an approval nobody can ' +
+        'give. Failing here is the visible version of that (ADR-004).',
+    );
+    this.name = 'McpToolNotPreApproved';
+    this.tools = [...tools];
+  }
+}
+
 export const STREAM_OUTPUT_FORMAT = 'stream-json';
 
 /** How much of the child's stderr is kept, for a refusal message and one bounded event. */
@@ -411,9 +448,46 @@ export interface StepArgvOptions {
    */
   readonly addDir: string;
   readonly mcpConfigs?: readonly string[];
+  /**
+   * The served tools this agent's AD-17 declaration grants, in the CLI's `mcp__<server>__<tool>`
+   * spelling (`allowedToolsFor` composes them).
+   *
+   * Separate from {@link allowedTools} on purpose, and **not** defaulted from it. These two are the
+   * grant and the pre-approval, and the whole point of the check below is that they can disagree —
+   * deriving one from the other would make the guard unable to fail, which is the defect this
+   * codebase has now found in four consecutive stories.
+   */
+  readonly mcpTools?: readonly string[];
+  /**
+   * What `--allowedTools` will pre-approve.
+   *
+   * Defaults to nothing, never to {@link mcpTools}: a caller that forgets it gets
+   * {@link McpToolNotPreApproved} rather than a silently pre-approved tool, and a caller that
+   * genuinely grants no served tool passes neither and the flag is not emitted at all.
+   */
+  readonly allowedTools?: readonly string[];
   /** Present only for a resume, and only ever the recorded session id (AD-8). */
   readonly resumeSessionId?: string | null;
 }
+
+/**
+ * The served tools an argv grants but does not pre-approve. Empty means the pairing holds.
+ *
+ * Over an argv rather than over the options it was built from, so it can be asked of the vector that
+ * will actually be executed — the AD-20 wrapper is free to rebuild `args`, and one that dropped
+ * `--allowedTools` would leave a step that hangs rather than one that fails. That is the same reason
+ * `missingRequiredFlags` reads the executed vector, and the same failure one flag over.
+ */
+export const missingPreApprovals = (
+  argv: readonly string[],
+  granted: readonly string[],
+): readonly string[] => {
+  if (granted.length === 0) return [];
+  const at = argv.indexOf('--allowedTools');
+  const value = at === -1 ? '' : (argv[at + 1] ?? '');
+  const approved = value.split(',').map((name) => name.trim());
+  return granted.filter((tool) => !approved.includes(tool));
+};
 
 /**
  * The AD-1 argv, as amended by ADR-001.
@@ -464,6 +538,33 @@ export const buildStepArgv = (options: StepArgvOptions): readonly string[] => {
   ];
   const configs = options.mcpConfigs ?? [];
   if (configs.length > 0) argv.push('--mcp-config', ...configs);
+
+  /**
+   * The pairing ADR-004 decision 3 requires: served, and pre-approved.
+   *
+   * Both halves are refused, because each fails differently and only one of them is loud. A granted
+   * tool with no server to serve it is a tool that does not exist, and the step discovers that by
+   * being told the tool is unavailable. A granted tool that is served but not pre-approved is the
+   * silent half: the step asks, nothing can answer, and it waits.
+   */
+  const granted = options.mcpTools ?? [];
+  const approved = options.allowedTools ?? [];
+  if (granted.length > 0) {
+    if (configs.length === 0) {
+      throw new McpToolNotPreApproved(
+        granted,
+        'no --mcp-config was supplied, so no server would be started and the tool would not exist',
+      );
+    }
+    const unapproved = granted.filter((tool) => !approved.includes(tool));
+    if (unapproved.length > 0) {
+      throw new McpToolNotPreApproved(
+        unapproved,
+        `--allowedTools would carry ${approved.length === 0 ? 'nothing' : approved.join(', ')}`,
+      );
+    }
+  }
+  if (approved.length > 0) argv.push('--allowedTools', approved.join(','));
   const resume = options.resumeSessionId ?? null;
   if (resume !== null) argv.push('--resume', resume);
   return argv;
@@ -535,6 +636,10 @@ export const errorCodeForResult = (result: ResultRecord): string =>
  * than relabelled as a spawn failure. See {@link createStepSpawner} for why that distinction matters.
  */
 const KEEPS_ITS_OWN_CODE = [
+  // A served tool that is granted and not pre-approved is a misconfigured spawn, not a transient
+  // one: `config.invalid` is `escalate-to-human`, and relabelling it retryable would have the loop
+  // rebuild the same unbuildable argv for ever.
+  McpToolNotPreApproved,
   ApiKeyModeRefusedError,
   ClaudeCliVersionError,
   ChildNodeUnavailableError,
@@ -798,6 +903,16 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
       // after a wrapper has had the plan.
       addDir: request.worktree,
       ...(options.mcpConfigs === undefined ? {} : { mcpConfigs: options.mcpConfigs }),
+      /**
+       * The served half of the AD-17 grant, granted and pre-approved in one breath.
+       *
+       * Both are composed from the *same* declaration because that is what the roster says this
+       * agent may do, and the argv is supposed to say the same thing the declaration does. The two
+       * parameters stay separate at `buildStepArgv`'s own boundary so a caller that supplies one
+       * without the other is refused rather than accommodated — see {@link McpToolNotPreApproved}.
+       */
+      mcpTools: allowedToolsFor(grant),
+      allowedTools: allowedToolsFor(grant),
       resumeSessionId,
     });
 
@@ -880,6 +995,21 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
           'requires the flag and its value, not the word.',
       );
     }
+    /**
+     * And the same question asked of the executed vector for the served half of the grant.
+     *
+     * `buildStepArgv` refuses an argv it would build without the pre-approval; this refuses one a
+     * wrapper rebuilt without it. The two are not the same check: everything between them is free to
+     * rewrite `args`, and the symptom of getting it wrong is a step that hangs rather than one that
+     * fails — which is the one failure mode that looks like nothing at all in a log.
+     */
+    const unapproved = missingPreApprovals(plan.args, allowedToolsFor(plan.grant));
+    if (unapproved.length > 0) {
+      throw new McpToolNotPreApproved(
+        unapproved,
+        'the argv that would be executed does not pre-approve them',
+      );
+    }
 
     emit(recorder, {
       step: request.step,
@@ -924,6 +1054,10 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
         // The flags observed on the executed vector, not the constant that was required: a log that
         // records the requirement rather than the fact cannot be used to audit what actually ran.
         flags: observedFlags,
+        // The served tools this argv pre-approved, recorded beside the grant for the same reason the
+        // grant is recorded: it is a security decision, and `granted_tools` alone does not say
+        // whether the step could actually reach what it was granted.
+        pre_approved_tools: [...allowedToolsFor(plan.grant)],
         mcp_config_count: (options.mcpConfigs ?? []).length,
         resumed: resumeSessionId !== null,
         wrapped: options.wrap !== undefined,
@@ -1250,6 +1384,31 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
         ok: false,
         code: 'step.schema_invalid_output',
         detail: `the output reports contract "${shaped.data.contract_id}" but was validated against "${contractId}"`,
+      };
+    }
+    /**
+     * A step cannot introduce a criterion of its own to pass against (CAP-13, matrix 19).
+     *
+     * CAP-13's intent is that implementation is "judged against criteria fixed before it was
+     * written", and the only way to show the criteria judged are the ones the run was accepted with
+     * is that they are the same bytes. The comparison lives here because it needs both halves and
+     * this is the one place that holds them: a contract sees one artifact and cannot know what the
+     * run was accepted with, and the loop sees the output only after the port has accepted it.
+     *
+     * `criteriaNotAccepted` answers about any output that judges criteria, keyed on the field rather
+     * than on the contract id — the discriminator idiom `declaredTerritoryIn` uses, for the reason
+     * story 2-5 found: pinning it to one contract makes it dead for the next one that has the field.
+     */
+    const invented = criteriaNotAccepted(request.input.acceptance_criteria, first.data);
+    if (invented.length > 0) {
+      return {
+        ok: false,
+        code: 'step.schema_invalid_output',
+        detail:
+          `the output judges ${invented.map((criterion) => `"${criterion}"`).join(', ')}, which ` +
+          'the run was not accepted with. A step is judged against criteria fixed before it was ' +
+          'written (CAP-13), so a criterion it introduced is one it set for itself — copy the ' +
+          'criteria from the step input verbatim, and raise a question rather than re-wording one.',
       };
     }
     /**

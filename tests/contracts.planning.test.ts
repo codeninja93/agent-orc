@@ -187,7 +187,13 @@ describe('planning re-grounds on the request, because there is nothing else to r
 
 describe('the phase vocabulary, widened safely (matrix 14, 15)', () => {
   it('carries analysis and planning alongside the two it had', () => {
-    expect([...STEP_PHASES]).toStrictEqual(['analysis', 'planning', 'implementation', 'verification']);
+    expect([...STEP_PHASES]).toStrictEqual([
+      'analysis',
+      'planning',
+      'implementation',
+      'testing',
+      'verification',
+    ]);
   });
 
   it('is the vocabulary a planned step’s phase is drawn from', () => {

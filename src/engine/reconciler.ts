@@ -34,7 +34,10 @@ import { join } from 'node:path';
 
 import {
   ANALYSIS_CONTRACT_ID,
+  DETERMINISTIC_GATE_NAMES,
   IMPLEMENTATION_CONTRACT_ID,
+  TESTING_CONTRACT_ID,
+  VERIFICATION_CONTRACT_ID,
   declaredTerritoryIn,
   CURRENT_SCHEMA_VERSION,
   DECLARATION_PAYLOAD_KEYS,
@@ -65,6 +68,7 @@ import type {
   EventEnvelope,
   FeatureState,
   ModelRung,
+  OrchError,
   Principal,
   QuestionDraft,
   QuestionState,
@@ -174,6 +178,7 @@ import {
 import type { TerritoryCandidate, TerritoryDeferral } from './territory.js';
 import { EngineLock } from './lock.js';
 import { resolveAgentGrant } from './agents.js';
+import { readStepConfiguration } from './config-snapshot.js';
 import { ModelRungUnrecognised, rungForAttempt } from './promotion.js';
 import { defaultUlidMinter } from './ulid.js';
 import type { UlidMinter } from './ulid.js';
@@ -204,8 +209,15 @@ export const STANDARD_PLAN_STEPS: readonly PlanStep[] = Object.freeze([
   // per-change provenance and outside-the-worktree refusal the new contract adds would be dead for
   // every default run — the same pairing failure story 2-4 found in the roster's declarations.
   { step: 'implement', contract_id: IMPLEMENTATION_CONTRACT_ID, phase: 'implementation' },
-  // `verify` keeps the generic envelope until story 2-6, which is where the gates actually run.
-  { step: 'verify', contract_id: 'step.output', phase: 'verification' },
+  // Story 2-6. `testing` was a declared agent with no phase and no step, so the plan went from the
+  // change straight to judging it: CAP-13's "something actively tries to break the result" had
+  // nothing in the plan that tried. It sits before `verify` because a test written after the
+  // verdict is a test written to agree with it.
+  { step: 'test', contract_id: TESTING_CONTRACT_ID, phase: 'testing' },
+  // `verify` named the generic envelope until story 2-6 — the same pairing failure as above, and the
+  // one that mattered most: `step.verification` is what makes a gate outcome and a per-criterion
+  // verdict sayable at all, and under `step.output` every refusal it adds was unreachable.
+  { step: 'verify', contract_id: VERIFICATION_CONTRACT_ID, phase: 'verification' },
 ]);
 export const STEP_INPUT_FILE_NAME = 'input.json';
 
@@ -837,9 +849,83 @@ export type FeaturePlanProvider = (feature: string) => FeaturePlan;
  */
 export type DurableBoundaryObserver = (label: string) => void;
 
+/**
+ * What one deterministic gate did, as the loop reads it.
+ *
+ * Structurally what `src/runner/`'s `CommandRunResult` is, and **declared here rather than imported**
+ * — the same seam AD-20's wrapper reaches the spawner through. `src/runner/` is the one unit that may
+ * start a container, so an engine that imported it would be one `createCommandRunner` call away from
+ * being a second one, and the guard in `tests/runner.command.test.ts` would have to carve out an
+ * exception for the file most worth guarding. A structural port costs an interface and keeps the
+ * claim absolute.
+ */
+export interface GateOutcomeRecord {
+  readonly command: string;
+  readonly declared: string;
+  readonly outcome: 'passed' | 'failed' | 'skipped';
+  readonly exitStatus: number | null;
+  readonly evidence: string;
+  readonly containerName: string | null;
+  readonly summary: string;
+}
+
+/** The runner, as the loop needs it: one verb, over a name the profile declares. */
+export interface DeterministicGateRunner {
+  readonly run: (command: string) => GateOutcomeRecord;
+}
+
+/** What the loop tells the runner about the step whose gates it is running. */
+export interface GateRunRequest {
+  readonly run: string;
+  readonly step: string;
+  readonly worktree: string;
+  /** The profile's declared commands, read from the run's AD-9 snapshot by the loop. */
+  readonly commands: Readonly<Record<string, string>>;
+  /**
+   * Which attempt of the step this is.
+   *
+   * Passed because the runner names a container with it, and AD-20 forbids `--rm` while a run is
+   * live: the first attempt's container still exists when the step is re-run, so a name that did not
+   * carry the attempt would be refused as already in use — and the refusal would read as a failing
+   * gate. Measured against a real runtime, not reasoned about.
+   */
+  readonly attempt: number;
+}
+
+/** Everything one verification step's first tier did. */
+export interface GateSummary {
+  readonly results: readonly GateOutcomeRecord[];
+  readonly failed: readonly GateOutcomeRecord[];
+  /** True when no declared gate failed. A run whose gates were all skipped has not *passed* them. */
+  readonly passed: boolean;
+}
+
 export interface ReconcilerOptions {
   /** `ORCH_HOME`; defaults to the AD-9 resolution. */
   readonly orchHome?: string;
+  /**
+   * How a run's recorder is obtained, so the loop and the executor can share one (AD-29).
+   *
+   * Defaults to opening one per run, which is what every caller has needed until now. It is
+   * injectable because AD-29 makes the recorder the *single* appender to a run's `events.jsonl` and
+   * enforces it with an exclusive claim — so a loop that opens its own and a spawner that opens its
+   * own cannot both run against one run, and the second `Recorder.open` throws. Story 1-4's spawner
+   * already says the caller "owns the AD-29 single-writer claim and hands the same recorder the
+   * reconciler is already writing through"; until this option there was no way to hand it one, which
+   * is why nothing in `src/` had ever assembled the two.
+   */
+  readonly recorderFor?: (run: string, feature: string) => Recorder;
+  /**
+   * CAP-13's first tier: how the loop runs the deterministic gates before it spawns a review.
+   *
+   * Omitted rather than defaulted, for the reason `reclamation` and `stopStep` are: the loop cannot
+   * build one, because building one means starting a container and `src/engine/` may not. What is
+   * *not* softened is the consequence — a run whose profile declares a gate and whose engine has no
+   * runner wired in does not skip the gate and spend a review anyway. It blocks, naming the gate it
+   * could not run. CAP-13's claim is that the gates run before any review, and an engine that cannot
+   * run them cannot make that claim about itself.
+   */
+  readonly gates?: ((request: GateRunRequest) => DeterministicGateRunner) | null;
   /** The port story 1-4 implements. This story drives a double. */
   readonly executor: StepExecutor;
   /** A feature's declared plan, territory and mode. */
@@ -957,6 +1043,8 @@ export class Reconciler {
   private readonly engineLock: EngineLock | null;
   private readonly ownsLock: boolean;
   private readonly reclamation: ReclamationPass | null;
+  private readonly gates: ((request: GateRunRequest) => DeterministicGateRunner) | null;
+  private readonly openRecorder: ((run: string, feature: string) => Recorder) | null;
   private readonly stopStep: StepStopper | null;
   private readonly pollIntervalMs: number;
   private readonly tornGraceMs: number;
@@ -1000,6 +1088,8 @@ export class Reconciler {
     this.engineLock = lock;
     this.ownsLock = ownsLock;
     this.reclamation = options.reclamation ?? null;
+    this.gates = options.gates ?? null;
+    this.openRecorder = options.recorderFor ?? null;
     this.stopStep = options.stopStep ?? null;
     this.pollIntervalMs = options.steeringPollIntervalMs ?? STEERING_POLL_INTERVAL_MS;
     this.tornGraceMs = options.tornIntentGraceMs ?? TORN_INTENT_GRACE_MS;
@@ -1027,11 +1117,19 @@ export class Reconciler {
     return this.engineLock;
   }
 
-  /** Release the lock and every recorder claim. The log itself is never rewritten. */
+  /**
+   * Release the lock and every recorder claim this instance took. The log itself is never rewritten.
+   *
+   * A recorder a *caller* supplied is not closed here, for the reason the AD-30 lock is released only
+   * when `ownsLock`: the claim belongs to whoever took it, and closing another unit's recorder would
+   * release AD-29's single-writer claim out from under a caller that is still using it.
+   */
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    for (const recorder of this.recorders.values()) recorder.close();
+    if (this.openRecorder === null) {
+      for (const recorder of this.recorders.values()) recorder.close();
+    }
     this.recorders.clear();
     if (this.ownsLock) this.engineLock?.release();
   }
@@ -2753,6 +2851,28 @@ export class Reconciler {
       baselineRef,
     });
 
+    /**
+     * CAP-13's first tier, before anything is spawned.
+     *
+     * The order is the whole claim: "deterministic gates (typecheck, lint, tests) run before any
+     * model-based review, and no review spend occurs on a run that fails them". `agent.spawned` is
+     * emitted by the spawner, so a failing gate returning here means that event never exists — which
+     * is how the economics are asserted in `tests/engine.gate-economics.test.ts`, by absence rather
+     * than by a counter that could read zero because nothing incremented it.
+     */
+    if (
+      !this.runGatesBeforeReview(
+        plan,
+        state,
+        options.step,
+        baselineRef,
+        options.transitionTo,
+        attempt,
+      )
+    ) {
+      return;
+    }
+
     const request = this.startRequest(
       paths,
       plan,
@@ -3054,6 +3174,232 @@ export class Reconciler {
     } catch (thrown: unknown) {
       if (thrown instanceof ModelRungUnrecognised) throw thrown;
       // No snapshot, no roster, or no entry for this phase: nothing is declared, and nothing is invented.
+      return null;
+    }
+  }
+
+  /**
+   * Run the deterministic gates for a verification step, and say whether the review may be spawned.
+   *
+   * Returns `true` when the step should go on to spend model turns, `false` when this pass is over
+   * because the step has already been terminated here.
+   *
+   * **Why the loop runs them and not the agent.** A spawn is the thing that costs, and a step cannot
+   * decline to be spawned: an agent told "run the gates first, and stop if they fail" has already
+   * been paid for by the time it reads the instruction. CAP-13's economics are only real if the
+   * decision is taken by the unit that does the spawning.
+   *
+   * **Only `verification`.** The story's Boundaries settle this: "the two tiers live inside
+   * verification, because there is no review agent". `testing` reaches the same runner as an MCP
+   * tool, because the tests it writes are its own to run.
+   */
+  private runGatesBeforeReview(
+    plan: FeaturePlan,
+    state: RunState,
+    step: PlanStep,
+    baselineRef: string,
+    transitionTo: FeatureState,
+    attempt: number,
+  ): boolean {
+    if (step.phase !== 'verification') return true;
+    const commands = this.declaredCommands(state.run);
+    /**
+     * No snapshot or no profile: nothing is declared, so there is no gate to run and none to skip.
+     *
+     * Not the same as "the gates passed", and the difference is why nothing is recorded as passing
+     * here. A run with no configuration snapshot is a run that was assembled without one, which the
+     * roster's own refusal (`src/engine/agents.ts`) reports at the spawn a moment later.
+     */
+    if (commands === null) return true;
+
+    const declared = DETERMINISTIC_GATE_NAMES.filter((name) => (commands[name] ?? '').trim() !== '');
+    const recorder = this.recorderFor(state.run, state.feature);
+    if (declared.length > 0 && this.gates === null) {
+      /**
+       * Declared gates and no runner: the run blocks rather than reviewing unverified work.
+       *
+       * This is the fail-closed direction, and it is the one the whole story turns on. Spawning
+       * anyway would spend a review on a change whose gates nobody ran while the log said nothing
+       * about it — a run that *looks* verified. `config.invalid` is `escalate-to-human`: no retry
+       * and no model rung wires a command runner into an engine.
+       */
+      this.recordTermination(
+        state,
+        step,
+        baselineRef,
+        {
+          step: step.step,
+          disposition: 'failed',
+          sessionId: null,
+          output: null,
+          error: makeError(
+            'config.invalid',
+            `This engine has no command runner wired in, so the ${declared.join(', ')} gate` +
+              `${declared.length === 1 ? '' : 's'} this repository declares cannot be run. CAP-13 ` +
+              'requires the deterministic gates to run before any model-based review, so the ' +
+              'review is not spawned and the run stops here rather than judging unverified work.',
+            'no gate runner is configured',
+          ),
+          usage: null,
+        },
+        { transitionTo },
+      );
+      return false;
+    }
+
+    const runner =
+      this.gates === null
+        ? null
+        : this.gates({
+            run: state.run,
+            step: step.step,
+            worktree: plan.worktree,
+            commands,
+            attempt,
+          });
+
+    const results: GateOutcomeRecord[] = [];
+    for (const name of DETERMINISTIC_GATE_NAMES) {
+      /**
+       * A gate with no declared command is skipped, and the *log line says skipped*.
+       *
+       * Reported without asking the runner at all when there is none wired: the answer does not
+       * depend on a container, and a skip is the one gate outcome that costs nothing to be sure of.
+       */
+      const declaredCommand = (commands[name] ?? '').trim();
+      if (declaredCommand === '' || runner === null) {
+        const skipped: GateOutcomeRecord = {
+          command: name,
+          declared: '',
+          outcome: 'skipped',
+          exitStatus: null,
+          evidence: '',
+          containerName: null,
+          summary: `the ${name} gate is skipped: this repository declares no ${name} command`,
+        };
+        results.push(skipped);
+        this.emit(recorder, {
+          step: step.step,
+          type: ENGINE_EVENT_TYPES.GateSkipped,
+          payload: { gate: name, reason: skipped.summary },
+          baselineRef,
+        });
+        continue;
+      }
+      /**
+       * A gate that could not be *started* is not a gate that failed.
+       *
+       * The runner refuses rather than returning an outcome when the runtime could not run the
+       * container at all — a name still held by a container AD-32 has not reclaimed, an image that
+       * vanished, a daemon that was restarting. Recording that as a failing gate would tell a person
+       * their tests are broken when nothing ran, so it routes through the AD-35 table under its own
+       * code (`container.start_failed`, `retry-with-backoff`) and the review is still not spawned.
+       */
+      let outcome: GateOutcomeRecord;
+      try {
+        outcome = runner.run(name);
+      } catch (thrown: unknown) {
+        const error =
+          thrown instanceof Error && 'orchError' in thrown
+            ? (thrown as { readonly orchError: OrchError }).orchError
+            : makeError(
+                'container.start_failed',
+                `The ${name} gate could not be run: ${renderCause(thrown) ?? 'the runner refused'}`,
+              );
+        this.recordTermination(
+          state,
+          step,
+          baselineRef,
+          {
+            step: step.step,
+            disposition: 'failed',
+            sessionId: null,
+            output: null,
+            error,
+            usage: null,
+          },
+          { transitionTo },
+        );
+        return false;
+      }
+      results.push(outcome);
+      this.emit(recorder, {
+        step: step.step,
+        type:
+          outcome.outcome === 'passed'
+            ? ENGINE_EVENT_TYPES.GatePassed
+            : outcome.outcome === 'failed'
+              ? ENGINE_EVENT_TYPES.GateFailed
+              : ENGINE_EVENT_TYPES.GateSkipped,
+        payload: {
+          gate: name,
+          command: outcome.declared,
+          exit_status: outcome.exitStatus,
+          // AD-23: the pointer, never the output. A test suite's stdout is megabytes and the control
+          // plane is bounded by a declared token ceiling.
+          evidence: outcome.evidence,
+          reason: outcome.summary,
+        },
+        baselineRef,
+      });
+    }
+
+    const failed = results.filter((result) => result.outcome === 'failed');
+    if (failed.length === 0) return true;
+
+    /**
+     * The failure names which gate and its exit status, which is matrix row 20's other half: a run
+     * that says "verification failed" and nothing else sends a person to read a transcript to learn
+     * what a single line could have told them.
+     */
+    const named = failed
+      .map((gate) => `${gate.command} exited ${String(gate.exitStatus ?? -1)} (${gate.evidence})`)
+      .join('; ');
+    this.emit(recorder, {
+      step: step.step,
+      type: ENGINE_EVENT_TYPES.ReviewSkipped,
+      payload: {
+        reason:
+          'the deterministic gates failed, so no model-based review was spawned for this step ' +
+          '(CAP-13: no review spend occurs on a run that fails them)',
+        failed_gates: failed.map((gate) => gate.command),
+      },
+      baselineRef,
+    });
+    this.recordTermination(
+      state,
+      step,
+      baselineRef,
+      {
+        step: step.step,
+        disposition: 'failed',
+        sessionId: null,
+        output: null,
+        // `step.verification_failed` is `escalate-model-tier`, which is the Stack's own promotion
+        // trigger — "one promotion per step per run, on a failed verification gate". A failing gate
+        // is exactly that trigger, and routing it through the table is what keeps this step's
+        // failure indistinguishable from any other failed verification to every reader downstream.
+        error: makeError('step.verification_failed', `A declared gate failed: ${named}.`, named),
+        usage: null,
+      },
+      { transitionTo },
+    );
+    return false;
+  }
+
+  /**
+   * The commands the run's profile declares, from its AD-9 snapshot, or `null` when it has none.
+   *
+   * Read from the snapshot rather than from `.orch/`, for the reason every other configuration read
+   * in this class is: run scope is the only configuration a step's world is built from (AD-34), so a
+   * profile edited mid-run changes nothing about a run already under way.
+   */
+  private declaredCommands(run: string): Readonly<Record<string, string>> | null {
+    try {
+      return readStepConfiguration(run, { orchHome: this.orchHome }).profile.mechanics.commands;
+    } catch {
+      // No snapshot, no profile, or one this build cannot read. Nothing is declared and nothing is
+      // invented; the refusal a missing snapshot deserves is the roster's, at the spawn.
       return null;
     }
   }
@@ -3379,6 +3725,13 @@ export class Reconciler {
   private recorderFor(run: string, feature: string): Recorder {
     const existing = this.recorders.get(run);
     if (existing !== undefined) return existing;
+    // A caller that assembles the loop with an executor of its own supplies the shared recorder, and
+    // is then the one holding AD-29's claim. Cached here either way, so the loop asks once per run.
+    if (this.openRecorder !== null) {
+      const supplied = this.openRecorder(run, feature);
+      this.recorders.set(run, supplied);
+      return supplied;
+    }
     const recorder = Recorder.open({
       runId: run,
       feature,

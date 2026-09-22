@@ -20,6 +20,7 @@ import {
   AGENTS_DIR_NAME,
   AgentDeclarationSchema,
   CURRENT_SCHEMA_VERSION,
+  PROFILE_SCHEMA_VERSION,
   KnowledgeEntrySchema,
   ORCH_DIR_NAME,
   PERMISSIONS_FILE_NAME,
@@ -46,11 +47,20 @@ export const makeWorkspace = (label: string): string =>
 /** The profile a fixture starts from: every AD-16 mechanic present, and no knowledge section. */
 export const fixtureProfile = (overrides: Partial<Profile> = {}): Profile =>
   ProfileSchema.parse({
-    schema_version: CURRENT_SCHEMA_VERSION,
+    // The profile's own version, which story 2-6 advanced past every other artifact's when
+    // `mechanics.commands` gained `typecheck` (AD-28). A fixture spelling `CURRENT_SCHEMA_VERSION`
+    // here would be refused by the schema it is built through, which is the point of the bump.
+    schema_version: PROFILE_SCHEMA_VERSION,
     project: { id: FIXTURE_PROJECT_ID, path: '/nowhere', remote: '' },
     mechanics: {
       package_manager: 'npm',
-      commands: { test: 'npm test', lint: 'npm run lint', build: 'npm run build', run: 'npm start' },
+      commands: {
+        test: 'npm test',
+        typecheck: 'npm run typecheck',
+        lint: 'npm run lint',
+        build: 'npm run build',
+        run: 'npm start',
+      },
       source_layout: ['src', 'tests'],
       resources: 'none',
     },

@@ -28,6 +28,7 @@ import {
 } from '../src/contracts/index.js';
 import { READ_ONLY_TOOLS, isElevatedTool } from '../src/engine/index.js';
 import { BUILT_IN_AGENTS } from '../src/installer/interview.js';
+import { DeclaredCommandRequestSchema } from '../src/runner/index.js';
 
 /**
  * The table ADR-003 fixes and ADR-004 amends, and the contract each agent answers against. A row changing
@@ -48,8 +49,23 @@ const DECLARED: Readonly<Record<string, { readonly tools: readonly string[]; rea
     tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob'],
     contract: 'step.implementation',
   },
-  testing: { tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob'], contract: 'step.output' },
-  verification: { tools: ['Read', 'Grep', 'Glob'], contract: 'step.output' },
+  /**
+   * The two rows story 2-6 changed, and the change is ADR-004 finally being satisfiable.
+   *
+   * ADR-004 removed `Bash` from these two and named its replacement — "an MCP tool whose server runs
+   * the command inside the container" — while saying plainly that until story 2-6 built it, "neither
+   * has a tool that runs anything". `RunDeclaredCommand` is that tool, and it is a grant rather than
+   * an implicit capability for the same reason every other grant is: AD-17 makes the roster the one
+   * place that says what an agent may do, and a served tool nobody declared is one nobody reviewed.
+   */
+  testing: {
+    tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'RunDeclaredCommand'],
+    contract: 'step.testing',
+  },
+  verification: {
+    tools: ['Read', 'Grep', 'Glob', 'RunDeclaredCommand'],
+    contract: 'step.verification',
+  },
   committing: { tools: ['Read', 'Grep', 'Glob'], contract: 'step.output' },
 };
 
@@ -86,7 +102,7 @@ describe('the built-in roster grants exactly what ADR-003 decided, as ADR-004 am
    * declaration naming `step.output` fails its own contract at AD-1's re-parse — every time, for every
    * default install. A test that checked only "the id is registered" would pass on exactly that.
    */
-  it.each(['analysis', 'planning', 'implementation'])(
+  it.each(['analysis', 'planning', 'implementation', 'testing', 'verification'])(
     'gives %s a contract whose own pinned id is the one it declares',
     (id) => {
       const agent = BUILT_IN_AGENTS.find((candidate) => candidate.id === id);
@@ -108,6 +124,9 @@ describe('the built-in roster grants exactly what ADR-003 decided, as ADR-004 am
         changes: [],
         territory: [],
         files_read: [],
+        tests: [],
+        gates: [],
+        judgements: [],
       });
       expect(probe.success, `${id} accepted an output claiming step.output`).toBe(false);
     },
@@ -135,6 +154,11 @@ describe('the built-in roster grants exactly what ADR-003 decided, as ADR-004 am
     expect(verification, 'verification is declared').toBeDefined();
     expect(verification?.tools).not.toContain('Write');
     expect(verification?.tools).not.toContain('Edit');
+    // And the tool story 2-6 added is not a way round it (matrix 23): the command runner takes the
+    // *name* of a command the profile declares and has no parameter a path could be named in, so a
+    // gate this agent can run is not a file it can write.
+    expect(DeclaredCommandRequestSchema.safeParse({ command: 'test', path: 'x' }).success).toBe(false);
+    expect(Object.keys(DeclaredCommandRequestSchema.shape)).toStrictEqual(['command']);
     // `testing` is the comparison that makes the assertion mean something: the two differ on exactly
     // these two names, so a suite that had stopped distinguishing them would fail here.
     const testing = BUILT_IN_AGENTS.find((agent) => agent.id === 'testing');
@@ -166,6 +190,27 @@ describe('the built-in roster grants exactly what ADR-003 decided, as ADR-004 am
     for (const [id, row] of Object.entries(DECLARED)) {
       expect(row.tools, `the pinned row for ${id} grants Bash`).not.toContain('Bash');
     }
+  });
+
+  /**
+   * Matrix 24 — the two purposes describe what these agents can now actually do.
+   *
+   * ADR-004 left both promising to "run" with no tool that ran anything, and said so in as many
+   * words: "both purpose strings promise to run … the replacement arrives with story 2-6". A purpose
+   * that describes a capability the declaration does not grant is the roster lying about itself, and
+   * it is the first thing a person reads about an agent.
+   */
+  it('describes what testing and verification can now actually do', () => {
+    const testing = BUILT_IN_AGENTS.find((agent) => agent.id === 'testing');
+    const verification = BUILT_IN_AGENTS.find((agent) => agent.id === 'verification');
+    // Testing writes tests and runs them, and now holds the tool that runs one.
+    expect(testing?.purpose.toLowerCase()).toContain('run');
+    expect(testing?.tools).toContain('RunDeclaredCommand');
+    // Verification's job is the judgement CAP-13 puts *after* the gates, and its purpose says so
+    // rather than describing the gates as the whole of it.
+    expect(verification?.purpose.toLowerCase()).toContain('acceptance criteria');
+    expect(verification?.purpose.toLowerCase()).toContain('gates');
+    expect(verification?.tools).toContain('RunDeclaredCommand');
   });
 
   it('grants no built-in the tools ADR-003 withholds from every one of them', () => {
