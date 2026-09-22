@@ -34,14 +34,22 @@ the decision ever being taken. This ADR takes it.
 |---|---|---|---|
 | `analysis` | `Read`, `Grep`, `Glob` | reversible | It states what the work is. It needs to read the repository and nothing else. |
 | `planning` | `Read`, `Grep`, `Glob` | reversible | It orders steps and declares territories. Same reach as analysis; it produces a plan, not a change. |
-| `implementation` | `Read`, `Write`, `Edit`, `Grep`, `Glob`, `Bash` | recoverable | It writes the change in the run worktree. `Bash` is how a gate runs, inside the container per ADR-001. |
-| `testing` | `Read`, `Write`, `Edit`, `Grep`, `Glob`, `Bash` | recoverable | **`Write`/`Edit` is deliberate and is broader than ADR-001's sketch.** That sketch said "testing and the committer get `Bash`", which is incomplete: this agent's job is to *write* the tests as well as run them, and a testing agent that cannot author a test is not one. |
-| `verification` | `Read`, `Grep`, `Glob`, `Bash` | reversible | It runs the declared gates and reports. It must not be able to edit what it is judging — that is the whole reason it is a separate agent from `testing`. |
+| `implementation` | `Read`, `Write`, `Edit`, `Grep`, `Glob` (**`Bash` removed by ADR-004**) | recoverable | It writes the change in the run worktree. `Bash` is how a gate runs, inside the container per ADR-001. |
+| `testing` | `Read`, `Write`, `Edit`, `Grep`, `Glob` (**`Bash` removed by ADR-004**) | recoverable | **`Write`/`Edit` is deliberate and is broader than ADR-001's sketch.** That sketch said "testing and the committer get `Bash`", which is incomplete: this agent's job is to *write* the tests as well as run them, and a testing agent that cannot author a test is not one. |
+| `verification` | `Read`, `Grep`, `Glob` (**`Bash` removed by ADR-004**) | reversible | It runs the declared gates and reports. It must not be able to edit what it is judging — that is the whole reason it is a separate agent from `testing`. |
 | `committing` | `Read`, `Grep`, `Glob` | irreversible | **Changed from what story 2-1 shipped.** See below. |
 
 **No built-in agent is granted `Task`**, so no step can spawn an unbounded tree of its own. **None is granted
 `WebFetch` or `WebSearch`**, because AD-13/AD-14 make every external read go through the engine's fetch
 record; a step reaching the network directly would leave that record incomplete.
+
+**Amended by ADR-004 (2026-09-22).** The three rows granting `Bash` no longer do. This table justified
+`Bash` as "how a gate runs, inside the container per ADR-001" — and that was measured to be false: the agent
+process runs on the host, its `Bash` tool runs on the host, and CLI 2.1.278 offers approve-or-deny through a
+permission tool but no way to relocate a tool use into a container. Command execution is now an MCP tool
+whose server runs the command inside the container. `GRANTABLE_TOOLS` keeps `Bash` because AD-17 lets a
+user-defined agent be granted anything the declared set contains — but granting it yields an uncontained
+host shell, which is why story 2-4's `elevated` reporting names it.
 
 ## The one correction: `committing` loses `Bash`
 
