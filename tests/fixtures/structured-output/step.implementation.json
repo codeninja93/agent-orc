@@ -1,0 +1,50 @@
+{
+  "contract_id": "step.implementation",
+  "step": "implement-adr-004-grant-change",
+  "status": "completed",
+  "summary": "ADR-004 removes the `Bash` grant from the `implementation`, `testing` and `verification` built-in agents, and `implementation` now returns the new `step.implementation` contract, which describes the files a step changed and leaves no field through which a path outside the run worktree can be returned. The model ladder — starting rung, one-promotion-per-step-per-run ceiling, and the AD-35-derived promotion trigger — is gathered into `src/engine/promotion.ts` instead of being spread across state, error and dispositions.",
+  "provenance": [
+    "src/contracts/implementation.ts",
+    "src/installer/interview.ts",
+    "src/engine/promotion.ts"
+  ],
+  "decisions": [],
+  "artifacts": [],
+  "questions": [],
+  "write_intents": [],
+  "error": null,
+  "territory": [
+    "src/contracts",
+    "src/installer",
+    "src/engine"
+  ],
+  "changes": [
+    {
+      "path": "src/contracts/implementation.ts",
+      "kind": "created",
+      "summary": "Adds the `step.implementation` output contract: a `changes` array whose elements carry path/kind/summary and `step.analysis`'s per-claim provenance, a declared `territory`, `contract_id` pinned to the registered id, and refinements that refuse a completed step with no change or no territory, a change path that is not repository-relative or falls outside the declared territory, a duplicate path after normalisation, and an artifact pointer outside the run's evidence plane — closing the last return channel now that ADR-004 removed `Bash`.",
+      "provenance": {
+        "step": "implement-adr-004-grant-change",
+        "source": "src/contracts/implementation.ts"
+      }
+    },
+    {
+      "path": "src/installer/interview.ts",
+      "kind": "modified",
+      "summary": "Per ADR-004, drops `Bash` from the `implementation`, `testing` and `verification` entries in `BUILT_IN_AGENTS` — with the reason recorded inline, that the agent's `Bash` runs on the host rather than in the ADR-001 container, so the ADR-003 grant was an uncontained host shell and running a gate belongs to story 2-6's command-runner tool — and repoints `implementation`'s `contract` from `step.output` to `step.implementation`, with the roster header prose updated from four of six referencing `step.output` to three.",
+      "provenance": {
+        "step": "implement-adr-004-grant-change",
+        "source": "src/installer/interview.ts"
+      }
+    },
+    {
+      "path": "src/engine/promotion.ts",
+      "kind": "created",
+      "summary": "Adds the model ladder as one module: `LOWEST_MODEL_RUNG`/`HIGHEST_MODEL_RUNG` and `startingRung` (a declared `start_tier` honoured, an absence falling to the cheapest rung), `PROMOTION_TRIGGER_CODES`/`triggersPromotion` derived from the AD-35 disposition table rather than re-listed, `promotionFor` enforcing the one-promotion-per-step-per-run ceiling with ordered named refusals (not-a-trigger, rung-unrecognised, ceiling-reached, ladder-exhausted), `ModelRungUnrecognised` so an unplaceable rung is refused instead of promoted down the ladder, and `rungForAttempt` ordering promotion over recorded over declared so a re-run cannot discard a promotion.",
+      "provenance": {
+        "step": "implement-adr-004-grant-change",
+        "source": "src/engine/promotion.ts"
+      }
+    }
+  ]
+}

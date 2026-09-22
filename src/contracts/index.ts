@@ -20,6 +20,7 @@ export * from './command.js';
 export * from './error.js';
 export * from './event.js';
 export * from './fetch.js';
+export * from './implementation.js';
 export * from './installer.js';
 export * from './knowledge.js';
 export * from './node-floor.js';

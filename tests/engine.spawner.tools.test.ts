@@ -14,16 +14,25 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { dispositionFor, exportContract } from '../src/contracts/index.js';
+import {
+  AgentDeclarationSchema,
+  CURRENT_SCHEMA_VERSION,
+  IMPLEMENTATION_CONTRACT_ID,
+  dispositionFor,
+  exportContract,
+} from '../src/contracts/index.js';
 import {
   AD1_REQUIRED_FLAGS,
   ADR001_REQUIRED_FLAGS,
   AddDirNotAbsolute,
   buildStepArgv,
   defaultPromptFor,
+  grantFromRoster,
   missingRequiredFlags,
+  toolsArgumentFor,
 } from '../src/engine/index.js';
-import type { StepStartRequest } from '../src/engine/index.js';
+import type { DiscoveredRoster, StepStartRequest } from '../src/engine/index.js';
+import { BUILT_IN_AGENTS } from '../src/installer/interview.js';
 
 /**
  * ADR-001's Decision, item 1, quoted: "`--restricted` …, plus `--strict-mcp-config`, plus `--add-dir`
@@ -249,5 +258,84 @@ describe('the --add-dir value is checked, not merely passed on (matrix 26)', () 
   it('accepts an absolute path, which is what a run worktree is', () => {
     const argv = argvWithGrant({ addDir: '/tmp/orch/worktrees/run-1' });
     expect(argv[argv.indexOf('--add-dir') + 1]).toBe('/tmp/orch/worktrees/run-1');
+  });
+});
+
+
+/**
+ * Matrix 18 — an implementation step spawned carries the declaration's grant, and no `Bash` in it.
+ *
+ * The argv is built the way a run builds it: the *built-in declaration* is parsed as a roster entry,
+ * the grant is resolved from that roster, and `toolsArgumentFor` composes the flag's value. Nothing
+ * here spells the grant twice — the expectation is a literal quoted from ADR-003-as-amended, so the
+ * test compares the argv a declaration produced against the decision, never against itself.
+ *
+ * This is the end of ADR-004's change that a person can see: whatever the table says, the vector the
+ * process receives is what actually bounds it.
+ */
+describe('an implementation spawn carries its declared grant, with no Bash (matrix 18)', () => {
+  /** ADR-003 as ADR-004 amended it: the row for `implementation`, quoted. */
+  const DECIDED_IMPLEMENTATION_GRANT = 'Read,Write,Edit,Grep,Glob';
+
+  /** The built-in declaration, parsed as `.orch/agents/implementation.toml` would be read. */
+  const declaredRoster = (agentId: string): DiscoveredRoster => {
+    const declaration = AgentDeclarationSchema.parse({
+      schema_version: CURRENT_SCHEMA_VERSION,
+      ...BUILT_IN_AGENTS.find((agent) => agent.id === agentId),
+    });
+    return {
+      agentsDir: '/nowhere/.orch/agents',
+      agents: [{ id: agentId, path: `/nowhere/.orch/agents/${agentId}.toml`, declaration }],
+      refused: [],
+      summary: `one declaration, read as ${agentId}.toml would be`,
+    };
+  };
+
+  it('puts the declared grant after --tools, and it is the one ADR-004 left', () => {
+    const grant = grantFromRoster(declaredRoster('implementation'), 'implementation');
+    const argv = buildStepArgv({
+      schema: exportContract(IMPLEMENTATION_CONTRACT_ID),
+      prompt: 'p',
+      model: 'claude-haiku-4-5',
+      tools: toolsArgumentFor(grant),
+      addDir: '/tmp/orch/worktrees/run-1',
+    });
+
+    expect(argv[argv.indexOf('--tools') + 1]).toBe(DECIDED_IMPLEMENTATION_GRANT);
+    expect(missingRequiredFlags(argv, { tools: DECIDED_IMPLEMENTATION_GRANT })).toStrictEqual([]);
+  });
+
+  it('carries no Bash anywhere in the vector the process receives', () => {
+    const grant = grantFromRoster(declaredRoster('implementation'), 'implementation');
+    const argv = buildStepArgv({
+      schema: exportContract(IMPLEMENTATION_CONTRACT_ID),
+      prompt: 'p',
+      model: 'claude-haiku-4-5',
+      tools: toolsArgumentFor(grant),
+      addDir: '/tmp/orch/worktrees/run-1',
+    });
+
+    expect(grant.tools).not.toContain('Bash');
+    // Not only the flag's value: the whole vector, because `Bash` reaching the process by any other
+    // argument would be the same host shell ADR-004 removed.
+    for (const argument of argv) expect(argument).not.toContain('Bash');
+    // And it still grants something, so "no Bash" is not passing because the grant is empty.
+    expect(grant.elevated).toStrictEqual(['Write', 'Edit']);
+  });
+
+  it('is the contract the roster declares that the spawn validates against', () => {
+    const grant = grantFromRoster(declaredRoster('implementation'), 'implementation');
+    const argv = buildStepArgv({
+      schema: exportContract(IMPLEMENTATION_CONTRACT_ID),
+      prompt: 'p',
+      model: 'claude-haiku-4-5',
+      tools: toolsArgumentFor(grant),
+      addDir: '/tmp/orch/worktrees/run-1',
+    });
+
+    expect(JSON.parse(argv[argv.indexOf('--json-schema') + 1] ?? '')).toStrictEqual(
+      exportContract(IMPLEMENTATION_CONTRACT_ID),
+    );
+    expect(IMPLEMENTATION_CONTRACT_ID).toBe('step.implementation');
   });
 });

@@ -162,11 +162,12 @@ const noSuggestion = (): null => null;
  * the installer's list of what it can *write*, not the system's list of what exists. An agent added
  * here becomes an offer at question 10 and nothing else; the implementations are stories 2-3 to 2-7.
  *
- * Each references a *registered* contract id (AD-17), never an inline schema. Four of the six reference
+ * Each references a *registered* contract id (AD-17), never an inline schema. Three of the six reference
  * `step.output`, the shared step envelope: a roster member that needs a genuinely new contract shape needs an
- * engine change, and those four do not. `analysis` and `planning` do — story 2-4 registered `step.analysis`
- * and `step.planning`, whose shapes carry per-claim provenance and a declared territory — and they name them
- * here. A declaration naming `step.output` while its agent's contract pins `contract_id` to its own id is a
+ * engine change, and those three do not. `analysis` and `planning` do — story 2-4 registered `step.analysis`
+ * and `step.planning`, whose shapes carry per-claim provenance and a declared territory — and so does
+ * `implementation`, whose `step.implementation` (story 2-5) describes the files changed and leaves no field
+ * through which a path outside the run worktree can be returned. They name them here. A declaration naming `step.output` while its agent's contract pins `contract_id` to its own id is a
  * pairing that can never both hold: every refusal the new contract adds would be dead for a default install,
  * with nothing able to notice. `tests/contracts.agent-grants.test.ts` pins the contract id beside the grant
  * for exactly that reason.
@@ -192,27 +193,35 @@ export const BUILT_IN_AGENTS: readonly AgentDeclarationInput[] = Object.freeze([
   },
   {
     id: 'implementation',
+    // ADR-004 — no `Bash`. ADR-003 granted it as "how a gate runs, inside the container per ADR-001",
+    // and that was measured false: the agent process runs on the host and so does its `Bash` tool, so
+    // the grant was an uncontained host shell rather than the contained one the table described.
+    // Running a gate is story 2-6's command-runner MCP tool; this agent's job is to write the change.
     purpose: 'Write the change in the run worktree, against the plan.',
-    contract: 'step.output',
-    tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'],
+    contract: 'step.implementation',
+    tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob'],
     mcp_domains: [],
     reversibility: 'recoverable',
     model: { start_tier: 'claude-sonnet-5', promotion_policy: 'on-gate-failure' },
   },
   {
     id: 'testing',
+    // ADR-004 — no `Bash`, for the reason `implementation` has none. `Write`/`Edit` stay: ADR-003 is
+    // explicit that a testing agent that cannot author a test is not one.
     purpose: 'Write and run the tests that decide whether the change did what was asked.',
     contract: 'step.output',
-    tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'],
+    tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob'],
     mcp_domains: [],
     reversibility: 'recoverable',
     model: { start_tier: 'claude-sonnet-5', promotion_policy: 'on-gate-failure' },
   },
   {
     id: 'verification',
+    // ADR-004 — no `Bash`. It still has no `Write` or `Edit` either, and that is ADR-003's reason for
+    // separating it from `testing`: it must not be able to change what it judges.
     purpose: 'Run the declared gates and report what was verified and what was not.',
     contract: 'step.output',
-    tools: ['Read', 'Grep', 'Glob', 'Bash'],
+    tools: ['Read', 'Grep', 'Glob'],
     mcp_domains: [],
     reversibility: 'reversible',
     model: { start_tier: 'claude-haiku-4-5', promotion_policy: 'on-gate-failure' },

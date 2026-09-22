@@ -65,6 +65,7 @@ export * from './ulid.js';
 export * from './lock.js';
 export * from './checkpoint.js';
 export * from './rebuild.js';
+export * from './promotion.js';
 export * from './dispositions.js';
 export * from './territory.js';
 export * from './baseline.js';

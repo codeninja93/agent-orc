@@ -1,5 +1,5 @@
 /**
- * ADR-003 — the built-in roster's tool grants, pinned.
+ * ADR-003, as amended by ADR-004 — the built-in roster's tool grants, pinned.
  *
  * ADR-001 made `--tools` load-bearing security configuration: a roster entry granting `Bash` grants the
  * ability to run commands, contained but real. Story 2-1 then shipped a roster with grants already in it,
@@ -9,6 +9,14 @@
  * Nothing asserted those grants. Changing `committing` from `['Read', 'Bash']` to `['Read', 'Grep', 'Glob']`
  * broke no test, which is how a security grant drifts without anyone reading a diff. These assertions are
  * the decision, written down where a change to it fails.
+ *
+ * **ADR-004 removed three rows' `Bash`, and a table edited until its tests pass is worth nothing.** The
+ * pinned table below is a literal, so editing it moves the goalposts by definition. So the rules that
+ * matter are asserted *against the rule* rather than against the table: no built-in is granted `Bash`
+ * (asserted of `BUILT_IN_AGENTS` **and** of the table itself, so neither can be edited to re-admit it),
+ * `verification` still has no `Write` or `Edit`, and `GRANTABLE_TOOLS` still contains `Bash` because
+ * AD-17 lets a user-defined agent be granted anything the declared set contains. Those four hold
+ * whatever the literal says.
  */
 import { describe, expect, it } from 'vitest';
 
@@ -18,6 +26,7 @@ import {
   getContract,
   isContractId,
 } from '../src/contracts/index.js';
+import { READ_ONLY_TOOLS, isElevatedTool } from '../src/engine/index.js';
 import { BUILT_IN_AGENTS } from '../src/installer/interview.js';
 
 /**
@@ -36,11 +45,11 @@ const DECLARED: Readonly<Record<string, { readonly tools: readonly string[]; rea
   analysis: { tools: ['Read', 'Grep', 'Glob'], contract: 'step.analysis' },
   planning: { tools: ['Read', 'Grep', 'Glob'], contract: 'step.planning' },
   implementation: {
-    tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'],
-    contract: 'step.output',
+    tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob'],
+    contract: 'step.implementation',
   },
-  testing: { tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'Bash'], contract: 'step.output' },
-  verification: { tools: ['Read', 'Grep', 'Glob', 'Bash'], contract: 'step.output' },
+  testing: { tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob'], contract: 'step.output' },
+  verification: { tools: ['Read', 'Grep', 'Glob'], contract: 'step.output' },
   committing: { tools: ['Read', 'Grep', 'Glob'], contract: 'step.output' },
 };
 
@@ -77,7 +86,7 @@ describe('the built-in roster grants exactly what ADR-003 decided', () => {
    * declaration naming `step.output` fails its own contract at AD-1's re-parse — every time, for every
    * default install. A test that checked only "the id is registered" would pass on exactly that.
    */
-  it.each(['analysis', 'planning'])(
+  it.each(['analysis', 'planning', 'implementation'])(
     'gives %s a contract whose own pinned id is the one it declares',
     (id) => {
       const agent = BUILT_IN_AGENTS.find((candidate) => candidate.id === id);
@@ -96,6 +105,7 @@ describe('the built-in roster grants exactly what ADR-003 decided', () => {
         error: null,
         claims: [],
         plan: [],
+        changes: [],
         territory: [],
         files_read: [],
       });
@@ -114,11 +124,48 @@ describe('the built-in roster grants exactly what ADR-003 decided', () => {
     expect(committing?.purpose.toLowerCase()).toContain('compose');
   });
 
+  /**
+   * The row that survives ADR-004 unchanged in substance, and the one this suite must not have got
+   * weaker at. `verification` lost `Bash` with the other two; what it never had, and must never have,
+   * is a way to change the thing it is judging — which is ADR-003's whole reason for separating it
+   * from `testing`.
+   */
   it('gives verification no way to edit what it judges', () => {
     const verification = BUILT_IN_AGENTS.find((agent) => agent.id === 'verification');
-    expect(verification?.tools).toContain('Bash');
+    expect(verification, 'verification is declared').toBeDefined();
     expect(verification?.tools).not.toContain('Write');
     expect(verification?.tools).not.toContain('Edit');
+    // `testing` is the comparison that makes the assertion mean something: the two differ on exactly
+    // these two names, so a suite that had stopped distinguishing them would fail here.
+    const testing = BUILT_IN_AGENTS.find((agent) => agent.id === 'testing');
+    expect(testing?.tools).toContain('Write');
+    expect(testing?.tools).toContain('Edit');
+  });
+
+  /**
+   * ADR-004, matrix row 4 — measured against every declaration, not against the table above.
+   *
+   * A grant of `Bash` is a *host* shell: the agent process runs on the host per ADR-001, and CLI
+   * 2.1.278 offers approve-or-deny through a permission tool with no way to relocate a tool use into a
+   * container. So the containment AD-20 describes never applies to it, and no built-in may hold it.
+   */
+  it('grants no built-in Bash, because a granted Bash is an uncontained host shell (ADR-004)', () => {
+    for (const agent of BUILT_IN_AGENTS) {
+      expect(agent.tools, `${agent.id} is granted Bash`).not.toContain('Bash');
+    }
+  });
+
+  /**
+   * And the same rule applied to the pinned table itself, so the table cannot be edited until the
+   * tests pass again.
+   *
+   * Without this, re-admitting `Bash` to a built-in is two edits — the declaration and the row — and
+   * the suite reports the roster as decided. The rule is the authority; the literal is only its record.
+   */
+  it('holds the pinned table to the same rule, so re-admitting Bash to a row fails here too', () => {
+    for (const [id, row] of Object.entries(DECLARED)) {
+      expect(row.tools, `the pinned row for ${id} grants Bash`).not.toContain('Bash');
+    }
   });
 
   it('grants no built-in the tools ADR-003 withholds from every one of them', () => {
@@ -150,5 +197,41 @@ describe('a granted tool name must be a declared name', () => {
     for (const agent of BUILT_IN_AGENTS) {
       for (const tool of agent.tools) expect(GRANTABLE_TOOLS).toContain(tool);
     }
+  });
+
+  /**
+   * Matrix rows 5 and 6 — the two lists do different jobs, and ADR-004 changed only one of them.
+   *
+   * `GRANTABLE_TOOLS` is the declared *vocabulary*: what a roster entry may name at all. The built-in
+   * table is a *decision* about six particular agents. AD-17 makes the roster declarative and question
+   * 11 of the interview asks a person for their own agent's grant directly, so removing `Bash` from the
+   * vocabulary would refuse a declaration ADR-004 explicitly keeps legal — and would do it at parse,
+   * where a person reads "not a declared name" rather than "this gives you a host shell".
+   *
+   * What makes that safe is the reporting rather than the refusal: `isElevatedTool` classifies from the
+   * tool name alone, so the grant is named as elevated on the spawn event. `tests/engine.agents.test.ts`
+   * carries the argv end of it — a user-defined agent granting `Bash` reaches `--tools` with `Bash` in
+   * it and `AgentGrant.elevated` says so, never silently corrected.
+   */
+  it('keeps Bash in the vocabulary, and reports a user-defined agent granting it as elevated', () => {
+    expect(GRANTABLE_TOOLS).toContain('Bash');
+
+    const userDefined = {
+      schema_version: 1,
+      id: 'my-own-agent',
+      purpose: 'a roster entry a person declared for themselves',
+      contract: 'step.output',
+      tools: ['Read', 'Bash'],
+      mcp_domains: [],
+      reversibility: 'recoverable',
+      model: { start_tier: 'claude-sonnet-5', promotion_policy: 'on-gate-failure' },
+    };
+    const parsed = AgentDeclarationSchema.safeParse(userDefined);
+    expect(parsed.success, 'AD-17 lets a person grant their own agent anything the set declares').toBe(
+      true,
+    );
+    // Accepted, and not accepted quietly: the name classifies as one that can change something.
+    expect(isElevatedTool('Bash')).toBe(true);
+    expect(READ_ONLY_TOOLS).not.toContain('Bash');
   });
 });

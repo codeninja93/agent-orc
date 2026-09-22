@@ -77,6 +77,12 @@ const WHOLE_REPOSITORY_SPELLINGS: readonly string[] = ['.', './', '.\\'];
  * worktree does not contain, and `--add-dir` scoped to that worktree is what ADR-001 bounds a step by — so a
  * claim naming one is a claim about a file the step was never admitted to.
  *
+ * **A leading `~` is refused with them.** It is not a relative path: every shell and most path-joining
+ * readers expand it to the home directory, so `~/.ssh/id_rsa` is an absolute path wearing one character of
+ * disguise — and it is the one spelling of "outside the tree" that survives the leading-`/` and the `..`
+ * checks. `step.implementation` leans on this predicate to show its contract offers no channel out of the
+ * worktree, and a channel that a spelling reopens is not closed.
+ *
  * **The raw spelling is checked before normalisation, not after.** `''`, `'   '`, `'/'`, `'//'` and
  * `'src/..'` all *normalise* to `.`, so a check written after normalising can only ask "is this the whole
  * repository", which every one of them answers yes to — and the `normalised === ''` refusal that used to be
@@ -89,6 +95,7 @@ export const isRepositoryRelativePath = (declared: string): boolean => {
   const raw = declared.trim();
   if (raw === '') return false;
   if (raw.startsWith('/') || raw.startsWith('\\')) return false;
+  if (raw.startsWith('~')) return false;
   if (/^[A-Za-z]:/.test(raw)) return false;
   const normalised = normaliseTerritoryPath(declared);
   if (normalised === '.') return WHOLE_REPOSITORY_SPELLINGS.includes(raw);

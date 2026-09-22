@@ -15,6 +15,7 @@ import { CommandIntentSchema } from './command.js';
 import { EventEnvelopeSchema } from './event.js';
 import { OrchErrorSchema } from './error.js';
 import { FetchRecordSchema } from './fetch.js';
+import { IMPLEMENTATION_CONTRACT_ID, ImplementationOutputSchema } from './implementation.js';
 import {
   AgentDeclarationSchema,
   ManifestSchema,
@@ -184,6 +185,21 @@ export const CONTRACTS = {
       'expects to touch, inside the declared territory.',
     model_produced: true,
     schema: PlanningOutputSchema,
+  },
+  /**
+   * Story 2-5's implementing agent. Registered for the reason the two above are — a roster entry
+   * references a contract by id, and `step.output` cannot tell an implementing agent from any other —
+   * and because the shape genuinely differs: the files changed, each with its own provenance, inside a
+   * declared territory, with no field through which a path outside the run worktree can be returned.
+   */
+  [IMPLEMENTATION_CONTRACT_ID]: {
+    id: IMPLEMENTATION_CONTRACT_ID,
+    kind: 'step',
+    description:
+      'The implementation agent\'s output: the files it changed, each carrying its provenance and ' +
+      'lying inside the declared territory, plus the write intents the engine executes (AD-15).',
+    model_produced: true,
+    schema: ImplementationOutputSchema,
   },
 } as const satisfies Readonly<Record<string, ContractEntry>>;
 

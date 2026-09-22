@@ -19,11 +19,11 @@
  */
 import {
   ERROR_CODES,
-  MAX_PROMOTIONS_PER_STEP,
   dispositionFor,
   isResumable,
-  nextModelRung,
 } from '../contracts/index.js';
+import { promotionFor } from './promotion.js';
+
 import type {
   Disposition,
   ModelRung,
@@ -171,24 +171,27 @@ export const routeTermination = (facts: StepTerminationFacts): DispositionRoutin
       );
 
     case 'escalate-model-tier': {
-      const promoteTo = nextModelRung(facts.modelTier);
-      if (promoteTo === null || facts.promotions >= MAX_PROMOTIONS_PER_STEP) {
-        // The ladder is exhausted, or this step has already spent its one promotion. Promoting again
-        // would be the retry loop AD-35 forbids, dressed as a model decision.
-        return routing(
-          'escalate-to-human',
-          `"${code}" is declared escalate-model-tier, but step "${facts.step}" has spent ` +
-            `${String(facts.promotions)} of ${String(MAX_PROMOTIONS_PER_STEP)} promotions and runs ` +
-            `on ${facts.modelTier}, so the ladder is exhausted and a person decides.`,
-          { errorDisposition: disposition, code },
-        );
+      /**
+       * The ladder decides, not this table. `src/engine/promotion.ts` owns the ceiling, the ordered
+       * rungs and the refusal for a rung this build cannot place; deciding any of it a second time
+       * here is how two units come to disagree about whether a step may climb.
+       */
+      const climb = promotionFor({
+        step: facts.step,
+        rung: facts.modelTier,
+        promotions: facts.promotions,
+        code,
+      });
+      if (!climb.promote || climb.to === null) {
+        // The ceiling, the top of the ladder, or a rung nobody can place. A further promotion would
+        // be the retry loop AD-35 forbids, dressed as a model decision, so a person decides.
+        return routing('escalate-to-human', climb.reason, { errorDisposition: disposition, code });
       }
-      return routing(
-        'promote-model-tier',
-        `"${code}" is declared escalate-model-tier, so step "${facts.step}" is promoted from ` +
-          `${facts.modelTier} to ${promoteTo} and re-run.`,
-        { errorDisposition: disposition, code, promoteTo },
-      );
+      return routing('promote-model-tier', climb.reason, {
+        errorDisposition: disposition,
+        code,
+        promoteTo: climb.to,
+      });
     }
 
     case 'escalate-to-human':

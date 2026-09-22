@@ -34,6 +34,7 @@ import { join } from 'node:path';
 
 import {
   ANALYSIS_CONTRACT_ID,
+  IMPLEMENTATION_CONTRACT_ID,
   AnalysisOutputSchema,
   CURRENT_SCHEMA_VERSION,
   DECLARATION_PAYLOAD_KEYS,
@@ -172,6 +173,7 @@ import {
 } from './territory.js';
 import type { TerritoryCandidate, TerritoryDeferral } from './territory.js';
 import { EngineLock } from './lock.js';
+import { rungForAttempt } from './promotion.js';
 import { defaultUlidMinter } from './ulid.js';
 import type { UlidMinter } from './ulid.js';
 
@@ -196,7 +198,12 @@ export const STEPS_DIR_NAME = 'steps';
 export const STANDARD_PLAN_STEPS: readonly PlanStep[] = Object.freeze([
   { step: 'analyse', contract_id: ANALYSIS_CONTRACT_ID, phase: 'analysis' },
   { step: 'plan', contract_id: PLANNING_CONTRACT_ID, phase: 'planning' },
-  { step: 'implement', contract_id: 'step.output', phase: 'implementation' },
+  // Story 2-5 registered `step.implementation`, whose shape pins `contract_id` to its own id. A plan
+  // still naming `step.output` here would be validated against the generic envelope, so every
+  // per-change provenance and outside-the-worktree refusal the new contract adds would be dead for
+  // every default run — the same pairing failure story 2-4 found in the roster's declarations.
+  { step: 'implement', contract_id: IMPLEMENTATION_CONTRACT_ID, phase: 'implementation' },
+  // `verify` keeps the generic envelope until story 2-6, which is where the gates actually run.
   { step: 'verify', contract_id: 'step.output', phase: 'verification' },
 ]);
 export const STEP_INPUT_FILE_NAME = 'input.json';
@@ -2656,7 +2663,13 @@ export class Reconciler {
       });
     }
 
-    let tier: ModelRung = options.promoteTo ?? existing?.model_tier ?? plan.starting_model_tier;
+    // The ladder owns the precedence, including that a re-run never drops below the rung the step
+    // already reached (`src/engine/promotion.ts`).
+    let tier: ModelRung = rungForAttempt({
+      promoteTo: options.promoteTo,
+      recorded: existing?.model_tier ?? null,
+      declared: plan.starting_model_tier,
+    });
     if (options.promoteTo !== null) {
       this.emit(recorder, {
         step: options.step.step,

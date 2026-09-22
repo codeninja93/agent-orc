@@ -2,9 +2,9 @@
 title: 'Step agent — implementation'
 type: 'feature'
 created: '2026-09-22'
-status: 'drafted'
+status: 'done'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 baseline_revision: 'c09e899'
 context:
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
@@ -12,7 +12,61 @@ context:
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-003-built-in-agent-tool-grants.md'
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-004-command-execution-as-a-capability.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/stories/2-4-analysis-and-planning-agents.md'
-deferred: []
+deferred:
+- summary: No review layer ran against this story.
+  evidence: 'The gate, seven implementer mutations and my own verification are the only scrutiny. I
+    re-ran the gate myself (exit 0, 2136/74, zero skips) and probed the tilde refusal in both directions,
+    the six promotion decisions, and the built-in grants. Read `status: done` as implemented and gated,
+    not reviewed.'
+  severity: high
+- summary: 'The intent''s "promoted only on a failed verification gate" is not implemented, deliberately.'
+  evidence: |-
+    `src/contracts/error.ts` maps `step.schema_invalid_output` to `escalate-model-tier` and
+    `src/contracts/state.ts` documents "a failed verification gate **or** a second schema-invalid
+    output". The shipped rule is implemented and verified: a schema-invalid output does promote. The
+    intent's stricter "only" would require moving the AD-35 table row and the Stack's model-rung row,
+    which is a spine change rather than an implementation choice. The divergence is recorded in
+    `promotion.ts`'s docblock and in the matrix-16 describe block as well as here. **This is the one item
+    that wants a decision from the user.**
+  location: src/engine/promotion.ts
+  severity: medium
+- summary: 'Between this story and 2-6 the system can write a change it cannot test.'
+  evidence: 'ADR-004 removed `Bash` from `verification`, and the command-runner MCP server that replaces
+    it belongs to 2-6 where gates actually run. So `verification` currently has no way to run a gate at
+    all. This was a deliberate scoping decision, stated in the spec''s Boundaries before the work began
+    rather than discovered afterwards, but it is a real hole in the walking skeleton until 2-6 lands.'
+  severity: medium
+- summary: 'The reconciler''s own suites never exercise `STANDARD_PLAN_STEPS`.'
+  evidence: |-
+    `tests/helpers/engine-fixture.ts`'s `DEFAULT_PLAN_STEPS` is a two-step plan naming `step.output`,
+    while the production `STANDARD_PLAN_STEPS` is four steps naming the real contracts. Verified. The
+    consequence is concrete rather than theoretical: pointing the plan's `implement` step back at
+    `step.output` initially broke nothing, and was caught only by an assertion added for exactly that,
+    because the run-level suites run a different plan. Any future change to the real plan is unprotected
+    by the suites that look like they cover it.
+  location: tests/helpers/engine-fixture.ts
+  severity: medium
+- summary: 'Four files were changed beyond the Code Map, three of them widening this story''s reach.'
+  evidence: |-
+    (1) `src/engine/dispositions.ts` — its `escalate-model-tier` branch already implemented the ceiling
+    and the next rung, so `promotion.ts` beside it would have been a second authority on whether a step
+    may climb; the branch now delegates. (2) `src/engine/reconciler.ts` — the tier expression now calls
+    `rungForAttempt`, without which the starting-rung half of `promotion.ts` would be dead code exercised
+    only by its own test. (3) `src/contracts/state.ts` — `isModelRung` added beside `MODEL_RUNGS` so an
+    unrecognised rung is expressible without a cast, which landmine E required. (4)
+    `src/contracts/territory.ts` — `isRepositoryRelativePath` now refuses a leading `~`, which also
+    tightens `step.analysis`, `step.planning` and the declared territory. I verified that tightening in
+    both directions: `~`, `~/`, `~/.ssh/id_rsa` and `~root/x` refused, while `src/~backup.ts`,
+    `docs/a~b.md` and `a/~/b.ts` are still accepted.
+  severity: low
+- summary: '`tests/helpers/agent-grant.ts` still grants `Bash`, and now models a user-defined agent.'
+  evidence: 'Its `fixtureGrant` carries `Bash` with `elevated: [Write, Edit, Bash]`, which is what keeps
+    story 2-4''s elevated-reporting assertions exercising a `Bash` grant — correctly, since AD-17 still
+    lets a user-defined agent be granted it. After ADR-004 no built-in matches that shape, so the
+    fixture''s comment should say it models a user-defined agent rather than reading as though it mirrors
+    the built-in roster.'
+  location: tests/helpers/agent-grant.ts
+  severity: low
 ---
 
 # Story 2-5 — Step agent: implementation
@@ -145,4 +199,68 @@ the ladder runs backwards.
 
 ## Verification
 
+Run by me, with the suite's exit status captured to a variable and the output kept in a file:
+`npm run typecheck && npm run lint && npm run build && npm test` — **exit 0, 2136 tests across 74 files, zero
+failures, zero skips.** Baseline `602fece` was 2053/72. Node pinned to v24.21.0.
+
+Seven mutations by the implementer, each run against the full suite and reverted:
+
+| Mutation | Caught by |
+|---|---|
+| `Bash` back into the `implementation` declaration | 4 tests across `contracts.agent-grants` and `engine.spawner.tools` |
+| `Bash` removed from `GRANTABLE_TOOLS` | 2 tests, including story 2-4's elevated-reporting case |
+| `Write`/`Edit` removed from `testing` | 2 tests |
+| `Write`/`Edit` added to `verification` | 2 tests |
+| The plan's `implement` step back to `step.output` | 2 tests — **after** a gap was found and closed; see below |
+| A second promotion allowed in one run | 5 tests, including the reconciler's own |
+| An unrecognised rung treated as the lowest | 2 tests |
+| (extra) `Bash` re-added to the pinned table row only | 2 tests, so the table cannot be edited until it passes |
+
+**The implementer reported a near-miss honestly and fixed it.** Mutation 5 initially caught nothing real: the
+only failure was `installer.delivery`, because an unused import broke the packed build — not because any
+assertion noticed. Matrix row 8 had no test, since the Code Map assigned it no file. A dedicated assertion
+was added and the mutation then fails properly. That is the same accidental-compiler-pin shape I found in
+story 2-4's TUI fix, caught here by the implementer rather than by review.
+
+**Verified by me directly, each with a positive control.** The tilde tightening holds in both directions —
+`~`, `~/`, `~/.ssh/id_rsa`, `~root/x`, `/etc/passwd`, `../x`, a drive letter and a UNC path all refused, while
+`src/~backup.ts`, `docs/a~b.md`, `a/~/b.ts`, `.`, `./` and `src` are accepted. No built-in is granted `Bash`
+and `GRANTABLE_TOOLS` still contains it. `implementation` declares `step.implementation`. All six promotion
+decisions behave: promote from the lowest rung, `ladder-exhausted` at the highest, `ceiling-reached` at one
+promotion, promote on a schema-invalid output per the shipped rule, `not-a-trigger` for a non-promoting code,
+and `rung-unrecognised` rather than clamping to the cheapest.
+
 ## Auto Run Result
+
+**Status: done.** The implementing agent has its own contract, the plan points at it, ADR-004's grant change
+is applied, and the model ladder starts at the cheapest rung with a one-per-step-per-run ceiling.
+
+**This story began as an architecture decision.** ADR-001 had recorded that its open question "must be
+settled before 2-5 and 2-6", and the investigation found ADR-003's justification for granting `Bash` —
+"inside the container per ADR-001" — was false against CLI 2.1.278: the agent runs on the host, so its shell
+does too, and the CLI offers approve-or-deny but no relocation. ADR-004 resolves it by making command
+execution a capability rather than a built-in tool.
+
+**Landmine C was answered structurally rather than by assertion.** Rather than re-checking `--add-dir`, which
+is story 2-4's property, the suite walks the exported draft-7 schema, collects every string-valued leaf, and
+requires each to be one of three things: a closed vocabulary that cannot hold a path, a refused path field
+tested against seven spellings of "outside", or an inert field named with the reader that makes it inert.
+Three assertions hold it together — the classification must cover every discovered leaf, the inert list may
+not name a field the export lacks, and the walk must find the fields it claims to be about. A first version
+of the walker missed nullable leaves, which Zod exports as `type: ["string","null"]`, and its own test caught
+that.
+
+**One classification is a judgement worth seeing.** `changes[].provenance.source` is inert *deliberately*:
+ADR-001 accepts that a host-side agent can read outside the worktree, so refusing an outside source would
+refuse an honest report of something that happened.
+
+**Follow-up review recommended: true.** No review layer ran. The specific unverified risk is the coverage gap
+found during mutation: `tests/helpers/engine-fixture.ts` runs a two-step plan naming `step.output`, so the
+reconciler's own suites never exercise `STANDARD_PLAN_STEPS`, and a change to the real plan is unprotected by
+the suites that appear to cover it.
+
+**Residual risks.** Six deferred entries, one `high`. The one wanting a decision: the intent's "promoted only
+on a failed verification gate" is not implemented, because `error.ts` already routes
+`step.schema_invalid_output` to `escalate-model-tier`; the shipped rule was implemented and the divergence
+recorded rather than either rule being changed silently. And until 2-6 lands, `verification` has no way to run
+a gate at all.

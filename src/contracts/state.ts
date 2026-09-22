@@ -109,6 +109,16 @@ export type ModelRung = (typeof MODEL_RUNGS)[number];
 
 export const ModelRungSchema = z.enum(MODEL_RUNGS);
 
+/**
+ * True when a string is a rung this build can place on the ladder.
+ *
+ * Beside {@link MODEL_RUNGS} rather than at a caller, because the question "is this a rung" and the
+ * list of rungs must be one fact: a reader that answers it for itself is the second authority whose
+ * disagreement with {@link nextModelRung} lets an unplaceable rung be treated as the lowest.
+ */
+export const isModelRung = (value: string): value is ModelRung =>
+  (MODEL_RUNGS as readonly string[]).includes(value);
+
 /** AD-1 / Stack — one promotion per step per run. */
 export const MAX_PROMOTIONS_PER_STEP = 1;
 
