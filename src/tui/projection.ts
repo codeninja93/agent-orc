@@ -39,6 +39,7 @@ import {
   FEATURE_STATES,
   SPEC_CRITERION_EDITED_EVENT_TYPE,
   SPEC_RECORDED_EVENT_TYPE,
+  STEP_PHASES,
   USAGE_PAYLOAD_KEY,
   addUsage,
   compareEventOrder,
@@ -495,8 +496,19 @@ const featureState = (value: string | null): FeatureState | null =>
     ? (value as FeatureState)
     : null;
 
+/**
+ * A phase the vocabulary declares, or `null` for one this build cannot place.
+ *
+ * Driven from `STEP_PHASES` rather than from a pair of literals. The literal version read
+ * `value === 'implementation' || value === 'verification'`, so story 2-4's `analysis` and `planning` would
+ * have rendered as no phase at all — a card silently omitting the phase of every step of the first half of
+ * a run, with no test failing, because the two the literals named still worked. A projection derives its
+ * vocabulary from the contract; it does not re-spell it.
+ */
 const stepPhase = (value: string | null): StepPhase | null =>
-  value === 'implementation' || value === 'verification' ? value : null;
+  value !== null && (STEP_PHASES as readonly string[]).includes(value)
+    ? (value as StepPhase)
+    : null;
 
 /** Milliseconds between two recorded instants, or `null` when either is missing or unparseable. */
 export const elapsedBetween = (from: string | null, to: string | null): number | null => {

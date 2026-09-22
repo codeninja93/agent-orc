@@ -72,11 +72,26 @@ export const isTerminalFeatureState = (state: FeatureState): boolean =>
   TERMINAL_FEATURE_STATES.includes(state);
 
 /**
- * Which half of the pipeline a step belongs to. CAP-13 runs deterministic gates after the
+ * Which phase of the pipeline a step belongs to. CAP-13 runs deterministic gates after the
  * implementation steps, and the lifecycle's `running` → `verifying` → `committed` path is exactly
  * the boundary between the two.
+ *
+ * **The names are the agent ids, deliberately, and this is an enum widening AD-28 covers.** `analysis`
+ * and `planning` arrived in story 2-4; the roster's six built-ins and ADR-003's grant table use the same
+ * six words, so a phase is the key a spawn resolves its AD-17 grant by and re-encoding the pair would
+ * give the engine a mapping to get wrong. Widening an enum on an artifact the engine writes is
+ * `schema_version`-relevant: a `state.json` written by a build that knows a phase this one does not is
+ * refused by `parseVersionedArtifact` with `config.schema_version_unrecognised` — the version is checked
+ * before the shape, so the refusal names the artifact and the installer rather than surfacing as a Zod
+ * issue about an enum. Every *reader* of this list derives from it rather than spelling its members,
+ * which is what makes adding one a one-line change (`src/tui/projection.ts` was the one that did not).
  */
-export const STEP_PHASES = ['implementation', 'verification'] as const;
+export const STEP_PHASES = [
+  'analysis',
+  'planning',
+  'implementation',
+  'verification',
+] as const;
 
 export type StepPhase = (typeof STEP_PHASES)[number];
 

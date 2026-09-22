@@ -15,6 +15,7 @@ import { assertNodeFloorOrExit } from './node-floor.js';
 
 assertNodeFloorOrExit();
 
+export * from './analysis.js';
 export * from './command.js';
 export * from './error.js';
 export * from './event.js';
@@ -22,11 +23,13 @@ export * from './fetch.js';
 export * from './installer.js';
 export * from './knowledge.js';
 export * from './node-floor.js';
+export * from './planning.js';
 export * from './project.js';
 export * from './question.js';
 export * from './registry.js';
 export * from './schema-version.js';
 export * from './state.js';
 export * from './step.js';
+export * from './territory.js';
 export * from './toml.js';
 export * from './usage.js';

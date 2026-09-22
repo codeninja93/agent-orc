@@ -38,6 +38,8 @@
  *   unparsed, plus the one question AD-16's precedence needs of them: do they speak to this anchor;
  * - `profile` — AD-16's profile loader: mechanics from the profile, conventions from the repository, and
  *   a knowledge entry the repository speaks to flagged stale rather than applied;
+ * - `agents` — AD-17's grant, resolved from the run's snapshot: the one place that answers "what is this
+ *   phase granted", so no caller invents a default and no `phase → tools` table exists to hold;
  * - `roster` — AD-17's discovery by directory read. The engine holds no compiled-in roster, and nothing
  *   under `src/engine/` may import the installer's `BUILT_IN_AGENTS`, which a recursive import guard in
  *   `tests/engine.roster.test.ts` asserts;
@@ -80,5 +82,6 @@ export * from './handoff.js';
 export * from './conventions.js';
 export * from './profile.js';
 export * from './roster.js';
+export * from './agents.js';
 export * from './config-snapshot.js';
 export * from './reconciler.js';

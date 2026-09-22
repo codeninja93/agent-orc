@@ -52,6 +52,8 @@ import type {
 import type { Recorder } from '../src/runtime/index.js';
 import type { SpawnPlan, SpawnWrapper, StepSpawnerOptions } from '../src/engine/index.js';
 
+import { fixtureGrant } from './helpers/agent-grant.js';
+
 const RUN = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 /**
  * A real temp `ORCH_HOME`, not a literal path.
@@ -82,6 +84,9 @@ const plan = (overrides: Partial<SpawnPlan> = {}): SpawnPlan => ({
   node: { path: '/usr/local/bin/node', version: '24.21.0', source: 'path' },
   step: 'implement',
   run: RUN,
+  // Story 2-4: every plan carries the AD-17 grant its `--tools` was built from. The wrapper contains the
+  // commands the agent runs and never rewrites the grant, which is what the assertions here rely on.
+  grant: fixtureGrant(),
   ...overrides,
 });
 

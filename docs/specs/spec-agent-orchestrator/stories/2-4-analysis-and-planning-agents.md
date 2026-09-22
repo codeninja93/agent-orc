@@ -2,9 +2,9 @@
 title: 'Step agents — analysis and planning'
 type: 'feature'
 created: '2026-09-22'
-status: 'drafted'
+status: 'done'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 baseline_revision: '795b4c4'
 context:
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
@@ -12,7 +12,65 @@ context:
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-003-built-in-agent-tool-grants.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/architecture.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/stories/2-3-profile-loader-and-roster.md'
-deferred: []
+deferred:
+- summary: No review layer ran against this story.
+  evidence: 'The gate, the implementer''s six mutations, and my own independent verification are the only
+    scrutiny. I re-ran the gate myself (exit 0, 1980/72, zero skips), planted a hardcoded grant table in a
+    nested subdirectory of `src/engine/` and confirmed the new shape guard catches it while story 2-3''s
+    roster guard passes clean, and probed the per-claim provenance and territory-containment refinements
+    against the recorded fixture with a positive control first. Read `status: done` as implemented and
+    gated, not reviewed.'
+  severity: high
+- summary: 'Nothing is wired into the reconciler: the two agents exist but no plan runs them.'
+  evidence: |-
+    `recordTerritoryRedeclaration` is exported from `src/engine/territory.ts` and tested against a real
+    Recorder and a real event log, but the reconciler does not call it, and no `FeaturePlan` yet contains
+    an `analysis` or `planning` step. So the contracts, the grant resolution and the argv are all real and
+    exercised, while the end-to-end path from "a feature is accepted" to "analysis runs and re-declares the
+    territory" does not exist. Wiring the phase sequence into the 3541-line reconciler was outside this
+    story's Code Map. This is the largest gap in the story and the first thing a later story must close.
+  location: src/engine/reconciler.ts
+  severity: high
+- summary: 'How the matrix-11 divergence from ADR-003 is reported is a proxy, not a comparison.'
+  evidence: |-
+    Matrix row 11 says the roster wins and the divergence from ADR-003 is reported. The engine cannot
+    literally compare a grant against ADR-003''s table, because holding that table is what AD-17 forbids
+    and what the whole grant-from-the-roster design exists to prevent. What is reported instead is a
+    property of the grant itself: `elevated` names every granted tool outside `READ_ONLY_TOOLS`
+    (Read/Grep/Glob), carried verbatim onto the `agent.spawned` event. For an agent ADR-003 grants read
+    tools, a non-empty `elevated` is the divergence — but it is a proxy for the comparison, not the
+    comparison. A literal ADR-003 check needs a decision about where that table may live, since it cannot
+    be in `src/engine/`.
+  location: src/engine/agents.ts
+  severity: medium
+- summary: 'The path vocabulary moved to `src/contracts/territory.ts`, which is not in the Code Map.'
+  evidence: |-
+    Matrix row 18 requires a claim''s path to lie inside the territory the same output declares — a
+    property of one artifact, so it belongs in the Zod refinement. But `src/contracts/` may import from no
+    other `src/` directory (asserted by `contracts.subset-guard.test.ts`), so a contract cannot reach
+    `src/engine/territory.ts`. The two alternatives were worse: a second implementation of path
+    containment (two spellings comparing unequal would report an overlap as disjoint), or contracts
+    importing the engine. So `normaliseTerritoryPath`, `normaliseTerritory`, `pathContains` and
+    `pathsCollide` moved and the engine module re-exports them. Verified: the test asserts
+    `expect(normaliseTerritory).toBe(normaliseTerritoryFromContracts)` — identity, not equivalence, so two
+    implementations that happen to agree cannot creep back.
+  location: src/contracts/territory.ts
+  severity: low
+- summary: 'An empty tool grant is passed through as `--tools ""` rather than refused.'
+  evidence: 'A declaration carrying `tools = []` produces `--tools ""`, which the CLI documents as
+    disabling all tools. Refusing it would be the engine overruling a declaration AD-17 makes
+    authoritative, and the grant''s summary says "no tools at all" so it is visible rather than silent.
+    Reversible if the spec would rather a roster entry granting nothing were a refusal at spawn.'
+  location: src/engine/agents.ts
+  severity: low
+- summary: 'Four optional payload keys were added to `src/contracts/event.ts` for the re-declaration.'
+  evidence: '`previous_paths`, `added_paths`, `removed_paths` and `widened`. The payload schema is
+    `z.looseObject`, so extra keys would have survived without declaring them — but that file''s docblock
+    requires payload keys be spelled once, beside the schemas that admit them, so emitter and readers share
+    one string. All four are optional, so a first declaration parses exactly as before, and AD-5 makes the
+    addition non-breaking.'
+  location: src/contracts/event.ts
+  severity: low
 ---
 
 # Story 2-4 — Step agents: analysis and planning
@@ -174,4 +232,64 @@ the engine, not by the agent.
 
 ## Verification
 
+Run by me, with the suite's own exit status captured to a variable and the output kept in a file:
+`npm run typecheck && npm run lint && npm run build && npm test` — **exit 0, 1980 tests across 72 files, zero
+failures, zero skips.** Baseline `795b4c4` was 1888 across 67. Node pinned to v24.21.0.
+
+Six mutations by the implementer, each applied to a backup-and-restore copy and reverted, with
+`grep -rn MUTATION src tests` empty afterwards:
+
+| Mutation | Caught by |
+|---|---|
+| `--tools` dropped from the built argv | 52 tests across 3 files, and the runtime guard fired on every real spawn: `the argv that would be executed is missing the AD-1 flags --tools` |
+| `--tools` removed from `AD1_REQUIRED_FLAGS` | 7 tests, including one reproducing the old four-flag list answering "complete" on an ungranted argv |
+| The roster lookup replaced by a hardcoded `PHASE_TOOLS` table | 5 tests — and `tests/engine.roster.test.ts` passed clean throughout |
+| A phase with no roster entry falling back to a default grant | 3 tests, all matrix 10 |
+| An unattributed claim accepted because the flat `provenance` array is non-empty | 3 tests, including one pinning that anti-pattern by name |
+| A re-declaration applied with nothing recorded, and with no widening trace | 5 tests, then 2 more |
+
+**Verified by me directly, not taken on report.** I planted a grant table named `PHASE_CAPABILITIES` in a new
+`src/engine/nested/` subdirectory: the new shape guard named all three rows and failed, while story 2-3's
+roster guard **passed clean** — confirming that guard matches import specifiers and two literal symbols and
+would have walked past a fresh hardcoded table. Then, with the recorded fixture parsing as a positive control:
+stripping one claim's provenance is refused while the flat array is still non-empty, and the error path names
+`claims[1].provenance`; an empty per-claim array is refused; and a claim path outside the declared territory is
+refused. `AD1_REQUIRED_FLAGS` now carries all six flags, and `StepArgvOptions.tools` is required, so an argv
+built with no grant is a compile error rather than a runtime omission.
+
 ## Auto Run Result
+
+**Status: done.** The first two roster agents exist as the pure functions `architecture.md` specifies, their
+output contracts are registered, and ADR-001's `--tools` and `--add-dir` are wired from the roster 2-3
+discovers.
+
+**Landmine A reproduced exactly as the spec predicted.** `AD1_REQUIRED_FLAGS` held four flags, two of which
+were neither of ADR-001's missing two, and `grep` for `--tools` and `--add-dir` across `src/` returned
+nothing — so `missingRequiredFlags` reported that AD-1's contract held while the per-agent grant was
+unenforced. The suite now keeps a test reproducing that old list answering "complete" on an ungranted argv, so
+the completeness assertion has something concrete to be about.
+
+**Landmine B was proven by test rather than argued, and I confirmed it independently.** A hardcoded grant
+table passes story 2-3's guard and fails the new one, in three forms — object literal, `Map`, `switch` — in a
+nested subdirectory. My own planted table confirmed both halves.
+
+**Landmine G reproduced in shipped code.** `src/tui/projection.ts`'s `stepPhase` read
+`value === 'implementation' || value === 'verification'` — a literal pair rather than the enum — so widening
+`STEP_PHASES` would have left every `analysis` and `planning` step rendering with no phase, and no test would
+have failed, because the two literals it named still worked. Now driven from `STEP_PHASES`, matching
+`featureState` three lines above it. No existing test was weakened.
+
+**The two recorded fixtures are real `claude -p` output**, captured against this repository per
+`contracts.round-trip.test.ts`'s prescription, not synthesised. Incidentally this established that CLI 2.1.278
+accepts the draft-7 `const` that `z.literal()` emits, which is what makes `contract_id` a refusal for every
+reader of the artifact rather than only inside the spawner's one comparison.
+
+**Follow-up review recommended: true.** No review layer has run. The specific unverified risk is the largest
+gap in the story: the reconciler calls none of this. `recordTerritoryRedeclaration` is exported and tested
+against a real event log, but no `FeaturePlan` contains an `analysis` or `planning` step, so the path from "a
+feature is accepted" to "analysis runs and re-declares the territory" does not exist end to end.
+
+**Residual risks.** Six deferred entries, two of them `high`: that nothing is wired into the reconciler, and
+that no review layer ran. The matrix-11 divergence report is a proxy — `elevated` names granted tools outside
+the read-only set — rather than a literal comparison against ADR-003, because holding that table in the engine
+is what AD-17 forbids.

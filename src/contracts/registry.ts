@@ -10,6 +10,7 @@
  */
 import { z } from 'zod';
 
+import { ANALYSIS_CONTRACT_ID, AnalysisOutputSchema } from './analysis.js';
 import { CommandIntentSchema } from './command.js';
 import { EventEnvelopeSchema } from './event.js';
 import { OrchErrorSchema } from './error.js';
@@ -20,6 +21,7 @@ import {
   PermissionsSchema,
   ProfileSchema,
 } from './installer.js';
+import { PLANNING_CONTRACT_ID, PlanningOutputSchema } from './planning.js';
 import { ProjectRegistrationSchema } from './project.js';
 import { QuestionStateSchema } from './question.js';
 import { RunStateSchema } from './state.js';
@@ -155,6 +157,33 @@ export const CONTRACTS = {
     description: 'The typed output a step agent produces, passed to claude -p --json-schema.',
     model_produced: true,
     schema: StepOutputSchema,
+  },
+  /**
+   * The two phase-specific output contracts of story 2-4.
+   *
+   * Registered rather than reusing `step.output` because AD-17 has a roster entry reference a contract by
+   * *id*: two agents sharing one id cannot be told apart by anything the engine reads, and the shapes
+   * genuinely differ — claims with per-claim provenance on one, an ordered plan on the other. Both are
+   * `model_produced`, so AD-31 requires each a recorded real `structured_output` fixture, and both stay
+   * inside the AD-2 structured-outputs subset.
+   */
+  [ANALYSIS_CONTRACT_ID]: {
+    id: ANALYSIS_CONTRACT_ID,
+    kind: 'step',
+    description:
+      'The analysis agent\'s output: claims carrying per-claim provenance, the territory the feature ' +
+      'touches, and the files that were read (architecture.md Agent contract, ADR-003).',
+    model_produced: true,
+    schema: AnalysisOutputSchema,
+  },
+  [PLANNING_CONTRACT_ID]: {
+    id: PLANNING_CONTRACT_ID,
+    kind: 'step',
+    description:
+      'The planning agent\'s output: the ordered steps, each carrying its provenance and the paths it ' +
+      'expects to touch, inside the declared territory.',
+    model_produced: true,
+    schema: PlanningOutputSchema,
   },
 } as const satisfies Readonly<Record<string, ContractEntry>>;
 

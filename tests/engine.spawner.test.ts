@@ -43,12 +43,15 @@ import {
   STREAM_OUTPUT_FORMAT,
 } from '../src/engine/index.js';
 import type {
+  AgentGrant,
   ChildNode,
   ClaudeCli,
   SpawnPlan,
   StepSpawner,
   StepStartRequest,
 } from '../src/engine/index.js';
+
+import { fixtureGrant } from './helpers/agent-grant.js';
 
 const FAKE_CLI_PATH = fileURLToPath(new URL('./helpers/fake-claude.ts', import.meta.url));
 const FIXTURES = fileURLToPath(new URL('./fixtures/stream-json/', import.meta.url));
@@ -110,6 +113,15 @@ const open = (
     readonly attemptTimeoutMs?: number;
     readonly killGraceMs?: number;
     readonly refusalFixture?: string;
+    /**
+     * The AD-17 grant `--tools` is built from.
+     *
+     * Injected rather than resolved from a snapshot: this suite's subject is the process, and the
+     * resolution from `.orch/agents/` through the AD-9 snapshot is `tests/engine.agents.test.ts`'s. There
+     * is no default *inside* the spawner — `grantFor` has no fallback — so something has to supply one
+     * here, which is the point of making it a required argument.
+     */
+    readonly grant?: AgentGrant;
   } = {},
 ): Harness => {
   const home = mkdtempSync(join(tmpdir(), 'orch-spawner-home-'));
@@ -150,11 +162,13 @@ const open = (
     return { path: shim, version: '2.1.278', auth: 'subscription', interpreter: 'direct' };
   };
 
+  const grant = options.grant ?? fixtureGrant();
   const spawner = createStepSpawner({
     recorderFor: () => recorder,
     cli: options.cli ?? (options.direct === true ? directShim() : fakeCli),
     node: childNode,
     env,
+    grantFor: () => grant,
     ...(options.mcpConfigs === undefined ? {} : { mcpConfigs: options.mcpConfigs }),
     ...(options.wrap === undefined ? {} : { wrap: options.wrap }),
     ...(options.attemptTimeoutMs === undefined ? {} : { attemptTimeoutMs: options.attemptTimeoutMs }),
@@ -220,6 +234,16 @@ afterEach(() => {
   while (harnesses.length > 0) harnesses.pop()?.close();
 });
 
+/**
+ * The two arguments story 2-4 made required on `buildStepArgv`.
+ *
+ * They have no defaults in the function, so every call names them: an argv built with no grant is a
+ * compile error rather than a spawn that quietly passed none. Spelled as literals here, and the
+ * assertions below compare the argv to literals too, so no case compares a value to itself.
+ */
+const GRANTED_TOOLS = 'Read,Grep,Glob';
+const ADD_DIR = '/tmp/orch-spawner-argv-worktree';
+
 describe('the AD-1 argv', () => {
   it('carries every required flag, and the suite knows which they are', () => {
     expect([...AD1_REQUIRED_FLAGS]).toStrictEqual([
@@ -227,11 +251,18 @@ describe('the AD-1 argv', () => {
       '--output-format',
       '--strict-mcp-config',
       '--restricted',
+      // ADR-001's last two, absent from this list until story 2-4 — which is why
+      // `missingRequiredFlags` reported that the contract held while the grant was never passed.
+      // `tests/engine.spawner.tools.test.ts` asserts the list against ADR-001's enumeration itself.
+      '--add-dir',
+      '--tools',
     ]);
     const argv = buildStepArgv({
       schema: exportContract('step.output'),
       prompt: 'do the thing',
       model: 'claude-haiku-4-5',
+      tools: GRANTED_TOOLS,
+      addDir: ADD_DIR,
     });
     expect(missingRequiredFlags(argv)).toStrictEqual([]);
     // The guard itself has to be able to fail, or it proves nothing about the argv it passes.
@@ -245,6 +276,8 @@ describe('the AD-1 argv', () => {
       schema: exportContract('step.output'),
       prompt: 'p',
       model: 'claude-sonnet-5',
+      tools: GRANTED_TOOLS,
+      addDir: ADD_DIR,
     });
     const schemaArg = argv[argv.indexOf('--json-schema') + 1] ?? '';
     expect(JSON.parse(schemaArg)).toStrictEqual(exportContract('step.output'));
@@ -255,14 +288,24 @@ describe('the AD-1 argv', () => {
   });
 
   it('passes --strict-mcp-config with no servers, and --mcp-config only when there are some', () => {
-    const none = buildStepArgv({ schema: {}, prompt: 'p', model: 'claude-haiku-4-5' });
+    const none = buildStepArgv({
+      schema: {},
+      prompt: 'p',
+      model: 'claude-haiku-4-5',
+      tools: GRANTED_TOOLS,
+      addDir: ADD_DIR,
+    });
     expect(none).toContain('--strict-mcp-config');
+    // Still an absence worth asserting, and still about MCP: `--mcp-config` is a different flag from the
+    // two story 2-4 added, and neither of those can make this pass for a new reason.
     expect(none).not.toContain('--mcp-config');
 
     const some = buildStepArgv({
       schema: {},
       prompt: 'p',
       model: 'claude-haiku-4-5',
+      tools: GRANTED_TOOLS,
+      addDir: ADD_DIR,
       mcpConfigs: ['/a.json', '/b.json'],
     });
     expect(some).toContain('--mcp-config');
@@ -271,12 +314,20 @@ describe('the AD-1 argv', () => {
 
   it('adds --resume only for a resume, and only the recorded id', () => {
     expect(
-      buildStepArgv({ schema: {}, prompt: 'p', model: 'claude-haiku-4-5' }),
+      buildStepArgv({
+        schema: {},
+        prompt: 'p',
+        model: 'claude-haiku-4-5',
+        tools: GRANTED_TOOLS,
+        addDir: ADD_DIR,
+      }),
     ).not.toContain('--resume');
     const resumed = buildStepArgv({
       schema: {},
       prompt: 'p',
       model: 'claude-haiku-4-5',
+      tools: GRANTED_TOOLS,
+      addDir: ADD_DIR,
       resumeSessionId: REAL_SESSION_ID,
     });
     expect(resumed[resumed.indexOf('--resume') + 1]).toBe(REAL_SESSION_ID);
@@ -299,6 +350,10 @@ describe('the AD-1 argv', () => {
     const argv = harness.argvSeenByChild();
     for (const flag of AD1_REQUIRED_FLAGS) expect(argv).toContain(flag);
     expect(argv[argv.indexOf('--output-format') + 1]).toBe(STREAM_OUTPUT_FORMAT);
+    // ADR-001's two, read back from the child rather than from the plan: `--add-dir` is the run worktree
+    // and `--tools` is the grant, both as the process actually received them.
+    expect(argv[argv.indexOf('--add-dir') + 1]).toBe(harness.worktree);
+    expect(argv[argv.indexOf('--tools') + 1]).toBe('Read,Write,Edit,Grep,Glob,Bash');
     expect(JSON.parse(argv[argv.indexOf('--json-schema') + 1] ?? '')).toStrictEqual(
       exportContract('step.output'),
     );
@@ -854,6 +909,10 @@ describe('the direct interpreter, which is the branch a real install takes', () 
     const argv = harness.argvSeenByChild();
     for (const flag of AD1_REQUIRED_FLAGS) expect(argv).toContain(flag);
     expect(argv[argv.indexOf('--output-format') + 1]).toBe(STREAM_OUTPUT_FORMAT);
+    // ADR-001's two, read back from the child rather than from the plan: `--add-dir` is the run worktree
+    // and `--tools` is the grant, both as the process actually received them.
+    expect(argv[argv.indexOf('--add-dir') + 1]).toBe(harness.worktree);
+    expect(argv[argv.indexOf('--tools') + 1]).toBe('Read,Write,Edit,Grep,Glob,Bash');
     expect(JSON.parse(argv[argv.indexOf('--json-schema') + 1] ?? '')).toStrictEqual(
       exportContract('step.output'),
     );
@@ -1004,6 +1063,10 @@ describe('an output that is not about this attempt', () => {
       node: childNode,
       env: unknown.env,
       schemaFor: () => exportContract('step.output'),
+      // The grant has no default anywhere in the spawner, so a second spawner built here supplies one
+      // too; without it this case would fail for the wrong reason — a missing AD-9 snapshot rather than
+      // an unregistered contract id.
+      grantFor: () => fixtureGrant(),
     });
     const failed = await spawner.start(unknown.request({ contractId: 'step.not_registered' }));
     expect(failed.disposition).toBe('failed');

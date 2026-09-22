@@ -70,6 +70,25 @@ export const DECLARATION_PAYLOAD_KEYS = {
   CriterionText: 'text',
   /** `feature.territory_declared` — the normalised declared paths. */
   TerritoryPaths: 'paths',
+  /**
+   * `feature.territory_declared` — the territory this line replaced, and how it differs.
+   *
+   * A re-declaration is a *correction*, so `territoryFromEvents` takes the last one and the earlier paths
+   * are gone from the fold. That is right for the admission decision and wrong for a reader asking what
+   * happened: a declaration that **widens** the territory can newly overlap a feature already admitted and
+   * already writing, and admission being recomputed every pass serialises them from the next pass onward
+   * while the work already done concurrently is not undone. The architecture has no rollback for that, so
+   * the story's job is to make the widening visible rather than to invent one — these keys are that
+   * visibility. They are additive and optional, which AD-5 makes non-breaking: the first declaration of a
+   * run carries none of them and an older reader ignores them.
+   */
+  TerritoryPreviousPaths: 'previous_paths',
+  /** `feature.territory_declared` — paths this declaration claims that the previous one did not. */
+  TerritoryAddedPaths: 'added_paths',
+  /** `feature.territory_declared` — paths the previous declaration claimed and this one does not. */
+  TerritoryRemovedPaths: 'removed_paths',
+  /** `feature.territory_declared` — true when this declaration claims ground the previous did not. */
+  TerritoryWidened: 'widened',
   /** `question.asked` — each option's id, label, consequence and escape flag (Q1). */
   OfferedOptions: 'offered_options',
   /** `question.asked` — the self-contained mini-brief (Q3). */
@@ -324,6 +343,15 @@ export type SpecCriterionEditedPayload = z.infer<typeof SpecCriterionEditedPaylo
 export const FeatureTerritoryDeclaredPayloadSchema = z.looseObject({
   /** The normalised declared paths. */
   [DECLARATION_PAYLOAD_KEYS.TerritoryPaths]: z.array(z.string()),
+  /**
+   * What a *re-declaration* replaced, and how. All four are optional and absent on a first declaration:
+   * the run-creation line carries only `paths`, and a reader that ignores these still folds the territory
+   * correctly, because `paths` remains the whole of the declaration.
+   */
+  [DECLARATION_PAYLOAD_KEYS.TerritoryPreviousPaths]: z.array(z.string()).optional(),
+  [DECLARATION_PAYLOAD_KEYS.TerritoryAddedPaths]: z.array(z.string()).optional(),
+  [DECLARATION_PAYLOAD_KEYS.TerritoryRemovedPaths]: z.array(z.string()).optional(),
+  [DECLARATION_PAYLOAD_KEYS.TerritoryWidened]: z.boolean().optional(),
   ...repairedKey,
 });
 

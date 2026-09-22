@@ -1,0 +1,141 @@
+{
+  "contract_id": "step.analysis",
+  "step": "analyse-territory",
+  "status": "completed",
+  "summary": "Wiring a per-agent tool grant into the spawner is already present in the working tree: src/engine/agents.ts resolves one phase's AD-17 grant from the discovered roster (never a compiled-in table) and src/engine/spawner.ts consumes that grant per attempt to build the CLI's --tools argument, refuse the spawn when no grant exists, and record the grant verbatim on both the SpawnPlan and the agent.spawned event.",
+  "provenance": [
+    "src/engine/territory.ts",
+    "src/engine/roster.ts",
+    "src/engine/agents.ts",
+    "src/engine/spawner.ts"
+  ],
+  "decisions": [],
+  "artifacts": [],
+  "questions": [],
+  "write_intents": [],
+  "error": null,
+  "territory": [
+    "src/engine",
+    "src/contracts"
+  ],
+  "files_read": [
+    "src/engine/territory.ts",
+    "src/engine/roster.ts",
+    "src/engine/agents.ts",
+    "src/engine/spawner.ts"
+  ],
+  "claims": [
+    {
+      "claim": "src/engine/territory.ts governs a different concern than the tool-grant wiring: it decides which features may run concurrently by comparing declared file territories (admitByTerritory, TerritoryLedger, territoryFromEvents), and it explicitly re-exports the path vocabulary (normaliseTerritory, pathContains, pathsCollide) from src/contracts because a contract — step.analysis — now needs to validate a declared territory at parse time. It contains no reference to agents, tool grants, or the spawner.",
+      "paths": [
+        "src/engine/territory.ts"
+      ],
+      "provenance": {
+        "step": "analyse-territory",
+        "source": "src/engine/territory.ts"
+      }
+    },
+    {
+      "claim": "src/engine/roster.ts implements AD-17 discovery: it reads *.toml files under a configuration source's agentsDir, parses each against AgentDeclarationSchema, checks the file name against the declared id, and validates the declared contract id against the registry. It holds no compiled-in agent list — an empty or absent directory is reported as an empty roster, and a bad entry is collected as a named RosterRefusal rather than dropped or defaulted.",
+      "paths": [
+        "src/engine/roster.ts"
+      ],
+      "provenance": {
+        "step": "analyse-territory",
+        "source": "src/engine/roster.ts"
+      }
+    },
+    {
+      "claim": "roster.ts exposes rosterAgent(roster, id), a pure lookup that returns one RosterEntry (id, file path, parsed AgentDeclaration) or null, and discoverRoster(source), which produces a DiscoveredRoster of agents plus refusals. These two are the roster-side primitives the tool-grant work is built on: rosterAgent is the only way agents.ts finds a phase's declaration.",
+      "paths": [
+        "src/engine/roster.ts"
+      ],
+      "provenance": {
+        "step": "analyse-territory",
+        "source": "src/engine/roster.ts"
+      }
+    },
+    {
+      "claim": "The actual per-agent tool grant logic already lives in src/engine/agents.ts (untracked, new in this working tree), not in territory.ts or roster.ts. grantFromRoster(roster, phase) calls rosterAgent to find the phase's declaration, throws AgentGrantUnresolved (code config.invalid) when none exists, and otherwise builds an AgentGrant carrying the declared tools verbatim, the subset classified as 'elevated' (anything not in READ_ONLY_TOOLS = [Read, Grep, Glob]), the declared reversibility, and a human-readable summary.",
+      "paths": [
+        "src/engine/agents.ts"
+      ],
+      "provenance": {
+        "step": "analyse-territory",
+        "source": "src/engine/agents.ts"
+      }
+    },
+    {
+      "claim": "resolveAgentGrant(options) in agents.ts is the filesystem-touching entry point: it calls readStepConfiguration(run, ...) to load the run's AD-9 configuration snapshot (never the live .orch/ directory) and passes its roster into grantFromRoster. This is the function the spawner defaults to when no grantFor override is supplied.",
+      "paths": [
+        "src/engine/agents.ts"
+      ],
+      "provenance": {
+        "step": "analyse-territory",
+        "source": "src/engine/agents.ts"
+      }
+    },
+    {
+      "claim": "toolsArgumentFor(grant) in agents.ts formats the CLI's --tools value by joining grant.tools with commas in declared order, including the CLI's documented empty-string form for a grant of no tools — no re-sorting or correction against any other table (e.g. ADR-003) happens here.",
+      "paths": [
+        "src/engine/agents.ts"
+      ],
+      "provenance": {
+        "step": "analyse-territory",
+        "source": "src/engine/agents.ts"
+      }
+    },
+    {
+      "claim": "The spawner side of the wiring is in src/engine/spawner.ts's planFor(): for every attempt it calls grantFor(request) (defaulting to resolveAgentGrant keyed by request.run and request.phase) before building argv, then passes toolsArgumentFor(grant) into buildStepArgv's --tools option alongside --restricted and --add-dir scoped to request.worktree, per ADR001_REQUIRED_FLAGS.",
+      "paths": [
+        "src/engine/spawner.ts"
+      ],
+      "provenance": {
+        "step": "analyse-territory",
+        "source": "src/engine/spawner.ts"
+      }
+    },
+    {
+      "claim": "The resolved AgentGrant is attached to the SpawnPlan itself (SpawnPlan.grant) so that a container wrapper (AD-20) or a test can inspect what was granted independent of the argv, and so the guard in runAttempt compares flags against the vector that will actually execute rather than the one that was built.",
+      "paths": [
+        "src/engine/spawner.ts"
+      ],
+      "provenance": {
+        "step": "analyse-territory",
+        "source": "src/engine/spawner.ts"
+      }
+    },
+    {
+      "claim": "runAttempt in spawner.ts records the grant on the agent.spawned event verbatim: granted_tools, elevated_tools, agent_id, and grant_declared_at are all read off plan.grant, which is a deliberate choice to report a roster that diverges from any expected table rather than silently correct it.",
+      "paths": [
+        "src/engine/spawner.ts"
+      ],
+      "provenance": {
+        "step": "analyse-territory",
+        "source": "src/engine/spawner.ts"
+      }
+    },
+    {
+      "claim": "A phase with no roster entry is not defaulted at the spawner boundary either: AgentGrantUnresolved is listed in spawner.ts's KEEPS_ITS_OWN_CODE array so it is re-thrown with its own config.invalid code (escalate-to-human) rather than being relabelled as a retryable StepSpawnFailed, keeping the refusal-not-default rule intact end to end from roster.ts through agents.ts to spawner.ts.",
+      "paths": [
+        "src/engine/spawner.ts",
+        "src/engine/agents.ts"
+      ],
+      "provenance": {
+        "step": "analyse-territory",
+        "source": "src/engine/spawner.ts"
+      }
+    },
+    {
+      "claim": "Given the above, the remaining 'work' of wiring a per-agent tool grant into the spawner in this working tree is not building new plumbing — agents.ts and spawner.ts already implement the read-roster, resolve-grant, build---tools, record-verbatim path end to end — but is instead whatever is still needed to make that wiring provable and consistent with the rest of story 2-4: contract/schema support for GrantableTool and AgentDeclaration (in src/contracts, also modified in this working tree) and test coverage proving the shape guard (no phase→tools table anywhere under src/engine) and the refusal/elevation behavior described above.",
+      "paths": [
+        "src/engine/agents.ts",
+        "src/engine/spawner.ts"
+      ],
+      "provenance": {
+        "step": "analyse-territory",
+        "source": "src/engine/agents.ts"
+      }
+    }
+  ]
+}

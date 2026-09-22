@@ -6,11 +6,19 @@
  * decisions in here are load-bearing, and each is the thing some plausible alternative gets wrong:
  *
  * **The flag set is a declared constant, not a call-site list.** {@link AD1_REQUIRED_FLAGS} names
- * `--json-schema`, `--output-format`, `--strict-mcp-config` and `--restricted`, and the suite asserts
- * the built argv against it. A missing `--restricted` or `--strict-mcp-config` silently *widens* the
+ * `--json-schema`, `--output-format`, `--strict-mcp-config`, `--restricted`, `--add-dir` and `--tools`,
+ * and the suite asserts the built argv against it *and* the list itself against
+ * {@link ADR001_REQUIRED_FLAGS}. A missing `--restricted` or `--strict-mcp-config` silently *widens* the
  * permission surface — the target repository's own `.mcp.json` and hooks become able to introduce
  * tools and credentials — and nothing about the run looks different when it happens. That is the
- * failure mode AD-1 exists to close, so the flags are asserted rather than trusted.
+ * failure mode AD-1 exists to close, so the flags are asserted rather than trusted. The last two were
+ * absent from both the list and the argv until story 2-4, which is the worse version of the same failure:
+ * `missingRequiredFlags` reported that the contract held while the grant that bounds the agent was never
+ * passed at all.
+ *
+ * **The grant comes from the roster, never from a table here.** `--tools` carries what the run's AD-9
+ * configuration snapshot declares for the phase, resolved by `src/engine/agents.ts`; a phase with no
+ * declaration is a refused spawn, not a default grant (AD-17).
  *
  * **The session id is reported before anything else can happen to the attempt.** `onSessionId` is
  * called synchronously from the stdout handler the instant the CLI announces the id, not on
@@ -64,6 +72,8 @@ import {
   resolveChildNodeOnce,
 } from './node-path.js';
 import type { ChildNode } from './node-path.js';
+import { AgentGrantUnresolved, resolveAgentGrant, toolsArgumentFor } from './agents.js';
+import type { AgentGrant } from './agents.js';
 import { createStreamParser } from './stream.js';
 import type { ResultRecord, StreamRecord } from './stream.js';
 import { ResumeRefused, StepSpawnFailed, terminated } from './executor.js';
@@ -108,16 +118,42 @@ export const SPAWNER_EVENT_TYPES = {
 export type SpawnerEventType = (typeof SPAWNER_EVENT_TYPES)[keyof typeof SPAWNER_EVENT_TYPES];
 
 /**
+ * The four flags ADR-001's accepted decision requires on every spawn, as that decision enumerates them.
+ *
+ * Quoted so the list can be compared to the ADR rather than to itself: "`--restricted` (which ignores
+ * user, project and local settings files, confines the file tools to the working directories, refuses
+ * `bypassPermissions`, and requires approval for writes to settings, git and tool-configuration files),
+ * plus `--strict-mcp-config`, plus `--add-dir` scoped to the run worktree, plus `--tools` naming exactly
+ * what that agent is granted."
+ *
+ * Two of the four were missing from {@link AD1_REQUIRED_FLAGS} until story 2-4, and neither `--add-dir`
+ * nor `--tools` appeared anywhere in `src/` — so `missingRequiredFlags` returned empty, reporting that the
+ * contract held, while the grant was unenforced. A required-flag list that omits a required flag is a
+ * guard that reads as coverage while covering less, which is why this is a separate constant the suite
+ * compares the list against: the assertion is about the *enumeration*, not about one argv.
+ */
+export const ADR001_REQUIRED_FLAGS = [
+  '--restricted',
+  '--strict-mcp-config',
+  '--add-dir',
+  '--tools',
+] as const;
+
+/**
  * The AD-1 flags every spawn carries, asserted by the suite rather than trusted to a call site.
  *
  * `--output-format` is named without its value because the assertion is about presence; the value is
- * asserted separately, as `stream-json` and nothing else.
+ * asserted separately, as `stream-json` and nothing else. `--json-schema` and `--output-format` are AD-1's
+ * own; the other four are {@link ADR001_REQUIRED_FLAGS}, and the suite asserts this list contains every
+ * one of them.
  */
 export const AD1_REQUIRED_FLAGS = [
   '--json-schema',
   '--output-format',
   '--strict-mcp-config',
   '--restricted',
+  '--add-dir',
+  '--tools',
 ] as const;
 
 /** The one accepted `--output-format`. The parser in `stream.ts` reads this and only this. */
@@ -203,6 +239,15 @@ export interface SpawnPlan {
   /** The step this plan belongs to, so a wrapper can name the worktree it mounts. */
   readonly step: string;
   readonly run: string;
+  /**
+   * The AD-17 grant this argv's `--tools` was built from, and the declaration it came from.
+   *
+   * On the plan so the log can record what was *granted* beside what was *passed*, and so the AD-20
+   * wrapper can see the grant it is containing the commands of. A wrapper that rebuilds `args` cannot
+   * change this, which is the point: the guard compares the vector that will run against the flags, and
+   * this says where the grant in it was declared.
+   */
+  readonly grant: AgentGrant;
 }
 
 /**
@@ -229,6 +274,17 @@ export interface StepSpawnerOptions {
   readonly env?: NodeJS.ProcessEnv;
   /** The prompt a step is given. Overridable so a suite can assert argv without asserting prose. */
   readonly promptFor?: (request: StepStartRequest) => string;
+  /**
+   * The AD-17 grant `--tools` is built from. Defaults to reading the run's AD-9 configuration snapshot.
+   *
+   * Injectable for the same reason `cli` and `node` are — a suite must be able to drive a grant without a
+   * snapshot on disk — and *not* defaultable to anything but a roster read: `src/engine/agents.ts` holds
+   * the refusal for a phase nothing declares, and a caller that supplied a constant here would be taking
+   * the security decision ADR-001 made load-bearing. There is no option that means "use a default grant".
+   */
+  readonly grantFor?: (request: StepStartRequest) => AgentGrant;
+  /** `ORCH_HOME`, for the default grant resolution. Defaults to the AD-9 resolution. */
+  readonly orchHome?: string;
   /** The draft-7 export for a contract id. Defaults to the AD-2 registry export. */
   readonly schemaFor?: (contractId: string) => JsonSchema;
   /** The wall-clock bound on one attempt. Defaults to {@link DEFAULT_ATTEMPT_TIMEOUT_MS}. */
@@ -265,13 +321,19 @@ export interface StepSpawner extends StepExecutor {
  * exactly that file (AD-23), and a re-run must read the same bytes (CAP-6). It carries no timestamp
  * and no attempt number, so two attempts at one step are byte-identical invocations — which is what
  * makes a re-run a re-run rather than a different request.
+ *
+ * It points the agent at `request` and says the word verbatim, because architecture.md's re-grounding rule
+ * is a rule about what the *agent* reads: "Every agent reads the original, verbatim feature request — never
+ * a summary of a summary." The input carries no summary field for it to read instead, and the prompt does
+ * not invite one.
  */
 export const defaultPromptFor = (request: StepStartRequest): string =>
   [
     `You are running step "${request.step}" (${request.phase}) of feature "${request.feature}".`,
     `Read the typed step input file at ${request.inputPath}. It is the complete statement of this`,
-    'step: the original request, the acceptance criteria, the decisions already taken and pointers to',
-    'the evidence you may read. Work only inside the current working directory.',
+    'step: its `request` field carries the user\u2019s original words verbatim and is what you ground your',
+    'work on — never a summary of them — alongside the acceptance criteria, the decisions already taken',
+    'and pointers to the evidence you may read. Work only inside the current working directory.',
     `Finish by producing the structured output required by the "${request.contractId}" contract, with`,
     `its \`step\` field set to "${request.step}". Report status "blocked" rather than guessing if the`,
     'input does not determine what to do.',
@@ -282,17 +344,41 @@ export interface StepArgvOptions {
   readonly schema: JsonSchema;
   readonly prompt: string;
   readonly model: ModelRung;
+  /**
+   * The `--tools` value: exactly what this agent's AD-17 declaration grants, comma-separated.
+   *
+   * Required rather than optional, and a string rather than a list of names, for two different reasons.
+   * Required, because an optional grant has a default, and the default would be *the* security decision —
+   * taken by this function, which has never read a roster. A string, because the value is composed by
+   * `toolsArgumentFor` in `src/engine/agents.ts` from the declaration: if this took tool *names* it would
+   * be a second place that knows what a tool name is, and the empty grant the CLI spells `""` would have
+   * two spellings.
+   */
+  readonly tools: string;
+  /**
+   * The directory `--add-dir` admits: the run worktree, and nothing above it.
+   *
+   * ADR-001 moved the containment boundary off the agent process, so `--restricted` plus this flag is the
+   * whole of what bounds the agent's file tools. A missing `--add-dir` under `--restricted` confines those
+   * tools to the working directory only, which happens to be the same worktree — so the omission is
+   * invisible until a wrapper changes `cwd`, and then it is a silent widening.
+   */
+  readonly addDir: string;
   readonly mcpConfigs?: readonly string[];
   /** Present only for a resume, and only ever the recorded session id (AD-8). */
   readonly resumeSessionId?: string | null;
 }
 
 /**
- * The AD-1 argv.
+ * The AD-1 argv, as amended by ADR-001.
  *
  * `--verbose` is here because the CLI requires it alongside `--print --output-format stream-json`; it
  * is a precondition of the stream this story parses, not a diagnostic choice, and no unit writes
  * diagnostics to stdout regardless.
+ *
+ * `--tools` and `--add-dir` are parameters with no defaults, so there is no argv this function can build
+ * that omits either one: ADR-001 requires both on every spawn, and `--tools` under `--restricted` is what
+ * decides whether the agent has any code-running tool at all.
  *
  * `--mcp-config` is passed only when servers were supplied. `--strict-mcp-config` is passed either
  * way, and that asymmetry is the point: with no servers supplied, strict mode means *no* MCP server
@@ -310,6 +396,12 @@ export const buildStepArgv = (options: StepArgvOptions): readonly string[] => {
     JSON.stringify(options.schema),
     '--strict-mcp-config',
     '--restricted',
+    // ADR-001: the two flags that bound a host-side agent. `--tools` carries the AD-17 grant verbatim,
+    // including the CLI's own empty value for an agent a roster grants nothing.
+    '--add-dir',
+    options.addDir,
+    '--tools',
+    options.tools,
     '--model',
     options.model,
   ];
@@ -343,6 +435,9 @@ const KEEPS_ITS_OWN_CODE = [
   ApiKeyModeRefusedError,
   ClaudeCliVersionError,
   ChildNodeUnavailableError,
+  // A phase nothing declares is `config.invalid` → `escalate-to-human`: no model rung and no retry fixes a
+  // roster, and relabelling it `retryable` would have the loop re-spawning a step that cannot be built.
+  AgentGrantUnresolved,
 ] as const;
 
 /**
@@ -469,6 +564,14 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
       resolveChildNodeOnce({ ...(options.env === undefined ? {} : { env: options.env }) }),
     );
   const schemaFor = options.schemaFor ?? ((contractId: string): JsonSchema => exportContract(contractId));
+  const grantFor =
+    options.grantFor ??
+    ((request: StepStartRequest): AgentGrant =>
+      resolveAgentGrant({
+        run: request.run,
+        phase: request.phase,
+        ...(options.orchHome === undefined ? {} : { orchHome: options.orchHome }),
+      }));
   const promptFor = options.promptFor ?? defaultPromptFor;
 
   /**
@@ -567,10 +670,23 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
     const resolvedCli = cli();
     assertCliPresent(resolvedCli);
     const resolvedNode = node();
+    /**
+     * The AD-17 grant, resolved before the argv exists.
+     *
+     * It is resolved per attempt rather than memoised like the CLI and the Node: those are facts about the
+     * machine, and this is a fact about one run's configuration snapshot, which is a different snapshot per
+     * run. A refusal here is a refused spawn — see the `catch` in `runAttempt` for why it keeps its own
+     * AD-35 code rather than being relabelled retryable.
+     */
+    const grant = grantFor(request);
     const cliArgs = buildStepArgv({
       schema: schemaFor(request.contractId),
       prompt: promptFor(request),
       model: request.modelTier,
+      tools: toolsArgumentFor(grant),
+      // ADR-001: scoped to the run worktree, which is also the cwd — the flag is what keeps that true
+      // after a wrapper has had the plan.
+      addDir: request.worktree,
       ...(options.mcpConfigs === undefined ? {} : { mcpConfigs: options.mcpConfigs }),
       resumeSessionId,
     });
@@ -582,6 +698,7 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
     // child is a Node script.
     const underNode = resolvedCli.interpreter === 'node';
     const base: SpawnPlan = {
+      grant,
       command: underNode ? resolvedNode.path : resolvedCli.path,
       args: underNode ? [resolvedCli.path, ...cliArgs] : [...cliArgs],
       cwd: request.worktree,
@@ -660,6 +777,18 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
         phase: request.phase,
         contract_id: request.contractId,
         output_format: STREAM_OUTPUT_FORMAT,
+        /**
+         * What the roster granted, recorded verbatim beside where it was declared.
+         *
+         * The roster is authoritative (AD-17), so a grant that diverges from ADR-003's table is passed and
+         * *reported* rather than corrected — a corrected grant would make the declaration a lie and hide a
+         * misconfiguration. `elevated_tools` is the part a reviewer acts on: it names every granted tool
+         * that can change something, which for an agent ADR-003 grants read tools is the divergence itself.
+         */
+        granted_tools: [...plan.grant.tools],
+        elevated_tools: [...plan.grant.elevated],
+        agent_id: plan.grant.agentId,
+        grant_declared_at: plan.grant.declaredAt,
         // The flags observed on the executed vector, not the constant that was required: a log that
         // records the requirement rather than the fact cannot be used to audit what actually ran.
         flags: observedFlags,

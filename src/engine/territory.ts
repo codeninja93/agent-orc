@@ -21,51 +21,36 @@
  * or it would hold its territory for as long as it waits and every overlapping feature would be deferred
  * behind it indefinitely. `Reconciler.pass` filters those out before calling in.
  */
-import { posix, sep } from 'node:path';
-
 import {
   DECLARATION_PAYLOAD_KEYS,
   FEATURE_TERRITORY_DECLARED_EVENT_TYPE,
   FeatureTerritoryDeclaredPayloadSchema,
+  normaliseTerritory,
+  normaliseTerritoryPath,
+  pathContains,
+  pathsCollide,
 } from '../contracts/index.js';
 import type { EventEnvelope } from '../contracts/index.js';
 import { REDACTION_MARKER } from '../runtime/index.js';
+import type { Recorder } from '../runtime/index.js';
 
+import { ENGINE_EMITTER } from './rebuild.js';
 import { compareUlid } from './ulid.js';
 
 /**
- * Normalise a declared territory entry to a comparable path.
+ * The path vocabulary, re-exported from where it now lives.
  *
- * Territories are declared by a person or by a profile, so they arrive spelled loosely: a backslash
- * separator on one machine, a trailing slash on a directory, a leading `./`. Two spellings of one path
- * that compared unequal would report an overlap as disjoint, which is the failure direction that
- * actually corrupts a worktree.
+ * It moved to `src/contracts/territory.ts` in story 2-4 because `step.analysis` declares a territory and
+ * refuses a claim outside it, which is a parse-time property of one artifact — and a contract cannot
+ * import the engine. Re-exported rather than wrapped so every existing caller keeps one name for one
+ * implementation; a second normaliser is the defect that reports an overlap as disjoint.
  */
-export const normaliseTerritoryPath = (declared: string): string => {
-  const slashed = declared.split(sep).join('/').split('\\').join('/');
-  const normalised = posix.normalize(slashed.trim());
-  const withoutLeadingDot = normalised.startsWith('./') ? normalised.slice(2) : normalised;
-  const trimmed = withoutLeadingDot.replace(/\/+$/, '');
-  return trimmed === '' || trimmed === '.' ? '.' : trimmed;
-};
-
-/** A declared territory: normalised, de-duplicated, and in a stable order. */
-export const normaliseTerritory = (declared: readonly string[]): readonly string[] =>
-  [...new Set(declared.map(normaliseTerritoryPath))].sort();
-
-/**
- * True when one path contains or equals the other.
- *
- * Compared segment by segment, not by string prefix: `src/engine` must not be read as containing
- * `src/engine-notes.ts`, which a `startsWith` would claim. A territory of `.` is the whole repository
- * and therefore contains everything.
- */
-export const pathsCollide = (a: string, b: string): boolean => {
-  if (a === b) return true;
-  if (a === '.' || b === '.') return true;
-  const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a];
-  return longer.startsWith(`${shorter}/`);
-};
+export {
+  normaliseTerritory,
+  normaliseTerritoryPath,
+  pathContains,
+  pathsCollide,
+} from '../contracts/index.js';
 
 /** True when two declared territories share any file, so the two features must be serialised. */
 export const territoriesOverlap = (a: readonly string[], b: readonly string[]): boolean => {
@@ -357,3 +342,141 @@ export const replayedOverlap = (
   left: ReplayedTerritory,
   right: ReplayedTerritory,
 ): readonly string[] => overlappingPaths(admissionTerritoryOf(left), admissionTerritoryOf(right));
+
+// -------------------------------------------------------------------------------------------------
+// Re-declaring a territory, which analysis is the first unit in a position to do
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * How a re-declaration differs from the territory it replaces.
+ *
+ * `acceptFeature` emits the first `feature.territory_declared` from the caller's plan, before any step has
+ * read the repository. Analysis is what actually knows which files a feature touches, so its output
+ * corrects that declaration — and `territoryFromEvents` already takes the last line as the correction,
+ * which is the designed behaviour and not a special case.
+ *
+ * **Widening is the hazard, and it is recorded rather than prevented.** A re-declaration that claims ground
+ * the previous one did not can newly overlap a feature that is already admitted and already writing.
+ * Admission is recomputed from the declared territories on every pass, so the *next* pass serialises them;
+ * the work already done concurrently is not undone, and the architecture has no mechanism that could undo
+ * it — there is no territory lock to revoke and no transaction to roll back. Inventing one here would be a
+ * second authority for a fact the declarations determine, which AD-4 forbids. So what this produces is the
+ * evidence: what was held, what is claimed, what was added, and a flag a reader can act on.
+ */
+export interface TerritoryRedeclaration {
+  /** The territory this declaration replaces, normalised. Empty when nothing was declared before. */
+  readonly previous: readonly string[];
+  /** The territory now declared, normalised. */
+  readonly declared: readonly string[];
+  /**
+   * Paths the new declaration claims that no entry of the previous one contained.
+   *
+   * Containment rather than set difference: a previous territory of `src` already covers a new
+   * `src/engine/lock.ts`, so narrowing a claim to a file inside it adds nothing and must not be reported as
+   * widening. That is the direction that matters — a spurious widening flag would have a reader looking for
+   * an overlap that cannot exist.
+   */
+  readonly added: readonly string[];
+  /** Paths the previous declaration claimed that no entry of the new one contains. */
+  readonly removed: readonly string[];
+  /** True when anything was added: the case a concurrent feature may already have been writing in. */
+  readonly widened: boolean;
+  /** True when anything was dropped. Both can be true at once: a territory can move. */
+  readonly narrowed: boolean;
+  readonly summary: string;
+}
+
+/** Compare a new declaration against the one it replaces. Pure; the recording is separate. */
+export const territoryRedeclaration = (
+  previous: readonly string[],
+  declared: readonly string[],
+): TerritoryRedeclaration => {
+  const held = normaliseTerritory(previous);
+  const now = normaliseTerritory(declared);
+  const added = now.filter((path) => !held.some((entry) => pathContains(entry, path)));
+  const removed = held.filter((path) => !now.some((entry) => pathContains(entry, path)));
+  const widened = added.length > 0;
+  const narrowed = removed.length > 0;
+  const parts = [
+    `Territory re-declared as ${now.join(', ')}`,
+    held.length === 0 ? 'where nothing was declared before' : `replacing ${held.join(', ')}`,
+  ];
+  if (widened) {
+    parts.push(
+      `It widens the territory by ${added.join(', ')}, which may already overlap a feature that is ` +
+        'admitted and writing: the next admission pass serialises them, and work already done ' +
+        'concurrently is not undone',
+    );
+  }
+  if (narrowed) parts.push(`It no longer claims ${removed.join(', ')}`);
+  return { previous: held, declared: now, added, removed, widened, narrowed, summary: `${parts.join('. ')}.` };
+};
+
+/**
+ * The payload of a re-declaration line.
+ *
+ * `paths` carries the whole of the new declaration, exactly as a first declaration's does, so
+ * {@link territoryFromEvents} needs no knowledge of this at all: the correction is read the same way
+ * whether or not the extra keys are present. Everything else is the visibility, and is additive per AD-5.
+ */
+export const territoryRedeclaredPayload = (
+  redeclaration: TerritoryRedeclaration,
+): Record<string, unknown> =>
+  FeatureTerritoryDeclaredPayloadSchema.parse({
+    [TERRITORY_PATHS_PAYLOAD_KEY]: [...redeclaration.declared],
+    [DECLARATION_PAYLOAD_KEYS.TerritoryPreviousPaths]: [...redeclaration.previous],
+    [DECLARATION_PAYLOAD_KEYS.TerritoryAddedPaths]: [...redeclaration.added],
+    [DECLARATION_PAYLOAD_KEYS.TerritoryRemovedPaths]: [...redeclaration.removed],
+    [DECLARATION_PAYLOAD_KEYS.TerritoryWidened]: redeclaration.widened,
+  });
+
+/** What {@link recordTerritoryRedeclaration} is asked to record. */
+export interface RecordTerritoryOptions {
+  /** The run's recorder. The caller owns the AD-29 single-writer claim; this never opens a log. */
+  readonly recorder: Recorder;
+  /** The step whose output declared this territory, so the line says which one corrected it. */
+  readonly step: string;
+  /** The territory currently in force — from the plan, or from the log's last declaration. */
+  readonly previous: readonly string[];
+  /** The territory the step's output declares. */
+  readonly declared: readonly string[];
+}
+
+/** A re-declaration, and whether the line about it reached the log. */
+export interface RecordedTerritoryRedeclaration extends TerritoryRedeclaration {
+  /**
+   * False when the AD-21 pass dropped the artifact and `redaction.failed` was appended in its place.
+   *
+   * Reported rather than swallowed because AD-4 makes the log the only truth: a caller that treated a
+   * dropped line as a recorded one would be acting on a correction the fold will never see, and would
+   * re-decide it on the next pass against a log that does not remember. The reconciler's own rule for that
+   * is `UnrecordedAction`; this module is below the loop and states the fact rather than choosing for it.
+   */
+  readonly recorded: boolean;
+}
+
+/**
+ * Record a re-declared territory as an event, and report what changed.
+ *
+ * **The engine writes this line, never the agent.** AD-15 enumerates the write surface and leaves every
+ * write to the engine; a step agent that could append to the log would also be a second writer of it,
+ * which AD-29 forbids outright. The agent's output *declares*; this records.
+ *
+ * It returns the comparison so the caller can act on a widening in the same breath it recorded one — and
+ * so a caller that ignores the return value has still left the evidence on disk, which is the direction
+ * that loses nothing.
+ */
+export const recordTerritoryRedeclaration = (
+  options: RecordTerritoryOptions,
+): RecordedTerritoryRedeclaration => {
+  const redeclaration = territoryRedeclaration(options.previous, options.declared);
+  const recorded = options.recorder.recordResult({
+    feature: options.recorder.feature,
+    run: options.recorder.paths.runId,
+    step: options.step,
+    emitter: ENGINE_EMITTER,
+    type: TERRITORY_DECLARED_EVENT_TYPE,
+    payload: territoryRedeclaredPayload(redeclaration),
+  });
+  return { ...redeclaration, recorded: !recorded.dropped };
+};

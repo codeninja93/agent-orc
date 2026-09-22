@@ -1,0 +1,120 @@
+{
+  "artifacts": [],
+  "contract_id": "step.planning",
+  "step": "plan-grant-wiring",
+  "status": "completed",
+  "summary": "Ordered plan for wiring the per-agent tool grant into the spawner. `src/engine/agents.ts` and the `--tools`/`--add-dir` wiring in `src/engine/spawner.ts` are already written and uncommitted; the gap is dedicated test coverage for I/O matrix items 9-13 (tests/engine.agents.test.ts and tests/engine.spawner.tools.test.ts do not exist yet). The plan verifies the existing wiring against AD-17/ADR-001/ADR-003, adds the two missing test files, then runs the suite.",
+  "provenance": [
+    "docs/specs/spec-agent-orchestrator/stories/2-4-analysis-and-planning-agents.md",
+    "src/engine/spawner.ts",
+    "src/engine/agents.ts",
+    "src/contracts/state.ts",
+    "src/contracts/registry.ts",
+    "tests/engine.spawner.test.ts",
+    "tests/helpers/agent-grant.ts",
+    "src/engine/roster.ts"
+  ],
+  "decisions": [
+    {
+      "question": "Should the plan re-implement the grant wiring in src/engine/agents.ts and src/engine/spawner.ts?",
+      "answer": "No — both already implement the wiring (resolveAgentGrant/grantFromRoster/toolsArgumentFor, AD1_REQUIRED_FLAGS carrying --add-dir and --tools, buildStepArgv requiring tools/addDir with no default). Plan steps verify this against the spec rather than redo it.",
+      "rationale": "git status shows src/engine/agents.ts as an untracked new file and src/engine/spawner.ts as modified, both already containing the AD-17/ADR-001 wiring described in the story; re-planning their creation would duplicate completed work."
+    },
+    {
+      "question": "What is the actual remaining gap for this story's grant-wiring task (Task 4 / matrix 9-13)?",
+      "answer": "Two test files named in the Code Map do not exist on disk: tests/engine.agents.test.ts and tests/engine.spawner.tools.test.ts. tests/engine.spawner.test.ts already covers the argv shape generically (via a fixtureGrant), but not the roster-refusal case, the Write-divergence-is-reported case, or the ADR001_REQUIRED_FLAGS-vs-ADR-001 enumeration assertion.",
+      "rationale": "Glob confirmed these two files are absent, and the module doc comment in src/engine/agents.ts explicitly defers the recursive no-hardcoded-roster guard and the divergence-reporting assertion to tests/engine.agents.test.ts, and the AD1_REQUIRED_FLAGS test comment in tests/engine.spawner.test.ts explicitly defers the ADR-001 enumeration check to tests/engine.spawner.tools.test.ts."
+    }
+  ],
+  "questions": [],
+  "write_intents": [],
+  "error": null,
+  "territory": [
+    "src/engine",
+    "src/contracts",
+    "tests"
+  ],
+  "plan": [
+    {
+      "step": "confirm-grant-module-contract",
+      "phase": "analysis",
+      "contract_id": "step.analysis",
+      "intent": "Confirm src/engine/agents.ts's grantFromRoster/resolveAgentGrant/toolsArgumentFor/AgentGrantUnresolved fully satisfy AD-17 (no compiled-in phase-to-tools table anywhere under src/engine/) and ADR-003 (the roster entry is authoritative; a grant that diverges from ADR-003's table is passed through and reported via `elevated`, never silently corrected).",
+      "territory": [
+        "src/engine/agents.ts"
+      ],
+      "provenance": {
+        "step": "plan-grant-wiring",
+        "source": "src/engine/agents.ts"
+      }
+    },
+    {
+      "step": "confirm-spawner-argv-wiring",
+      "phase": "analysis",
+      "contract_id": "step.analysis",
+      "intent": "Confirm src/engine/spawner.ts's buildStepArgv requires `tools`/`addDir` with no default, that planFor resolves the grant via grantFor before building argv, and that both ADR001_REQUIRED_FLAGS and AD1_REQUIRED_FLAGS already name --add-dir and --tools.",
+      "territory": [
+        "src/engine/spawner.ts"
+      ],
+      "provenance": {
+        "step": "plan-grant-wiring",
+        "source": "src/engine/spawner.ts"
+      }
+    },
+    {
+      "step": "confirm-phase-vocabulary-and-registry",
+      "phase": "analysis",
+      "contract_id": "step.analysis",
+      "intent": "Confirm STEP_PHASES carries `analysis` and `planning` (AD-28 enum widening) and that registry.ts registers step.analysis/step.planning so the spawner's schemaFor/getContract re-parse has something to validate against for those two phases.",
+      "territory": [
+        "src/contracts/state.ts",
+        "src/contracts/registry.ts"
+      ],
+      "provenance": {
+        "step": "plan-grant-wiring",
+        "source": "src/contracts/state.ts"
+      }
+    },
+    {
+      "step": "write-engine-agents-test",
+      "phase": "implementation",
+      "contract_id": "step.implementation",
+      "intent": "Add tests/engine.agents.test.ts covering I/O matrix 9-11: a spawn for `analysis` carries --tools from the roster entry and --add-dir scoped to the worktree; a phase with no roster entry throws AgentGrantUnresolved naming the phase and the roster read, never a default grant; a roster entry granting Write to analysis passes Write through in argv while the AgentGrant's `elevated` names the divergence. Also add the recursive guard proving no structure under src/engine/ associates an agent id with a granted tool name, planting a violation in a fixture tree to prove the guard catches it.",
+      "territory": [
+        "tests/engine.agents.test.ts"
+      ],
+      "provenance": {
+        "step": "plan-grant-wiring",
+        "source": "docs/specs/spec-agent-orchestrator/stories/2-4-analysis-and-planning-agents.md"
+      }
+    },
+    {
+      "step": "write-engine-spawner-tools-test",
+      "phase": "implementation",
+      "contract_id": "step.implementation",
+      "intent": "Add tests/engine.spawner.tools.test.ts covering I/O matrix 12-13: assert ADR001_REQUIRED_FLAGS equals ADR-001's four required flags verbatim, assert AD1_REQUIRED_FLAGS contains every one of them, and assert missingRequiredFlags names --tools on an argv built without it.",
+      "territory": [
+        "tests/engine.spawner.tools.test.ts"
+      ],
+      "provenance": {
+        "step": "plan-grant-wiring",
+        "source": "src/engine/spawner.ts"
+      }
+    },
+    {
+      "step": "run-grant-wiring-tests",
+      "phase": "verification",
+      "contract_id": "step.verification",
+      "intent": "Run the vitest suite including the two new files plus tests/engine.spawner.test.ts and tests/engine.roster.test.ts, confirming no regression and that the recursive no-hardcoded-roster guard fails on the planted violation and passes once it is removed.",
+      "territory": [
+        "tests/engine.agents.test.ts",
+        "tests/engine.spawner.tools.test.ts",
+        "tests/engine.spawner.test.ts"
+      ],
+      "provenance": {
+        "step": "plan-grant-wiring",
+        "source": "docs/specs/spec-agent-orchestrator/stories/2-4-analysis-and-planning-agents.md"
+      }
+    }
+  ]
+}
