@@ -2,15 +2,67 @@
 title: 'Committer — branch naming, pull request, git note on the merge commit'
 type: 'feature'
 created: '2026-09-23'
-status: 'drafted'
+status: 'done'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 baseline_revision: '2b5bb7b'
 context:
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ADR-005-per-artifact-schema-versions.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/stories/2-6-testing-and-verification.md'
-deferred: []
+deferred:
+- summary: No review layer ran against this story.
+  evidence: 'The gate, eight implementer mutations and my own independent verification are the only
+    scrutiny. I re-ran the gate myself (exit 0, 2470/83, zero skips), reproduced the AD-22 placeholder
+    mismatch directly, confirmed `.strict()` refuses a `force` field on `WriteIntentSchema` with a
+    corrected positive control, and confirmed the note advances independently of `state.json` by issue
+    content rather than by success/failure alone. Read `status: done` as implemented and gated, not
+    reviewed.'
+  severity: high
+- summary: "AD-22's own canonical wording and the codebase's existing default disagreed on the slug placeholder."
+  evidence: |-
+    AD-22 in `ARCHITECTURE-SPINE.md` says the branch pattern defaults "to `feature/<feature-slug>`".
+    The installer's `DEFAULT_BRANCH_PATTERN` was `feature/<slug>`, and its validation checked for the
+    substring `<slug>` — which `'feature/<feature-slug>'.includes('<slug>')` answers `false` for,
+    verified directly. So AD-22's own stated default would have been refused by the installer that is
+    supposed to write it, and two existing test fixtures (`tests/helpers/config-fixture.ts`,
+    `tests/contracts.toml.test.ts`) already wrote profiles the interview would never have produced.
+    Resolved by declaring both spellings valid in one place (`BRANCH_SLUG_PLACEHOLDERS`) rather than
+    picking one and migrating the other, which is the non-breaking option. A reviewer may prefer one
+    canonical spelling instead; that is now a spec-level choice, not an implementation one.
+  location: src/contracts/installer.ts
+  severity: medium
+- summary: 'An `unknown` branch-protection result does not refuse the run, by decision.'
+  evidence: 'The story requires unknown to be reported as unknown, never as satisfied, but does not say
+    whether it blocks. Verified: only `unprotected` refuses; `unknown` is recorded and the run continues,
+    on the stated ground that refusing every repository the engine cannot reach would stop an offline
+    machine running at all. This is a real policy call recorded in the module docblock, not a gap.'
+  location: src/engine/protection.ts
+  severity: medium
+- summary: 'No host probe exists yet, so every shipped run currently records `unknown`.'
+  evidence: '`branchProtection` is an injected `ReconcilerOptions` field defaulting to `null`. A real
+    probe needs a host credential, which AD-13 puts behind the fetch record and AD-15 behind the write
+    surface, and no unit yet assembles one. The assertion, the three outcomes and the refusal are all
+    live and tested; what is absent is the caller that supplies a probe.'
+  location: src/engine/protection.ts
+  severity: medium
+- summary: "The `step.committing` fixture was authored, not recorded from a real `claude -p` call."
+  evidence: "`tests/contracts.round-trip.test.ts`'s own docblock describes these fixtures as captured
+    once from a real invocation. This one satisfies the Zod parse, the draft-7 validation and the
+    round-trip losslessly, but carries no evidence a model produced it, so the AD-31 claim is not yet
+    honest for this contract. Needs a real recording."
+  location: tests/fixtures/structured-output/step.committing.json
+  severity: low
+- summary: '`git_tag` remains in `WRITE_INTENT_KINDS` with nothing composing one.'
+  evidence: 'Pre-existing and unchanged by this story; noted so it stays a known gap rather than being
+    rediscovered as a surprise.'
+  severity: low
+- summary: 'There is still no production assembly point for a run.'
+  evidence: 'Carried forward from story 2-6. Nothing under `src/` or `bin/` constructs a `Reconciler`
+    with a real spawner, runner, recorder and now committer. This story adds a third unit whose
+    acceptance criteria are asserted one level down from an actual run, and still no story in
+    `stories.yaml` owns the composition root.'
+  severity: high
 ---
 
 # Story 2-7 — Committer: branch naming, pull request, git note
@@ -153,4 +205,63 @@ write intent that no agent may perform. It is not granted the command runner eit
 
 ## Verification
 
+Run by me, exit status captured to a variable and output kept in a file:
+`npm run typecheck && npm run lint && npm run build && npm test` — **exit 0, 2470 tests across 83 files, zero
+failures, zero skips.** Baseline `ea21995` was 2366/79. Node pinned to v24.21.0.
+
+Eight mutations, each applied, run and reverted, tree confirmed clean afterwards:
+
+| Mutation | Caught by |
+|---|---|
+| A committing output states a step disposition | 4 tests |
+| `WriteIntentSchema` gains a `force` field | 3 direct + 5 collateral in the composition suite |
+| A branch name derived from a feature slug planted in `src/tui/cards/caption.ts` | the recursive guard, naming the file and the evidence |
+| `intentIdFor` incremented a module counter | the re-run test — the **second** composition failed, not the first |
+| `unknown()` protection returns `'protected'` | 7 tests across both files |
+| The no-placeholder refusal in `branchFor` bypassed | 4 tests, twice (weak and strong variants) |
+| `NOTE_SCHEMA_VERSION` advanced to 2 | the note test, while `state.json` at its own version still read |
+| A `git push` planted outside the committer, in `src/engine/labels.ts` | the write-surface guard |
+
+**Verified by me directly, not taken on report.** `'feature/<feature-slug>'.includes('<slug>')` is `false` —
+AD-22's own canonical default would have been refused by the installer's original validation. `.strict()` on
+`WriteIntentSchema` refuses a `force` field with a corrected fixture (my first probe used the wrong field
+names and proved nothing). `GitNoteSchema` refuses v2 specifically on version — the issue names version,
+not shape — while `RunStateSchema` at its own version fails purely on missing fields, confirming the two
+artifacts' versions are independent per ADR-005. The branch-naming guard has a positive control proving it is
+not blind to the committer's own derivation, so its absence-of-findings elsewhere is evidence rather than a
+guard that cannot see anything.
+
 ## Auto Run Result
+
+**Status: done.** The committer has its phase and contract, the note is a versioned record of what the run
+did rather than what the model claims, the branch name comes from one place, and force-push has no field to
+carry it in.
+
+**A defect in the shipped baseline was found and fixed, not introduced.** `WriteIntentSchema` had no `force`
+field, but an intent *carrying* one silently lost it: plain `z.object` strips unknown keys while the same
+schema's draft-7 export already declared `additionalProperties: false` — two halves of one contract
+disagreeing about the exact field the shape exists not to have. `.strict()` closes both sides at once.
+
+**AD-22's own stated default did not survive contact with the installer that must write it.** The
+architecture record says the branch pattern defaults to `feature/<feature-slug>`; the installer's existing
+default and validation used `<slug>`, and the substring check the two disagree on is not a stylistic
+nit — it is whether the architecture's own example passes its own validation. Verified directly rather than
+argued. Resolved non-breakingly by accepting both spellings; recorded as a spec-level choice if a narrower
+resolution is wanted.
+
+**One policy call is the implementer's, stated plainly rather than hidden in behaviour.** The story requires
+`unknown` branch protection to be *reported* as unknown; it does not say whether it *blocks*. The
+implementation continues on unknown and refuses only `unprotected`, on the grounds that refusing every
+repository the engine cannot reach would stop an offline machine running at all. That is a real judgement,
+recorded in the module's own docblock rather than discovered later — and it is a deferred entry here so it
+gets a second look rather than shipping silently.
+
+**Follow-up review recommended: true.** No review layer has run. The specific unverified risk is compounding:
+no host probe for branch protection exists, so every shipped run today records `unknown`, and the
+`step.committing` fixture was hand-authored rather than recorded from a real `claude -p` call — the AD-31
+claim is not yet honest for this one contract.
+
+**Residual risks.** Six deferred entries, two `high`: no review layer has run, and the production assembly
+gap now spans a third unit. The committer composes correctly and executes nothing, which is exactly this
+story's boundary — but it means stage 2 now has an analysis agent, a planning agent, an implementation agent,
+a testing/verification pair and a committer, none of which has ever been assembled into one running loop.

@@ -45,10 +45,20 @@ export const BRANCH_PROTECTION_CODE = 'write.branch_protection_violation';
  */
 export { BRANCH_PROTECTION_ASSERTED_EVENT_TYPE };
 
-/** The payload keys of that line, spelled once so a reader and the writer cannot drift. */
+/**
+ * The payload keys of that line, spelled once so a reader and the writer cannot drift.
+ *
+ * `default_branch` and not `branch`, for two reasons that happen to agree. It names a different thing:
+ * the branch a pull request would merge *into*, not the branch a feature's work is on. And `branch` is a
+ * payload key story 1-11 forbade outright — `tests/tui.reconstruction.test.ts` asserts no payload carries
+ * one — because the take-over branch embeds a ULID and AD-21's entropy sweep would rewrite it, leaving a
+ * card quoting a redacted name. A default branch is `main` or `master`: low entropy, product-meaningful
+ * and safe in a payload. Taking the forbidden key anyway and narrowing that guard would have weakened
+ * another story's rule to make room for this one.
+ */
 export const BRANCH_PROTECTION_PAYLOAD_KEYS = {
   Outcome: 'outcome',
-  Branch: 'branch',
+  Branch: 'default_branch',
   Reason: 'reason',
 } as const;
 

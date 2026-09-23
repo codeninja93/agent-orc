@@ -66,7 +66,10 @@ const DECLARED: Readonly<Record<string, { readonly tools: readonly string[]; rea
     tools: ['Read', 'Grep', 'Glob', 'RunDeclaredCommand'],
     contract: 'step.verification',
   },
-  committing: { tools: ['Read', 'Grep', 'Glob'], contract: 'step.output' },
+  // Story 2-7 pointed it at a contract of its own. Under `step.output` nothing stopped a committing
+  // output declaring a write intent or restating a step's disposition, both of which AD-22 reserves
+  // to the engine — the same pairing failure this table caught in story 2-4's declarations.
+  committing: { tools: ['Read', 'Grep', 'Glob'], contract: 'step.committing' },
 };
 
 const GRANTED: Readonly<Record<string, readonly string[]>> = Object.fromEntries(

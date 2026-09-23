@@ -1,0 +1,24 @@
+{
+  "contract_id": "step.committing",
+  "step": "commit",
+  "status": "completed",
+  "summary": "Composed the pull-request title and body for story 2-7's committer from the change and the plan, and declared no write intent: AD-22 reserves the branch name and the note to the engine.",
+  "provenance": [
+    "commit: src/engine/committer.ts",
+    "commit: src/contracts/note.ts",
+    "commit: docs/specs/spec-agent-orchestrator/stories/2-7-committer.md"
+  ],
+  "decisions": [],
+  "artifacts": [
+    {
+      "kind": "diff",
+      "path": "evidence/commit-1.diff",
+      "description": "The change this pull request describes, as the run worktree holds it."
+    }
+  ],
+  "questions": [],
+  "write_intents": [],
+  "error": null,
+  "pull_request_title": "Committer: branch naming, pull request and the AD-22 git note",
+  "pull_request_body": "Gives the committer its phase and contract.\n\nThe branch name comes from the profile's `branch_pattern`, which is the only place AD-22 lets it be declared, and a pattern with no slug placeholder is refused where it is read rather than producing one branch for every feature. The git note becomes a versioned artifact carrying its own schema version, so it stays readable when another artifact's shape changes.\n\nThe three write intents are composed and none is performed: AD-15 makes the engine their executor, and that executor belongs to a later change."
+}

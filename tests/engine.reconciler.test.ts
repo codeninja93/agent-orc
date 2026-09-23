@@ -24,6 +24,7 @@ import {
 import type { ModelRung, OrchError, StepDisposition } from '../src/contracts/index.js';
 import { Recorder, readEventLog, runPaths, runsDir } from '../src/runtime/index.js';
 import {
+  BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
   BaselineResetError,
   ENGINE_EMITTER,
   ENGINE_EVENT_TYPES,
@@ -171,10 +172,13 @@ describe('a new feature is accepted with a minted run id', () => {
     // Story 1-11 added the two run-level declarations, in this order: the run exists, then what it is
     // being built against (CAP-2), then the territory its overlap is recomputed from. All three land
     // before anything can read them, which is what lets the spec echo offer a confirmation at `drafting`.
+    // Story 2-7 added the fourth, last: ADR-001's branch-protection assertion is *about this run*, so a
+    // refusal has to have a run to be recorded against, and the three above are what make one readable.
     expect(eventTypes(accepted.run)).toStrictEqual([
       ENGINE_EVENT_TYPES.RunCreated,
       SPEC_RECORDED_EVENT_TYPE,
       TERRITORY_DECLARED_EVENT_TYPE,
+      BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
     ]);
   });
 

@@ -196,6 +196,8 @@ describe('the phase vocabulary, widened safely (matrix 14, 15)', () => {
       'implementation',
       'testing',
       'verification',
+      // Story 2-7: `committing` was a declared agent with no phase, so nothing could spawn it.
+      'committing',
     ]);
   });
 
@@ -206,7 +208,10 @@ describe('the phase vocabulary, widened safely (matrix 14, 15)', () => {
     }
     expect(
       PlanningOutputSchema.safeParse(
-        planningOutput({ plan: [{ ...plannedStep(), phase: 'committing' } as unknown as PlannedStep] }),
+        // `committing` was the example here until story 2-7 made it a phase. The point of the
+        // assertion is that a word outside the enum is refused, so the example has to be a word
+        // outside the enum — and one no story is about to add.
+        planningOutput({ plan: [{ ...plannedStep(), phase: 'archiving' } as unknown as PlannedStep] }),
       ).success,
     ).toBe(false);
   });

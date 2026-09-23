@@ -97,13 +97,15 @@ describe('the roster and the plan point at it (matrix 15)', () => {
     expect(verification?.contract).toBe(VERIFICATION_CONTRACT_ID);
   });
 
-  it('runs the five steps in order, with each phase pointed at its own contract', () => {
+  it('runs the six steps in order, with each phase pointed at its own contract', () => {
     expect(STANDARD_PLAN_STEPS.map((step) => [step.phase, step.contract_id])).toStrictEqual([
       ['analysis', 'step.analysis'],
       ['planning', 'step.planning'],
       ['implementation', 'step.implementation'],
       ['testing', TESTING_CONTRACT_ID],
       ['verification', VERIFICATION_CONTRACT_ID],
+      // Story 2-7: the plan ended at the verdict, so nothing in it ever reached AD-22's note.
+      ['committing', 'step.committing'],
     ]);
   });
 });
