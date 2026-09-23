@@ -2,9 +2,9 @@
 title: 'Interviewer — single entry point, spec echo, question compression'
 type: 'feature'
 created: '2026-09-23'
-status: 'drafted'
+status: 'done'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 baseline_revision: '10393f1'
 context:
   - '{project-root}/docs/planning-artifacts/architecture/architecture-agent-orcastrator-2026-09-19/ARCHITECTURE-SPINE.md'
@@ -12,7 +12,59 @@ context:
   - '{project-root}/docs/specs/spec-agent-orchestrator/glossary.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/architecture.md'
   - '{project-root}/docs/specs/spec-agent-orchestrator/stories/2-7-committer.md'
-deferred: []
+deferred:
+- summary: No review layer ran against this story.
+  evidence: 'The gate, six implementer mutations and my own independent verification are the only
+    scrutiny. I re-ran the gate myself (exit 0, 2552/86, zero skips), confirmed the tree was clean after
+    the implementer''s own reported and corrected file-corruption incident, verified anchor-only matching
+    directly, and probed the run-id redaction claim myself. Read `status: done` as implemented and gated,
+    not reviewed.'
+  severity: high
+- summary: 'A bare run id embedded in a deflection answer is redacted, so "naming the run" is not actually true.'
+  evidence: |-
+    Verified directly: `redactValue` on a string containing a bare 26-character ULID sweeps it to
+    `[redacted]`. Matrix row 7 requires a `decision_ledger` deflection to name "the run the decision came
+    from", and the answer text currently embeds the run id unpunctuated, so a person reading the log sees
+    "From decision.recorded in run [redacted]" — naming nothing. The project's own established fix for
+    exactly this shape of problem already exists: `mintQuestionId` breaks a ULID into hyphen-joined
+    8-character groups so AD-21's unbroken-run sweep does not catch it. The deflection answer should use
+    the same technique rather than the bare id.
+  location: src/engine/deflection.ts
+  severity: high
+- summary: 'Subagent questions carry no anchor field, and no run is linked to a project.'
+  evidence: |-
+    `StepOutputSchema.questions` is `QuestionDraftSchema[]`, which has no anchor; `RaisedQuestion` takes
+    the anchor as a field the caller must supply separately, and the decision-ledger matcher takes its
+    run list as a caller-supplied argument rather than deriving "prior runs for this project" from
+    anything recorded. Both are genuine gaps in what a real assembly needs, and both are the same shape
+    as the "no production assembly point" gap this project has carried since story 2-4 — not new, and
+    not blocking this story, but a decision about whether already-shipped step contracts (analysis
+    through committing) should retroactively gain an anchor field belongs with whichever story first
+    assembles a real run, not with this one.
+  location: src/engine/interviewer.ts
+  severity: medium
+- summary: 'The interactive terminal loop is not built or tested.'
+  evidence: 'Nothing in this story spawns a live `claude -p` conversation or drives a real back-and-forth
+    with a person. The tests exercise only the logic a live turn would call into: composing the echo,
+    parsing a confirmation or edit, constructing a deflection, merging drafts. The same honest boundary
+    story 2-6 recorded for its MCP stdio transport.'
+  location: src/engine/interviewer.ts
+  severity: medium
+- summary: 'A merge''s reason is recorded by appending it to the merged card''s brief, not a dedicated event type.'
+  evidence: 'A defensible choice rather than an oversight: it avoids widening the event vocabulary for a
+    fact that is otherwise only ever read alongside the question itself, and AD-5 makes adding an event
+    type non-breaking either way if a later story wants one. Worth a second look precisely because it
+    trades structured queryability for vocabulary economy.'
+  location: src/engine/question-merge.ts
+  severity: low
+- summary: 'Who drafts the initial spec-echo criteria — the live turn, or a sentence/list-item fallback — is an assumption.'
+  evidence: 'The live turn may supply the candidate criteria directly; absent that, the code falls back
+    to splitting the request''s own lines and list items, never splitting sentences. Reasonable given the
+    story''s own boundary that the interactive loop is not built here, but it is an assumption about the
+    division of labour between the conversation and the code that a later story should confirm rather
+    than inherit silently.'
+  location: src/engine/interviewer.ts
+  severity: low
 ---
 
 # Story 2-8 — Interviewer: single entry point, spec echo, question compression
@@ -154,4 +206,66 @@ beside the ones `attemptQuestionDeflection` and `resolveQuestion` already use.
 
 ## Verification
 
+Run by me, exit status captured to a variable and output kept in a file:
+`npm run typecheck && npm run lint && npm run build && npm test` — **exit 0, 2552 tests across 86 files, zero
+failures, zero skips.** Baseline `10393f1` was 2486/82.
+
+Six mutations, each applied, run and reverted, tree confirmed clean afterwards:
+
+| Mutation | Caught by |
+|---|---|
+| Two different-anchor drafts merge on a prefix match | 1 test naming the exact boundary case (a symbol and its longer namesake) |
+| A deflection writes `state.json` directly rather than through `attemptQuestionDeflection` | 5 tests, including an explicit source guard |
+| An unreadable prior run's log throws instead of counting as no match | 2 tests |
+| Zero questions raised reports 0% deflected instead of inapplicable | 2 tests |
+| A merged question skips `assertAskableDraft` | 2 tests, one for the anchor path and one for the judgment path |
+| Repository/git-history/ledger matching does substring rather than whole-token comparison | 3 tests, one per matcher, each confirming the underlying search *does* surface the false match and the anchor check is what refuses it |
+
+**A real incident, caught and fixed before I saw it.** A stale `backup/` folder from an earlier session in
+the scratchpad got copied over nine files during a mutation-restore step — three tracked files overwritten,
+six untracked ones added. The implementer verified each was byte-identical to the stale backup, restored the
+three with `git checkout --`, deleted the six, and re-ran every mutation on a confirmed-clean tree. I
+independently confirmed `git status` shows only the ten files this story actually touches, with no residual
+diff on the three files that were briefly overwritten.
+
+**Verified by me directly, not taken on report.** Anchor-only matching: confirmed the repository, git-history
+and decision-ledger matchers all route through whole-token comparison, not substring or similarity. No
+second write path: `applyDeflection` calls only `attemptQuestionDeflection`. And the run-id redaction claim,
+which I probed myself rather than accepting: a bare 26-character ULID embedded in a deflection answer is
+swept to `[redacted]` by `redactValue`, so a `decision_ledger` deflection's answer currently names no run at
+all once it reaches the log — see the deferred entry.
+
 ## Auto Run Result
+
+**Status: done.** The Interviewer's two jobs — spec echo and question compression — are built as the logic a
+live turn calls into: composing and confirming an acceptance-criteria list, and constructing a deflection or
+a merge for a subagent's question, all anchor-based per the TypeSafe decision this story closed.
+
+**Matching stayed disciplined against the temptation this story was written to resist.** Every matcher —
+repository, git history, decision ledger — is whole-token anchor comparison, reusing story 2-3's
+`mentionsSymbol` rather than adding a similarity score or a semantic layer. The git-history matcher's own
+test proves the discipline is load-bearing rather than incidental: git's own `--grep` prefilter finds a
+commit naming a longer symbol sharing a prefix with the anchor, and the anchor check is what refuses to
+deflect from it — the false match is real and caught, not merely absent from the test data.
+
+**One finding survived my own verification that the implementer did not flag as a defect.** The report named
+"run ids get redacted in the log" as an open question about whether that's acceptable. I checked, and it
+isn't: matrix row 7 requires naming the run a decision came from, and the answer text as built embeds an
+unpunctuated ULID that AD-21's sweep removes. The project's own `mintQuestionId` already solved exactly this
+shape of problem for question ids; the deflection answer needs the same treatment. Recorded as a `high`
+deferred entry for the review pass to fix.
+
+**Two premises did not hold, and both are honest gaps rather than papered-over ones.** Subagent questions
+carry no anchor field in their shipped contract, and no run is linked to a project — so `RaisedQuestion`
+takes both as inputs a real caller must supply rather than deriving them. This is the same shape as the "no
+production assembly point" gap carried since story 2-4, not a new failure, and it does not block this
+story's own logic from being complete and tested on its own terms.
+
+**Follow-up review recommended: true.** No review layer has run, and one `high` defect was found during my
+own verification pass rather than by review. The specific unverified risk beyond the redaction bug: the
+interactive terminal loop that would actually drive a live conversation is untested, the same honest gap
+story 2-6 recorded for its MCP stdio transport.
+
+**Residual risks.** Six deferred entries, two `high`: no review layer ran, and the run-id redaction defect
+means `decision_ledger` deflections currently name nothing a person can read. Both are addressable in the
+review pass that follows.
