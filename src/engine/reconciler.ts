@@ -56,6 +56,7 @@ import {
   PLANNING_CONTRACT_ID,
   MODEL_RUNGS,
   REPAIRED_PAYLOAD_KEY,
+  REVIEW_SKIPPED_PAYLOAD_KEYS,
   SPEC_CRITERION_EDITED_EVENT_TYPE,
   SPEC_RECORDED_EVENT_TYPE,
   SpecCriterionEditedPayloadSchema,
@@ -216,12 +217,14 @@ import {
   ceilingVerdict,
   describeReading,
   downshiftFor,
+  gateOutcomesOfLatestAttempt,
   measureConsumption,
   readCeilings,
+  recordedExhaustion,
   runCeilingsFrom,
   skipsModelReview,
 } from './ceilings.js';
-import type { CeilingReading, CeilingVerdict, DownshiftDecision } from './ceilings.js';
+import type { CeilingReading, CeilingVerdict, DownshiftDecision, RecordedExhaustion } from './ceilings.js';
 import { defaultUlidMinter } from './ulid.js';
 import type { UlidMinter } from './ulid.js';
 
@@ -809,7 +812,12 @@ export type ReconcileAction =
   | {
       readonly kind: 'hibernate';
       readonly step: string | null;
-      readonly reading: CeilingReading;
+      /**
+       * The reading that decided it: fresh when this pass decided it, the `budget.exhausted` line's own when
+       * a pass is finishing a hibernation the log already recorded — and `null` only when that line carried
+       * no reading this build can read, in which case nothing below needs one.
+       */
+      readonly reading: CeilingReading | null;
       readonly readings: readonly CeilingReading[];
       readonly reason: string;
     };
@@ -2828,8 +2836,17 @@ export class Reconciler {
     state: RunState,
     action: ReconcileAction,
   ): ReconcileAction {
-    const exhausted = loaded.events.some((event) => event.type === BUDGET_EXHAUSTED_EVENT_TYPE);
-    if (!exhausted && !SPENDING_ACTION_KINDS.includes(action.kind)) return action;
+    // A terminal run — including a hibernated one, whose log still carries its `budget.exhausted` — is left
+    // alone by `decideCeilingAction`'s first test, which both branches below reach before anything is read.
+    /**
+     * A hibernation the log has already recorded is finished without reading the ceilings at all.
+     *
+     * The decision is durable; re-measuring could only disagree with it (the clock has moved) or fail (the
+     * snapshot has become unreadable), and neither is a reason to leave a recorded hibernation unfinished.
+     */
+    const recorded = recordedExhaustion(loaded.events);
+    if (recorded !== null) return decideCeilingAction(action, state, null, recorded);
+    if (!SPENDING_ACTION_KINDS.includes(action.kind)) return action;
     let readings: readonly CeilingReading[];
     try {
       readings = this.ceilingReadings(state, loaded.events);
@@ -2837,7 +2854,7 @@ export class Reconciler {
       if (!(thrown instanceof UnreadableCeilingConfiguration)) throw thrown;
       return { kind: 'escalate-to-human', step: spendingStepOf(action), reason: thrown.message };
     }
-    return decideCeilingAction(action, state, ceilingVerdict(readings), exhausted);
+    return decideCeilingAction(action, state, ceilingVerdict(readings), null);
   }
 
   /** The run's three ceilings, read against what it has consumed so far. */
@@ -2961,7 +2978,81 @@ export class Reconciler {
          * worktree moved under a crash — is caught where AD-26 catches everything else of that
          * kind: the next `reset-and-rerun`, which goes through `driveStep` and gates in full.
          */
-        const request = this.startRequest(paths, plan, state, planStep, record, record.model_tier);
+        /**
+         * AD-24 on the resume path, which `driveStep` does not reach: degradation must apply here too.
+         *
+         * A run near a ceiling is disproportionately likely to have been interrupted, so a degraded run
+         * whose resumed attempts kept the ordinary tier and the ordinary review would be degraded in name
+         * only. The budget is read here, before anything is recorded, so an unreadable snapshot blocks the
+         * run rather than escaping after `step.resume_attempted` with an attempt left unterminated.
+         */
+        let readings: readonly CeilingReading[];
+        try {
+          readings = this.ceilingReadings(state, readEventLog(paths.eventLog));
+        } catch (thrown: unknown) {
+          if (!(thrown instanceof UnreadableCeilingConfiguration)) throw thrown;
+          this.emit(recorder, {
+            step: action.step,
+            type: ENGINE_EVENT_TYPES.FeatureStateChanged,
+            payload: { from: state.state, to: 'blocked', reason: thrown.message },
+          });
+          return action.step;
+        }
+        const degraded = state.degradation !== null;
+        /**
+         * Narrowed scope on a resume: the review is not resumed either.
+         *
+         * The gates are not re-run on a resume (above), so there is no fresh first tier to decide on. The
+         * outcomes this attempt already recorded are what it spawned the review against, and they are what
+         * the non-resume path would have skipped the review on; reading them back keeps the two paths one
+         * rule rather than letting an interruption buy a degraded run the review it would otherwise not get.
+         */
+        const recordedGates = gateOutcomesOfLatestAttempt(readEventLog(paths.eventLog), action.step);
+        if (skipsModelReview({ degraded, phase: planStep.phase, gates: recordedGates })) {
+          this.emit(recorder, {
+            step: action.step,
+            type: ENGINE_EVENT_TYPES.ReviewSkipped,
+            payload: {
+              [REVIEW_SKIPPED_PAYLOAD_KEYS.Reason]:
+                'the run is degraded, so its scope is narrowed: the gates this attempt recorded did not fail, ' +
+                'and the interrupted model-based review was not resumed (AD-24)',
+              [REVIEW_SKIPPED_PAYLOAD_KEYS.NarrowedBy]: BUDGET_DEGRADED_EVENT_TYPE,
+              [REVIEW_SKIPPED_PAYLOAD_KEYS.Resumed]: true,
+              [REVIEW_SKIPPED_PAYLOAD_KEYS.FailedGates]: [],
+            },
+            baselineRef: record.baseline_ref,
+          });
+          this.recordTermination(
+            state,
+            planStep,
+            record.baseline_ref,
+            { step: action.step, disposition: 'completed', sessionId: null, output: null, error: null, usage: null },
+            { transitionTo: action.transitionTo, plan },
+          );
+          return action.step;
+        }
+        let tier: ModelRung = record.model_tier;
+        if (degraded) {
+          const downshift = downshiftFor(record.model_tier);
+          tier = downshift.to;
+          if (downshift.moved) {
+            this.emit(recorder, {
+              step: action.step,
+              type: ENGINE_EVENT_TYPES.StepTierDownshifted,
+              payload: {
+                from: downshift.from,
+                to: downshift.to,
+                trigger: BUDGET_DEGRADED_EVENT_TYPE,
+                ladder: MODEL_RUNGS.join('>'),
+                declined_promotion: null,
+                resumed: true,
+                reason: downshift.reason,
+              },
+            });
+          }
+        }
+        const input = this.stepInput(paths, plan, state, planStep, record.baseline_ref, [], readings);
+        const request = this.startRequest(paths, plan, state, planStep, record, tier, input.value);
 
         this.emit(recorder, {
           step: action.step,
@@ -3044,6 +3135,9 @@ export class Reconciler {
       }
 
       case 'escalate-to-human': {
+        // Already blocked is already escalated: a second `blocked → blocked` line would record a transition
+        // that did not happen, once per pass for as long as the person takes to answer.
+        if (state.state === 'blocked') return action.step;
         this.emit(recorder, {
           step: action.step,
           type: ENGINE_EVENT_TYPES.FeatureStateChanged,
@@ -3128,6 +3222,27 @@ export class Reconciler {
   ): Promise<void> {
     const recorder = this.recorderFor(state.run, state.feature);
     const existing = findStepRecord(state, options.step.step);
+
+    /**
+     * The budget the step input will carry, read before a single line of this attempt is recorded.
+     *
+     * The step input is written after `step.started`, and reading the snapshot there meant a snapshot that
+     * became unreadable between the ceiling check and the write escaped *after* the attempt was recorded as
+     * started — leaving an attempt with no termination for the next pass to adopt as an orphan. Read here, the
+     * failure blocks the run the way the ceiling check itself does, with nothing half-recorded.
+     */
+    let readings: readonly CeilingReading[];
+    try {
+      readings = this.ceilingReadings(state, readEventLog(paths.eventLog));
+    } catch (thrown: unknown) {
+      if (!(thrown instanceof UnreadableCeilingConfiguration)) throw thrown;
+      this.emit(recorder, {
+        step: options.step.step,
+        type: ENGINE_EVENT_TYPES.FeatureStateChanged,
+        payload: { from: state.state, to: 'blocked', reason: thrown.message },
+      });
+      return;
+    }
 
     if (state.state !== options.transitionTo) {
       this.emit(recorder, {
@@ -3293,12 +3408,14 @@ export class Reconciler {
         step: options.step.step,
         type: ENGINE_EVENT_TYPES.ReviewSkipped,
         payload: {
-          reason:
-            'the run is degraded, so its scope is narrowed: the deterministic gates ran and passed, and ' +
-            'the model-based review was not spawned (AD-24)',
-          narrowed_by: BUDGET_DEGRADED_EVENT_TYPE,
-          failed_gates: [],
-          passed_gates: gates.filter((gate) => gate.outcome === 'passed').map((gate) => gate.command),
+          [REVIEW_SKIPPED_PAYLOAD_KEYS.Reason]:
+            'the run is degraded, so its scope is narrowed: no deterministic gate failed, and the ' +
+            'model-based review was not spawned (AD-24)',
+          [REVIEW_SKIPPED_PAYLOAD_KEYS.NarrowedBy]: BUDGET_DEGRADED_EVENT_TYPE,
+          [REVIEW_SKIPPED_PAYLOAD_KEYS.FailedGates]: [],
+          [REVIEW_SKIPPED_PAYLOAD_KEYS.PassedGates]: gates
+            .filter((gate) => gate.outcome === 'passed')
+            .map((gate) => gate.command),
         },
         baselineRef,
       });
@@ -3321,7 +3438,7 @@ export class Reconciler {
      * ways to satisfy its contract — re-run every gate through the command runner, doubling the
      * container time CAP-13's ordering exists to save, or invent them.
      */
-    const input = this.stepInput(paths, plan, state, options.step, baselineRef, gates);
+    const input = this.stepInput(paths, plan, state, options.step, baselineRef, gates, readings);
 
     const request = this.startRequest(
       paths,
@@ -3541,21 +3658,25 @@ export class Reconciler {
     readings: readonly CeilingReading[],
     reason: string,
   ): Record<string, unknown> {
-    const budget = budgetFrom(stepsRemainingIn(plan, state), readings);
+    const wall = readings.find((entry) => entry.dimension === 'wall_clock');
     const rate = readings.find((entry) => entry.dimension === 'rate_limit_budget');
     return {
       [BUDGET_PAYLOAD_KEYS.Dimension]: reading.dimension,
+      [BUDGET_PAYLOAD_KEYS.Unit]: CEILING_UNITS[reading.dimension],
       [BUDGET_PAYLOAD_KEYS.Fraction]: reading.fraction,
       [BUDGET_PAYLOAD_KEYS.Consumed]: reading.consumed,
       [BUDGET_PAYLOAD_KEYS.Ceiling]: reading.ceiling,
+      [BUDGET_PAYLOAD_KEYS.Measurable]: reading.measurable,
       [BUDGET_PAYLOAD_KEYS.Reason]: reason,
-      ...budget,
-      // Unclamped in the log, unlike in a step input: `formatBudgetShare` reports a share past 1 as outside
-      // the scale rather than clamping it, and a clamped figure here would give it nothing to report (R12).
-      rate_limit_budget_consumed:
-        rate !== undefined && Number.isFinite(rate.fraction)
-          ? rate.fraction
-          : budget.rate_limit_budget_consumed,
+      [BUDGET_PAYLOAD_KEYS.PlanStepsRemaining]: stepsRemainingIn(plan, state),
+      /**
+       * Both unclamped here, consistently, unlike in a step input: this line is where an overshoot is
+       * reported, so a negative remainder and a share past 1 are written as measured (R12) — the TUI states
+       * a share past 1 as outside its scale, and adds a negative remainder to the elapsed time to recover
+       * the ceiling exactly. An unmeasurable reading writes `null` for its figure rather than `NaN`.
+       */
+      wall_clock_ms_remaining: wall?.measurable === true ? wall.ceiling - wall.consumed : null,
+      rate_limit_budget_consumed: rate?.measurable === true ? rate.fraction : null,
     };
   }
 
@@ -3568,12 +3689,13 @@ export class Reconciler {
    * keep crash-safe, and the first thing to drift would be the one sentence that must never be wrong —
    * where the work is. What is new here is only the trigger and what the record says about it.
    *
-   * **Every step is safe to repeat, and the repeat writes nothing twice.** The order is the take-over's:
-   * the work is preserved before any line claims it is, the document before the lines that describe it,
-   * and the state change last, because it is what makes the run terminal and nothing looks at a terminal
-   * run again. A crash anywhere before it leaves a non-terminal run whose log carries — or is about to carry
-   * — `budget.exhausted`, and the next pass comes back here: the hatch adopts its own branch, the document
-   * is rewritten whole, and each line is appended only if the log does not already hold it (matrix row 11).
+   * **Every step is safe to repeat, and the repeat writes nothing twice.** The decision is recorded first,
+   * then the take-over's order: the work is preserved before any line claims it is, the document before the
+   * line that describes it, and the state change last, because it is what makes the run terminal and nothing
+   * looks at a terminal run again. A crash anywhere before it leaves a non-terminal run whose log carries
+   * `budget.exhausted` (or no hibernation line at all), and the next pass comes back here: the hatch adopts its
+   * own branch, the document is rewritten whole, and each line is appended only if the log does not already
+   * hold it (matrix row 11).
    */
   private hibernate(
     paths: RunPaths,
@@ -3582,6 +3704,25 @@ export class Reconciler {
     action: Extract<ReconcileAction, { kind: 'hibernate' }>,
   ): void {
     const recorder = this.recorderFor(state.run, state.feature);
+    const logged = readEventLog(paths.eventLog);
+
+    /**
+     * `budget.exhausted` first: the decision is made durable before anything acts on it.
+     *
+     * It claims nothing about the work — only which ceiling was reached — so it may precede the escape hatch,
+     * and putting it first means a crash anywhere after it is finished by the next pass from *this line*
+     * rather than from a fresh reading of the ceilings. A fresh reading after a restart could say the run is
+     * no longer at its ceiling (the clock moved, or waiting time was excluded) and describe a hibernation as
+     * "0 of its 10 wall-clock minutes"; the recorded one says what was decided.
+     */
+    if (action.reading !== null && !logged.some((event) => event.type === BUDGET_EXHAUSTED_EVENT_TYPE)) {
+      this.emit(recorder, {
+        step: null,
+        type: BUDGET_EXHAUSTED_EVENT_TYPE,
+        payload: this.budgetPayload(plan, state, action.reading, action.readings, action.reason),
+      });
+    }
+
     const escape = escapeHatch({
       run: state.run,
       feature: state.feature,
@@ -3601,7 +3742,6 @@ export class Reconciler {
       state: 'hibernated',
     });
 
-    const logged = readEventLog(paths.eventLog);
     if (
       !logged.some(
         (event) =>
@@ -3613,13 +3753,6 @@ export class Reconciler {
         step: null,
         type: ENGINE_EVENT_TYPES.HandoffRecorded,
         payload: { code: CEILING_HANDOFF_CODE, reason },
-      });
-    }
-    if (!logged.some((event) => event.type === BUDGET_EXHAUSTED_EVENT_TYPE)) {
-      this.emit(recorder, {
-        step: null,
-        type: BUDGET_EXHAUSTED_EVENT_TYPE,
-        payload: this.budgetPayload(plan, state, action.reading, action.readings, action.reason),
       });
     }
     this.emit(recorder, {
@@ -4214,9 +4347,8 @@ export class Reconciler {
     step: PlanStep,
     record: Pick<StepRecord, 'baseline_ref' | 'attempts'>,
     tier: ModelRung,
-    prepared?: StepInput,
+    input: StepInput,
   ): StepStartRequest {
-    const input = prepared ?? this.stepInput(paths, plan, state, step, record.baseline_ref).value;
     const recorder = this.recorderFor(state.run, state.feature);
     return {
       run: state.run,
@@ -4266,7 +4398,8 @@ export class Reconciler {
     state: RunState,
     step: PlanStep,
     baselineRef: string,
-    gates: readonly GateOutcomeRecord[] = [],
+    gates: readonly GateOutcomeRecord[],
+    readings: readonly CeilingReading[],
   ): { readonly value: StepInput; readonly relativePath: string } {
     const path = stepInputPath(paths, step.step);
     const relativePath = stepInputRelativePath(step.step);
@@ -4343,10 +4476,7 @@ export class Reconciler {
        * Read from the same log and snapshot the ceiling decision reads, so the step is told the allowance
        * the loop is actually holding it to. `steps_remaining` is the plan-derived count it always was.
        */
-      budget: budgetFrom(
-        stepsRemainingIn(plan, state),
-        this.ceilingReadings(state, readEventLog(paths.eventLog)),
-      ),
+      budget: budgetFrom(stepsRemainingIn(plan, state), readings),
       created_at: formatTimestamp(this.now()),
     };
 
@@ -4881,40 +5011,46 @@ const spendingStepOf = (action: ReconcileAction): string | null => {
 /**
  * AD-24 — what the ceilings make of the action `decideAction` chose. A pure function, like that one.
  *
- * Three answers, in this order:
+ * Four answers, in this order:
  *
- * 1. **Hibernate** when a ceiling is reached, or when the log already carries `budget.exhausted` — the
- *    second is the crash case, where the hibernation began and the terminal state never landed, and the
- *    next pass must finish it rather than notice the clock went backwards and carry on spending.
- * 2. **Degrade** at eighty percent of any ceiling, but **only for a run that has not already degraded.**
- *    That guard is the whole of "a second ceiling crossing eighty percent does not re-emit": the standing
- *    degradation is folded from the first `budget.degraded`, and a run already carrying one goes on to the
- *    step it chose, which it takes degraded.
- * 3. Otherwise the action stands, unchanged.
+ * 1. **Nothing, for a terminal run.** A hibernated run's log still carries its `budget.exhausted`, and without
+ *    this a later pass would find it and hibernate the run again — escape hatch, note and all.
+ * 2. **Finish the recorded hibernation** when the log already carries `budget.exhausted` — the crash case,
+ *    decided from that line and never from a fresh reading (`verdict` is `null` then; nothing is measured).
+ * 3. **Hibernate** when a ceiling is reached — **whether or not the run has already degraded.** This is asked
+ *    before the degradation guard below, and that order is the common route to a ceiling: degrade first,
+ *    exhaust later. A guard asked first would let a degraded run spend past its ceiling for good.
+ * 4. **Degrade** at eighty percent, but **only for a run that has not already degraded** — the whole of "a
+ *    second ceiling crossing eighty percent does not re-emit". Otherwise the action stands, unchanged.
  */
 export const decideCeilingAction = (
   action: ReconcileAction,
   state: RunState,
-  verdict: CeilingVerdict,
-  exhaustedRecorded: boolean,
+  verdict: CeilingVerdict | null,
+  recorded: RecordedExhaustion | null,
 ): ReconcileAction => {
-  if (verdict.kind === 'hibernate' || exhaustedRecorded) {
-    const reading =
-      verdict.kind === 'within'
-        ? [...verdict.readings].sort((left, right) => right.fraction - left.fraction)[0]
-        : verdict.reading;
-    if (reading !== undefined) {
-      return {
-        kind: 'hibernate',
-        step: spendingStepOf(action),
-        reading,
-        readings: verdict.readings,
-        reason:
-          `The run reached a ceiling: ${describeReading(reading)}. AD-24 has a run hibernate at its ` +
-          'ceiling rather than continue, so the work is put on a take-over branch and a hand-off note is ' +
-          'written instead of starting another step.',
-      };
-    }
+  if (isTerminalFeatureState(state.state)) return action;
+  if (recorded !== null) {
+    return {
+      kind: 'hibernate',
+      step: spendingStepOf(action),
+      reading: recorded.reading,
+      readings: [],
+      reason: recorded.reason,
+    };
+  }
+  if (verdict === null) return action;
+  if (verdict.kind === 'hibernate') {
+    return {
+      kind: 'hibernate',
+      step: spendingStepOf(action),
+      reading: verdict.reading,
+      readings: verdict.readings,
+      reason:
+        `The run reached a ceiling: ${describeReading(verdict.reading)}. AD-24 has a run hibernate at its ` +
+        'ceiling rather than continue, so the work is put on a take-over branch and a hand-off note is ' +
+        'written instead of starting another step.',
+    };
   }
   if (verdict.kind === 'degrade' && state.degradation === null) {
     return {
@@ -4928,4 +5064,11 @@ export const decideCeilingAction = (
     };
   }
   return action;
+};
+
+/** The unit each dimension's `consumed` and `ceiling` are written in, so a reader never has to guess. */
+const CEILING_UNITS: Readonly<Record<CeilingReading['dimension'], string>> = {
+  steps: 'step_attempts',
+  wall_clock: 'ms',
+  rate_limit_budget: 'tokens',
 };

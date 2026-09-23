@@ -10,11 +10,12 @@
  * checked by behaviour — the take-over commit carries the ceiling trigger only `escapeHatch` writes — and by
  * a source guard in the same idiom story 2-8 used for "no second write path to question state".
  */
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { BUDGET_EXHAUSTED_EVENT_TYPE, isTerminalFeatureState } from '../src/contracts/index.js';
+import { BUDGET_EXHAUSTED_EVENT_TYPE, PROFILE_FILE_NAME, isTerminalFeatureState } from '../src/contracts/index.js';
 import type { RunState } from '../src/contracts/index.js';
 import { ENGINE_EVENT_TYPES, decideAction, takeoverBranchFor, terminated } from '../src/engine/index.js';
 import type { WorktreeGit } from '../src/engine/index.js';
@@ -58,14 +59,21 @@ const PARTIAL_CONTENT = 'export const partial = "half of the feature";\n';
  *
  * Only the wall clock is tight, so the ceiling that trips is the one the test moves.
  */
-const hibernatingWorld = (label: string): { readonly world: CeilingWorld; readonly worktree: GitWorktree } => {
+const hibernatingWorld = (
+  label: string,
+  gitCalls: string[][] = [],
+): { readonly world: CeilingWorld; readonly worktree: GitWorktree } => {
   const worktree = makeGitWorktree(`hibernation-${label}`);
   cleanups.push(() => rmSync(worktree.dir, { recursive: true, force: true }));
   const world = ceilingWorld({
     label: `hibernation-${label}`,
     ceilings: { ...LOOSE_CEILINGS, wall_clock_minutes: 10 },
     worktree: worktree.dir,
-    worktreeGit: fixtureWorktreeGit,
+    // Every git call the escape hatch makes is recorded, so a test can assert that none happened.
+    worktreeGit: (dir, args) => {
+      gitCalls.push([...args]);
+      return fixtureWorktreeGit(dir, args);
+    },
     onStart: (request) => {
       if (request.step === 'implement') worktree.write(PARTIAL_FILE, PARTIAL_CONTENT);
       return terminated(request.step, 'completed');
@@ -127,6 +135,8 @@ describe('a run reaching a ceiling hibernates through the escape hatch (matrix r
     expect(note).toContain('hibernated at a run ceiling');
     expect(note).toContain('`budget.exhausted`');
     expect(note).toContain('`hibernated`');
+    // The next step a person is given is about the allowance, not about a failure.
+    expect(note).toContain('raise that ceiling under `[ceilings]` in `.orch/profile.toml`');
     // The verify step was never started: hibernation replaced the spend, it did not follow it.
     expect(world.executor.started.map((request) => request.step)).toStrictEqual(['implement']);
   });
@@ -269,5 +279,87 @@ describe('hibernation has no second branch-and-document path (landmine D)', () =
       expect({ module, checkout: source(module).includes("'checkout'") }).toStrictEqual({ module, checkout: false });
     }
     expect(source('engine/ceilings.ts')).not.toMatch(/from 'node:/);
+  });
+});
+
+describe('a hibernation is never repeated and never blocked by a later read (review items C, E and K)', () => {
+  it('finishes a recorded hibernation even when the snapshot has since become unreadable', async () => {
+    const { world, worktree } = hibernatingWorld('unreadable-after');
+    const { run, branch } = await leavePartialWork(world, worktree);
+    world.at(600_000);
+    world.restart((label) => {
+      if (label === 'event-appended:budget.exhausted') throw new Error('killed after budget.exhausted');
+    });
+    await world.reconciler.pass();
+    writeFileSync(join(runPaths(run, world.home).configDir, PROFILE_FILE_NAME), 'ceilings = [not toml\n', 'utf8');
+
+    world.restart();
+    await world.reconciler.pass();
+
+    // Not escalated to a person: the decision was already durable and needs no ceiling read to finish.
+    expect(stateOf(world, run).state).toBe('hibernated');
+    expect(branchExists(worktree, branch)).toBe(true);
+  });
+
+  it('describes a finished hibernation by the recorded reading, not by the clock after the restart', async () => {
+    const { world, worktree } = hibernatingWorld('recorded-reason');
+    const { run } = await leavePartialWork(world, worktree);
+    world.at(600_000);
+    world.restart((label) => {
+      if (label === 'event-appended:budget.exhausted') throw new Error('killed after budget.exhausted');
+    });
+    await world.reconciler.pass();
+    world.at(0);
+    world.restart();
+    await world.reconciler.pass();
+
+    const [entered] = world
+      .ofType(run, ENGINE_EVENT_TYPES.FeatureStateChanged)
+      .filter((event) => event.payload['to'] === 'hibernated');
+    expect(String(entered?.payload['reason'])).toContain('10 of its 10 wall-clock minutes (100%');
+    const note = readFileSync(runPaths(run, world.home).handoffDocument, 'utf8');
+    expect(note).toContain('10 of its 10 wall-clock minutes');
+    expect(note).not.toMatch(/going 0 of its 10|\(0% of the wall-clock/);
+  });
+
+  it('does nothing at all to a run that has already hibernated, however it is advanced', async () => {
+    const gitCalls: string[][] = [];
+    const { world, worktree } = hibernatingWorld('already', gitCalls);
+    const { run } = await leavePartialWork(world, worktree);
+    world.at(600_000);
+    await world.reconciler.pass();
+    expect(stateOf(world, run).state).toBe('hibernated');
+    // Positive control: the hibernation itself did use git.
+    expect(gitCalls.length).toBeGreaterThan(0);
+    const calls = gitCalls.length;
+    const lines = world.events(run).length;
+
+    const action = await world.reconciler.advance(run);
+
+    expect(action.kind).toBe('idle');
+    expect(gitCalls).toHaveLength(calls);
+    expect(world.events(run)).toHaveLength(lines);
+  });
+
+  it('runs no git for a run stopped by a person after its hibernation began', async () => {
+    const gitCalls: string[][] = [];
+    const { world, worktree } = hibernatingWorld('killed-mid', gitCalls);
+    const { run } = await leavePartialWork(world, worktree);
+    world.at(600_000);
+    world.restart((label) => {
+      if (label === 'event-appended:budget.exhausted') throw new Error('killed after budget.exhausted');
+    });
+    await world.reconciler.pass();
+    world.restart();
+    world.reconciler.kill(run);
+    const calls = gitCalls.length;
+
+    await world.reconciler.pass();
+
+    expect(stateOf(world, run).state).toBe('killed');
+    expect(gitCalls).toHaveLength(calls);
+    expect(
+      world.ofType(run, ENGINE_EVENT_TYPES.FeatureStateChanged).filter((event) => event.payload['to'] === 'hibernated'),
+    ).toStrictEqual([]);
   });
 });

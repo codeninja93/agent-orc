@@ -113,8 +113,27 @@ export const GATE_PASSED_EVENT_TYPE = 'gate.passed';
 export const GATE_FAILED_EVENT_TYPE = 'gate.failed';
 export const GATE_SKIPPED_EVENT_TYPE = 'gate.skipped';
 
-/** The review that was not spawned, and why (CAP-13: no review spend on a failing run). */
+/**
+ * The review that was not spawned, and why.
+ *
+ * **It has two causes, and `narrowed_by` is the key that tells them apart.** Story 2-6 emits it when a
+ * deterministic gate failed (CAP-13: no review spend on a failing run), carrying the failed gates. Story 2-9
+ * emits it when a degraded run narrows scope (AD-24) and every gate that ran passed; that line carries
+ * {@link REVIEW_SKIPPED_PAYLOAD_KEYS}.NarrowedBy set to `budget.degraded`, and an empty `failed_gates`. A
+ * reader must check `narrowed_by` rather than infer the cause from `failed_gates` being empty.
+ */
 export const REVIEW_SKIPPED_EVENT_TYPE = 'verification.review_skipped';
+
+/** The payload keys a `verification.review_skipped` line may carry. */
+export const REVIEW_SKIPPED_PAYLOAD_KEYS = {
+  Reason: 'reason',
+  FailedGates: 'failed_gates',
+  PassedGates: 'passed_gates',
+  /** Present only on a narrowed skip: the event type that caused it, `budget.degraded`. Absent means a gate failed. */
+  NarrowedBy: 'narrowed_by',
+  /** True when the skip was decided on a resume, from the outcomes the resumed attempt had already recorded. */
+  Resumed: 'resumed',
+} as const;
 
 /**
  * AD-24's two ceiling lines, spelled once for the writer and every reader.
@@ -127,24 +146,45 @@ export const BUDGET_DEGRADED_EVENT_TYPE = 'budget.degraded';
 export const BUDGET_EXHAUSTED_EVENT_TYPE = 'budget.exhausted';
 
 /**
- * The payload keys a `budget.degraded` or `budget.exhausted` line carries beside the three
- * `BudgetSchema` fields.
+ * A degraded run's step put on a lower rung by budget pressure (AD-24) — never a promotion run backwards.
  *
- * The three budget fields travel under their `BudgetSchema` names — `steps_remaining`,
- * `wall_clock_ms_remaining`, `rate_limit_budget_consumed` — because `src/tui/projection.ts` already folds
- * those names off exactly these two types, so a second spelling here would be a field no surface reads.
+ * Declared here rather than only in the engine's own table because a renderer has to show it: a downshift is
+ * the visible half of degradation, and AD-5's ignore-unknown rule would otherwise have the timeline drop it.
+ */
+export const STEP_TIER_DOWNSHIFTED_EVENT_TYPE = 'step.tier_downshifted';
+
+/**
+ * The payload keys a `budget.degraded` or `budget.exhausted` line carries beside two `BudgetSchema` fields.
+ *
+ * `wall_clock_ms_remaining` and `rate_limit_budget_consumed` travel under their `BudgetSchema` names because
+ * `src/tui/projection.ts` already folds those names off exactly these two types, so a second spelling here
+ * would be a field no surface reads. Both are unclamped in the log — a negative remainder or a share past 1
+ * is the overshoot this line exists to report (R12) — though a step input clamps them to its schema.
  * What is added is *which* ceiling tripped and by how much, which the budget alone cannot say. Every value
  * is a short enum member or a number, so AD-21's entropy sweep has nothing to rewrite (AD-5 additive).
  */
 export const BUDGET_PAYLOAD_KEYS = {
   /** Which of AD-24's three ceilings this line is about. */
   Dimension: 'dimension',
+  /** The unit `consumed` and `ceiling` are in: `step_attempts`, `ms` or `tokens`. */
+  Unit: 'unit',
   /** Consumed over ceiling on that dimension, unclamped: an overshoot is reported as one (R12). */
   Fraction: 'fraction',
-  /** What was consumed on that dimension, in its own unit: steps, milliseconds or tokens. */
+  /** What was consumed on that dimension, in its own unit. */
   Consumed: 'consumed',
   /** The ceiling that dimension is measured against, in the same unit. */
   Ceiling: 'ceiling',
+  /**
+   * False when the reading could not be measured (a zero ceiling, an unparseable timestamp): the fraction is
+   * then written as exactly `1`, "treated as reached", instead of `NaN`/`Infinity` serialising as `null`.
+   */
+  Measurable: 'measurable',
+  /**
+   * Declared plan steps with no completed record — the *plan's* count, which is not the step-attempt ceiling
+   * `dimension: 'steps'` measures. Named for what it is so the two are not read as one figure; the step input
+   * carries the same number as `BudgetSchema.steps_remaining`.
+   */
+  PlanStepsRemaining: 'plan_steps_remaining',
   Reason: 'reason',
 } as const;
 
@@ -251,6 +291,7 @@ export const EVENT_TYPES = [
   'redaction.failed',
   BUDGET_DEGRADED_EVENT_TYPE,
   BUDGET_EXHAUSTED_EVENT_TYPE,
+  STEP_TIER_DOWNSHIFTED_EVENT_TYPE,
   'question.asked',
   'question.resolved',
   'question.default_taken',

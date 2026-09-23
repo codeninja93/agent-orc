@@ -435,7 +435,21 @@ export const renderHandoffDocument = (
     );
   }
 
+  const hibernated = brief.state === 'hibernated';
   const nextSteps: string[] = [];
+  /**
+   * A hibernated run stopped at an allowance, not on a failure, so its first next step is about the
+   * allowance: the ceiling is declared in the profile, and a run's allowance is fixed at its start (AD-9), so
+   * raising it means raising it there and starting again — picking up from the branch rather than from zero.
+   */
+  if (hibernated) {
+    nextSteps.push(
+      'This run was not failing — it reached the ceiling named at the top of this note. If the work is ' +
+        'worth more than that allowance, raise that ceiling under `[ceilings]` in `.orch/profile.toml` and ' +
+        'start a new run from the take-over branch named above; a running run never re-reads its profile, ' +
+        'so raising it does not revive this one.',
+    );
+  }
   if (brief.escape !== null && brief.escape.failure === null) {
     nextSteps.push(
       `Look at the branch — \`git checkout ${brief.escape.branch}\` — and decide whether the partial ` +
@@ -472,7 +486,6 @@ export const renderHandoffDocument = (
    * the state the run is entering rather than on the escape outcome, because a hibernation whose git sequence
    * failed is still a hibernation.
    */
-  const hibernated = brief.state === 'hibernated';
   const lines: string[] = [
     `# ${brief.feature} — ${hibernated ? 'hibernated at a run ceiling' : 'handed off'}`,
     '',

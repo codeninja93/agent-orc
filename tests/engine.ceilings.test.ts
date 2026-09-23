@@ -12,20 +12,22 @@
  * one hundred percent, so the wall-clock ceiling is ten minutes and the clock is set to the millisecond:
  * 479 999 ms does not degrade, 480 000 ms does, 599 999 ms degrades, 600 000 ms hibernates.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   BUDGET_DEGRADED_EVENT_TYPE,
   BUDGET_EXHAUSTED_EVENT_TYPE,
+  CeilingsSchema,
   GATE_PASSED_EVENT_TYPE,
   REVIEW_SKIPPED_EVENT_TYPE,
   StepInputSchema,
   findStepRecord,
   makeError,
 } from '../src/contracts/index.js';
-import type { RunState, StepUsage } from '../src/contracts/index.js';
+import type { EventEnvelope, RunState, StepUsage } from '../src/contracts/index.js';
 import {
   DEGRADATION_THRESHOLD_PERCENT,
   ENGINE_EVENT_TYPES,
@@ -36,6 +38,7 @@ import {
   decideAction,
   decideCeilingAction,
   downshiftFor,
+  measureConsumption,
   readCeilings,
   runCeilingsFrom,
   skipsModelReview,
@@ -43,6 +46,7 @@ import {
   terminated,
 } from '../src/engine/index.js';
 import type { PassAction, PlanStep, ReconcileAction, StepStartRequest } from '../src/engine/index.js';
+import { PROFILE_FILE_NAME } from '../src/contracts/index.js';
 import { runPaths } from '../src/runtime/index.js';
 
 import {
@@ -214,18 +218,23 @@ describe('degradation is a standing condition: once, and for good (matrix row 4)
     const base = { degradation: null } as const;
 
     // Positive control: the same verdict on a run that has not degraded yet is a `degrade`.
-    expect(decideCeilingAction(action, { ...stateFixture(), ...base }, verdict, false).kind).toBe('degrade');
-    expect(
-      decideCeilingAction(
-        action,
-        { ...stateFixture(), degradation: { dimension: 'wall_clock', recorded_at: '2026-09-23T09:05:00.000Z' } },
-        verdict,
-        false,
-      ),
-    ).toBe(action);
+    expect(decideCeilingAction(action, { ...stateFixture(), ...base }, verdict, null).kind).toBe('degrade');
+    const degradedState: RunState = {
+      ...stateFixture(),
+      state: 'degraded',
+      degradation: { dimension: 'wall_clock', recorded_at: '2026-09-23T09:05:00.000Z' },
+    };
+    expect(decideCeilingAction(action, degradedState, verdict, null)).toBe(action);
+    // And a run with more room than when it degraded is not un-degraded either: the action is its own, and
+    // `decideAction` already gave it `degraded` as its working state.
+    const roomier = ceilingVerdict(
+      readCeilings({ steps: 1, wallClockMs: 0, rateLimitTokens: null }, runCeilingsFrom({ ...LOOSE_CEILINGS, steps: 10 })),
+    );
+    expect(roomier.kind).toBe('within');
+    expect(decideCeilingAction(action, degradedState, roomier, null)).toBe(action);
   });
 
-  it('never takes a degraded run back to running, through a gate, an interruption and more room on the clock', async () => {
+  it('never takes a degraded run back to running, through a gate and an interruption', async () => {
     const world = open({
       label: 'no-flap',
       ceilings: WALL_CLOCK_TEN_MINUTES,
@@ -244,8 +253,8 @@ describe('degradation is a standing condition: once, and for good (matrix row 4)
     world.at(500_000);
     expect((await passOnce(world, run))?.kind).toBe('degrade');
 
-    // The same ceiling now has *more* room than when the run degraded: the clock is back at the start.
-    world.at(0);
+    // The clock holds at eighty-three percent from here, so every later pass meets the same `degrade` verdict
+    // on a run that has already degraded — which is exactly what must not re-emit or reset anything.
     expect((await passOnce(world, run))?.kind).toBe('run-step');
     expect((await passOnce(world, run))?.kind).toBe('escalate-to-human');
     expect(stateOf(world, run).state).toBe('blocked');
@@ -362,10 +371,17 @@ describe('a degraded run narrows scope to the deterministic gates (matrix row 6)
     expect(stateOf(world, run).state).toBe('committed');
   });
 
-  it('keeps the review when no gate actually ran, because skipping it would verify nothing', () => {
+  it('narrows a degraded verification only when a gate passed and none failed', () => {
     const skippedGates = [{ outcome: 'skipped' as const }, { outcome: 'skipped' as const }];
+    // Skipped-only, or no gates at all, verify nothing — the review is kept rather than leaving the step
+    // verified by nothing, which this story's Boundaries forbid.
     expect(skipsModelReview({ degraded: true, phase: 'verification', gates: skippedGates })).toBe(false);
+    expect(skipsModelReview({ degraded: true, phase: 'verification', gates: [] })).toBe(false);
     expect(skipsModelReview({ degraded: true, phase: 'verification', gates: [{ outcome: 'passed' }] })).toBe(true);
+    // A failing gate is never narrowed past: it is disposed as any failing gate is (row 7).
+    expect(
+      skipsModelReview({ degraded: true, phase: 'verification', gates: [{ outcome: 'passed' }, { outcome: 'failed' }] }),
+    ).toBe(false);
     // Only verification is narrowed, and only a degraded run's.
     expect(skipsModelReview({ degraded: true, phase: 'implementation', gates: [{ outcome: 'passed' }] })).toBe(false);
     expect(skipsModelReview({ degraded: false, phase: 'verification', gates: [{ outcome: 'passed' }] })).toBe(false);
@@ -473,6 +489,9 @@ describe('consumed rate-limit budget is read from recorded usage, never currency
     const [line] = world.ofType(run, BUDGET_DEGRADED_EVENT_TYPE);
     expect(line).toBeDefined();
     expect(Object.keys(line?.payload ?? {}).filter((key) => /usd|cost|currency|dollar/i.test(key))).toStrictEqual([]);
+    // The plan's count and the step-attempt ceiling are two figures, named as two, each with its unit.
+    expect(line?.payload).toMatchObject({ unit: 'ms', plan_steps_remaining: 2, measurable: true });
+    expect(line?.payload).not.toHaveProperty('steps_remaining');
   });
 
   it('names no currency figure anywhere in the ceiling module’s code', () => {
@@ -586,11 +605,61 @@ describe('the boundaries are exact (matrix rows 15 and 16)', () => {
     expect(verdictAt(500_001, 1_000_001)).toBe('hibernate');
   });
 
-  it('treats a ceiling it cannot divide by as reached, rather than as no ceiling', () => {
+  it('treats a ceiling it cannot divide by as reached, and says so with a finite figure', () => {
     const verdict = ceilingVerdict(
       readCeilings({ steps: 0, wallClockMs: 0, rateLimitTokens: null }, runCeilingsFrom({ ...LOOSE_CEILINGS, steps: 0 })),
     );
-    expect(verdict).toMatchObject({ kind: 'hibernate', reading: { dimension: 'steps' } });
+    // Exactly 1 and flagged, never NaN or Infinity — either would serialise as `null` and hide the overshoot.
+    expect(verdict).toMatchObject({ kind: 'hibernate', reading: { dimension: 'steps', fraction: 1, measurable: false } });
+    const unparseable = ceilingVerdict(
+      readCeilings({ steps: 0, wallClockMs: Number.NaN, rateLimitTokens: null }, runCeilingsFrom(LOOSE_CEILINGS)),
+    );
+    expect(unparseable).toMatchObject({ kind: 'hibernate', reading: { dimension: 'wall_clock', fraction: 1, measurable: false } });
+  });
+
+  it('breaks a tie between two ceilings at the same fraction by the declared order', () => {
+    // Steps and wall clock both sit exactly on eighty percent: one verdict, naming steps, declared first.
+    const verdict = ceilingVerdict(
+      readCeilings(
+        { steps: 8, wallClockMs: 480_000, rateLimitTokens: null },
+        runCeilingsFrom({ ...LOOSE_CEILINGS, steps: 10, wall_clock_minutes: 10 }),
+      ),
+    );
+    expect(verdict).toMatchObject({ kind: 'degrade', reading: { dimension: 'steps' } });
+    // Positive control: the fuller one wins when they differ, whichever comes first.
+    const fuller = ceilingVerdict(
+      readCeilings(
+        { steps: 8, wallClockMs: 540_000, rateLimitTokens: null },
+        runCeilingsFrom({ ...LOOSE_CEILINGS, steps: 10, wall_clock_minutes: 10 }),
+      ),
+    );
+    expect(fuller).toMatchObject({ kind: 'degrade', reading: { dimension: 'wall_clock' } });
+  });
+
+  it('degrades once when two ceilings cross eighty percent on the same pass', async () => {
+    const world = open({
+      label: 'simultaneous',
+      ceilings: { ...LOOSE_CEILINGS, steps: 5, wall_clock_minutes: 10 },
+      steps: implementationSteps(6),
+      onStart: completes,
+    });
+    const run = world.start();
+    for (let index = 0; index < 4; index += 1) await passOnce(world, run);
+    world.at(480_000);
+    expect((await passOnce(world, run))?.kind).toBe('degrade');
+    const lines = world.ofType(run, BUDGET_DEGRADED_EVENT_TYPE);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.payload['dimension']).toBe('steps');
+  });
+
+  it('reports an overshoot unclamped in the budget.exhausted line, for both figures', async () => {
+    const world = open({ label: 'overshoot', ceilings: WALL_CLOCK_TEN_MINUTES, onStart: completes });
+    const run = world.start();
+    world.at(700_000);
+    await passOnce(world, run);
+    const [line] = world.ofType(run, BUDGET_EXHAUSTED_EVENT_TYPE);
+    expect(line?.payload['fraction']).toBeCloseTo(700_000 / 600_000);
+    expect(line?.payload['wall_clock_ms_remaining']).toBe(-100_000);
   });
 });
 
@@ -608,4 +677,230 @@ const stateFixture = (): RunState => ({
   updated_at: '2026-09-23T09:00:00.000Z',
   handoff: null,
   degradation: null,
+});
+
+describe('the ceilings a run is held to come from its snapshot, or the fallback, never silently from neither', () => {
+  it('blocks, and starts nothing, when the snapshot’s profile exists and cannot be read', async () => {
+    const world = open({ label: 'unreadable', ceilings: WALL_CLOCK_TEN_MINUTES, onStart: completes });
+    const run = world.start();
+    writeFileSync(join(runPaths(run, world.home).configDir, PROFILE_FILE_NAME), 'ceilings = [not toml\n', 'utf8');
+
+    const action = await passOnce(world, run);
+
+    expect(action?.kind).toBe('escalate-to-human');
+    expect(stateOf(world, run).state).toBe('blocked');
+    expect(world.executor.started).toStrictEqual([]);
+    expect(world.ofType(run, ENGINE_EVENT_TYPES.StepStarted)).toStrictEqual([]);
+  });
+
+  it('holds a run with no snapshot to the declared fallback, so it still degrades', async () => {
+    const world = open({ label: 'fallback', ceilings: WALL_CLOCK_TEN_MINUTES, onStart: completes });
+    const run = world.startWithoutSnapshot();
+    // Forty-eight of the fallback's sixty minutes: past the snapshot's ten, which is not what is read here.
+    world.at(47 * 60_000);
+    expect((await passOnce(world, run))?.kind).toBe('run-step');
+    world.at(48 * 60_000);
+    expect((await passOnce(world, run))?.kind).toBe('degrade');
+  });
+
+  it('refuses a hand-edited ceiling outside the bounds the interview enforces', () => {
+    const valid = { steps: 10, wall_clock_minutes: 10, rate_limit_budget_percent: 50 };
+    expect(CeilingsSchema.safeParse(valid).success).toBe(true);
+    expect(CeilingsSchema.safeParse({ ...valid, steps: 0 }).success).toBe(false);
+    expect(CeilingsSchema.safeParse({ ...valid, wall_clock_minutes: 10_081 }).success).toBe(false);
+    expect(CeilingsSchema.safeParse({ ...valid, rate_limit_budget_percent: 101 }).success).toBe(false);
+    expect(CeilingsSchema.safeParse({ ...valid, rate_limit_window_tokens: 10_000_000_001 }).success).toBe(false);
+  });
+});
+
+describe('a degraded run that goes on to reach a ceiling hibernates (the common route: degrade, then exhaust)', () => {
+  it('hibernates from degraded, once, rather than spending past its ceiling', async () => {
+    const world = open({ label: 'degrade-then-exhaust', ceilings: WALL_CLOCK_TEN_MINUTES, onStart: completes });
+    const run = world.start();
+    world.at(500_000);
+    expect((await passOnce(world, run))?.kind).toBe('degrade');
+    expect((await passOnce(world, run))?.kind).toBe('run-step');
+    expect(stateOf(world, run).state).toBe('degraded');
+
+    world.at(600_000);
+    expect((await passOnce(world, run))?.kind).toBe('hibernate');
+
+    expect(stateOf(world, run).state).toBe('hibernated');
+    expect(world.ofType(run, BUDGET_EXHAUSTED_EVENT_TYPE)).toHaveLength(1);
+    const last = world.ofType(run, ENGINE_EVENT_TYPES.FeatureStateChanged).at(-1);
+    expect(last?.payload).toMatchObject({ from: 'degraded', to: 'hibernated' });
+    // The verify step never spent: hibernation replaced it.
+    expect(world.executor.started.map((request) => request.step)).toStrictEqual(['implement']);
+  });
+});
+
+describe('the wall clock stops while a run waits on a person (AD-24 bounds work, not waiting)', () => {
+  it('does not count two hours spent blocked at a gate', async () => {
+    const world = open({
+      label: 'blocked-time',
+      ceilings: WALL_CLOCK_TEN_MINUTES,
+      onStart: (request, attempt) =>
+        request.step === 'implement' && attempt === 1
+          ? terminated(request.step, 'blocked', { error: makeError('permission.denied', 'needs a person') })
+          : completes(request),
+    });
+    const run = world.start();
+    await passOnce(world, run);
+    expect((await passOnce(world, run))?.kind).toBe('escalate-to-human');
+
+    world.at(2 * 60 * 60_000);
+    world.reconciler.approve(run);
+    world.at(2 * 60 * 60_000 + 60_000);
+    await world.reconciler.runUntilSettled();
+
+    expect(world.ofType(run, BUDGET_DEGRADED_EVENT_TYPE)).toStrictEqual([]);
+    expect(world.ofType(run, BUDGET_EXHAUSTED_EVENT_TYPE)).toStrictEqual([]);
+    expect(stateOf(world, run).state).toBe('committed');
+  });
+
+  it('does not count time spent in drafting before the criteria were confirmed', async () => {
+    const world = open({ label: 'drafting-time', ceilings: WALL_CLOCK_TEN_MINUTES, onStart: completes });
+    const run = world.start(2 * 60 * 60_000);
+    world.at(2 * 60 * 60_000 + 60_000);
+    expect((await passOnce(world, run))?.kind).toBe('run-step');
+    expect(world.ofType(run, BUDGET_EXHAUSTED_EVENT_TYPE)).toStrictEqual([]);
+  });
+
+  it('still counts working time — the positive control for both', async () => {
+    const world = open({ label: 'working-time', ceilings: WALL_CLOCK_TEN_MINUTES, onStart: completes });
+    const run = world.start();
+    world.at(2 * 60 * 60_000 + 60_000);
+    expect((await passOnce(world, run))?.kind).toBe('hibernate');
+  });
+});
+
+describe('what counts against the rate-limit budget (review items I and J)', () => {
+  it('does not count cache reads, however many, against the budget', async () => {
+    const world = open({
+      label: 'cache-reads',
+      ceilings: { ...LOOSE_CEILINGS, rate_limit_budget_percent: 50, rate_limit_window_tokens: 200_000 },
+      onStart: (request) =>
+        terminated(request.step, 'completed', {
+          usage: usage({ cache_read_input_tokens: 5_000_000, input_tokens: 10 }),
+        }),
+    });
+    const run = world.start();
+    await world.reconciler.runUntilSettled();
+    // Positive control is the rate-limit row: the same ceiling, tripped by counted tokens.
+    expect(world.ofType(run, BUDGET_DEGRADED_EVENT_TYPE)).toStrictEqual([]);
+    expect(stateOf(world, run).state).toBe('committed');
+  });
+
+  it('sums each attempt’s reported usage once, and a killed attempt that reported none adds nothing', () => {
+    const line = (seq: number, disposition: string, usageFigure: StepUsage | null): EventEnvelope => ({
+      ts: '2026-09-23T09:00:00.000Z',
+      seq,
+      feature: 'ceilings',
+      run: '01K5NQ9ZJ7V3M2P9XQWRTC4BDE',
+      step: 'implement',
+      emitter: 'engine.reconciler',
+      type: ENGINE_EVENT_TYPES.StepTerminated,
+      payload: { disposition, ...(usageFigure === null ? {} : { usage: usageFigure }) },
+    });
+    const consumption = measureConsumption({
+      state: stateFixture(),
+      events: [
+        line(1, 'killed', null),
+        line(2, 'interrupted', null),
+        line(3, 'completed', usage({ input_tokens: 300, output_tokens: 20 })),
+      ],
+      now: new Date('2026-09-23T09:00:00.000Z'),
+    });
+    expect(consumption.rateLimitTokens).toBe(320);
+    // Nothing recorded at all is absence, not zero.
+    expect(measureConsumption({ state: stateFixture(), events: [line(1, 'killed', null)], now: new Date() }).rateLimitTokens).toBeNull();
+  });
+});
+
+describe('degradation reaches a resumed attempt too (review item B)', () => {
+  const interruptedOnce = (request: StepStartRequest) =>
+    terminated(request.step, 'interrupted', { sessionId: `sess-${request.step}` });
+
+  it('downshifts a resumed attempt, where the undegraded run resumes on its recorded rung', async () => {
+    const build = (label: string) =>
+      open({
+        label,
+        ceilings: WALL_CLOCK_TEN_MINUTES,
+        startTiers: { implementation: 'claude-opus-5' },
+        sessionIdFor: (request) => `sess-${request.step}`,
+        onStart: (request) => (request.step === 'implement' ? interruptedOnce(request) : completes(request)),
+        onResume: (request) => terminated(request.step, 'completed', { sessionId: request.sessionId }),
+      });
+
+    const control = build('resume-control');
+    const controlRun = control.start();
+    await control.reconciler.runUntilSettled();
+    expect(control.executor.resumed.map((request) => request.modelTier)).toStrictEqual(['claude-opus-5']);
+    expect(control.ofType(controlRun, ENGINE_EVENT_TYPES.StepTierDownshifted)).toStrictEqual([]);
+
+    const world = build('resume-degraded');
+    const run = world.start();
+    await passOnce(world, run);
+    world.at(500_000);
+    expect((await passOnce(world, run))?.kind).toBe('degrade');
+    await world.reconciler.runUntilSettled();
+
+    expect(world.executor.resumed.map((request) => request.modelTier)).toStrictEqual(['claude-sonnet-5']);
+    const [downshift] = world.ofType(run, ENGINE_EVENT_TYPES.StepTierDownshifted);
+    expect(downshift?.payload).toMatchObject({ from: 'claude-opus-5', to: 'claude-sonnet-5', resumed: true });
+  });
+
+  it('does not resume an interrupted review on a degraded run, where the undegraded run resumes it', async () => {
+    const build = (label: string) =>
+      open({
+        label,
+        ceilings: WALL_CLOCK_TEN_MINUTES,
+        sessionIdFor: (request) => `sess-${request.step}`,
+        onStart: (request) => (request.step === 'verify' ? interruptedOnce(request) : completes(request)),
+        onResume: (request) => terminated(request.step, 'completed', { sessionId: request.sessionId }),
+      });
+
+    const control = build('resume-review-control');
+    const controlRun = control.start();
+    await control.reconciler.runUntilSettled();
+    expect(control.executor.resumed.map((request) => request.step)).toStrictEqual(['verify']);
+    expect(control.ofType(controlRun, REVIEW_SKIPPED_EVENT_TYPE)).toStrictEqual([]);
+
+    const world = build('resume-review');
+    const run = world.start();
+    await passOnce(world, run);
+    await passOnce(world, run);
+    expect(findStepRecord(stateOf(world, run), 'verify')?.disposition).toBe('interrupted');
+    world.at(500_000);
+    expect((await passOnce(world, run))?.kind).toBe('degrade');
+    await world.reconciler.runUntilSettled();
+
+    expect(world.executor.resumed).toStrictEqual([]);
+    const [skipped] = world.ofType(run, REVIEW_SKIPPED_EVENT_TYPE);
+    expect(skipped?.payload).toMatchObject({ narrowed_by: BUDGET_DEGRADED_EVENT_TYPE, resumed: true });
+    expect(findStepRecord(stateOf(world, run), 'verify')?.disposition).toBe('completed');
+  });
+});
+
+describe('a crash between budget.degraded and the state change is finished without a second line', () => {
+  it('enters degraded on the next pass, with one budget.degraded', async () => {
+    const world = open({ label: 'degrade-crash', ceilings: WALL_CLOCK_TEN_MINUTES, onStart: completes });
+    const run = world.start();
+    world.at(500_000);
+    world.restart((label) => {
+      if (label === `event-appended:${BUDGET_DEGRADED_EVENT_TYPE}`) throw new Error('killed after budget.degraded');
+    });
+    const crashed = await world.reconciler.pass();
+    expect(crashed.refusals.map((refusal) => refusal.run)).toContain(run);
+    // The fact is durable; the state change is not.
+    expect(stateOf(world, run).degradation).not.toBeNull();
+    expect(stateOf(world, run).state).not.toBe('degraded');
+
+    world.restart();
+    expect((await passOnce(world, run))?.kind).toBe('run-step');
+
+    expect(stateOf(world, run).state).toBe('degraded');
+    expect(world.ofType(run, BUDGET_DEGRADED_EVENT_TYPE)).toHaveLength(1);
+    expect(statesEntered(world, run).filter((state) => state === 'degraded')).toHaveLength(1);
+  });
 });

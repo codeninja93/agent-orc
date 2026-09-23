@@ -24,7 +24,10 @@ import {
   COMMITTING_CONTRACT_ID,
   DEFAULT_BRANCH_PATTERN,
   ENV_VAR_NAME_PATTERN,
+  MAX_CEILING_STEPS,
+  MAX_CEILING_WALL_CLOCK_MINUTES,
   MAX_ENV_VAR_NAME_LENGTH,
+  MAX_RATE_LIMIT_BUDGET_PERCENT,
   MAX_RATE_LIMIT_WINDOW_TOKENS,
   MECHANICS_COMMAND_NAMES,
   MODEL_RUNGS,
@@ -308,12 +311,13 @@ const parseCeiling = (raw: string, name: string, max: number): number | string =
   return value;
 };
 
-/** AD-24's third ceiling is a share of the rate-limit window, so its maximum is a hundred percent. */
-export const MAX_RATE_LIMIT_BUDGET_PERCENT = 100;
-
-/** Bounds that exist so a typo cannot declare a ceiling no run could reach. */
-export const MAX_CEILING_STEPS = 10_000;
-export const MAX_CEILING_WALL_CLOCK_MINUTES = 10_080;
+/**
+ * Re-exported rather than declared, since story 2-9 moved the three maxima into `src/contracts/installer.ts`.
+ *
+ * `CeilingsSchema` now enforces them on a hand-edited profile too, and a schema cannot import the installer —
+ * so the one declaration lives where both can read it, as `DEFAULT_BRANCH_PATTERN` does below.
+ */
+export { MAX_CEILING_STEPS, MAX_CEILING_WALL_CLOCK_MINUTES, MAX_RATE_LIMIT_BUDGET_PERCENT };
 
 /**
  * Re-exported rather than declared, since story 2-7 moved the vocabulary to `src/contracts/installer.ts`.

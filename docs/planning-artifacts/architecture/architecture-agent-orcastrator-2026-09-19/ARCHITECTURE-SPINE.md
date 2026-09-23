@@ -407,25 +407,41 @@ stateDiagram-v2
     confirmed --> running: reconciler claims next step
     running --> running: step completed, state advanced
     running --> blocked: irreversible gate reached
-    blocked --> running: approval, or default-on-timeout taken
+    blocked --> running: approval, or default-on-timeout taken, for a run not degraded
     running --> degraded: eighty percent of a ceiling
     degraded --> degraded: step completed, scope narrowed, tier downshifted
     running --> interrupted: engine killed, crash, or laptop closed
-    interrupted --> running: resume by session id, else baseline reset and re-run
+    interrupted --> running: resume by session id, else baseline reset and re-run, for a run not degraded
+    degraded --> blocked: irreversible gate reached while degraded
+    blocked --> degraded: approval of a run already degraded
+    degraded --> interrupted: engine killed, crash, or laptop closed while degraded
+    interrupted --> degraded: re-run of a degraded run, or eighty percent reached before the resume
+    confirmed --> degraded: eighty percent reached before the first step
+    verifying --> degraded: eighty percent of a ceiling
     running --> verifying: implementation steps complete
     verifying --> running: gate failed, tier promoted
     verifying --> committed: gates passed, committer opens a pull request
     degraded --> committed: gates passed while degraded, committer opens a pull request
     degraded --> hibernated: ceiling reached
     running --> hibernated: a ceiling reached with no eighty percent step in between
+    verifying --> hibernated: a ceiling reached with no eighty percent step in between
+    interrupted --> hibernated: a ceiling reached before the resume or re-run
+    confirmed --> hibernated: a ceiling reached before the first step
     running --> killed: user steering command
     running --> handed_off: escape hatch, or repeated failure
     blocked --> handed_off: escape hatch
+    degraded --> killed: user steering command
+    degraded --> handed_off: escape hatch, or repeated failure
     committed --> [*]
     hibernated --> [*]
     killed --> [*]
     handed_off --> [*]
 ```
+
+A degraded run never returns to `running` or `verifying`: story 2-9 makes degradation a standing condition, so
+`blocked` and `interrupted` hand a degraded run back to `degraded`. One label above is looser than the engine:
+a successful resume by session id records no state change of its own, so `interrupted --> running` and
+`interrupted --> degraded` are drawn at the next step that starts, not at the resume itself.
 
 Question lifecycle, per AD-25 — one accepted transition, three possible resolvers:
 

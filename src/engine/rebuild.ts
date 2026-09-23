@@ -32,6 +32,7 @@ import {
   RUN_MODES,
   STEP_DISPOSITIONS,
   STEP_PHASES,
+  STEP_TIER_DOWNSHIFTED_EVENT_TYPE,
   formatTimestamp,
 } from '../contracts/index.js';
 import type {
@@ -105,7 +106,7 @@ export const ENGINE_EVENT_TYPES = {
    * one-per-step ceiling must never count a downshift as one. Not folded: `step.started` already carries the
    * rung the attempt ran on, and a second line that moved `model_tier` would be a second authority on it.
    */
-  StepTierDownshifted: 'step.tier_downshifted',
+  StepTierDownshifted: STEP_TIER_DOWNSHIFTED_EVENT_TYPE,
   /**
    * One deterministic gate ran, was skipped, or failed — CAP-13's first tier, recorded per gate.
    *

@@ -230,6 +230,26 @@ export const PLACEHOLDER_RATE_LIMIT_WINDOW_TOKENS = 10_000_000;
  */
 export const MAX_RATE_LIMIT_WINDOW_TOKENS = 10_000_000_000;
 
+/** AD-24's third ceiling is a share of the rate-limit window, so its maximum is a hundred percent. */
+export const MAX_RATE_LIMIT_BUDGET_PERCENT = 100;
+
+/** Bounds that exist so a typo cannot declare a ceiling no run could reach. */
+export const MAX_CEILING_STEPS = 10_000;
+export const MAX_CEILING_WALL_CLOCK_MINUTES = 10_080;
+
+/**
+ * A whole number from one to `max`, as a refinement so the draft-7 export carries no bound keywords.
+ *
+ * Applied to every ceiling, not only the window: story 2-9's boundary arithmetic multiplies a consumption by
+ * ten thousand and a ceiling by a percent, so an unbounded hand-edited value could push either product past
+ * `Number.MAX_SAFE_INTEGER` and decide the eighty-percent boundary on a rounded number. The interview already
+ * refused values outside these bounds; a person editing `profile.toml` by hand is now refused the same way.
+ */
+const ceilingBound = (name: string, max: number) =>
+  z.int().refine((value) => value >= 1 && value <= max, {
+    message: `${name} must be between 1 and ${String(max)}`,
+  });
+
 /**
  * AD-24 — three ceilings and no currency dimension, which R10 restates as "cost is subscription
  * usage, never currency". So the third ceiling is a share of the rate-limit window in percent, and
@@ -245,14 +265,16 @@ export const MAX_RATE_LIMIT_WINDOW_TOKENS = 10_000_000_000;
  * with nothing to migrate.
  */
 export const CeilingsSchema = z.object({
-  steps: z.int(),
-  wall_clock_minutes: z.int(),
-  rate_limit_budget_percent: z.int(),
-  rate_limit_window_tokens: z
-    .int()
-    .refine((tokens) => tokens >= 1 && tokens <= MAX_RATE_LIMIT_WINDOW_TOKENS, {
-      message: `rate_limit_window_tokens must be between 1 and ${String(MAX_RATE_LIMIT_WINDOW_TOKENS)}`,
-    })
+  steps: ceilingBound('steps', MAX_CEILING_STEPS).describe(
+    'The most step attempts a run may make — every start, re-run and resume — a whole number from 1 to 10,000.',
+  ),
+  wall_clock_minutes: ceilingBound('wall_clock_minutes', MAX_CEILING_WALL_CLOCK_MINUTES).describe(
+    'The most minutes a run may work, excluding time waiting on a person, a whole number from 1 to 10,080.',
+  ),
+  rate_limit_budget_percent: ceilingBound('rate_limit_budget_percent', MAX_RATE_LIMIT_BUDGET_PERCENT).describe(
+    'The share of the rate-limit window a run may consume, in whole percent from 1 to 100.',
+  ),
+  rate_limit_window_tokens: ceilingBound('rate_limit_window_tokens', MAX_RATE_LIMIT_WINDOW_TOKENS)
     .default(PLACEHOLDER_RATE_LIMIT_WINDOW_TOKENS)
     .describe(
       'How many tokens one rate-limit window holds, a whole number from 1 to 10,000,000,000. ' +

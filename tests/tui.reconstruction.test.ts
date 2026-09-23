@@ -38,6 +38,7 @@ import {
 } from '../src/engine/index.js';
 import type { WorktreeGit } from '../src/engine/index.js';
 import { readEventLog, runPaths } from '../src/runtime/index.js';
+import { ceilingWorld } from './helpers/ceiling-fixture.js';
 import type { EventEnvelope } from '../src/contracts/index.js';
 import {
   DEFAULT_BRIEF_HEIGHT,
@@ -517,11 +518,11 @@ describe('all six cards render from one completed run event log, with nothing el
    * The kill card's numbers come from the log — and what the log does not carry is pinned as absent.
    *
    * R10's token counts are folded from the `step.terminated` lines the run really wrote. The other two
-   * halves of R11's sentence are **not** in any stage-1 log and this states so rather than leaving it
-   * unobserved: nothing in `src/engine/` emits `budget.degraded` or `budget.exhausted`, and `run.created`
-   * carries `{ mode, step_count }` with no `wall_clock_ms_estimate` — ceilings and their estimate are story
-   * 2-9's, which this story's Boundaries say explicitly. The day one is recorded, this assertion is the
-   * reminder that the card can now say more.
+   * halves of R11's sentence are **not** in *this* run's log, and this states so rather than leaving it
+   * unobserved: story 2-9's engine does emit `budget.degraded` and `budget.exhausted`, but only for a run that
+   * reaches eighty percent of a ceiling, and this one handed off long before — so it carries neither, and
+   * `run.created` carries `{ mode, step_count }` with no `wall_clock_ms_estimate`. The test below folds
+   * lines the engine really emitted, which is where the card saying more is asserted.
    */
   it('folds the kill card’s usage out of the log, and states the estimate it has none of (R10, R11)', async () => {
     const handedOff = await handedOffRunWithOnlyItsLog();
@@ -677,6 +678,39 @@ describe('all six cards render from one completed run event log, with nothing el
     // Every line is one whole JSON object, which is what makes the log replayable at all (AD-4, AD-5).
     for (const line of readFileSync(paths.eventLog, 'utf8').trim().split('\n')) {
       expect(() => JSON.parse(line) as unknown).not.toThrow();
+    }
+  });
+});
+
+describe('the budget lines the engine really emits reconstruct on the surfaces (story 2-9)', () => {
+  it('folds an engine-emitted budget.degraded, downshift and budget.exhausted into the view', async () => {
+    const world = ceilingWorld({
+      label: 'tui-budget',
+      ceilings: { steps: 10_000, wall_clock_minutes: 10, rate_limit_budget_percent: 100, rate_limit_window_tokens: 10_000_000 },
+      startTiers: { implementation: 'claude-sonnet-5' },
+      onStart: (request) => terminated(request.step, 'completed'),
+    });
+    try {
+      const run = world.start();
+      world.at(500_000);
+      await world.reconciler.pass();
+      await world.reconciler.pass();
+      world.at(600_000);
+      await world.reconciler.pass();
+
+      const view = foldEvents(world.events(run));
+
+      // The estimate is recovered from the engine's own remainder: 600 000 ms, the ceiling itself.
+      expect(view.usage.estimateMs).toBe(600_000);
+      // No step recorded usage, so the share is 0 of the allowance rather than unrecorded or invented.
+      expect(view.usage.rateLimitBudgetConsumed).toBe(0);
+      const said = view.notices.map((entry) => entry.text);
+      expect(said).toContain('a ceiling is close: the model tier was downshifted and the scope narrowed');
+      expect(said.some((text) => text.includes('downshifted from claude-sonnet-5 to claude-haiku-4-5'))).toBe(true);
+      expect(said).toContain('a ceiling was reached: the run hibernated and wrote a note');
+      expect(view.featureState).toBe('hibernated');
+    } finally {
+      world.close();
     }
   });
 });

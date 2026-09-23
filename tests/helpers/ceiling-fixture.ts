@@ -72,8 +72,13 @@ export interface CeilingWorld {
   readonly gateCalls: readonly GateCall[];
   /** Set the clock to `RUN_START_MS + offsetMs`. */
   readonly at: (offsetMs: number) => void;
-  /** Accept, snapshot and confirm a run at the current instant. */
-  readonly start: () => string;
+  /**
+   * Accept and snapshot a run at the current instant, then confirm it — at `confirmAtMs` after the run start
+   * when given, so the run spends that long in `drafting` first.
+   */
+  readonly start: (confirmAtMs?: number) => string;
+  /** Accept and confirm a run with no configuration snapshot, so its ceilings are the declared fallback. */
+  readonly startWithoutSnapshot: () => string;
   readonly events: (run: string) => readonly EventEnvelope[];
   readonly ofType: (run: string, type: string) => readonly EventEnvelope[];
   readonly close: () => void;
@@ -100,6 +105,8 @@ export const ceilingWorld = (options: {
   readonly label: string;
   readonly ceilings: Ceilings;
   readonly onStart: ScriptedExecutorOptions['onStart'];
+  readonly onResume?: ScriptedExecutorOptions['onResume'];
+  readonly sessionIdFor?: ScriptedExecutorOptions['sessionIdFor'];
   readonly steps?: readonly PlanStep[];
   readonly worktree?: string;
   readonly worktreeGit?: WorktreeGit;
@@ -135,7 +142,11 @@ export const ceilingWorld = (options: {
   });
 
   let clock = RUN_START_MS;
-  const executor = createScriptedExecutor({ onStart: options.onStart });
+  const executor = createScriptedExecutor({
+    onStart: options.onStart,
+    ...(options.onResume === undefined ? {} : { onResume: options.onResume }),
+    ...(options.sessionIdFor === undefined ? {} : { sessionIdFor: options.sessionIdFor }),
+  });
   const gateCalls: GateCall[] = [];
   const gate = options.gate ?? passingGate;
   const gates = (request: GateRunRequest): DeterministicGateRunner => ({
@@ -175,9 +186,15 @@ export const ceilingWorld = (options: {
     at: (offsetMs: number): void => {
       clock = RUN_START_MS + offsetMs;
     },
-    start: (): string => {
+    start: (confirmAtMs?: number): string => {
       const accepted = reconciler.acceptFeature(plan);
       takeConfigSnapshot({ repository, runId: accepted.run, orchHome: home });
+      if (confirmAtMs !== undefined) clock = RUN_START_MS + confirmAtMs;
+      reconciler.confirm(accepted.run);
+      return accepted.run;
+    },
+    startWithoutSnapshot: (): string => {
+      const accepted = reconciler.acceptFeature(plan);
       reconciler.confirm(accepted.run);
       return accepted.run;
     },

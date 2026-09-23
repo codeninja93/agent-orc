@@ -202,8 +202,9 @@ describe('every member of the Command enum has a declared handling', () => {
     const decision = decideSteering(anIntent('narrow'), aState(), noneApplied);
     expect(decision.kind).toBe('awaiting');
     if (decision.kind !== 'awaiting') return;
-    // Story 2-9 owns scope narrowing, and has to be able to see the intent that asked for it.
-    expect(decision.owner).toContain('2-9');
+    // No story's accepted scope names `narrow` yet; story 4-3 owns the steering controls it sits among, and
+    // has to be able to see the intent that asked for it.
+    expect(decision.owner).toContain('4-3');
   });
 
   /**
@@ -224,8 +225,8 @@ describe('every member of the Command enum has a declared handling', () => {
   });
 
   it.each([
-    ['narrow', /2-9/],
-    ['pause', /2-9/],
+    ['narrow', /^story 4-3\b.*not yet named in any story/],
+    ['pause', /^story 4-3\b/],
     ['inject_note', /2-10/],
     ['fork', /4-3/],
   ] as const)('names %s’s owner as the story that actually owns it', (command, owner) => {

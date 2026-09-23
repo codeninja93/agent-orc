@@ -256,8 +256,8 @@ describe('detected defaults are offered, and every one of them can be overridden
       ...parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8')),
       ceilings: { steps: 60, wall_clock_minutes: 120, rate_limit_budget_percent: 50 },
     });
+    // Read at the version the installer writes today, whatever that is: the field did not need a bump.
     expect(profile.schema_version).toBe(PROFILE_SCHEMA_VERSION);
-    expect(PROFILE_SCHEMA_VERSION).toBe(2);
     expect(profile.ceilings.rate_limit_window_tokens).toBe(PLACEHOLDER_RATE_LIMIT_WINDOW_TOKENS);
     expect(profile.ceilings).toMatchObject({ steps: 60, wall_clock_minutes: 120, rate_limit_budget_percent: 50 });
   });

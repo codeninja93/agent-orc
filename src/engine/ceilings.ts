@@ -15,9 +15,10 @@
  * `consumed / ceiling ≥ 0.8`: the quotient is the kind of floating-point value that reads `0.7999999…` for
  * a run that is exactly at eighty percent, and the boundary is precisely where that rounding would decide.
  *
- * **Wall-clock is the run's own, from `run.created`.** A run slowed by one long step and a run slowed by
- * many quick ones must trip the same ceiling, so elapsed time is measured from the run's recorded start —
- * the fold sets `created_at` from the `run.created` line — and never from when the current step began.
+ * **Wall-clock is the run's own, from `run.created`, less the time it waited on a person.** A run slowed by
+ * one long step and a run slowed by many quick ones must trip the same ceiling, so elapsed time is measured
+ * from the run's recorded start — the fold sets `created_at` from the `run.created` line — and never from when
+ * the current step began. Time in `drafting` or `blocked` is subtracted: see {@link PERSON_WAITING_STATES}.
  *
  * **Consumed rate-limit budget is read, never assumed, and is never money.** It is the token counts the CLI
  * reported on each `step.terminated` line, summed the way story 2-7's note totals are, as a share of the
@@ -30,7 +31,12 @@
  * the only safe reading of "I cannot tell how much is left" is "none is".
  */
 import {
+  BUDGET_EXHAUSTED_EVENT_TYPE,
+  BUDGET_PAYLOAD_KEYS,
   CEILING_DIMENSIONS,
+  GATE_FAILED_EVENT_TYPE,
+  GATE_PASSED_EVENT_TYPE,
+  GATE_SKIPPED_EVENT_TYPE,
   MODEL_RUNGS,
   PLACEHOLDER_RATE_LIMIT_WINDOW_TOKENS,
   USAGE_PAYLOAD_KEY,
@@ -43,6 +49,7 @@ import type {
   CeilingDimension,
   Ceilings,
   EventEnvelope,
+  FeatureState,
   GateResult,
   ModelRung,
   RunState,
@@ -50,6 +57,7 @@ import type {
   StepUsage,
 } from '../contracts/index.js';
 
+import { COMMAND_EVENT_TYPES } from './commands.js';
 import { LOWEST_MODEL_RUNG, ModelRungUnrecognised } from './promotion.js';
 import { ENGINE_EVENT_TYPES } from './rebuild.js';
 
@@ -122,7 +130,7 @@ export const runCeilingsFrom = (declared: Ceilings): RunCeilings => ({
 export interface RunConsumption {
   /** Step attempts so far, summed over every step record. */
   readonly steps: number;
-  /** Milliseconds since the run's own recorded start. */
+  /** Milliseconds since the run's own recorded start, less time spent waiting on a person. */
   readonly wallClockMs: number;
   /**
    * Tokens the CLI reported across every attempt, or `null` when no attempt reported any.
@@ -134,18 +142,23 @@ export interface RunConsumption {
 }
 
 /**
- * The token counts a usage record carries, and only those.
+ * The token counts held against the rate-limit budget: fresh input, output, and cache writes.
  *
  * Listed rather than derived from `STEP_USAGE_FIELDS`, because that list also holds the one figure that is
  * not a token count, and reading "every field" here would put that figure into a ceiling AD-24 says has no
- * such dimension. All four are counted unweighted: the CLI does not report how the window weighs a cached
- * read against a fresh one, so any weighting would be a number invented here.
+ * such dimension.
+ *
+ * **`cache_read_input_tokens` is deliberately not counted.** A multi-turn `claude -p` session re-reads its
+ * whole cached context on every turn, so cache reads grow with the *length of a conversation* rather than
+ * with the work done, and routinely outnumber every other figure by an order of magnitude. Counted at full
+ * weight against a placeholder window they would degrade ordinary runs for reasons unrelated to what they
+ * consumed; weighted, they would need a discount factor nobody has published. Leaving them out undercounts
+ * rather than overcounts, and the three that remain are unweighted — no factor is invented here.
  */
 const TOKEN_FIELDS = [
   'input_tokens',
   'output_tokens',
   'cache_creation_input_tokens',
-  'cache_read_input_tokens',
 ] as const satisfies readonly (keyof StepUsage)[];
 
 const tokensIn = (usage: StepUsage | null): number | null => {
@@ -157,11 +170,68 @@ const tokensIn = (usage: StepUsage | null): number | null => {
 };
 
 /**
+ * The states in which a run is waiting on a person, and its wall clock is therefore stopped.
+ *
+ * `drafting` waits for the criteria to be confirmed (CAP-2) and `blocked` for a gate to be approved (CAP-12).
+ * Neither spends anything, and the ceilings are only asked before a spend — so counting them let a run sit
+ * blocked overnight, accrue its whole allowance unchecked, and hibernate on the first pass after the person
+ * approved it, having done no work in that time. AD-24's wall clock bounds how long a run *works*.
+ * `interrupted` is not here: a crashed engine or a closed laptop is the run's own time lost, not a person's.
+ */
+export const PERSON_WAITING_STATES: readonly FeatureState[] = ['drafting', 'blocked'];
+
+const stringField = (event: EventEnvelope, key: string): string | null => {
+  const value = event.payload[key];
+  return typeof value === 'string' ? value : null;
+};
+
+/**
+ * Milliseconds the run has spent in {@link PERSON_WAITING_STATES}, read from its lifecycle lines.
+ *
+ * Every line that moves the feature state is read in `seq` order — `run.created` enters `drafting`,
+ * `feature.state_changed` and a steering `command.applied` carry the state entered — and each interval that
+ * began in a waiting state is summed, including the one still open at `now`.
+ */
+const personWaitingMs = (events: readonly EventEnvelope[], now: Date): number => {
+  let current: string | null = null;
+  let since = Number.NaN;
+  let total = 0;
+  const waiting = (state: string | null): boolean =>
+    state !== null && (PERSON_WAITING_STATES as readonly string[]).includes(state);
+  for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
+    const entered =
+      event.type === ENGINE_EVENT_TYPES.RunCreated
+        ? 'drafting'
+        : event.type === ENGINE_EVENT_TYPES.FeatureStateChanged
+          ? stringField(event, 'to')
+          : event.type === COMMAND_EVENT_TYPES.Applied
+            ? stringField(event, 'to_state')
+            : null;
+    if (entered === null) continue;
+    const at = Date.parse(event.ts);
+    if (waiting(current)) total += at - since;
+    current = entered;
+    since = at;
+  }
+  if (waiting(current)) total += now.getTime() - since;
+  return total;
+};
+
+/**
  * Measure a run's consumption from its checkpoint, its log and the clock.
  *
  * **Every attempt counts, including a failed one.** A step that failed after twenty turns consumed exactly
  * what one that succeeded did, which is why story 1-11 records usage on every disposition; a ceiling that
  * read only completions would under-count precisely the thrashing run it exists to stop.
+ *
+ * **Each `step.terminated` figure is summed once, as the CLI reported it for that one process.** Whether a
+ * resumed session's result line reports that invocation alone or the whole session is not established — no
+ * successful resume has been recorded in this repository. It cannot double-count by construction today: a
+ * resume only follows an `interrupted` attempt, and an attempt interrupted by a signal has no result line and
+ * so records no usage. The one exception is a timed-out attempt whose result line had already arrived; if a
+ * resumed result proves cumulative, that case over-counts, and this sum is where it would be corrected. A
+ * killed or crashed attempt records nothing and so adds nothing — undercounting what it spent, which is the
+ * known, documented cost of reading only what the CLI reported.
  */
 export const measureConsumption = (request: {
   readonly state: RunState;
@@ -170,8 +240,11 @@ export const measureConsumption = (request: {
 }): RunConsumption => ({
   steps: request.state.steps.reduce((sum, record) => sum + record.attempts, 0),
   // `created_at` is the `run.created` line's timestamp — the fold assigns it from that line — so this is
-  // the run's clock and not any one step's `started_at`.
-  wallClockMs: request.now.getTime() - Date.parse(request.state.created_at),
+  // the run's clock and not any one step's `started_at`, less the time it spent waiting on a person.
+  wallClockMs:
+    request.now.getTime() -
+    Date.parse(request.state.created_at) -
+    personWaitingMs(request.events, request.now),
   rateLimitTokens: tokensIn(
     totalUsage(
       request.events
@@ -194,6 +267,13 @@ export interface CeilingReading {
    */
   readonly fraction: number;
   /**
+   * False when the consumption or the ceiling is not a number that can be compared — a ceiling of zero, a
+   * timestamp that did not parse. Such a reading is decided as reached (see {@link atLeast}), its `fraction`
+   * is set to exactly `1` so the log says "reached" rather than serialising `NaN` or `Infinity` as `null`,
+   * and this flag travels in the payload so a reader can tell a measured one hundred percent from this.
+   */
+  readonly measurable: boolean;
+  /**
    * The same comparison in whole numbers, scaled by a common factor — what {@link atLeast} decides on.
    *
    * Equal to `consumed` and `ceiling` for steps and wall clock. For the rate-limit budget both are in
@@ -208,13 +288,18 @@ const readingOf = (
   consumed: number,
   ceiling: number,
   scale: { readonly consumed: number; readonly ceiling: number } = { consumed, ceiling },
-): CeilingReading => ({
-  dimension,
-  consumed,
-  ceiling,
-  fraction: scale.consumed / scale.ceiling,
-  scaled: scale,
-});
+): CeilingReading => {
+  const measurable =
+    Number.isFinite(scale.consumed) && Number.isFinite(scale.ceiling) && scale.ceiling > 0;
+  return {
+    dimension,
+    consumed,
+    ceiling,
+    fraction: measurable ? scale.consumed / scale.ceiling : 1,
+    measurable,
+    scaled: scale,
+  };
+};
 
 /** Read all three ceilings, in {@link CEILING_DIMENSIONS} order. */
 export const readCeilings = (
@@ -245,10 +330,8 @@ export const readCeilings = (
  * reached — the fail-safe direction this module's header gives the reason for.
  */
 export const atLeast = (reading: CeilingReading, percent: number): boolean => {
-  const { consumed, ceiling } = reading.scaled;
-  if (!Number.isFinite(ceiling) || ceiling <= 0) return true;
-  if (!Number.isFinite(consumed)) return true;
-  return consumed * 100 >= ceiling * percent;
+  if (!reading.measurable) return true;
+  return reading.scaled.consumed * 100 >= reading.scaled.ceiling * percent;
 };
 
 /** What the ceilings say about a run's next spending action. */
@@ -272,7 +355,8 @@ export const ceilingVerdict = (readings: readonly CeilingReading[]): CeilingVerd
     readings
       .filter((reading) => atLeast(reading, percent))
       .reduce<CeilingReading | null>(
-        (best, reading) => (best === null || !(reading.fraction <= best.fraction) ? reading : best),
+        // Strictly greater, so a tie keeps the earlier reading: `CEILING_DIMENSIONS` order decides it.
+        (best, reading) => (best === null || reading.fraction > best.fraction ? reading : best),
         null,
       );
   const reached = fullest(HIBERNATION_THRESHOLD_PERCENT);
@@ -310,6 +394,12 @@ export const budgetFrom = (stepsRemaining: number, readings: readonly CeilingRea
 
 /** One sentence naming which ceiling decided, and by how much, for the log and the hand-off document. */
 export const describeReading = (reading: CeilingReading): string => {
+  if (!reading.measurable) {
+    return (
+      `the ${reading.dimension.replace(/_/g, '-')} ceiling could not be measured — its consumption or its ` +
+      'declared limit is not a comparable number — so it is treated as reached rather than as absent'
+    );
+  }
   const percent = Number.isFinite(reading.fraction) ? Math.floor(reading.fraction * 100) : 100;
   switch (reading.dimension) {
     case 'steps':
@@ -394,9 +484,14 @@ export const downshiftFor = (rung: string): DownshiftDecision => {
  * why this is asked only *after* they have run and returned outcomes. No acceptance criterion is dropped,
  * no planned step is skipped, and no gate is weakened.
  *
- * **And only when a gate actually passed.** A repository that declares no gate at all has a first tier made
- * entirely of `skipped`, and cutting the review there would complete a verification step that verified
- * nothing. That is a weakened gate wearing the name of a narrowed scope, so the review is kept for it.
+ * **Only when a gate actually passed, and none failed.** A repository that declares no gate at all has a
+ * first tier made entirely of `skipped` — nothing verified the step — and cutting the review there too would
+ * leave it verified by nothing at all, which is exactly what this story's Boundaries rule out ("the
+ * deterministic gates still run and still gate correctness"). A review round once argued the other way —
+ * that "none passed because none exist" shouldn't count against narrowing, since a repository's own choice
+ * to declare no gates shouldn't buy it a mandatory review — and that reading was tried and reverted: cost
+ * discipline never outranks the floor of at least one real check. `gate.skipped` lines still say, on every
+ * surface, that nothing ran; they just don't buy the review a matching skip.
  */
 export const skipsModelReview = (request: {
   readonly degraded: boolean;
@@ -407,3 +502,72 @@ export const skipsModelReview = (request: {
   request.phase === 'verification' &&
   request.gates.some((gate) => gate.outcome === 'passed') &&
   !request.gates.some((gate) => gate.outcome === 'failed');
+
+/**
+ * What the deterministic gates returned on a step's latest attempt, read back from the log.
+ *
+ * A resume does not re-run the gates (the reconciler's `resume-step` says why), so a resumed verification
+ * step's review-skip decision has to be taken from the outcomes its attempt already recorded — the lines
+ * after that step's last `step.started`.
+ */
+export const gateOutcomesOfLatestAttempt = (
+  events: readonly EventEnvelope[],
+  step: string,
+): readonly { readonly outcome: GateResult }[] => {
+  const ordered = [...events].sort((left, right) => left.seq - right.seq);
+  let outcomes: { readonly outcome: GateResult }[] = [];
+  for (const event of ordered) {
+    if (event.step !== step) continue;
+    if (event.type === ENGINE_EVENT_TYPES.StepStarted) outcomes = [];
+    else if (event.type === GATE_PASSED_EVENT_TYPE) outcomes.push({ outcome: 'passed' });
+    else if (event.type === GATE_FAILED_EVENT_TYPE) outcomes.push({ outcome: 'failed' });
+    else if (event.type === GATE_SKIPPED_EVENT_TYPE) outcomes.push({ outcome: 'skipped' });
+  }
+  return outcomes;
+};
+
+/** A hibernation the log has already recorded: the reading and the reason its `budget.exhausted` carried. */
+export interface RecordedExhaustion {
+  /** The recorded reading, or `null` when the line did not carry one this build can read (AD-5). */
+  readonly reading: CeilingReading | null;
+  readonly reason: string;
+}
+
+/**
+ * The first `budget.exhausted` line, read back — so finishing a crashed hibernation says what was decided.
+ *
+ * Re-measuring instead would describe whatever the ceilings read *now*: after a restart the clock has moved,
+ * and a run that hibernated at its ceiling would be written up as "0 of its 10 wall-clock minutes (0%)".
+ */
+export const recordedExhaustion = (events: readonly EventEnvelope[]): RecordedExhaustion | null => {
+  const line = [...events]
+    .sort((left, right) => left.seq - right.seq)
+    .find((event) => event.type === BUDGET_EXHAUSTED_EVENT_TYPE);
+  if (line === undefined) return null;
+  const number = (key: string): number | null => {
+    const value = line.payload[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+  };
+  const dimension = stringField(line, BUDGET_PAYLOAD_KEYS.Dimension);
+  const consumed = number(BUDGET_PAYLOAD_KEYS.Consumed);
+  const ceiling = number(BUDGET_PAYLOAD_KEYS.Ceiling);
+  const fraction = number(BUDGET_PAYLOAD_KEYS.Fraction);
+  const known = CEILING_DIMENSIONS.find((candidate) => candidate === dimension);
+  const reading: CeilingReading | null =
+    known === undefined || consumed === null || ceiling === null || fraction === null
+      ? null
+      : {
+          dimension: known,
+          consumed,
+          ceiling,
+          fraction,
+          measurable: line.payload[BUDGET_PAYLOAD_KEYS.Measurable] !== false,
+          scaled: { consumed, ceiling },
+        };
+  return {
+    reading,
+    reason:
+      stringField(line, BUDGET_PAYLOAD_KEYS.Reason) ??
+      'The run’s log records that it reached a ceiling, and the hibernation that began then is finished here.',
+  };
+};

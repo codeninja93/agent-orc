@@ -35,6 +35,8 @@ import type {
   StepUsage,
 } from '../contracts/index.js';
 import {
+  BUDGET_DEGRADED_EVENT_TYPE,
+  BUDGET_EXHAUSTED_EVENT_TYPE,
   DECLARATION_PAYLOAD_KEYS,
   FEATURE_STATES,
   GATE_FAILED_EVENT_TYPE,
@@ -44,6 +46,7 @@ import {
   SPEC_CRITERION_EDITED_EVENT_TYPE,
   SPEC_RECORDED_EVENT_TYPE,
   STEP_PHASES,
+  STEP_TIER_DOWNSHIFTED_EVENT_TYPE,
   USAGE_PAYLOAD_KEY,
   addUsage,
   compareEventOrder,
@@ -77,8 +80,10 @@ export const TUI_EVENT_TYPES = {
   QuestionResolved: 'question.resolved',
   QuestionDefaultTaken: 'question.default_taken',
   QuestionDeflected: 'question.deflected',
-  BudgetDegraded: 'budget.degraded',
-  BudgetExhausted: 'budget.exhausted',
+  BudgetDegraded: BUDGET_DEGRADED_EVENT_TYPE,
+  BudgetExhausted: BUDGET_EXHAUSTED_EVENT_TYPE,
+  /** AD-24 — a degraded run's step on a lower rung, which is the part of degradation a person can see. */
+  StepTierDownshifted: STEP_TIER_DOWNSHIFTED_EVENT_TYPE,
   HandoffRecorded: 'handoff.recorded',
   PermissionDenied: 'permission.denied',
   RedactionFailed: 'redaction.failed',
@@ -777,6 +782,21 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
         // termination carrying no usage key adds nothing, which is how the total stays `null` for a run
         // nothing measured rather than becoming a zero nobody claimed.
         totalUsageSoFar = addUsage(totalUsageSoFar, usageFromPayload(payload[TUI_PAYLOAD_KEYS.Usage]));
+        break;
+      }
+
+      case TUI_EVENT_TYPES.StepTierDownshifted: {
+        // Not silent, unlike a promotion: a promotion is the ordinary answer to a failure, while a downshift
+        // is the run working on a cheaper model *because* it is near a ceiling, which a person deciding
+        // whether to let it continue needs to see.
+        const from = text(payload, 'from');
+        const to = text(payload, 'to');
+        notice(
+          event.ts,
+          from === null || to === null || from === to
+            ? `step "${event.step ?? 'unknown'}" stayed on the lowest model tier because the run is degraded`
+            : `step "${event.step ?? 'unknown'}" was downshifted from ${from} to ${to} because the run is degraded`,
+        );
         break;
       }
 
