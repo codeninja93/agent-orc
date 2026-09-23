@@ -97,6 +97,15 @@ export const DECLARATION_PAYLOAD_KEYS = {
   Brief: 'brief',
   /** `question.asked` — the instant a countdown is measured from (Q2). */
   AskedAt: 'asked_at',
+  /**
+   * `question.asked` — how many raised questions this one card stands for; `1` for an unmerged one.
+   *
+   * A number in the payload rather than a sentence in the brief, because the deflection rate counts raised
+   * questions (story 2-8, matrix 28) and a count parsed back out of prose fails by reading as `1` — a
+   * plausible value nobody would notice. Additive, which AD-5 makes non-breaking: a line written before it
+   * existed carries no such key, and a reader treats the absence as absence.
+   */
+  RaisedQuestionCount: 'raised_question_count',
 } as const;
 
 /** CAP-13's first tier, one type per outcome so a skip is legible without reading a payload. */

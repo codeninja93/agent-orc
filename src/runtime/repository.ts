@@ -108,18 +108,46 @@ export interface CommitRecord {
 }
 
 export interface CommitSearchOptions {
-  /** How many of the newest candidates to return. Bounded so a large history cannot stall a question. */
+  /** How many candidates one call returns: a positive whole number. Bounded so one call cannot stall. */
   readonly limit?: number;
+  /** How many of the newest candidates to pass over first, so a caller can page past {@link limit}. */
+  readonly skip?: number;
   /** A notes ref whose text is searched as if it were part of the message, as `git log --notes` does. */
   readonly notesRef?: string;
 }
 
-/** The default candidate bound: generous for a question's lifetime, small beside any real history. */
+/**
+ * What one search found, and whether git was able to answer at all.
+ *
+ * `failure` is separate from an empty `commits` because the two mean different things to a reader that
+ * must say why a question was not deflected: "no commit names this" is an answer about the history,
+ * "git could not be run" — not a repository, no commits yet, a history too large for the buffer — is an
+ * answer about the probe. {@link git}'s `null`-for-everything rule is right for the installer's
+ * questions and wrong for this one.
+ */
+export interface CommitSearchResult {
+  readonly commits: readonly CommitRecord[];
+  /** `null` when git answered; otherwise one sentence saying why it did not. */
+  readonly failure: string | null;
+}
+
+/** The default candidate bound per call: generous for one page, small beside any real history. */
 export const DEFAULT_COMMIT_SEARCH_LIMIT = 200;
+
+/**
+ * The output ceiling for one search, stated rather than inherited.
+ *
+ * `execFileSync` defaults to 1 MiB and reports an overflow as a thrown `ENOBUFS`, which the old shape
+ * turned into "no commits". Stated here so the bound is a decision, and an overflow is a failure a caller
+ * is told about rather than an empty history.
+ */
+const COMMIT_SEARCH_MAX_BUFFER = 64 * 1024 * 1024;
 
 /** Unit and record separators: characters no commit message is written with, so a split is exact. */
 const FIELD_SEPARATOR = '\u001f';
 const RECORD_SEPARATOR = '\u001e';
+
+const isCount = (value: number, least: number): boolean => Number.isSafeInteger(value) && value >= least;
 
 /**
  * Commits whose message or note *contains* `needle`, newest first — a prefilter, never a verdict.
@@ -132,29 +160,58 @@ const RECORD_SEPARATOR = '\u001e';
  * narrows a history of thousands to a handful; it does not decide which of them speaks to the anchor.
  *
  * Fixed strings rather than a pattern because an anchor is data: a file-path anchor carries `.` and a
- * symbol may carry `$`, and a regular expression built from one matches things it does not name.
+ * symbol may carry `$`, and a regular expression built from one matches things it does not name. A needle
+ * carrying a line break is refused as a failure, because git reads each line of `--grep` as a pattern of
+ * its own and the prefilter would silently widen to whichever line is shortest.
  *
- * Runs through {@link git}, so it inherits {@link gitEnvironment}'s named-not-inherited environment and
- * its `null`-for-every-failure rule — a path that is not a repository, or has no commits, answers with
- * no commits rather than an error. A question must never be blocked by the attempt to deflect it.
+ * The environment is {@link gitEnvironment}'s, named rather than inherited, exactly as {@link git} uses.
+ * A `limit` or `skip` that is not a whole count is a caller's mistake, refused by a throw at the call
+ * rather than quietly clamped into a different search.
  */
 export const searchCommitHistory = (
   repositoryPath: string,
   needle: string,
   options: CommitSearchOptions = {},
-): readonly CommitRecord[] => {
-  if (needle === '') return [];
+): CommitSearchResult => {
   const limit = options.limit ?? DEFAULT_COMMIT_SEARCH_LIMIT;
+  const skip = options.skip ?? 0;
+  if (!isCount(limit, 1)) throw new RangeError(`A commit search limit must be a positive whole number, not ${String(limit)}.`);
+  if (!isCount(skip, 0)) throw new RangeError(`A commit search skip must be a whole number of commits, not ${String(skip)}.`);
+  if (needle === '') return { commits: [], failure: null };
+  if (/[\r\n]/.test(needle)) {
+    return { commits: [], failure: 'the search text carries a line break, which git would read as several patterns' };
+  }
   const notes = options.notesRef === undefined ? [] : [`--notes=${options.notesRef}`];
-  const output = git(repositoryPath, [
-    'log',
-    `--max-count=${String(limit)}`,
-    '--fixed-strings',
-    `--grep=${needle}`,
-    ...notes,
-    `--format=%H${FIELD_SEPARATOR}%B${FIELD_SEPARATOR}%N${RECORD_SEPARATOR}`,
-  ]);
-  if (output === null) return [];
+  let output: string;
+  try {
+    output = execFileSync(
+      'git',
+      [
+        'log',
+        `--max-count=${String(limit)}`,
+        `--skip=${String(skip)}`,
+        '--fixed-strings',
+        `--grep=${needle}`,
+        ...notes,
+        `--format=%H${FIELD_SEPARATOR}%B${FIELD_SEPARATOR}%N${RECORD_SEPARATOR}`,
+      ],
+      {
+        cwd: repositoryPath,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: gitEnvironment(),
+        timeout: 10_000,
+        maxBuffer: COMMIT_SEARCH_MAX_BUFFER,
+      },
+    );
+  } catch (error) {
+    const stderr =
+      typeof error === 'object' && error !== null && 'stderr' in error && typeof error.stderr === 'string'
+        ? error.stderr.trim()
+        : '';
+    const reason = stderr !== '' ? stderr : error instanceof Error ? error.message : String(error);
+    return { commits: [], failure: `git log could not search ${repositoryPath}: ${reason}` };
+  }
   const commits: CommitRecord[] = [];
   for (const record of output.split(RECORD_SEPARATOR)) {
     const [sha = '', message = '', note = ''] = record.split(FIELD_SEPARATOR);
@@ -162,5 +219,5 @@ export const searchCommitHistory = (
     if (trimmedSha === '') continue;
     commits.push({ sha: trimmedSha, message: message.trim(), note: note.trim() });
   }
-  return commits;
+  return { commits, failure: null };
 };

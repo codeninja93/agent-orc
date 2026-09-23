@@ -1,8 +1,9 @@
 /**
  * CAP-3 — questions that are one question are merged before any is asked, and Q1 still binds the card.
  *
- * Matrix rows 9–11 and 16. The row that decides whether this suite proves anything is 10: two questions
- * whose prose is nearly identical but whose anchors differ must stay two questions. A merge keyed on
+ * Matrix rows 9–11, 16, 18 and 21–23. The rows that decide whether this suite proves anything are 10 and
+ * 18: two questions whose prose is nearly identical but whose anchors differ — in the symbol, or in the
+ * aspect of one symbol — must stay two questions. A merge keyed on
  * anything looser than anchor equality — a shared prefix, a similar prompt — passes every same-anchor
  * test and fails that one, which is why it is written against prompts that are the same sentence.
  */
@@ -15,6 +16,7 @@ import {
   assertAskableDraft,
   mergeByAnchor,
   mergeOnJudgment,
+  raisedQuestionsStatedIn,
 } from '../src/engine/index.js';
 import type { RaisedQuestion } from '../src/engine/index.js';
 
@@ -32,11 +34,13 @@ const aDraft = (overrides: Partial<QuestionDraft> = {}): QuestionDraft => ({
   ...overrides,
 });
 
-const raised = (anchor: string, overrides: Partial<QuestionDraft> = {}, step: string | null = 'implement'): RaisedQuestion => ({
-  draft: aDraft(overrides),
-  anchor,
-  step,
-});
+/** A raised question about `symbol`, asking about `aspect` — `unregistered` unless a test says otherwise. */
+const raised = (
+  symbol: string,
+  overrides: Partial<QuestionDraft> = {},
+  step: string | null = 'implement',
+  aspect = 'unregistered',
+): RaisedQuestion => ({ draft: aDraft(overrides), anchor: { symbol, aspect }, step });
 
 describe('two questions sharing one anchor become one question (matrix 9)', () => {
   it('merges them into a single card standing for both', () => {
@@ -53,7 +57,7 @@ describe('two questions sharing one anchor become one question (matrix 9)', () =
     expect(outcome.questions).toHaveLength(1);
     const card = outcome.questions[0];
     expect(card?.basis).toBe('anchor');
-    expect(card?.anchors).toStrictEqual(['resolveProject']);
+    expect(card?.anchors).toStrictEqual([{ symbol: 'resolveProject', aspect: 'unregistered' }]);
     expect(card?.raised).toStrictEqual([first, second]);
     expect(card?.draft.prompt).toBe(first.draft.prompt);
   });
@@ -67,7 +71,9 @@ describe('two questions sharing one anchor become one question (matrix 9)', () =
     expect(brief).toContain('Throwing makes a missing registration loud');
     expect(brief).toContain('The test step needs to know.');
     expect(brief).toContain('Also asked as: "What does resolveProject do on an unknown path?"');
-    expect(brief).toContain('This one question stands for 2 raised questions: they share the anchor "resolveProject"');
+    expect(brief).toContain(
+      'This one question stands for 2 raised questions: they share the anchor "resolveProject:unregistered"',
+    );
   });
 
   it('takes the shortest window any asker declared, so no subagent waits past the deadline it set', () => {
@@ -101,7 +107,25 @@ describe('two questions on different anchors are not merged, however alike they 
     ]);
     expect(outcome.questions).toHaveLength(2);
     expect(outcome.questions.map((card) => card.basis)).toStrictEqual(['single', 'single']);
-    expect(outcome.questions.map((card) => card.anchors)).toStrictEqual([['resolveProject'], ['resolveProjectPath']]);
+    expect(outcome.questions.map((card) => card.anchors.map((a) => a.symbol))).toStrictEqual([
+      ['resolveProject'],
+      ['resolveProjectPath'],
+    ]);
+  });
+
+  it('keeps two questions about one symbol apart when they ask about different aspects (matrix 18)', () => {
+    const outcome = mergeByAnchor([
+      raised('resolveProject', {}, 'implement', 'unregistered'),
+      raised('resolveProject', {}, 'verify', 'caching'),
+    ]);
+    expect(outcome.questions).toHaveLength(2);
+    expect(outcome.questions.map((card) => card.anchors[0]?.aspect)).toStrictEqual(['unregistered', 'caching']);
+  });
+
+  it('does not confuse two anchors whose joined display form is the same', () => {
+    // "a:b" / "c" and "a" / "b:c" both render as "a:b:c"; they are still two anchors.
+    const outcome = mergeByAnchor([raised('a:b', {}, 'implement', 'c'), raised('a', {}, 'verify', 'b:c')]);
+    expect(outcome.questions).toHaveLength(2);
   });
 
   it('keeps identical prompts apart when their anchors differ only in case', () => {
@@ -137,9 +161,11 @@ describe('a merged question still satisfies assertAskableDraft (matrix 11)', () 
   it('refuses a merge whose parts leave the card with no window, rather than asking an open-ended question', () => {
     // One asker declared a zero window; the shortest-window rule carries it into the card, and the gate
     // refuses the card — a merge is not a way past Q2.
-    expect(() =>
-      mergeByAnchor([raised('resolveProject'), raised('resolveProject', { default_window_ms: 0 })]),
-    ).toThrow(QuestionDraftRefused);
+    const outcome = mergeByAnchor([raised('resolveProject'), raised('resolveProject', { default_window_ms: 0 })]);
+    expect(outcome.questions).toStrictEqual([]);
+    expect(outcome.refused).toHaveLength(1);
+    expect(outcome.refused[0]?.field).toBe('default_window_ms');
+    expect(outcome.refused[0]?.raised).toHaveLength(2);
   });
 
   it('hands back a group whose options would exceed three, instead of dropping one', () => {
@@ -147,6 +173,7 @@ describe('a merged question still satisfies assertAskableDraft (matrix 11)', () 
       raised('resolveProject'),
       raised('resolveProject', {
         options: [
+          { id: 'null', label: 'Return null', consequence: 'The installer can offer to register the path.' },
           { id: 'register', label: 'Register it', consequence: 'Registered on first use.' },
           { id: 'warn', label: 'Warn and continue', consequence: 'A warning is printed.' },
         ],
@@ -177,6 +204,65 @@ describe('a merged question still satisfies assertAskableDraft (matrix 11)', () 
   });
 });
 
+describe('one refused draft or group is reported alone, and the rest of the batch still compresses (matrix 21)', () => {
+  it('reports a bad single draft and a bad group, and still composes the good cards beside them', () => {
+    const outcome = mergeByAnchor([
+      raised('widgetCache', { prompt: 'Should widgetCache be shared?' }, 'implement', 'sharing'),
+      raised('sessionKey', { default_window_ms: 0 }, 'implement', 'rotation'),
+      raised('resolveProject', { brief: '' }),
+      raised('resolveProject', { brief: '' }),
+      raised('ProjectStore', {}, 'verify', 'lookup'),
+    ]);
+    expect(outcome.questions.map((card) => card.anchors[0]?.symbol)).toStrictEqual(['widgetCache', 'ProjectStore']);
+    expect(outcome.refused.map((refusal) => [refusal.raised.length, refusal.field])).toStrictEqual([
+      [1, 'default_window_ms'],
+      [2, 'brief'],
+    ]);
+  });
+});
+
+describe('a merge loses nothing any asker declared (matrix 22)', () => {
+  it('hands back a group whose askers state different default actions', () => {
+    const outcome = mergeByAnchor([
+      raised('resolveProject'),
+      raised('resolveProject', { default_action: 'resolveProject returns null and logs a warning.' }),
+    ]);
+    expect(outcome.questions).toStrictEqual([]);
+    expect(outcome.awaitingJudgment[0]?.reason).toContain('different default actions');
+  });
+
+  it('hands back a group whose askers offer different escapes', () => {
+    const outcome = mergeByAnchor([
+      raised('resolveProject'),
+      raised('resolveProject', {
+        escape: { id: 'defer', label: 'Defer to the reviewer', consequence: 'The reviewer decides.' },
+      }),
+    ]);
+    expect(outcome.awaitingJudgment[0]?.reason).toContain('different escapes');
+  });
+
+  it('checks every asker’s escape against the options, not only the first asker’s', () => {
+    // The second asker's escape id is the same id the first offers as a concrete option.
+    const escape = { id: 'throw', label: 'Throw', consequence: 'A caller that forgot to register fails loudly.' };
+    const outcome = mergeByAnchor([
+      raised('resolveProject', { escape }),
+      raised('resolveProject', { escape }),
+    ]);
+    expect(outcome.questions).toStrictEqual([]);
+    expect(outcome.awaitingJudgment[0]?.reason).toContain('escape "throw" is a concrete option');
+  });
+});
+
+describe('a merged card says how many raised questions it stands for, where the rate can read it (matrix 28)', () => {
+  it('reads back the count a merged brief states, and 1 for a brief that states none', () => {
+    const outcome = mergeByAnchor([raised('resolveProject'), raised('resolveProject'), raised('resolveProject')]);
+    expect(raisedQuestionsStatedIn(outcome.questions[0]?.draft.brief ?? '')).toBe(3);
+    expect(raisedQuestionsStatedIn(aDraft().brief)).toBe(1);
+    // A subagent's brief quoting the words mid-text is not a merge.
+    expect(raisedQuestionsStatedIn('This one question stands for 9 raised questions: no.\n\nMore prose.')).toBe(1);
+  });
+});
+
 describe('a live judgement merges what the anchors missed, and is recorded as the reason (matrix 16)', () => {
   const judged = (): readonly RaisedQuestion[] => [
     raised('resolveProject'),
@@ -190,12 +276,20 @@ describe('a live judgement merges what the anchors missed, and is recorded as th
     });
     expect(card.basis).toBe('judgment');
     expect(card.reason).toBe('resolveProject is a thin wrapper over ProjectStore.lookup, so one answer settles both');
-    expect(card.anchors).toStrictEqual(['resolveProject', 'ProjectStore.lookup']);
+    expect(card.anchors.map((a) => a.symbol)).toStrictEqual(['resolveProject', 'ProjectStore.lookup']);
     // Recorded where the `question.asked` line will carry it, not left in memory.
     expect(card.draft.brief).toContain(
       'This one question stands for 2 raised questions: the Interviewer judged them the same question — ' +
         'resolveProject is a thin wrapper over ProjectStore.lookup',
     );
+  });
+
+  it('uses the shortest window among the judged card and every draft it replaces (matrix 23)', () => {
+    const card = mergeOnJudgment(
+      [raised('resolveProject', { default_window_ms: 10 * 60 * 1000 }), raised('ProjectStore', { default_window_ms: 2 * 60 * 1000 })],
+      { reason: 'one answer settles both', draft: aDraft({ default_window_ms: 60 * 60 * 1000 }) },
+    );
+    expect(card.draft.default_window_ms).toBe(2 * 60 * 1000);
   });
 
   it('refuses a judgement that gives no reason, because the merge would be left implicit', () => {

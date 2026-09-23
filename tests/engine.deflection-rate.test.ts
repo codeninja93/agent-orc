@@ -1,7 +1,7 @@
 /**
  * Q4 — the deflection rate, folded from `question.asked` and `question.deflected` lines alone.
  *
- * Matrix rows 13 and 14. Row 13 is driven end to end through the real emitters: six questions asked by
+ * Matrix rows 13, 14, 27 and 28. Row 13 is driven end to end through the real emitters: six questions asked by
  * the reconciler, five of them deflected by a deflection this story *constructs* and applies through the
  * existing compare-and-set, and the `question.deflected` lines appended by the reconciler's own pass
  * when it settles them. A rate folded from hand-written lines would prove the fold agrees with this file.
@@ -23,19 +23,27 @@ import {
   createRecordingResetter,
   createScriptedExecutor,
   deflectionRate,
+  mergeByAnchor,
   terminated,
 } from '../src/engine/index.js';
+import type { DeflectionMatch } from '../src/engine/index.js';
 
 import { makeHome, makePlan, planProvider } from './helpers/engine-fixture.js';
 
 const BASELINE = 'ddd9bed4d286ac1f8a0f4f7bfef9530046605787';
 
 let home: string;
+let clock: Date;
 const toClose: Reconciler[] = [];
 
 beforeEach(() => {
   home = makeHome('engine-deflection-rate');
+  clock = new Date('2026-09-23T10:00:00.000Z');
 });
+
+const advance = (ms: number): void => {
+  clock = new Date(clock.getTime() + ms);
+};
 
 afterEach(() => {
   for (const reconciler of toClose.splice(0)) reconciler.close();
@@ -50,12 +58,15 @@ const openReconciler = (): Reconciler => {
     }),
     plans: planProvider(makePlan()),
     baseline: createRecordingResetter(BASELINE),
+    now: () => clock,
   });
   toClose.push(reconciler);
   return reconciler;
 };
 
-const aDraft = (n: number): QuestionDraft => ({
+const WINDOW_MS = 15 * 60 * 1000;
+
+const aDraft = (n: number, windowMs = WINDOW_MS): QuestionDraft => ({
   prompt: `Question ${String(n)}: should widget${String(n)} be cached?`,
   brief: 'A cache makes the second read cheap and the first one stale.',
   options: [
@@ -65,8 +76,16 @@ const aDraft = (n: number): QuestionDraft => ({
   escape: { id: 'later', label: 'Ask me later', consequence: 'The step waits.' },
   recommended_option_id: 'fresh',
   default_action: 'Every read is fresh.',
-  default_window_ms: 15 * 60 * 1000,
+  default_window_ms: windowMs,
 });
+
+const fromRepository: DeflectionMatch = {
+  source: 'repository',
+  anchor: { symbol: 'widgetCache', aspect: 'cached' },
+  answer: 'CLAUDE.md: widgets are never cached.',
+  evidence: 'CLAUDE.md',
+  run: null,
+};
 
 const eventsOf = (run: string): readonly EventEnvelope[] => readEventLog(runPaths(run, home).eventLog);
 
@@ -76,13 +95,7 @@ describe('the rate is deflected over raised, read from the log (matrix 13)', () 
     const run = reconciler.acceptFeature(makePlan()).run;
     const asked = [1, 2, 3, 4, 5, 6].map((n) => reconciler.ask(run, aDraft(n)));
     for (const state of asked.slice(0, 5)) {
-      const deflection = constructDeflection({
-        source: 'repository',
-        anchor: 'widgetCache',
-        answer: 'CLAUDE.md: widgets are never cached.',
-        evidence: 'CLAUDE.md',
-        run: null,
-      });
+      const deflection = constructDeflection(fromRepository, clock);
       expect(applyDeflection(runPaths(run, home), state.question.id, deflection).accepted).toBe(true);
     }
     // The pass settles each question and appends its `question.deflected` line; nothing here writes one.
@@ -98,9 +111,14 @@ describe('the rate is deflected over raised, read from the log (matrix 13)', () 
       feature: 'engine-reconciler',
       raised: 6,
       deflected: 5,
-      reachedUser: 1,
+      // The sixth is asked and not yet answered: nobody has decided it yet.
+      reachedUser: 0,
+      defaultTaken: 0,
+      unsettled: 1,
       rate: 5 / 6,
-      summary: 'engine-reconciler deflected 5 of 6 raised questions; 1 reached a person.',
+      summary:
+        'engine-reconciler deflected 5 of 6 raised questions; 0 answered by a person, 0 by the timeout ' +
+        'default, 1 unsettled.',
     });
   });
 
@@ -112,7 +130,7 @@ describe('the rate is deflected over raised, read from the log (matrix 13)', () 
     applyDeflection(
       runPaths(run, home),
       first.question.id,
-      constructDeflection({ source: 'git_history', anchor: 'widgetCache', answer: 'commit abc: no', evidence: 'abc', run: null }),
+      constructDeflection(fromRepository, clock),
     );
     await reconciler.pass();
     const events = eventsOf(run);
@@ -127,6 +145,101 @@ describe('the rate is deflected over raised, read from the log (matrix 13)', () 
     await reconciler.pass();
     expect(deflectionRate(eventsOf(run), 'engine-reconciler')).toMatchObject({ kind: 'measured', raised: 1, rate: 0 });
     expect(deflectionRate(eventsOf(run), 'some-other-feature').kind).toBe('inapplicable');
+  });
+});
+
+describe('reachedUser means a person settled it, and a timeout or an open question is its own count (matrix 27)', () => {
+  it('reports each way a question left asked in its own field', async () => {
+    const reconciler = openReconciler();
+    const run = reconciler.acceptFeature(makePlan()).run;
+    const deflected = reconciler.ask(run, aDraft(1));
+    reconciler.ask(run, aDraft(2));
+    reconciler.ask(run, aDraft(3));
+    reconciler.ask(run, aDraft(4, WINDOW_MS * 4));
+    applyDeflection(runPaths(run, home), deflected.question.id, constructDeflection(fromRepository, clock));
+    // An answer goes to the earliest question still asked — the second, now the first is deflected.
+    reconciler.answer(run, 'cache');
+    advance(WINDOW_MS);
+    // The third's window has passed and the pass takes its default; the fourth's has not.
+    await reconciler.pass();
+
+    expect(deflectionRate(eventsOf(run), 'engine-reconciler')).toMatchObject({
+      kind: 'measured',
+      raised: 4,
+      deflected: 1,
+      reachedUser: 1,
+      defaultTaken: 1,
+      unsettled: 1,
+      rate: 0.25,
+    });
+  });
+});
+
+describe('a merged card counts as the raised questions it stands for (matrix 28)', () => {
+  it('puts all three questions a card replaced in the denominator, not one', async () => {
+    const reconciler = openReconciler();
+    const run = reconciler.acceptFeature(makePlan()).run;
+    const anchorOf = { symbol: 'widgetCache', aspect: 'cached' };
+    const merged = mergeByAnchor([1, 2, 3].map(() => ({ draft: aDraft(1), anchor: anchorOf, step: 'implement' })));
+    const card = merged.questions[0];
+    if (card === undefined) throw new Error('three same-anchor questions merge into one card');
+    reconciler.ask(run, card.draft, { raisedQuestionCount: card.raised.length });
+    const lone = reconciler.ask(run, aDraft(9));
+    applyDeflection(runPaths(run, home), lone.question.id, constructDeflection(fromRepository, clock));
+    await reconciler.pass();
+
+    const events = eventsOf(run);
+    expect(events.filter((event) => event.type === QUESTION_EVENT_TYPES.Asked)).toHaveLength(2);
+    expect(deflectionRate(events, 'engine-reconciler')).toMatchObject({
+      raised: 4,
+      deflected: 1,
+      unsettled: 3,
+      rate: 0.25,
+    });
+  });
+});
+
+describe('the count is a structured payload field, and the brief is only a fallback for older lines', () => {
+  /** One `question.asked` envelope, as a reader meets it in the log. */
+  const askedLine = (seq: number, payload: Record<string, unknown>): EventEnvelope => ({
+    ts: '2026-09-23T10:00:00.000Z',
+    seq,
+    feature: 'engine-reconciler',
+    run: 'r',
+    step: null,
+    emitter: 'engine',
+    type: QUESTION_EVENT_TYPES.Asked,
+    payload,
+  });
+
+  it('states the count on every question.asked line, 1 for an unmerged question', async () => {
+    const reconciler = openReconciler();
+    const run = reconciler.acceptFeature(makePlan()).run;
+    reconciler.ask(run, aDraft(1));
+    reconciler.ask(run, aDraft(2), { raisedQuestionCount: 3 });
+    await reconciler.pass();
+    const counts = eventsOf(run)
+      .filter((event) => event.type === QUESTION_EVENT_TYPES.Asked)
+      .map((event) => event.payload['raised_question_count']);
+    expect(counts).toStrictEqual([1, 3]);
+  });
+
+  it('takes the field over the brief, so a brief without the merge sentence cannot undercount', () => {
+    // A card whose brief was reworded or cut: the sentence is gone, the field is not.
+    const events = [askedLine(1, { question_id: 'q-a', brief: 'Reworded entirely.', raised_question_count: 3 })];
+    expect(deflectionRate(events, 'engine-reconciler')).toMatchObject({ raised: 3 });
+  });
+
+  it('falls back to the brief only for a line with no field, as an older build wrote it', () => {
+    const brief = 'Why.\n\nThis one question stands for 2 raised questions: they share the anchor "x:y"';
+    expect(deflectionRate([askedLine(1, { question_id: 'q-a', brief })], 'engine-reconciler')).toMatchObject({
+      raised: 2,
+    });
+  });
+
+  it('does not trust an unusable count, which would drop a question from the denominator', () => {
+    const events = [askedLine(1, { question_id: 'q-a', brief: 'Why.', raised_question_count: 0 })];
+    expect(deflectionRate(events, 'engine-reconciler')).toMatchObject({ raised: 1 });
   });
 });
 
@@ -152,6 +265,6 @@ describe('a feature that raised no questions has no rate, not a rate of zero (ma
     const run = reconciler.acceptFeature(makePlan()).run;
     reconciler.ask(run, aDraft(1));
     const rate = deflectionRate(eventsOf(run), 'engine-reconciler');
-    expect(rate).toMatchObject({ kind: 'measured', raised: 1, deflected: 0, reachedUser: 1, rate: 0 });
+    expect(rate).toMatchObject({ kind: 'measured', raised: 1, deflected: 0, reachedUser: 0, unsettled: 1, rate: 0 });
   });
 });

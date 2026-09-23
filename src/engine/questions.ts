@@ -616,6 +616,12 @@ export interface AskQuestionRequest {
   readonly step?: string | null;
   readonly draft: unknown;
   readonly askedAt?: Date;
+  /**
+   * CAP-3 — how many raised questions a merged card stands for. Omitted for an unmerged question.
+   *
+   * Recorded on the question file so a `question.asked` line re-emitted after a crash carries it too.
+   */
+  readonly raisedQuestionCount?: number;
 }
 
 /**
@@ -641,6 +647,7 @@ export const askQuestion = (request: AskQuestionRequest): AskedQuestion => {
     run: request.paths.runId,
     step: request.step ?? null,
     asked_at: formatTimestamp(request.askedAt ?? new Date()),
+    ...(request.raisedQuestionCount === undefined ? {} : { raised_question_count: request.raisedQuestionCount }),
   });
 
   const state = writeQuestionState(paths, {
@@ -1268,6 +1275,9 @@ export const questionAskedPayload = (
       default_action: state.question.default_action,
       default_window_ms: state.question.default_window_ms,
       [DECLARATION_PAYLOAD_KEYS.AskedAt]: state.question.asked_at,
+      // Stated for every question, `1` when unmerged, so a reader never has to infer a count from absence
+      // on a line this build wrote. Only a line from an older build lacks it.
+      [DECLARATION_PAYLOAD_KEYS.RaisedQuestionCount]: state.question.raised_question_count ?? 1,
     },
     [
       ['prompt', state.question.prompt],

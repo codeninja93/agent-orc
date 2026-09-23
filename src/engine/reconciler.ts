@@ -1141,6 +1141,8 @@ export interface AskOptions {
    * may or may not have landed asks again under the same id and gets one question, not two.
    */
   readonly questionId?: string;
+  /** CAP-3 — how many raised questions a merged card stands for; omitted for an unmerged question. */
+  readonly raisedQuestionCount?: number;
 }
 
 /** What accepting a feature produced. */
@@ -1552,6 +1554,7 @@ export class Reconciler {
       step: options.step ?? null,
       draft,
       askedAt: this.now(),
+      ...(options.raisedQuestionCount === undefined ? {} : { raisedQuestionCount: options.raisedQuestionCount }),
     });
     this.boundary(`question-asked:${asked.created ? 'created' : 'already-durable'}`);
     this.recordQuestion(

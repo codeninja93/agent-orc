@@ -75,6 +75,25 @@ export const QuestionSchema = QuestionDraftSchema.extend({
   run: z.string(),
   step: z.string().nullable(),
   asked_at: TimestampSchema,
+  /**
+   * CAP-3 — how many raised questions this card stands for, when compression merged several into it.
+   *
+   * Carried on the question rather than supplied at emission, because the `question.asked` line is
+   * emitted again from this file by a later pass when a crash fell between the two; a count held only in
+   * memory would be lost exactly then. Optional and additive, so every question file written before it
+   * reads unchanged, and absence means an unmerged question. Not on the draft: a subagent raises one
+   * question, and only the Interviewer's merge knows how many a card replaced.
+   */
+  raised_question_count: z
+    .number()
+    .refine((count) => Number.isSafeInteger(count) && count >= 1, {
+      message: 'raised_question_count must be a whole number of at least 1',
+    })
+    .optional()
+    .describe(
+      'How many raised questions this one card stands for after the Interviewer merged them. A whole ' +
+        'number of at least 1; absent for a question that was never merged.',
+    ),
 });
 
 export type Question = z.infer<typeof QuestionSchema>;
