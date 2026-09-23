@@ -97,3 +97,70 @@ export const firstCommitSha = (repositoryPath: string): string | null => {
 /** The push remote, or `null` when there is none. A repository with no remote is a real answer. */
 export const gitRemote = (repositoryPath: string): string | null =>
   git(repositoryPath, ['remote', 'get-url', 'origin']);
+
+/** One commit as history search returns it: its SHA, its whole message, and its note if it has one. */
+export interface CommitRecord {
+  readonly sha: string;
+  /** The subject and body, as the author wrote them. */
+  readonly message: string;
+  /** The note under the requested ref, or `''` — the committer's AD-22 record lives there, not here. */
+  readonly note: string;
+}
+
+export interface CommitSearchOptions {
+  /** How many of the newest candidates to return. Bounded so a large history cannot stall a question. */
+  readonly limit?: number;
+  /** A notes ref whose text is searched as if it were part of the message, as `git log --notes` does. */
+  readonly notesRef?: string;
+}
+
+/** The default candidate bound: generous for a question's lifetime, small beside any real history. */
+export const DEFAULT_COMMIT_SEARCH_LIMIT = 200;
+
+/** Unit and record separators: characters no commit message is written with, so a split is exact. */
+const FIELD_SEPARATOR = '\u001f';
+const RECORD_SEPARATOR = '\u001e';
+
+/**
+ * Commits whose message or note *contains* `needle`, newest first — a prefilter, never a verdict.
+ *
+ * Q4 makes git history one of the three places a question is attempted against before it reaches a
+ * person, and this is the read that attempt needs. **It deliberately answers "contains", which is
+ * weaker than what a deflection may rest on.** `--fixed-strings --grep` is a substring test, so
+ * `resolveProject` finds a commit that only ever names `resolveProjectPath`; the whole-token decision
+ * belongs to the engine's anchor comparison, which is the same one story 2-3 uses for staleness. Git
+ * narrows a history of thousands to a handful; it does not decide which of them speaks to the anchor.
+ *
+ * Fixed strings rather than a pattern because an anchor is data: a file-path anchor carries `.` and a
+ * symbol may carry `$`, and a regular expression built from one matches things it does not name.
+ *
+ * Runs through {@link git}, so it inherits {@link gitEnvironment}'s named-not-inherited environment and
+ * its `null`-for-every-failure rule — a path that is not a repository, or has no commits, answers with
+ * no commits rather than an error. A question must never be blocked by the attempt to deflect it.
+ */
+export const searchCommitHistory = (
+  repositoryPath: string,
+  needle: string,
+  options: CommitSearchOptions = {},
+): readonly CommitRecord[] => {
+  if (needle === '') return [];
+  const limit = options.limit ?? DEFAULT_COMMIT_SEARCH_LIMIT;
+  const notes = options.notesRef === undefined ? [] : [`--notes=${options.notesRef}`];
+  const output = git(repositoryPath, [
+    'log',
+    `--max-count=${String(limit)}`,
+    '--fixed-strings',
+    `--grep=${needle}`,
+    ...notes,
+    `--format=%H${FIELD_SEPARATOR}%B${FIELD_SEPARATOR}%N${RECORD_SEPARATOR}`,
+  ]);
+  if (output === null) return [];
+  const commits: CommitRecord[] = [];
+  for (const record of output.split(RECORD_SEPARATOR)) {
+    const [sha = '', message = '', note = ''] = record.split(FIELD_SEPARATOR);
+    const trimmedSha = sha.trim();
+    if (trimmedSha === '') continue;
+    commits.push({ sha: trimmedSha, message: message.trim(), note: note.trim() });
+  }
+  return commits;
+};

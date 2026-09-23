@@ -48,6 +48,14 @@
  * - `committer` — AD-22's branch naming, git note and the three write intents a committing step declares.
  *   It composes them and performs none: AD-15 makes the engine the executor, and that executor is story
  *   2-11's along with the durability rule that a `write.attempted` record is durable before the call;
+ * - `deflection` — Q4's three mechanical matchers, by anchor occurrence and never by meaning, and the
+ *   `QuestionDeflection` they construct for AD-25's existing compare-and-set; the ledger match is a fold
+ *   over `decision.recorded` lines, because story 5-3 owns the index;
+ * - `question-merge` — CAP-3's merge of same-anchor questions into one card that still passes Q1, and
+ *   the seam where the live Interviewer turn merges on a stated judgement;
+ * - `deflection-rate` — Q4's reported rate, folded from `question.asked`/`question.deflected` lines;
+ * - `interviewer` — spec echo and question compression as the logic a live turn calls into. The live
+ *   conversation itself is not here; it is the one component architecture.md requires to be a model;
  * The run-start branch-protection assertion is deliberately **not** here. `src/container/lifecycle.ts`
  * already owned it, and a second implementation in this package disagreed with it about the one thing
  * that matters — whether "we could not check" and "it is not protected" have the same consequence. The
@@ -94,4 +102,8 @@ export * from './roster.js';
 export * from './agents.js';
 export * from './config-snapshot.js';
 export * from './committer.js';
+export * from './deflection.js';
+export * from './question-merge.js';
+export * from './deflection-rate.js';
+export * from './interviewer.js';
 export * from './reconciler.js';
