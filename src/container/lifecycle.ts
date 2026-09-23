@@ -36,8 +36,13 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, chownSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { isTerminalFeatureState, makeError } from '../contracts/index.js';
-import type { FeatureState, OrchError } from '../contracts/index.js';
+import { BRANCH_PROTECTION_OUTCOMES, isTerminalFeatureState, makeError } from '../contracts/index.js';
+import type {
+  BranchProtectionOutcome,
+  BranchProtectionReport,
+  FeatureState,
+  OrchError,
+} from '../contracts/index.js';
 import { resolveOrchHome, runPaths } from '../runtime/index.js';
 
 import {
@@ -311,6 +316,17 @@ export const createPhaseSequencer = (): PhaseSequencer => {
 
 /* ------------------------------------------------- branch protection at run start */
 
+/**
+ * The three-outcome vocabulary, re-exported so this module is the one place a reader looks for branch
+ * protection.
+ *
+ * It is *declared* in `src/contracts/event.ts` because the reconciler records the outcome as a log line
+ * and may import only `src/contracts/`, `src/runtime/` and `node:` builtins. The decision is here; the
+ * words are where both units may see them.
+ */
+export { BRANCH_PROTECTION_OUTCOMES };
+export type { BranchProtectionOutcome, BranchProtectionReport };
+
 /** What a probe found out about the default branch. */
 export interface BranchProtection {
   readonly branch: string;
@@ -367,13 +383,31 @@ export class DefaultBranchUnknownError extends Error {
 export const GIT_PROBE_TIMEOUT_MS = 30_000;
 
 /**
+ * The remote a default branch is read from when a caller names none.
+ *
+ * `origin` is git's own convention and is what every existing caller means, so it is a default rather
+ * than an assumption — but it is a *parameter*, because the profile's `project.remote` is an arbitrary
+ * URL and nothing guarantees the local remote holding it is called `origin`. Reading
+ * `refs/remotes/origin/HEAD` on a repository whose remote is named `upstream` answers "no default
+ * branch", which under the fail-closed rule refuses a run for the wrong reason.
+ */
+export const DEFAULT_REMOTE_NAME = 'origin';
+
+/**
  * Read the default branch from the repository: the remote's HEAD first, then `init.defaultBranch`.
  *
  * The remote's HEAD is the honest answer — the default branch is a property of the shared repository,
  * not of this checkout — and a local `HEAD` is deliberately *not* consulted, because inside a feature
  * worktree that is the feature branch and would make the assertion pass by asking the wrong question.
+ *
+ * The short name is what comes back: `symbolic-ref --short` answers `origin/main`, and the remote
+ * prefix is stripped because every caller compares against a *branch*. Returning the full ref would
+ * make the assertion ask the forge about a branch called `origin/main`, which does not exist.
  */
-export const detectDefaultBranch = (repository: string): string => {
+export const detectDefaultBranch = (
+  repository: string,
+  remote: string = DEFAULT_REMOTE_NAME,
+): string => {
   const git = (args: readonly string[]): string | null => {
     try {
       return execFileSync('git', ['-C', repository, ...args], {
@@ -385,15 +419,17 @@ export const detectDefaultBranch = (repository: string): string => {
       return null;
     }
   };
-  const remoteHead = git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']);
+  const head = `refs/remotes/${remote}/HEAD`;
+  const remoteHead = git(['symbolic-ref', '--short', head]);
   if (remoteHead !== null && remoteHead !== '') {
-    return remoteHead.startsWith('origin/') ? remoteHead.slice('origin/'.length) : remoteHead;
+    const prefix = `${remote}/`;
+    return remoteHead.startsWith(prefix) ? remoteHead.slice(prefix.length) : remoteHead;
   }
   const configured = git(['config', '--get', 'init.defaultBranch']);
   if (configured !== null && configured !== '') return configured;
   throw new DefaultBranchUnknownError(
     repository,
-    'neither refs/remotes/origin/HEAD nor init.defaultBranch is set',
+    `neither ${head} nor init.defaultBranch is set`,
   );
 };
 
@@ -401,9 +437,87 @@ export interface BranchProtectionOptions {
   readonly repository: string;
   /** The branch to assert about. Detected from the repository when omitted. */
   readonly defaultBranch?: string;
+  /** Which local remote holds the shared repository. `origin` when omitted. */
+  readonly remote?: string;
   /** The probe. Omitted means unverified, which refuses. */
   readonly probe?: BranchProtectionProbe;
 }
+
+/**
+ * The one decision, reached once and read by both callers.
+ *
+ * {@link assertDefaultBranchProtected} throws from it and {@link checkDefaultBranchProtection} reports
+ * it, so the throwing and the reporting path cannot come to different conclusions — which is exactly the
+ * split that let a second branch-protection module exist with the opposite policy.
+ */
+const evaluateDefaultBranchProtection = (
+  options: BranchProtectionOptions,
+): BranchProtectionReport & { readonly protection: BranchProtection | null } => {
+  const unverified = (
+    outcome: BranchProtectionOutcome,
+    branch: string,
+    detail: string,
+  ): BranchProtectionReport & { readonly protection: BranchProtection | null } => {
+    const error = new UnprotectedDefaultBranchError(branch, detail);
+    return { outcome, branch, reason: error.message, refusal: error.orchError, protection: null };
+  };
+
+  let branch: string;
+  try {
+    branch =
+      options.defaultBranch ?? detectDefaultBranch(options.repository, options.remote);
+  } catch (thrown: unknown) {
+    if (!(thrown instanceof DefaultBranchUnknownError)) throw thrown;
+    // No branch could be named, so there is nothing to assert about. Unknown, and unknown refuses.
+    return {
+      outcome: 'unknown',
+      branch: null,
+      reason: thrown.message,
+      refusal: thrown.orchError,
+      protection: null,
+    };
+  }
+  const found = options.probe?.(options.repository, branch) ?? null;
+  if (found === null) {
+    return unverified(
+      'unknown',
+      branch,
+      'its protection could not be established (no branch-protection probe is configured)',
+    );
+  }
+  if (!found.protected) {
+    return unverified('unprotected', branch, `the branch is not protected (per ${found.source})`);
+  }
+  if (!found.forcePushDisabled) {
+    return unverified('unprotected', branch, `force-push is permitted on it (per ${found.source})`);
+  }
+  if (!found.deletionDisabled) {
+    return unverified('unprotected', branch, `deletion is permitted on it (per ${found.source})`);
+  }
+  return {
+    outcome: 'protected',
+    branch,
+    reason: `${branch} is protected, with force-push and deletion disabled (per ${found.source})`,
+    refusal: null,
+    protection: found,
+  };
+};
+
+/**
+ * Report protection on the default branch without throwing, for the caller that must record the answer
+ * before acting on it.
+ *
+ * The reconciler emits `branch.protection_asserted` and *then* decides whether to refuse, because the one
+ * outcome that stops a run was the one outcome an inline throw left unrecorded. Three outcomes come back
+ * and two of them refuse; `refusal` carries the AD-35 shape so the recorder and the decider read the same
+ * conclusion rather than each re-deriving it.
+ */
+export const checkDefaultBranchProtection = (
+  options: BranchProtectionOptions,
+): BranchProtectionReport => {
+  const { protection: _protection, ...report } = evaluateDefaultBranchProtection(options);
+  return report;
+};
 
 /**
  * Assert protection on the default branch, or refuse the run naming the branch.
@@ -412,24 +526,15 @@ export interface BranchProtectionOptions {
  * force-push allowed is protection that the one action this system must never perform can walk through.
  */
 export const assertDefaultBranchProtected = (options: BranchProtectionOptions): BranchProtection => {
-  const branch = options.defaultBranch ?? detectDefaultBranch(options.repository);
-  const found = options.probe?.(options.repository, branch) ?? null;
-  if (found === null) {
-    throw new UnprotectedDefaultBranchError(
-      branch,
-      'its protection could not be established (no branch-protection probe is configured)',
-    );
+  const evaluated = evaluateDefaultBranchProtection(options);
+  if (evaluated.protection !== null) return evaluated.protection;
+  if (evaluated.branch === null) {
+    throw new DefaultBranchUnknownError(options.repository, evaluated.refusal?.cause ?? 'unknown');
   }
-  if (!found.protected) {
-    throw new UnprotectedDefaultBranchError(branch, `the branch is not protected (per ${found.source})`);
-  }
-  if (!found.forcePushDisabled) {
-    throw new UnprotectedDefaultBranchError(branch, `force-push is permitted on it (per ${found.source})`);
-  }
-  if (!found.deletionDisabled) {
-    throw new UnprotectedDefaultBranchError(branch, `deletion is permitted on it (per ${found.source})`);
-  }
-  return found;
+  throw new UnprotectedDefaultBranchError(
+    evaluated.branch,
+    evaluated.refusal?.cause ?? 'its protection could not be established',
+  );
 };
 
 /* ------------------------------------------------------------ the AD-31 gate */

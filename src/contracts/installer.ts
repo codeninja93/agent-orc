@@ -168,6 +168,47 @@ export const DEFAULT_BRANCH_PATTERN = 'feature/<slug>';
 export const branchPatternVaries = (pattern: string): boolean =>
   BRANCH_SLUG_PLACEHOLDERS.some((placeholder) => pattern.includes(placeholder));
 
+/** The characters git refuses in a ref name, plus the ASCII control range and DEL. */
+const REF_FORBIDDEN_CHARACTERS = /[~^:?*[\\\x00-\x1f\x7f]/;
+
+/**
+ * Why this pattern could not name a git branch, or `null` when it could.
+ *
+ * **A pattern is a template for an argument `git` receives**, and the placeholder check answers a
+ * different question: "can this name two branches", not "is this a branch name". So `feature/../<slug>`,
+ * a leading `-`, a space, a `~^:?*`, a doubled slash and a `.lock` tail all reached argv unchallenged —
+ * some of them refused by `git` at the far end with a message about a ref, and `..` not refused at all.
+ *
+ * The rules are `git check-ref-format --branch`'s, restricted to the ones a *pattern* can break. `<` and
+ * `>` are deliberately not forbidden: git permits them in a ref name, and the placeholder is spelled
+ * with them. The slug substituted in is separately held to being a safe path segment, so this is about
+ * the fixed text around it.
+ *
+ * Applied at the three places the pattern is read — the interview, where a person can retype it;
+ * `ProfileSchema`, so a hand-edited `.orch/profile.toml` is refused when it is parsed; and
+ * `src/engine/committer.ts`, which is where a branch is actually named.
+ */
+export const branchPatternProblem = (pattern: string): string | null => {
+  if (pattern.trim() === '') return 'it is blank';
+  if (pattern !== pattern.trim()) return 'it is wrapped in whitespace';
+  if (/\s/.test(pattern)) return 'it contains whitespace, which no git ref name may';
+  if (REF_FORBIDDEN_CHARACTERS.test(pattern)) {
+    return 'it contains one of ~ ^ : ? * [ \\ or a control character, which git forbids in a ref name';
+  }
+  if (pattern.includes('..')) return 'it contains "..", which git forbids and which climbs a path';
+  if (pattern.includes('@{')) return 'it contains "@{", which git reads as a reflog selector';
+  if (pattern === '@') return 'it is "@", which git reserves';
+  if (pattern.startsWith('-')) return 'it starts with "-", so git would read the branch name as a flag';
+  if (pattern.startsWith('/') || pattern.endsWith('/')) return 'it starts or ends with "/"';
+  if (pattern.includes('//')) return 'it contains an empty path component ("//")';
+  if (pattern.endsWith('.')) return 'it ends with ".", which git forbids';
+  for (const component of pattern.split('/')) {
+    if (component.startsWith('.')) return `its component "${component}" starts with "."`;
+    if (component.endsWith('.lock')) return `its component "${component}" ends with ".lock"`;
+  }
+  return null;
+};
+
 /**
  * AD-24 — three ceilings and no currency dimension, which R10 restates as "cost is subscription
  * usage, never currency". So the third ceiling is a share of the rate-limit window in percent, and
@@ -390,7 +431,19 @@ export const ProfileSchema = versioned(
      * the one AD-17 makes authoritative, and it is not regenerable from anything else.
      */
     roster: z.object({ builtin_agents: z.array(z.string()) }),
-    branch_pattern: z.string(),
+    /**
+     * The branch-name template AD-22 declares once, here and nowhere else.
+     *
+     * Refused at parse when it could not name a git branch, for the reason every other rule in this
+     * schema is: `.orch/profile.toml` is human-edited, so the interview's own validation is the first
+     * gate and not the only one. The refusal is the same sentence the committer would give, because
+     * {@link branchPatternProblem} is the same function.
+     */
+    branch_pattern: z.string().refine((pattern) => branchPatternProblem(pattern) === null, {
+      error: (issue): string =>
+        `branch_pattern ${JSON.stringify(issue.input)} could not name a git branch: ` +
+        `${branchPatternProblem(typeof issue.input === 'string' ? issue.input : '') ?? 'it is invalid'}`,
+    }),
     /**
      * AD-27 — shadow is an ordinary run carrying a mode flag, so the autonomy a project starts at is
      * that flag's default and nothing else. The finer autonomy ladder a person steers through at

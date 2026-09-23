@@ -30,12 +30,20 @@
  * low-entropy values. Getting this wrong is silent: the run works and the log becomes unreadable.
  */
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import {
   ANALYSIS_CONTRACT_ID,
+  BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
+  BRANCH_PROTECTION_PAYLOAD_KEYS,
   COMMITTING_CONTRACT_ID,
+  COMMIT_COMPOSED_EVENT_TYPE,
+  COMMIT_COMPOSED_PAYLOAD_KEYS,
   DETERMINISTIC_GATE_NAMES,
+  NOTE_REF,
+  composedProseIn,
+  totalUsage,
+  usageFromPayload,
   IMPLEMENTATION_CONTRACT_ID,
   TESTING_CONTRACT_ID,
   VERIFICATION_CONTRACT_ID,
@@ -65,6 +73,7 @@ import type {
   Command,
   CommandIntent,
   CommandSource,
+  BranchProtectionReport,
   DeflectionSource,
   EventEnvelope,
   FeatureState,
@@ -74,6 +83,7 @@ import type {
   OrchError,
   Principal,
   QuestionDraft,
+  StepPhase,
   QuestionState,
   RunState,
   StepInput,
@@ -184,19 +194,71 @@ import { EngineLock } from './lock.js';
 import { resolveAgentGrant } from './agents.js';
 import { readStepConfiguration } from './config-snapshot.js';
 import { ProfileNotFound } from './profile.js';
+import { decisionsInLog } from './decision.js';
 import {
-  BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
-  BRANCH_PROTECTION_NOT_CONFIGURED,
-  BRANCH_PROTECTION_PAYLOAD_KEYS,
-  assertBranchProtection,
-} from './protection.js';
-import type { BranchProtectionRequest } from './protection.js';
+  BranchPatternRefused,
+  COMPOSED_COMMIT_RELATIVE_PATH,
+  NoteUncomposable,
+  commitRunRecordFrom,
+  composeCommit,
+} from './committer.js';
+import type { ComposedCommit } from './committer.js';
+
 import { ModelRungUnrecognised, rungForAttempt } from './promotion.js';
 import { defaultUlidMinter } from './ulid.js';
 import type { UlidMinter } from './ulid.js';
 
 /** `runs/<run-id>/steps/` — where a step's typed input file lives. */
 export const STEPS_DIR_NAME = 'steps';
+
+/**
+ * The run-start branch-protection assertion, as the loop sees it: a function that reports, never throws.
+ *
+ * The implementation is `src/container/lifecycle.ts`'s `checkDefaultBranchProtection`, which holds the
+ * probe port and the fail-closed policy. It reaches the loop as a port because the engine imports only
+ * `src/contracts/`, `src/runtime/` and `node:` builtins — and because reporting rather than throwing is
+ * what lets the outcome be recorded before it is acted on.
+ */
+export type BranchProtectionAssertion = () => BranchProtectionReport;
+
+/**
+ * What an engine handed no assertion at all concludes: `unknown`, recorded, and not a refusal.
+ *
+ * **This is the one place the fail-closed rule stops, and the boundary is deliberate.** Matrix row 23 is
+ * about a *repository* whose protection cannot be checked — an assertion that was made and could not
+ * conclude — and that refuses: `checkDefaultBranchProtection` returns a `refusal` for every outcome but
+ * `protected`, including a missing probe, so wiring the port and having nothing to ask stops the run.
+ * An engine with no port wired has not made an assertion about anything; refusing there would be the
+ * engine refusing itself, not a repository.
+ *
+ * That gap is real and it is the composition-root gap this story already carries as a `high` deferral:
+ * nothing under `src/` or `bin/` yet assembles a `Reconciler`, so nothing yet supplies the port. What is
+ * *not* true is that an unasserted run looks asserted — every one of them writes this line into its log,
+ * saying in full that the branch was never checked.
+ */
+export const BRANCH_PROTECTION_UNASSERTED: BranchProtectionReport = {
+  outcome: 'unknown',
+  branch: null,
+  reason:
+    'no branch-protection assertion is wired into this engine, so the default branch was never ' +
+    'checked; this is recorded as unknown and never as satisfied',
+  refusal: null,
+};
+
+/** Refusal to start a run whose default branch is unprotected, or whose protection could not be checked. */
+export class BranchProtectionRefused extends Error {
+  readonly code = 'write.branch_protection_violation';
+  readonly report: BranchProtectionReport;
+  readonly orchError: OrchError;
+
+  constructor(report: BranchProtectionReport) {
+    super(`Refusing to start the run: ${report.reason}`);
+    this.name = 'BranchProtectionRefused';
+    this.report = report;
+    this.orchError =
+      report.refusal ?? makeError('write.branch_protection_violation', report.reason, report.outcome);
+  }
+}
 
 /**
  * The steps a feature runs, one per phase, in the order a run meets them.
@@ -1033,13 +1095,18 @@ export interface ReconcilerOptions {
    */
   readonly principal?: Principal;
   /**
-   * The run-start branch-protection assertion (ADR-001), or `null` when nothing can make it.
+   * The run-start branch-protection assertion (ADR-001), as an injected port.
    *
-   * Absent is *not* "protected": `acceptFeature` records the outcome as `unknown` and starts the run,
-   * because refusing every repository the engine cannot reach would stop an offline machine running at
-   * all. `src/engine/protection.ts` holds the three outcomes and the judgement.
+   * A function rather than a configuration object, because the assertion itself belongs to
+   * `src/container/lifecycle.ts` — which holds the probe port and the fail-closed policy — and the
+   * engine may not import that package. A composition root supplies
+   * `() => checkDefaultBranchProtection({ repository, probe })`.
+   *
+   * `null` is *not* "protected". It answers `unknown`, and `unknown` refuses the run exactly as
+   * `unprotected` does: "we could not check" and "it is not protected" have the same consequence,
+   * because protected main is the one control that survives total agent failure.
    */
-  readonly branchProtection?: BranchProtectionRequest | null;
+  readonly branchProtection?: BranchProtectionAssertion | null;
 }
 
 /**
@@ -1110,7 +1177,7 @@ export class Reconciler {
   private readonly tornGraceMs: number;
   private readonly worktreeGit: WorktreeGit;
   private readonly principal: Principal;
-  private readonly branchProtection: BranchProtectionRequest | null;
+  private readonly branchProtection: BranchProtectionAssertion | null;
   /** Open recorders, keyed by run id. An I/O handle, not run state: nothing is read back from it. */
   private readonly recorders = new Map<string, Recorder>();
   private closed = false;
@@ -1257,15 +1324,17 @@ export class Reconciler {
      * no run to read it on, and the three lines above are what makes the run readable at all. The
      * refusal still happens before anything is spawned, which is what "at run start" is for.
      *
-     * An `unknown` outcome is recorded and the run continues. That is the honest degradation
-     * `src/engine/protection.ts` exists for: a repository with no remote, or a host the engine cannot
-     * reach, cannot be asserted against, and reporting that as satisfied would be a guarantee nobody
-     * checked reading exactly like one somebody did.
+     * **The line is emitted before the outcome is acted on**, which is the whole reason the port
+     * reports rather than throws. An assertion called inline in an assignment gives `protected` and
+     * `unknown` a log line and gives the one outcome that stops a run none at all — the run refuses,
+     * and the record of why it refused is the record that is missing.
+     *
+     * Both `unprotected` and `unknown` refuse. "We could not check" and "it is not protected" have the
+     * same consequence, which is `src/container/lifecycle.ts`'s fail-closed rule and the threat model's
+     * reason for it. The outcomes stay distinct in the log because a person needs to know which of the
+     * two they are fixing.
      */
-    const protection =
-      this.branchProtection === null
-        ? BRANCH_PROTECTION_NOT_CONFIGURED
-        : assertBranchProtection(this.branchProtection);
+    const protection = this.branchProtection === null ? BRANCH_PROTECTION_UNASSERTED : this.branchProtection();
     this.emit(recorder, {
       step: null,
       type: BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
@@ -1275,6 +1344,35 @@ export class Reconciler {
         [BRANCH_PROTECTION_PAYLOAD_KEYS.Reason]: protection.reason,
       },
     });
+
+    /**
+     * **The assertion decides, and this reads its answer rather than re-deciding it.** A reconciler
+     * that re-derived "does this outcome stop a run" from the outcome word would be a second authority
+     * on the fail-closed rule, and the two would disagree the moment one of them changed — which is the
+     * shape of the defect that let two branch-protection modules exist at once.
+     */
+    if (protection.refusal !== null) {
+      /**
+       * The refused run is marked terminal before the throw escapes, so nothing reloads it.
+       *
+       * Deleting the directory would take the line just emitted with it, and that line is the record of
+       * *why* a person's run refused. So the run is abandoned instead: a `killed` checkpoint, which
+       * `TERMINAL_FEATURE_STATES` makes unreclaimable and un-advanceable, is written before the throw —
+       * otherwise the directory holds events and no `state.json`, and the next pass reads a run that
+       * never started as an ordinary one sitting in `drafting`.
+       */
+      this.emit(recorder, {
+        step: null,
+        type: ENGINE_EVENT_TYPES.FeatureStateChanged,
+        payload: {
+          from: 'drafting',
+          to: 'killed',
+          reason: 'the run-start branch-protection assertion refused this run before any step ran',
+        },
+      });
+      this.checkpointFromLog(paths, plan);
+      throw new BranchProtectionRefused(protection);
+    }
 
     return { run, state: this.checkpointFromLog(paths, plan) };
   }
@@ -2785,6 +2883,7 @@ export class Reconciler {
 
         this.recordTermination(state, planStep, record.baseline_ref, termination, {
           transitionTo: action.transitionTo,
+          plan,
         });
         this.applyStopObservation(state, action.step, watch.observed());
         return action.step;
@@ -3029,6 +3128,7 @@ export class Reconciler {
 
     this.recordTermination(state, options.step, baselineRef, termination, {
       transitionTo: options.transitionTo,
+      plan,
     });
 
     this.applyStopObservation(state, options.step.step, watch.observed());
@@ -3228,7 +3328,7 @@ export class Reconciler {
     step: PlanStep,
     baselineRef: string,
     termination: StepTermination,
-    context: { readonly transitionTo: FeatureState },
+    context: { readonly transitionTo: FeatureState; readonly plan: FeaturePlan },
   ): void {
     const recorder = this.recorderFor(state.run, state.feature);
     this.emit(recorder, {
@@ -3254,6 +3354,7 @@ export class Reconciler {
 
     if (termination.disposition === 'completed') {
       this.recordDeclaredTerritory(state, step, recorder, termination);
+      this.recordComposedCommit(state, context.plan, step, recorder, termination);
     }
 
     if (termination.disposition === 'interrupted' && context.transitionTo !== 'interrupted') {
@@ -3337,7 +3438,7 @@ export class Reconciler {
           error: makeError(thrown.code, thrown.message, renderCause(thrown.cause)),
           usage: null,
         },
-        { transitionTo },
+        { transitionTo, plan },
       );
       return null;
     }
@@ -3380,7 +3481,7 @@ export class Reconciler {
           ),
           usage: null,
         },
-        { transitionTo },
+        { transitionTo, plan },
       );
       return null;
     }
@@ -3422,7 +3523,7 @@ export class Reconciler {
             ),
             usage: null,
           },
-          { transitionTo },
+          { transitionTo, plan },
         );
         return null;
       }
@@ -3488,7 +3589,7 @@ export class Reconciler {
             error,
             usage: null,
           },
-          { transitionTo },
+          { transitionTo, plan },
         );
         return null;
       }
@@ -3569,7 +3670,7 @@ export class Reconciler {
         error: makeError('step.verification_failed', `A declared gate failed: ${named}.`, named),
         usage: null,
       },
-      { transitionTo },
+      { transitionTo, plan },
     );
     return null;
   }
@@ -3641,6 +3742,129 @@ export class Reconciler {
     // AD-4: a correction the log does not carry is one the next pass will not see, so a dropped line is
     // the same unrecorded action every other emit treats as one rather than something to carry on past.
     if (!recorded.recorded) throw new UnrecordedAction(TERRITORY_DECLARED_EVENT_TYPE);
+  }
+
+  /**
+   * Compose the commit a completed committing step's prose calls for, and record it.
+   *
+   * **This is the join story 2-4 had to make for territory, one phase later.** `composeCommit` existed
+   * and nothing called it: the standard plan spawned a committing step, its output was parsed against
+   * `step.committing` and then dropped, so the branch was never named, the note was never built and the
+   * three AD-15 intents were never composed. A unit whose functions nothing calls is a unit that is not
+   * in the system, whatever its tests say.
+   *
+   * **Keyed on the output's prose, not on the phase.** The same reason {@link recordDeclaredTerritory}
+   * keys on the field: a phase test would be a second place that decides what a committing agent is, and
+   * AD-17 puts that in the roster. An output that composed no prose says nothing and nothing happens.
+   *
+   * **It composes and performs nothing.** No push, no pull request, no note write — those are story
+   * 2-11's, along with the rule that a `write.attempted` record carrying the idempotency key is durable
+   * before the call. What lands here is a value: the composed artifact on disk, and a log line pointing
+   * at it, so the executor has somewhere to read the intents back from.
+   *
+   * **A composition that fails is a *failure of the run's record*, and it is recorded rather than
+   * thrown.** A throw here escapes a pass that has already durably recorded the step's termination, and
+   * would take every other feature's pass down with it — the same reasoning the gate path states. The
+   * step stays completed and the log carries why no commit was composed.
+   */
+  private recordComposedCommit(
+    state: RunState,
+    plan: FeaturePlan,
+    step: PlanStep,
+    recorder: Recorder,
+    termination: StepTermination,
+  ): void {
+    const prose = composedProseIn(termination.contractOutput);
+    // Not an output that composed pull-request prose. Every other contract reaches here and says nothing.
+    if (prose === null) return;
+
+    const paths = runPaths(state.run, this.orchHome);
+    /**
+     * Folded from the log, not read off `state`.
+     *
+     * `state` is the checkpoint as it stood *before* this termination, so the committing step's own
+     * disposition is still `null` there — and `NotedStepSchema` has no way to spell an in-flight step,
+     * deliberately. `rebuildFromLog` is pure and the termination is already durable, so this is the
+     * run's record including the step that just ended. No checkpoint is written: converging it is the
+     * next pass's job and doing it here would move a durable boundary other suites observe.
+     */
+    const events = readEventLog(paths.eventLog);
+    const settled = rebuildFromLog(events, { run: state.run, plan, now: this.now });
+    const record = commitRunRecordFrom({
+      run: state.run,
+      feature: state.feature,
+      steps: settled.steps,
+      acceptanceCriteria: plan.acceptance_criteria,
+      usage: totalUsage(
+        events
+          .filter((event) => event.type === ENGINE_EVENT_TYPES.StepTerminated)
+          .map((event) => usageFromPayload(event.payload[USAGE_PAYLOAD_KEY])),
+      ),
+      decisions: decisionsInLog(events).map((payload: Record<string, unknown>) => ({
+        question: typeof payload['question'] === 'string' ? payload['question'] : '',
+        answer: typeof payload['answer'] === 'string' ? payload['answer'] : '',
+        rationale: typeof payload['resolver'] === 'string' ? `resolved by ${payload['resolver']}` : '',
+      })),
+    });
+
+    let composed: ComposedCommit;
+    try {
+      composed = composeCommit({
+        record,
+        branchPattern: this.declaredBranchPattern(state.run),
+        prose,
+        step: step.step,
+      });
+    } catch (thrown: unknown) {
+      if (!(thrown instanceof BranchPatternRefused) && !(thrown instanceof NoteUncomposable)) throw thrown;
+      this.emit(recorder, {
+        step: step.step,
+        type: COMMIT_COMPOSED_EVENT_TYPE,
+        payload: { [COMMIT_COMPOSED_PAYLOAD_KEYS.Refusal]: thrown.code, reason: thrown.message },
+      });
+      return;
+    }
+
+    /**
+     * The artifact on disk, the pointer in the log (AD-23).
+     *
+     * The note carries the run id, which is an unbroken ULID, and AD-21's entropy sweep rewrites one
+     * wherever it appears in a *payload* — so putting the composition in the event would hand story
+     * 2-11 a note whose run id had been replaced by a marker. Everything in the payload below is short
+     * and punctuated.
+     */
+    const artifact = join(paths.runDir, COMPOSED_COMMIT_RELATIVE_PATH);
+    mkdirSync(dirname(artifact), { recursive: true });
+    writeFileSync(artifact, `${JSON.stringify(composed, null, 2)}\n`, 'utf8');
+
+    this.emit(recorder, {
+      step: step.step,
+      type: COMMIT_COMPOSED_EVENT_TYPE,
+      payload: {
+        [COMMIT_COMPOSED_PAYLOAD_KEYS.Branch]: composed.branch,
+        [COMMIT_COMPOSED_PAYLOAD_KEYS.IntentIds]: composed.intents.map((intent) => intent.intent_id),
+        [COMMIT_COMPOSED_PAYLOAD_KEYS.NoteRef]: NOTE_REF,
+        [COMMIT_COMPOSED_PAYLOAD_KEYS.NoteSchemaVersion]: composed.note.schema_version,
+        [COMMIT_COMPOSED_PAYLOAD_KEYS.Artifact]: COMPOSED_COMMIT_RELATIVE_PATH,
+      },
+    });
+  }
+
+  /**
+   * The branch pattern this run's profile declares, or `null` when nothing declares one.
+   *
+   * Read from the AD-9 run snapshot, which is the only configuration a run reads — the same source and
+   * the same absent-versus-unreadable distinction {@link declaredCommands} draws one method over. An
+   * unreadable profile is *not* silently the default: `branchFor` would then name a branch from a
+   * pattern nobody wrote.
+   */
+  private declaredBranchPattern(run: string): string | null {
+    try {
+      return readStepConfiguration(run, { orchHome: this.orchHome }).profile.profile.branch_pattern;
+    } catch (thrown: unknown) {
+      if (thrown instanceof ProfileNotFound) return null;
+      throw new UnreadableGateConfiguration(run, thrown);
+    }
   }
 
   /** Build the port's request. Nothing here spawns: that is story 1-4's whole subject. */
@@ -4239,22 +4463,40 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
       to: 'committed',
       reason:
         'Every declared step completed, so the gates have passed and the run reaches its terminal ' +
-        'state. Opening the pull request is the committer’s work in story 2-7.',
+        'state. The committing step composed the branch, the pull request and the AD-22 note; ' +
+        'executing those three intents is story 2-11’s, and nothing here performs one.',
     };
   }
 
   return {
     kind: 'run-step',
     step: next,
-    transitionTo: next.phase === 'verification' ? 'verifying' : 'running',
+    transitionTo: featureStateWhileRunning(next.phase),
     reason:
       `Step "${next.step}" is the next declared ${next.phase} step with no completed record, so the ` +
       'reconciler claims it.',
   };
 };
 
+/**
+ * The feature state a phase puts the run in while its step runs.
+ *
+ * `verifying` for verification, and `running` for everything else **including `committing`** — which
+ * looks like a reversion and is not. The lifecycle's states are the ones `FEATURE_STATES` declares, and
+ * there is no `committing` among them: the path is `running` → `verifying` → `committed`, where
+ * `committed` is terminal and is reached once every step has completed. A committing step is work in
+ * progress like any other, so the run is `running` while it happens and `committed` when it is done; a
+ * step that put the run back into `verifying` would say a second verification was under way, and one
+ * that jumped to `committed` would claim a terminal state before the note had been composed.
+ *
+ * Spelled once and shared by both callers, because the two used to decide it separately and a phase
+ * added to one and not the other is a run whose state disagrees with itself between passes.
+ */
+const featureStateWhileRunning = (phase: StepPhase): FeatureState =>
+  phase === 'verification' ? 'verifying' : 'running';
+
 /** The feature state a step's phase puts the run in while that step runs. */
 const targetStateFor = (plan: FeaturePlan, step: string): FeatureState => {
   const entry = plan.steps.find((candidate) => candidate.step === step);
-  return entry?.phase === 'verification' ? 'verifying' : 'running';
+  return entry === undefined ? 'running' : featureStateWhileRunning(entry.phase);
 };

@@ -15,6 +15,14 @@
  * profile gains a field, and the profile advancing must not refuse a note that never changed shape. The
  * two numbers are independent and {@link NOTE_SCHEMA_VERSION_POLICY} is this one's.
  *
+ * **"On the merge commit" is the executor's binding, not this story's.** AD-22 puts the note on the merge
+ * commit, and the note is *composed* at the committing step — before the branch is pushed, before the pull
+ * request exists and so before any merge commit exists to name. There is therefore nothing commit-shaped
+ * to put in the composition: the `git_note` intent's `target` is {@link NOTE_REF}, the single named ref,
+ * and the commit the note lands on is chosen by story 2-11's executor at the moment it writes it. The note
+ * becomes the durable in-repository record then, not now. Saying so here rather than leaving it implied is
+ * the difference between a deliberate boundary and a field somebody later fills with a guess.
+ *
  * **There is deliberately no timestamp.** The run id is a ULID minted by the engine at run creation
  * (AD-29) and carries its own minting time, so a `recorded_at` beside it would be a second authority on
  * when the run happened — and, worse here than elsewhere, it would make the note vary between two
@@ -30,7 +38,7 @@ import { z } from 'zod';
 
 import { DecisionRecordSchema, STEP_DISPOSITIONS } from './step.js';
 import { STEP_PHASES } from './state.js';
-import { StepUsageSchema } from './usage.js';
+import { StepUsageSchema, hasRecordedUsage } from './usage.js';
 import { versioned } from './schema-version.js';
 import type { SchemaVersionPolicy } from './schema-version.js';
 
@@ -174,6 +182,49 @@ export const GitNoteSchema = versioned(
         'that did nothing, and it makes every per-step rule pass vacuously',
     });
   }
+  /**
+   * The criteria get the rule the steps already had, for the same reason.
+   *
+   * A note with no criteria is a record of a run nobody agreed a standard for, and an empty list makes
+   * the per-entry rule below pass vacuously — the shape story 2-6's review named. A blank entry is the
+   * same fault one level in: a criterion nobody can read is not a criterion the change was judged
+   * against.
+   */
+  if (note.acceptance_criteria.length === 0) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['acceptance_criteria'],
+      message:
+        'a note records the criteria the run was accepted with; an empty list is a durable record of ' +
+        'a run judged against nothing, and it makes every per-criterion rule pass vacuously',
+    });
+  }
+  note.acceptance_criteria.forEach((criterion, index) => {
+    if (criterion.trim() === '') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['acceptance_criteria', index],
+        message: 'a blank criterion states no standard, and reads as one the change was judged against',
+      });
+    }
+  });
+
+  /**
+   * The field's own `.describe()` promises absence is never spelled as a zero; this is what makes that
+   * true rather than advisory. A record whose every field is null is *no* measurement, and `null` is how
+   * this artifact spells that — so a five-null record is the same claim said a second way, and the two
+   * spellings would read differently to a surface that only checks for the record's presence.
+   */
+  if (note.usage !== null && !hasRecordedUsage(note.usage)) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['usage'],
+      message:
+        'a usage record whose every field is null records nothing; absence is spelled by omitting the ' +
+        'record (null), not by a record of nulls, and two spellings of absence read differently',
+    });
+  }
+
   const named = new Set<string>();
   note.steps.forEach((step, index) => {
     if (step.step.trim() === '') {

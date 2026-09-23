@@ -211,6 +211,38 @@ describe('a write intent cannot express a force (matrix 13)', () => {
     }
   });
 
+
+  it.each(['target', 'summary'])(
+    'refuses an intent whose %s is blank, which its own description already promised',
+    (field) => {
+      const result = WriteIntentSchema.safeParse({
+        intent_id: 'commit.git_push',
+        kind: 'git_push',
+        target: 'feature/x',
+        summary: 'Push',
+        reversibility: 'irreversible',
+        [field]: '   ',
+      });
+      // A description that states a rule nothing checks is the worst of both: the producer is told,
+      // and the artifact is accepted anyway.
+      expect(result.success).toBe(false);
+      expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain(field);
+    },
+  );
+
+  it('refuses a title broken by a line separator, not only by a newline', () => {
+    // U+2028 and U+2029 are invisible in most editors and terminate a line in JavaScript's own
+    // grammar, so a check that saw only \n let a two-line title through as a one-line one.
+    for (const brk of ['\n', '\r', '\u2028', '\u2029']) {
+      expect(
+        CommittingOutputSchema.safeParse(
+          committingOutput({ pull_request_title: `Committer${brk}and the note` }),
+        ).success,
+        JSON.stringify(brk),
+      ).toBe(false);
+    }
+  });
+
   it('refuses an intent that carries a force anyway, rather than stripping it', () => {
     const forced = {
       intent_id: 'commit.git_push',

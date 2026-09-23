@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
   RUN_STATE_FILE_NAME,
   StepInputSchema,
   dispositionFor,
@@ -24,7 +25,6 @@ import {
 import type { ModelRung, OrchError, StepDisposition } from '../src/contracts/index.js';
 import { Recorder, readEventLog, runPaths, runsDir } from '../src/runtime/index.js';
 import {
-  BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
   BaselineResetError,
   ENGINE_EMITTER,
   ENGINE_EVENT_TYPES,

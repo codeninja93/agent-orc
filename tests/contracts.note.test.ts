@@ -11,7 +11,7 @@
  * `tests/contracts.committing.test.ts` rather than here: this file holds the shape, that one holds the
  * refusal that keeps a model out of it.
  */
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 
 import { describe, expect, it } from 'vitest';
 
@@ -28,6 +28,8 @@ import {
   parseVersionedArtifact,
 } from '../src/contracts/index.js';
 import type { GitNote } from '../src/contracts/index.js';
+
+import { sourceFilesUnder, stripComments } from './helpers/source-sweep.js';
 
 const NOTE_ARTIFACT_NAME = 'the AD-22 git note';
 
@@ -135,6 +137,50 @@ describe('the note carries what AD-22 says a run leaves behind (matrix 5)', () =
     expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain('steps.1.step');
   });
 
+
+  /**
+   * The two fields the schema guarded in prose and not in code.
+   *
+   * `acceptance_criteria` gets the rule `steps` already had — an empty list is a record of a run judged
+   * against nothing, and it makes the per-entry rule below it pass vacuously. `usage` gets the rule its
+   * own `.describe()` already promised: absence is spelled by omitting the record, and a record of five
+   * nulls is the same claim said a second way, which a surface checking only for the record's presence
+   * reads differently.
+   */
+  it('refuses a note with no acceptance criteria, which is a run judged against nothing', () => {
+    const result = GitNoteSchema.safeParse(note({ acceptance_criteria: [] }));
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain(
+      'acceptance_criteria',
+    );
+  });
+
+  it('refuses a blank criterion, which states no standard and reads as one', () => {
+    const result = GitNoteSchema.safeParse(note({ acceptance_criteria: ['a real one', '  '] }));
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain(
+      'acceptance_criteria.1',
+    );
+  });
+
+  it('refuses a usage record of nothing but nulls, which is absence spelled twice', () => {
+    const result = GitNoteSchema.safeParse(
+      note({
+        usage: {
+          cost_usd: null,
+          input_tokens: null,
+          output_tokens: null,
+          cache_creation_input_tokens: null,
+          cache_read_input_tokens: null,
+        },
+      }),
+    );
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain('usage');
+    // And the one spelling of absence this artifact does accept still parses.
+    expect(GitNoteSchema.safeParse(note({ usage: null })).success).toBe(true);
+  });
+
   it.each(['run', 'feature', 'branch'])(
     'refuses a note whose %s is blank, because a record nothing can be found by is no record',
     (field) => {
@@ -219,16 +265,11 @@ describe('the note has one ref, spelled once (AD-22)', () => {
    */
   it('is the only refs/notes spelling anywhere under src/, checked recursively', () => {
     const sourceRoot = new URL('../src/', import.meta.url);
-    const files = readdirSync(sourceRoot, { recursive: true })
-      .filter((name): name is string => typeof name === 'string' && name.endsWith('.ts'))
-      .sort();
+    const files = sourceFilesUnder(sourceRoot);
     expect(files.length).toBeGreaterThan(0);
     // Nested files are in the list, so a violation under `src/tui/cards/` is inside the sweep rather
     // than one directory past it.
     expect(files.some((file) => file.includes('/'))).toBe(true);
-
-    const stripComments = (source: string): string =>
-      source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
 
     const spellings = new Map<string, readonly string[]>();
     for (const file of files) {

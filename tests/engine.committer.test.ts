@@ -20,13 +20,42 @@
  * precisely so they cannot collide with, or pre-empt, the branch the committer names; a guard that made
  * the system's two legitimate branch namers illegal would be replaced rather than obeyed.
  */
-import { readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 
-import { DEFAULT_BRANCH_PATTERN } from '../src/contracts/index.js';
-import { BranchPatternRefused, branchFor, branchPatternOf } from '../src/engine/index.js';
-import { TAKEOVER_BRANCH_PREFIX, takeoverBranchFor } from '../src/runtime/index.js';
+import {
+  COMMIT_COMPOSED_EVENT_TYPE,
+  CommittingOutputSchema,
+  DEFAULT_BRANCH_PATTERN,
+  NOTE_REF,
+  StepOutputSchema,
+  branchPatternProblem,
+} from '../src/contracts/index.js';
+import type { EventEnvelope } from '../src/contracts/index.js';
+import {
+  BranchPatternRefused,
+  COMPOSED_COMMIT_RELATIVE_PATH,
+  NoteUncomposable,
+  Reconciler,
+  STANDARD_PLAN_STEPS,
+  branchFor,
+  branchPatternOf,
+  createScriptedExecutor,
+  noteFor,
+  terminated,
+} from '../src/engine/index.js';
+import {
+  TAKEOVER_BRANCH_PREFIX,
+  readEventLog,
+  runPaths,
+  takeoverBranchFor,
+} from '../src/runtime/index.js';
+
+import { makePlan, planProvider } from './helpers/engine-fixture.js';
+import { sourceFilesUnder, stripComments } from './helpers/source-sweep.js';
 
 describe('the branch name comes from the profile’s pattern (matrix 9)', () => {
   it('substitutes the feature slug into the declared pattern', () => {
@@ -84,6 +113,92 @@ describe('a pattern that cannot vary is refused where it is read (matrix 10)', (
   });
 });
 
+
+describe('a pattern that could not name a git branch is refused (matrix 10)', () => {
+  /**
+   * The second question the placeholder check does not ask.
+   *
+   * A pattern is a template for an argument `git` receives, and every one of these has a placeholder —
+   * so `branchPatternVaries` passes all of them, and only a ref-format check stops them reaching argv.
+   * `feature/../<slug>` is the sharp one: it varies, it is a valid template, and it climbs a path.
+   */
+  it.each([
+    ['feature/../<slug>', '".."'],
+    ['-feature/<slug>', '"-"'],
+    ['feature /<slug>', 'whitespace'],
+    ['feature/~<slug>', 'control character'],
+    ['feature//<slug>', 'empty path component'],
+    ['feature/<slug>.lock', '".lock"'],
+    ['feature/<slug>/', 'ends with "/"'],
+    ['feature/.<slug>', 'starts with "."'],
+  ])('refuses %s', (pattern, expected) => {
+    let refusal: BranchPatternRefused | null = null;
+    try {
+      branchFor(pattern, 'committer');
+    } catch (error) {
+      refusal = error instanceof BranchPatternRefused ? error : null;
+    }
+    expect(refusal, pattern).not.toBeNull();
+    expect(refusal?.code).toBe('config.invalid');
+    expect(refusal?.message, pattern).toContain(expected);
+  });
+
+  it('is the same question the profile asks when it is parsed', () => {
+    // `.orch/profile.toml` is human-edited, so the interview is the first gate and not the only one.
+    expect(branchPatternProblem('feature/<slug>')).toBeNull();
+    expect(branchPatternProblem('feature/../<slug>')).not.toBeNull();
+  });
+
+  /**
+   * An unsafe feature slug leaves this unit with a code, not as a bare path error.
+   *
+   * AD-35 binds every failure crossing a unit boundary, and `UnsafePathSegmentError` carries none — so
+   * a caller routing it reached the unknown-code fallback and abandoned the run for a reason the table
+   * never named.
+   */
+  it('refuses an unsafe feature slug with a declared disposition code', () => {
+    let refusal: BranchPatternRefused | null = null;
+    try {
+      branchFor('feature/<slug>', '../../etc');
+    } catch (error) {
+      refusal = error instanceof BranchPatternRefused ? error : null;
+    }
+    expect(refusal).not.toBeNull();
+    expect(refusal?.code).toBe('config.invalid');
+    expect(refusal?.message).toContain('../../etc');
+  });
+
+  /**
+   * A record that cannot make a note is a named refusal too, for the same reason.
+   *
+   * A raw `ZodError` out of `composeCommit` carries no code and no run id, and the reconciler catches
+   * this on the path where a step has just completed — the worst moment to lose both.
+   */
+  it('refuses a record that cannot make a note, naming the run and carrying a code', () => {
+    let refusal: NoteUncomposable | null = null;
+    try {
+      noteFor(
+        {
+          run: '01JBQ8Z1X2Y3W4V5U6T7S8R9Q0',
+          feature: 'committer',
+          // No steps: a note is written on a merge commit, so a run that took none never reaches one.
+          steps: [],
+          acceptance_criteria: ['one'],
+          usage: null,
+          decisions: [],
+        },
+        'feature/committer',
+      );
+    } catch (error) {
+      refusal = error instanceof NoteUncomposable ? error : null;
+    }
+    expect(refusal).not.toBeNull();
+    expect(refusal?.code).toBe('config.invalid');
+    expect(refusal?.run).toBe('01JBQ8Z1X2Y3W4V5U6T7S8R9Q0');
+    expect(refusal?.message).toContain('steps');
+  });
+});
+
 // -------------------------------------------------------------------------------------------------
 // Matrix 11, 12 — the recursive guard
 // -------------------------------------------------------------------------------------------------
@@ -96,9 +211,6 @@ describe('a pattern that cannot vary is refused where it is read (matrix 10)', (
  * name-matching weakness story 2-4 found one layer over.
  */
 const COMMITTER_SOURCE = 'engine/committer.ts';
-
-const stripComments = (source: string): string =>
-  source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
 
 /** A literal that is already most of a branch name: `feature/`, `branch/`, `refs/heads/`. */
 const BRANCHISH_LITERAL = /(?:^|[^A-Za-z])(?:feature|feat|branch|branches|heads)\//i;
@@ -175,9 +287,7 @@ export const branchNamingViolationsIn = (source: string): readonly BranchNamingV
 
 describe('no unit but the committer derives a branch name from a feature slug (matrix 11)', () => {
   const sourceRoot = new URL('../src/', import.meta.url);
-  const files = readdirSync(sourceRoot, { recursive: true })
-    .filter((name): name is string => typeof name === 'string' && name.endsWith('.ts'))
-    .sort();
+  const files = sourceFilesUnder(sourceRoot);
 
   it('sweeps src/ recursively, reaching files two directories deep', () => {
     expect(files.length).toBeGreaterThan(50);
@@ -291,5 +401,292 @@ describe('the run-id-keyed branches do not trip the guard (matrix 12)', () => {
           '  `${TAKEOVER_BRANCH_PREFIX}${assertSafePathSegment(slug, \'a feature slug\')}`;',
       ).length,
     ).toBeGreaterThan(0);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Matrix 20 — the executor is story 2-11's, and nothing here performs a write
+// -------------------------------------------------------------------------------------------------
+
+/** Git subcommands that write somewhere this process does not own. */
+const WRITING_SUBCOMMANDS = ['push', 'notes', 'tag'];
+
+/** Ways of creating a pull request, none of which is a git subcommand. */
+const PULL_REQUEST_CALLS = [/\bgh\b[^\n]{0,40}\bpr\b/i, /api\.github\.com/i, /\/pulls\b/];
+
+/** The two AD-15 lines story 2-11 introduces; nothing may emit either yet. */
+const EXECUTOR_EVENT_TYPES = ['write.attempted', 'write.executed'];
+
+/** Where a child process is started. A write this story forbids has to go through one of these. */
+const PROCESS_INVOCATION = /\b(?:execFileSync|execFile|execSync|exec|spawnSync|spawn)\s*\(/g;
+
+/** How far past an invocation its argument list can reasonably run. */
+const ARGV_WINDOW = 300;
+
+interface PerformedWrite {
+  readonly signal: string;
+  readonly evidence: string;
+}
+
+/**
+ * Where a source *performs* one of the three writes this story only composes.
+ *
+ * The signals are invocations and emissions, not names: a subcommand handed to a child process, a
+ * pull-request API reached over the network, and the two event types whose whole purpose is to record a
+ * write being attempted. The last is the sharpest of the three — AD-15 fixes the durability order, so
+ * the executor cannot exist without emitting `write.attempted`, and a build in which nothing emits it is
+ * a build in which nothing executes an intent.
+ *
+ * **The subcommand signal is scoped to a process invocation, not to the whole file.** A bare `'tag'` or
+ * `'push'` literal anywhere under `src/` is a guard that will one day fire on a renderer's label or a
+ * vocabulary entry, and a guard whose first real encounter is a false positive gets weakened rather than
+ * obeyed. What it must catch is a subcommand reaching `git`, so it looks in the argument list of a call
+ * that starts a process — which is the only place one can.
+ *
+ * `src/contracts/event.ts` declares the vocabulary and is exempt from the event signal alone: declaring
+ * a type is not emitting one, and the vocabulary has carried both names since story 1-1.
+ */
+export const performedWritesIn = (file: string, source: string): readonly PerformedWrite[] => {
+  const stripped = stripComments(source);
+  const found: PerformedWrite[] = [];
+  for (const call of stripped.matchAll(PROCESS_INVOCATION)) {
+    const argv = stripped.slice(call.index, call.index + ARGV_WINDOW);
+    for (const subcommand of WRITING_SUBCOMMANDS) {
+      if (new RegExp(`(['"\`])${subcommand}\\1`).test(argv)) {
+        found.push({ signal: 'git-subcommand', evidence: subcommand });
+      }
+    }
+  }
+  for (const call of PULL_REQUEST_CALLS) {
+    const match = call.exec(stripped);
+    if (match !== null) found.push({ signal: 'pull-request-call', evidence: match[0] });
+  }
+  if (file !== 'contracts/event.ts') {
+    for (const type of EXECUTOR_EVENT_TYPES) {
+      if (stripped.includes(`'${type}'`) || stripped.includes(`"${type}"`)) {
+        found.push({ signal: 'executor-event', evidence: type });
+      }
+    }
+  }
+  return found;
+};
+
+describe('the engine performs no push, pull request or note write (matrix 20)', () => {
+  const sourceRoot = new URL('../src/', import.meta.url);
+  const files = sourceFilesUnder(sourceRoot);
+
+  it('sweeps the whole of src/ recursively, not only src/engine/', () => {
+    // AD-15 binds every unit, not the engine alone, and the write that matters would be as damaging
+    // from `src/runner/` or `src/pool/` — both of which already run git.
+    expect(files.length).toBeGreaterThan(50);
+    expect(files.some((file) => file.split('/').length >= 3)).toBe(true);
+    expect(files).toContain('pool/worktree.ts');
+    expect(files).toContain('engine/committer.ts');
+  });
+
+  it('finds none anywhere under src/', () => {
+    const offenders = new Map<string, readonly PerformedWrite[]>();
+    for (const file of files) {
+      const performed = performedWritesIn(file, readFileSync(new URL(file, sourceRoot), 'utf8'));
+      if (performed.length > 0) offenders.set(file, performed);
+    }
+    expect(
+      [...offenders.entries()].map(([file, writes]) => `${file}: ${JSON.stringify(writes)}`),
+    ).toStrictEqual([]);
+  });
+
+  /**
+   * The positive control. Without it, "no violations" is satisfied by a detector that matches nothing —
+   * which is how an absence assertion passes against a renamed constant or a typo in a regex.
+   */
+  it.each([
+    ['engine/executor.ts', "execFileSync('git', ['push', '--set-upstream', remote, branch]);"],
+    ['engine/committer.ts', "await run('gh', ['pr', 'create', '--title', title]);"],
+    ['runner/pulls.ts', "await fetch('https://api.github.com/repos/o/r/pulls', { method: 'POST' });"],
+    ['engine/labels.ts', "execFileSync('git', ['notes', '--ref', NOTE_REF, 'add', '-m', body]);"],
+    ['engine/intents.ts', "recorder.append({ type: 'write.attempted', payload: { key } });"],
+  ])('catches the write planted in %s', (file, source) => {
+    expect(performedWritesIn(file, source).length).toBeGreaterThan(0);
+  });
+
+  it('does not read a declaration of the vocabulary as an emission of it', () => {
+    // `src/contracts/event.ts` has carried both names since story 1-1, and it is the file that must.
+    expect(performedWritesIn('contracts/event.ts', "const t = ['write.attempted'];")).toStrictEqual(
+      [],
+    );
+    expect(
+      performedWritesIn('engine/intents.ts', "const t = ['write.attempted'];").length,
+    ).toBeGreaterThan(0);
+  });
+
+  /**
+   * The narrowing, asserted so it is a decision rather than a hole.
+   *
+   * A subcommand word is only a write when it reaches a process. A renderer's label that happens to say
+   * `'tag'`, or a vocabulary entry spelling `'push'`, is neither — and a guard that fired on those would
+   * be switched off the first time it did.
+   */
+  it('reads a subcommand word only where it could reach a process', () => {
+    expect(performedWritesIn('tui/cards/label.ts', "const LABELS = ['push', 'tag'];")).toStrictEqual(
+      [],
+    );
+    expect(
+      performedWritesIn('pool/worktree.ts', "execFileSync('git', ['worktree', 'add', path]);"),
+    ).toStrictEqual([]);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Matrix 26, 27 — the reconciler calls the composer, and keeps what it produced
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * The join the story is named for, asserted at the level it happens.
+ *
+ * `composeCommit` existed and nothing called it: the standard plan spawned a committing step, its
+ * output was parsed against `step.committing` and then dropped. That is the same shape as story 2-4's
+ * original `recordDeclaredTerritory` gap, and it is invisible to a unit test — every assertion about
+ * the composer passed while the composer was not in the system. So these drive a real reconciler and
+ * read the run's own log and directory back.
+ */
+describe('a completed committing step composes the commit, and the run keeps it', () => {
+  const homes: string[] = [];
+  const home = (): string => {
+    const made = mkdtempSync(join(tmpdir(), 'orch-commit-'));
+    homes.push(made);
+    return made;
+  };
+
+  afterAll(() => {
+    for (const made of homes) rmSync(made, { recursive: true, force: true });
+  });
+
+  const committingOutput = (step: string): Record<string, unknown> => ({
+    contract_id: 'step.committing',
+    step,
+    status: 'completed',
+    summary: 'Composed the pull-request prose.',
+    provenance: ['commit: src/engine/committer.ts'],
+    decisions: [],
+    artifacts: [],
+    questions: [],
+    write_intents: [],
+    error: null,
+    pull_request_title: '  Committer: branch naming and the AD-22 note  ',
+    pull_request_body: 'The committer names the branch and the engine records the note.',
+  });
+
+  const driveToCommit = async (
+    orchHome: string,
+  ): Promise<{ readonly run: string; readonly events: readonly EventEnvelope[] }> => {
+    const plan = makePlan({ feature: 'committer-wiring', steps: STANDARD_PLAN_STEPS });
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(plan),
+      baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+      executor: createScriptedExecutor({
+        onStart: (request) => {
+          if (request.phase !== 'committing') return terminated(request.step, 'completed', {});
+          const raw = committingOutput(request.step);
+          return terminated(request.step, 'completed', {
+            output: StepOutputSchema.parse(raw),
+            contractOutput: CommittingOutputSchema.parse(raw),
+          });
+        },
+      }),
+    });
+    try {
+      const accepted = reconciler.acceptFeature(plan);
+      reconciler.confirm(accepted.run);
+      await reconciler.runUntilSettled();
+      return { run: accepted.run, events: readEventLog(runPaths(accepted.run, orchHome).eventLog) };
+    } finally {
+      reconciler.close();
+    }
+  };
+
+  it('records a commit.composed line naming the branch, the intents and the note ref', async () => {
+    const orchHome = home();
+    const { events } = await driveToCommit(orchHome);
+    const composed = events.find((event) => event.type === COMMIT_COMPOSED_EVENT_TYPE);
+    expect(composed, 'nothing composed a commit for a completed committing step').toBeDefined();
+    expect(composed?.payload['composed_branch']).toBe('feature/committer-wiring');
+    expect(composed?.payload['intent_ids']).toStrictEqual([
+      'commit.git_push',
+      'commit.pull_request',
+      'commit.git_note',
+    ]);
+    expect(composed?.payload['note_ref']).toBe(NOTE_REF);
+  });
+
+  /**
+   * Matrix 27 — the composition is kept where story 2-11 can read it, not dropped after the call.
+   *
+   * On disk rather than in the payload because the note carries the run id, and AD-21's entropy sweep
+   * rewrites an unbroken ULID wherever it appears in a payload — so a note passed through the event
+   * would reach the executor with its run id replaced by a marker.
+   */
+  it('writes the composed commit into the run, with the note and the three intents', async () => {
+    const orchHome = home();
+    const { run, events } = await driveToCommit(orchHome);
+    const composed = events.find((event) => event.type === COMMIT_COMPOSED_EVENT_TYPE);
+    const relative = String(composed?.payload['artifact']);
+    expect(relative).toBe(COMPOSED_COMMIT_RELATIVE_PATH);
+
+    const artifact: unknown = JSON.parse(
+      readFileSync(join(runPaths(run, orchHome).runDir, relative), 'utf8'),
+    );
+    const held = artifact as {
+      readonly branch: string;
+      readonly pull_request: { readonly title: string; readonly head: string };
+      readonly note: { readonly run: string; readonly steps: readonly { readonly step: string }[] };
+      readonly intents: readonly { readonly kind: string; readonly target: string }[];
+    };
+
+    expect(held.branch).toBe('feature/committer-wiring');
+    expect(held.pull_request.head).toBe(held.branch);
+    // The trimmed title reaches the plan, which is the half that becomes the pull request.
+    expect(held.pull_request.title).toBe('Committer: branch naming and the AD-22 note');
+    expect(held.intents.map((intent) => intent.kind)).toStrictEqual([
+      'git_push',
+      'pull_request',
+      'git_note',
+    ]);
+
+    // The note's step list is the *run's*, folded from the log — including the committing step that
+    // had only just terminated, which the pre-termination checkpoint still showed as in flight.
+    expect(held.note.run).toBe(run);
+    expect(held.note.steps.map((step) => step.step)).toStrictEqual([
+      'analyse',
+      'plan',
+      'implement',
+      'test',
+      'verify',
+      'commit',
+    ]);
+  });
+
+  it('composes nothing for a step that returned no prose, and says nothing about it', async () => {
+    // The negative control: the composer is keyed on the output's prose, not on the phase, so a plan
+    // with no committing output must produce no line rather than an empty composition.
+    const orchHome = home();
+    const plan = makePlan({ feature: 'no-committing-step' });
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(plan),
+      baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+      executor: createScriptedExecutor({
+        onStart: (request) => terminated(request.step, 'completed', {}),
+      }),
+    });
+    try {
+      const accepted = reconciler.acceptFeature(plan);
+      reconciler.confirm(accepted.run);
+      await reconciler.runUntilSettled();
+      const events = readEventLog(runPaths(accepted.run, orchHome).eventLog);
+      expect(events.some((event) => event.type === COMMIT_COMPOSED_EVENT_TYPE)).toBe(false);
+    } finally {
+      reconciler.close();
+    }
   });
 });

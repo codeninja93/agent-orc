@@ -31,6 +31,7 @@ import {
   RESOURCE_NEEDS,
   REVERSIBILITY_CLASSES,
   RUN_MODES,
+  branchPatternProblem,
   branchPatternVaries,
   isContractId,
 } from '../contracts/index.js';
@@ -536,6 +537,20 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
           `"${pattern}" carries no ${BRANCH_SLUG_PLACEHOLDERS.join(' and no ')}, so every feature ` +
             'would land on the same branch. The pattern is a template: the placeholder is replaced by ' +
             'the feature slug.',
+        );
+      }
+      /**
+       * The second question, which the first does not ask.
+       *
+       * "Can this name two branches" and "is this a branch name" are different, and `feature/../<slug>`
+       * passes the first: it has a placeholder, it varies, and it climbs a path straight into `git`'s
+       * argv. Asked here so a person is told while they can still retype it.
+       */
+      const problem = branchPatternProblem(pattern);
+      if (problem !== null) {
+        return refuse(
+          `"${pattern}" could not name a git branch: ${problem}. The branch name this produces is ` +
+            'handed to git as an argument and to a person as something to type.',
         );
       }
       return { ok: true, value: { branch_pattern: pattern } };

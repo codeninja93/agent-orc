@@ -167,7 +167,35 @@ export const WriteIntentSchema = z
       .enum(REVERSIBILITY_CLASSES)
       .describe('The blast-radius class that decides which gate this write stops at (AD-12).'),
   })
-  .strict();
+  .strict()
+  /**
+   * The two "never blank" promises above, enforced.
+   *
+   * A description that states a rule nothing checks is the worst of both: the producer is told, and the
+   * artifact is accepted anyway. A blank `target` is a write against nothing, and a blank `summary` is
+   * an entry in the write surface that a person reviewing the run cannot read — and this is the one
+   * surface AD-15 says a person's approval gates on.
+   */
+  .superRefine((intent, ctx) => {
+    if (intent.target.trim() === '') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['target'],
+        message:
+          'a write intent names what it writes; a blank target is a write against nothing, and the ' +
+          'executor would have to guess what it meant',
+      });
+    }
+    if (intent.summary.trim() === '') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['summary'],
+        message:
+          'a write intent says what it does and why; a blank summary is an entry on the AD-15 write ' +
+          'surface that the person gating it cannot read',
+      });
+    }
+  });
 
 export type WriteIntent = z.infer<typeof WriteIntentSchema>;
 

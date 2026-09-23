@@ -231,6 +231,44 @@ describe('detected defaults are offered, and every one of them can be overridden
     const profile = parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8'));
     expect(profile['branch_pattern']).toBe('work/<slug>');
   });
+
+  /**
+   * Story 2-7, matrix 25 — AD-22's own spelling of the placeholder, typed by a person.
+   *
+   * AD-22 says the pattern defaults "to `feature/<feature-slug>`", and the interview's original check
+   * asked for the substring `<slug>` — which `'feature/<feature-slug>'.includes('<slug>')` answers
+   * `false` for. So the architecture's own default was an answer the installer refused, and a person
+   * copying it out of the spine would have been re-asked for ever. Every existing case here types
+   * `<slug>`, so the widening that fixed it was exercised by nothing: this is the case that fails if
+   * the two spellings ever stop being one vocabulary.
+   */
+  it('accepts AD-22’s own spelling of the placeholder and writes it', async () => {
+    const repo = repository();
+    const io = scriptedIo({ 'branch_pattern.pattern': 'feature/<feature-slug>' });
+    await runInit({ repository: repo, io });
+
+    const profile = parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8'));
+    expect(profile['branch_pattern']).toBe('feature/<feature-slug>');
+    // Accepted first time: no refusal was printed and the person was not asked again.
+    expect(io.said.some((line) => line.includes('carries no'))).toBe(false);
+  });
+
+  /**
+   * A pattern that could not name a git branch is refused where a person can retype it.
+   *
+   * The placeholder check answers "can this name two branches"; this one answers "is this a branch
+   * name". `feature/../<slug>` has a placeholder and climbs a path, so the first check passes it and
+   * only the second stops it reaching `git`'s argv.
+   */
+  it('refuses a pattern that could not name a git branch, even with a placeholder in it', async () => {
+    const repo = repository();
+    const io = scriptedIo({ 'branch_pattern.pattern': ['feature/../<slug>', 'work/<slug>'] });
+    await runInit({ repository: repo, io });
+
+    expect(io.said.some((line) => line.includes('".."'))).toBe(true);
+    const profile = parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8'));
+    expect(profile['branch_pattern']).toBe('work/<slug>');
+  });
 });
 
 describe('a re-run asks only the question whose answer is missing (matrix 3)', () => {

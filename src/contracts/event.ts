@@ -11,6 +11,8 @@
  */
 import { z } from 'zod';
 
+import type { OrchError } from './error.js';
+
 /**
  * RFC3339 with milliseconds in UTC — the one timestamp format in the system.
  *
@@ -118,6 +120,82 @@ export const REVIEW_SKIPPED_EVENT_TYPE = 'verification.review_skipped';
 export const BRANCH_PROTECTION_ASSERTED_EVENT_TYPE = 'branch.protection_asserted';
 
 /**
+ * What the assertion concluded. `unknown` is a first-class answer and not an error case.
+ *
+ * **All three refuse the run except the first.** "We could not check" and "it is not protected" have the
+ * same consequence, which is the fail-closed direction `src/container/lifecycle.ts` already took and the
+ * threat model's reason for it: protected main is the one control that survives total agent failure, so
+ * an unverified branch is treated exactly as an unprotected one. The vocabulary still distinguishes them
+ * because the *log* must — a person reading a refusal needs to know whether their branch is unprotected
+ * or whether nothing could reach the host, and those are two different things to go and fix.
+ *
+ * **Declared here rather than in `src/container/lifecycle.ts`, which owns the assertion itself.** The
+ * engine may import only `src/contracts/`, `src/runtime/` and `node:` builtins — asserted in
+ * `tests/engine.reconciler.test.ts` — so a vocabulary spelled in the container package is one the
+ * reconciler that records the line cannot see. The decision lives in one place; the words it answers in
+ * live where both readers are allowed to look.
+ */
+export const BRANCH_PROTECTION_OUTCOMES = ['protected', 'unprotected', 'unknown'] as const;
+
+export type BranchProtectionOutcome = (typeof BRANCH_PROTECTION_OUTCOMES)[number];
+
+/** The payload keys of a `branch.protection_asserted` line, spelled once. */
+export const BRANCH_PROTECTION_PAYLOAD_KEYS = {
+  Outcome: 'outcome',
+  /**
+   * `default_branch` and not `branch`, for two reasons that agree. It names the branch a pull request
+   * would merge *into*, not the branch a feature's work is on. And `branch` is a payload key story 1-11
+   * forbade outright — `tests/tui.reconstruction.test.ts` asserts no payload carries one — because the
+   * take-over branch embeds a ULID and AD-21's entropy sweep would rewrite it. A default branch is
+   * `main` or `master`: low entropy, product-meaningful and safe in a payload.
+   */
+  Branch: 'default_branch',
+  Reason: 'reason',
+} as const;
+
+/**
+ * The outcome of the run-start branch-protection assertion, as the recorder of the line receives it.
+ *
+ * `refusal` carries the AD-35 error shape when the outcome is not `protected`, so the unit that records
+ * the line and the unit that decides the run cannot disagree about whether this outcome stops a run.
+ */
+export interface BranchProtectionReport {
+  readonly outcome: BranchProtectionOutcome;
+  /** The branch asserted about, or `null` when none could even be named. */
+  readonly branch: string | null;
+  /** Why this outcome, in one line that stands alone. Never blank, including for `protected`. */
+  readonly reason: string;
+  readonly refusal: OrchError | null;
+}
+
+/**
+ * The commit a completed committing step composed: the branch, the intents and the note (AD-22, AD-15).
+ *
+ * Emitted by the reconciler when a committing step completes, so the composition is in the durable
+ * record rather than living only in the value a method returned. Story 2-11's executor reads the intents
+ * back from here and from the artifact this line points at; nothing in this build executes one.
+ */
+export const COMMIT_COMPOSED_EVENT_TYPE = 'commit.composed';
+
+/**
+ * The payload keys of that line, spelled once.
+ *
+ * Every value is short and punctuated. The note itself is **not** in the payload: it carries the run id,
+ * which is an unbroken ULID, and AD-21's entropy sweep rewrites one wherever it appears in a payload. So
+ * the line carries a pointer into the evidence plane (AD-23) and the composed artifact is on disk, which
+ * is the same split every other large value in this system takes.
+ */
+export const COMMIT_COMPOSED_PAYLOAD_KEYS = {
+  Branch: 'composed_branch',
+  IntentIds: 'intent_ids',
+  NoteRef: 'note_ref',
+  NoteSchemaVersion: 'note_schema_version',
+  Artifact: 'artifact',
+  /** Present instead of the rest when the record could not be composed, carrying the AD-35 code. */
+  Refusal: 'refusal_code',
+} as const;
+
+/**
  * The declared event vocabulary. Dot-namespaced and past-tense. The vocabulary is open by
  * design: a reader meeting a type absent from this list accepts the envelope and ignores the
  * event, so later stories add types without a breaking change.
@@ -180,6 +258,8 @@ export const EVENT_TYPES = [
   REVIEW_SKIPPED_EVENT_TYPE,
   /** What the run-start branch-protection assertion concluded, including that it could not be made. */
   BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
+  /** The branch, the three write intents and the note a completed committing step composed (AD-22). */
+  COMMIT_COMPOSED_EVENT_TYPE,
 ] as const;
 
 export type DeclaredEventType = (typeof EVENT_TYPES)[number];

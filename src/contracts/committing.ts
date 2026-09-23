@@ -59,8 +59,10 @@ const CommittingOutputShape = StepOutputSchema.extend({
     .string()
     .describe(
       'The pull request’s body, in prose. Describe the change and why it was made. Do not state ' +
-        'how any step ended, what any gate did, or what the run cost: the engine records those from ' +
-        'its own log and puts them in the AD-22 git note, and this step is not told them.',
+        'how any step ended, what any gate did, or what the run has spent: the engine records those ' +
+        'from its own log and puts them in the AD-22 git note. The step input does carry a remaining ' +
+        'budget, so a step can moderate its own work — that is not the run’s totals, and ' +
+        'neither is a fact this body reports.',
     ),
 }).strict();
 
@@ -120,9 +122,16 @@ export const CommittingOutputSchema = CommittingOutputShape.superRefine((output,
     }
   }
 
-  // A title is one line by construction, not by convention: the pull-request host renders it on one
-  // line whatever it is given, so a newline here silently truncates everything after it.
-  if (output.pull_request_title.includes('\n')) {
+  /**
+   * A title is one line by construction, not by convention: the pull-request host renders it on one
+   * line whatever it is given, so a break here silently truncates everything after it.
+   *
+   * `U+2028` and `U+2029` are line breaks too. They are invisible in most editors, they terminate a
+   * line in JavaScript's own grammar and in every renderer that respects Unicode, and a check that saw
+   * only `\n` let a two-line title through as a one-line one — the failure this refusal exists for,
+   * arriving in the one spelling nobody would notice.
+   */
+  if (/[\n\r\u2028\u2029]/.test(output.pull_request_title)) {
     ctx.addIssue({
       code: 'custom',
       path: ['pull_request_title'],
@@ -134,3 +143,41 @@ export const CommittingOutputSchema = CommittingOutputShape.superRefine((output,
 });
 
 export type CommittingOutput = z.infer<typeof CommittingOutputSchema>;
+
+/**
+ * The shape of "an output that composed pull-request prose": two fields, of the right type.
+ *
+ * Loose on purpose, and for the reason `declaredTerritoryIn` gives about territory: it is a
+ * *discriminator*, not a contract. Every committing output is validated against its own registered
+ * contract first, and asking `CommittingOutputSchema.safeParse` here would pin `contract_id` to
+ * `step.committing` — so a later contract that also composes prose would have its composition silently
+ * skipped, which is the defect story 2-5 found in the territory recorder wearing the fix's clothes.
+ */
+const ProseComposingOutputSchema = z.object({
+  pull_request_title: z.string(),
+  pull_request_body: z.string(),
+});
+
+/** The pull-request prose an output composed, or `null` when it composed none. */
+export interface ComposedProse {
+  readonly title: string;
+  readonly body: string;
+}
+
+/**
+ * The prose a step output carries, or `null`.
+ *
+ * The engine keys the commit composition on *this*, not on the phase: a phase test would be a second
+ * place that decides what a committing agent is, and AD-17 puts that decision in the roster.
+ *
+ * Trimmed on the way out, because the trimmed value is the one that goes into the pull request and the
+ * one the contract's own `completed` rule judges. Handing back the raw string let the intent's summary
+ * and the pull request itself disagree about the title by a leading newline.
+ */
+export const composedProseIn = (output: unknown): ComposedProse | null => {
+  const parsed = ProseComposingOutputSchema.safeParse(output);
+  if (!parsed.success) return null;
+  const title = parsed.data.pull_request_title.trim();
+  const body = parsed.data.pull_request_body.trim();
+  return title === '' && body === '' ? null : { title, body };
+};

@@ -48,9 +48,11 @@
  * - `committer` — AD-22's branch naming, git note and the three write intents a committing step declares.
  *   It composes them and performs none: AD-15 makes the engine the executor, and that executor is story
  *   2-11's along with the durability rule that a `write.attempted` record is durable before the call;
- * - `protection` — ADR-001's run-start assertion that the default branch is protected, with three
- *   outcomes rather than two, because a repository the engine cannot ask about is *unknown* and never
- *   satisfied.
+ * The run-start branch-protection assertion is deliberately **not** here. `src/container/lifecycle.ts`
+ * already owned it, and a second implementation in this package disagreed with it about the one thing
+ * that matters — whether "we could not check" and "it is not protected" have the same consequence. The
+ * reconciler takes the assertion as an injected port, so the engine records the outcome and refuses the
+ * run without importing the container package it may not see.
  *
  * The steering and command modules are what stories 1-9 and 1-10 write against. A renderer needs
  * `writeCommandIntent`, `newCommandIntent` and `mintIntentId` and nothing else: it never learns the
@@ -92,5 +94,4 @@ export * from './roster.js';
 export * from './agents.js';
 export * from './config-snapshot.js';
 export * from './committer.js';
-export * from './protection.js';
 export * from './reconciler.js';

@@ -97,23 +97,3 @@ export const firstCommitSha = (repositoryPath: string): string | null => {
 /** The push remote, or `null` when there is none. A repository with no remote is a real answer. */
 export const gitRemote = (repositoryPath: string): string | null =>
   git(repositoryPath, ['remote', 'get-url', 'origin']);
-
-/**
- * The remote's default branch, or `null` when the repository cannot say.
- *
- * `refs/remotes/origin/HEAD` is a local symbolic ref that `git clone` sets and that a repository created
- * with `git init` never has, so `null` here is common and means exactly "this repository does not record
- * which branch the remote treats as default". It is *not* a fallback to the checked-out branch: the
- * assertion this feeds (`src/engine/protection.ts`) is about the branch a pull request would merge into,
- * and answering it with whatever happens to be checked out would assert protection on the wrong branch
- * and report the answer as though it were about the right one.
- *
- * This is a read, never a naming: AD-22 gives branch *naming* to the committer, and nothing here derives
- * a name from anything — it reports the one git already holds.
- */
-export const defaultBranch = (repositoryPath: string): string | null => {
-  const ref = git(repositoryPath, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']);
-  if (ref === null) return null;
-  const prefix = 'refs/remotes/origin/';
-  return ref.startsWith(prefix) ? (ref.slice(prefix.length) || null) : null;
-};

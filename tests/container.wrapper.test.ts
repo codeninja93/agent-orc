@@ -21,6 +21,7 @@
  * drives `composeRunArgs` directly and never touched the wrapper, which is exactly why ADR-001 could
  * say the AD-31 suite "is unchanged and still correct" while the argv inside the boundary changed.
  */
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -51,6 +52,8 @@ import {
   removeContainerIfTerminal,
   sessionDirFor,
   assertDefaultBranchProtected,
+  checkDefaultBranchProtection,
+  detectDefaultBranch,
 } from '../src/container/index.js';
 import type {
   BranchProtection,
@@ -60,7 +63,22 @@ import type {
   ContainerRuntime,
 } from '../src/container/index.js';
 import type { ContainedCommandPlan } from '../src/container/index.js';
-import type { SpawnWrapper } from '../src/engine/index.js';
+import {
+  BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
+  RUN_STATE_FILE_NAME,
+  isTerminalFeatureState,
+} from '../src/contracts/index.js';
+import type { FeatureState } from '../src/contracts/index.js';
+import {
+  BranchProtectionRefused,
+  Reconciler,
+  createScriptedExecutor,
+  terminated,
+} from '../src/engine/index.js';
+import type { BranchProtectionAssertion, SpawnWrapper } from '../src/engine/index.js';
+import { readEventLog, runPaths } from '../src/runtime/index.js';
+
+import { makePlan, planProvider } from './helpers/engine-fixture.js';
 
 const RUN = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 /**
@@ -593,6 +611,25 @@ describe('provisioning, then execution', () => {
   });
 });
 
+/**
+ * A git repository with no default branch of its own.
+ *
+ * `init.defaultBranch` is set to the empty string *locally*, which overrides whatever the developer's
+ * global git configuration says. Without that, `detectDefaultBranch`'s documented fallback finds the
+ * machine's own setting and these tests pass or fail depending on whose laptop they run on — which is
+ * the same reason `tests/helpers/engine-fixture.ts` neutralises `GIT_CONFIG_GLOBAL`.
+ */
+const repositoryGit = (repository: string, ...args: readonly string[]): void => {
+  execFileSync('git', ['-C', repository, ...args], { stdio: ['ignore', 'ignore', 'ignore'] });
+};
+
+const emptyRepository = (): string => {
+  const repository = mkdtempSync(join(tmpdir(), 'orch-default-branch-'));
+  repositoryGit(repository, 'init', '--quiet');
+  repositoryGit(repository, 'config', 'init.defaultBranch', '');
+  return repository;
+};
+
 describe('branch protection at run start', () => {
   const protection = (overrides: Partial<BranchProtection> = {}): BranchProtection => ({
     branch: 'main',
@@ -647,6 +684,246 @@ describe('branch protection at run start', () => {
     const source = readFileSync(new URL('../src/container/lifecycle.ts', import.meta.url), 'utf8');
     expect(source).not.toMatch(/https?:\/\/api\./);
     expect(source).not.toContain('Authorization');
+  });
+
+  /**
+   * Story 2-7, matrix 22 and 23 — the three outcomes, reported rather than thrown.
+   *
+   * The reporting path exists so the reconciler can record the outcome *before* acting on it, and it is
+   * asserted beside the throwing path so the two cannot come to different conclusions. All three are
+   * named: two of them refuse, and the log still has to say which of the two a person is looking at.
+   */
+  it.each([
+    ['protected', {}, null],
+    ['unprotected', { protected: false }, 'not protected'],
+    // Matrix 22 — "protected" with force-push allowed is protection the one action this system must
+    // never perform can walk straight through.
+    ['unprotected', { forcePushDisabled: false }, 'force-push is permitted'],
+    ['unprotected', { deletionDisabled: false }, 'deletion is permitted'],
+  ])('reports %s', (outcome, overrides, detail) => {
+    const report = checkDefaultBranchProtection({
+      repository: '/repo',
+      defaultBranch: 'main',
+      probe: () => protection(overrides),
+    });
+    expect(report.outcome).toBe(outcome);
+    expect(report.branch).toBe('main');
+    if (detail === null) {
+      expect(report.refusal).toBeNull();
+    } else {
+      expect(report.reason).toContain(detail);
+      expect(report.refusal?.code).toBe('write.branch_protection_violation');
+    }
+  });
+
+  /**
+   * Matrix 23 — "could not be checked" is its own outcome and refuses all the same.
+   *
+   * Distinct from `unprotected` in the log because a person fixes the two differently, and identical to
+   * it in consequence because an unverified branch is exactly as dangerous as an unprotected one.
+   */
+  it('reports a branch whose protection cannot be established as unknown, and still refuses it', () => {
+    const report = checkDefaultBranchProtection({ repository: '/repo', defaultBranch: 'main' });
+    expect(report.outcome).toBe('unknown');
+    expect(report.outcome).not.toBe('protected');
+    expect(report.reason).toContain('could not be established');
+    // The refusal is what makes unknown fail closed; an outcome with no refusal would continue.
+    expect(report.refusal?.code).toBe('write.branch_protection_violation');
+  });
+
+  it('reports a repository that can name no default branch as unknown, naming no branch', () => {
+    const repository = emptyRepository();
+    try {
+      const report = checkDefaultBranchProtection({ repository, probe: () => protection() });
+      expect(report.outcome).toBe('unknown');
+      expect(report.branch).toBeNull();
+      expect(report.refusal).not.toBeNull();
+    } finally {
+      rmSync(repository, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Matrix 24 — the happy path of the default-branch read, against a real repository.
+ *
+ * The prefix strip was the untested half: `symbolic-ref --short` answers `origin/main`, and returning
+ * that would have the assertion ask the forge about a branch named `origin/main`, which does not exist —
+ * so the probe answers nothing, the outcome is `unknown`, and a correctly protected repository refuses
+ * its own runs. Nothing but a real repository shows that, because the strip is downstream of git.
+ */
+describe('reading the default branch from a repository', () => {
+  const makeRepository = (remote: string, branch: string): string => {
+    const repository = emptyRepository();
+    repositoryGit(repository, 'symbolic-ref', `refs/remotes/${remote}/HEAD`, `refs/remotes/${remote}/${branch}`);
+    return repository;
+  };
+
+  it('reads the short branch name, not the full ref and not the remote prefix', () => {
+    const repository = makeRepository('origin', 'main');
+    try {
+      expect(detectDefaultBranch(repository)).toBe('main');
+    } finally {
+      rmSync(repository, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The remote is a parameter, because the profile's `project.remote` is an arbitrary URL and nothing
+   * says the local remote holding it is called `origin`. Asking the wrong remote answers "no default
+   * branch", which under the fail-closed rule refuses a run for a reason that is not true of it.
+   */
+  it('asks the remote it is given, rather than assuming origin', () => {
+    const repository = makeRepository('upstream', 'trunk');
+    try {
+      expect(detectDefaultBranch(repository, 'upstream')).toBe('trunk');
+      // Asking `origin` of a repository whose remote is `upstream` finds no HEAD, so the read falls
+      // through to the `init.defaultBranch` the fixture neutralised and refuses — naming the ref it
+      // looked for, so the refusal says which remote was asked rather than only that none answered.
+      expect(() => detectDefaultBranch(repository, 'origin')).toThrow(/refs\/remotes\/origin\/HEAD/);
+    } finally {
+      rmSync(repository, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Matrix 21 and 30 — the assertion reaches the run through the reconciler, and the outcome is recorded
+ * before it is acted on.
+ *
+ * Here rather than in a suite of its own, because there is one branch-protection implementation now and
+ * this is where it lives. The engine takes it as a port: `src/engine/` may import only `src/contracts/`,
+ * `src/runtime/` and `node:` builtins, so the reconciler cannot reach into this package and a test is
+ * the one place the two halves are allowed to meet.
+ */
+describe('the run-start assertion, as the reconciler applies it', () => {
+  const engine = (
+    home: string,
+    branchProtection: BranchProtectionAssertion | null,
+  ): Reconciler =>
+    Reconciler.open({
+      orchHome: home,
+      plans: planProvider(makePlan()),
+      executor: createScriptedExecutor({
+        onStart: (request) => terminated(request.step, 'completed', {}),
+      }),
+      baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+      branchProtection,
+    });
+
+  const homes: string[] = [];
+  const home = (): string => {
+    const made = mkdtempSync(join(tmpdir(), 'orch-protection-'));
+    homes.push(made);
+    return made;
+  };
+
+  afterAll(() => {
+    for (const made of homes) rmSync(made, { recursive: true, force: true });
+  });
+
+  const outcomeLine = (orchHome: string, run: string): Record<string, unknown> | undefined =>
+    readEventLog(runPaths(run, orchHome).eventLog).find(
+      (event) => event.type === BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
+    )?.payload;
+
+  it('starts the run and records protected when the branch is protected', () => {
+    const orchHome = home();
+    const reconciler = engine(orchHome, () =>
+      checkDefaultBranchProtection({
+        repository: '/repo',
+        defaultBranch: 'main',
+        probe: () => ({
+          branch: 'main',
+          protected: true,
+          forcePushDisabled: true,
+          deletionDisabled: true,
+          source: 'a test probe',
+        }),
+      }),
+    );
+    try {
+      const accepted = reconciler.acceptFeature(makePlan());
+      expect(outcomeLine(orchHome, accepted.run)?.['outcome']).toBe('protected');
+      expect(outcomeLine(orchHome, accepted.run)?.['default_branch']).toBe('main');
+    } finally {
+      reconciler.close();
+    }
+  });
+
+  it.each([
+    ['unprotected', false as const],
+    // Matrix 23 — unknown refuses too, reversing this story's original text.
+    ['unknown', null],
+  ])('refuses the run when the assertion reports %s', (outcome, answer) => {
+    const orchHome = home();
+    const reconciler = engine(orchHome, () =>
+      checkDefaultBranchProtection({
+        repository: '/repo',
+        defaultBranch: 'main',
+        ...(answer === null
+          ? {}
+          : {
+              probe: (): BranchProtection => ({
+                branch: 'main',
+                protected: answer,
+                forcePushDisabled: true,
+                deletionDisabled: true,
+                source: 'a test probe',
+              }),
+            }),
+      }),
+    );
+    let thrown: unknown;
+    let run: string | null = null;
+    try {
+      reconciler.acceptFeature(makePlan());
+    } catch (error: unknown) {
+      thrown = error;
+      run = readdirSync(join(orchHome, 'runs'))[0] ?? null;
+    } finally {
+      reconciler.close();
+    }
+    expect(thrown).toBeInstanceOf(BranchProtectionRefused);
+    expect((thrown as BranchProtectionRefused).code).toBe('write.branch_protection_violation');
+
+    /**
+     * Matrix 30 — the one outcome that stops a run is the one outcome that must be recorded.
+     *
+     * The assertion used to be called inline in an assignment, two lines above the `emit`, so a throw
+     * skipped the line entirely: `protected` and `unknown` got a record and a refusal got none.
+     */
+    expect(run).not.toBeNull();
+    expect(outcomeLine(orchHome, run ?? '')?.['outcome']).toBe(outcome);
+
+    /**
+     * Matrix 31 — no half-created run is left behind.
+     *
+     * The directory keeps its events, because those are the record of *why* the run refused. What it
+     * must not keep is a checkpoint the next pass reads as an ordinary run sitting in `drafting`, so the
+     * run is marked terminal before the throw escapes.
+     */
+    const statePath = join(runPaths(run ?? '', orchHome).runDir, RUN_STATE_FILE_NAME);
+    expect(existsSync(statePath)).toBe(true);
+    const checkpoint: unknown = JSON.parse(readFileSync(statePath, 'utf8'));
+    const state = (checkpoint as { readonly state: FeatureState }).state;
+    expect(isTerminalFeatureState(state)).toBe(true);
+    expect(state).toBe('killed');
+  });
+
+  it('records unknown and starts the run when no assertion is wired at all', () => {
+    // The boundary the fail-closed rule stops at, asserted so it is a decision rather than a leak: an
+    // engine with no port has asserted nothing *about a repository*, and every such run says so in its
+    // own log. The missing composition root is the story's own tracked deferral.
+    const orchHome = home();
+    const reconciler = engine(orchHome, null);
+    try {
+      const accepted = reconciler.acceptFeature(makePlan());
+      expect(outcomeLine(orchHome, accepted.run)?.['outcome']).toBe('unknown');
+      expect(String(outcomeLine(orchHome, accepted.run)?.['reason'])).toContain('never as satisfied');
+    } finally {
+      reconciler.close();
+    }
   });
 });
 
