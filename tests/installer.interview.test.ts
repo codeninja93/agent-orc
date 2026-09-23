@@ -138,13 +138,22 @@ describe('a repository with no .orch/ is asked everything, in order', () => {
 });
 
 describe('detected defaults are offered, and every one of them can be overridden (matrix 12)', () => {
-  it('offers the package manager and the four commands the repository already declares', async () => {
+  it('offers the package manager and every command the repository already declares', async () => {
     const repo = repository();
     const io = scriptedIo();
     await runInit({ repository: repo, io });
 
     expect(io.suggestions.get('mechanics.package_manager')).toBe('npm');
     expect(io.suggestions.get('mechanics.test')).toBe('npm run test');
+    /**
+     * Matrix 35 — the gate CAP-13 names, detected rather than left to a person to remember.
+     *
+     * Nothing asserted this, and the fixture repository declared no `typecheck` script, so every
+     * install in every suite wrote `typecheck = ""` — which is recorded as *skipped*. Emptying the
+     * detection table left the whole suite green while CAP-13's first gate went silently missing on
+     * every repository that has one.
+     */
+    expect(io.suggestions.get('mechanics.typecheck')).toBe('npm run typecheck');
     expect(io.suggestions.get('mechanics.lint')).toBe('npm run lint');
     expect(io.suggestions.get('mechanics.build')).toBe('npm run build');
     expect(io.suggestions.get('mechanics.run')).toBe('npm run start');
@@ -158,8 +167,36 @@ describe('detected defaults are offered, and every one of them can be overridden
     const profile = parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8'));
     expect(profile['mechanics']).toMatchObject({
       package_manager: 'npm',
-      commands: { test: 'npm run test', lint: 'npm run lint' },
+      // The written profile, not only the offer: a suggestion nothing records is a suggestion the
+      // run never sees, and `typecheck` reaching the file is what makes the gate runnable.
+      commands: { test: 'npm run test', typecheck: 'npm run typecheck', lint: 'npm run lint' },
     });
+  });
+
+  it('detects the three spellings the ecosystem uses for it, and offers none when there is none', () => {
+    // `typecheck`, `type-check` and `tsc` are all common; a table naming one would leave the other
+    // two undetected and the gate empty. The negative case is what keeps this from passing on a
+    // detector that answers the same thing whatever it reads.
+    for (const [script, expected] of [
+      ['typecheck', 'npm run typecheck'],
+      ['type-check', 'npm run type-check'],
+      ['tsc', 'npm run tsc'],
+    ] as const) {
+      const repo = repository();
+      writeFileSync(
+        join(repo, 'package.json'),
+        JSON.stringify({ name: 'fixture', version: '1.0.0', scripts: { [script]: 'tsc --noEmit' } }),
+        'utf8',
+      );
+      expect(detectDefaults(repo).commands.typecheck, script).toBe(expected);
+    }
+    const bare = repository();
+    writeFileSync(
+      join(bare, 'package.json'),
+      JSON.stringify({ name: 'fixture', version: '1.0.0', scripts: { test: 'vitest run' } }),
+      'utf8',
+    );
+    expect(detectDefaults(bare).commands.typecheck).toBe('');
   });
 
   it('writes the person’s answer instead when they give one', async () => {

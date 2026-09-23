@@ -37,6 +37,10 @@ import type {
 import {
   DECLARATION_PAYLOAD_KEYS,
   FEATURE_STATES,
+  GATE_FAILED_EVENT_TYPE,
+  GATE_PASSED_EVENT_TYPE,
+  GATE_SKIPPED_EVENT_TYPE,
+  REVIEW_SKIPPED_EVENT_TYPE,
   SPEC_CRITERION_EDITED_EVENT_TYPE,
   SPEC_RECORDED_EVENT_TYPE,
   STEP_PHASES,
@@ -82,6 +86,17 @@ export const TUI_EVENT_TYPES = {
   SpecRecorded: SPEC_RECORDED_EVENT_TYPE,
   /** One criterion amended, so the card renders the current text rather than the original. */
   SpecCriterionEdited: SPEC_CRITERION_EDITED_EVENT_TYPE,
+  /**
+   * CAP-13's first tier, story 2-6. Folded because a person cannot see an absence.
+   *
+   * The engine records what each deterministic gate did and whether it spawned a review; none of it
+   * reached a screen, so a run whose gates were all *skipped* — a repository that declares no test
+   * command — looked exactly like a run whose gates all passed.
+   */
+  GatePassed: GATE_PASSED_EVENT_TYPE,
+  GateFailed: GATE_FAILED_EVENT_TYPE,
+  GateSkipped: GATE_SKIPPED_EVENT_TYPE,
+  ReviewSkipped: REVIEW_SKIPPED_EVENT_TYPE,
 } as const;
 
 export type TuiEventType = (typeof TUI_EVENT_TYPES)[keyof typeof TUI_EVENT_TYPES];
@@ -235,6 +250,32 @@ export interface ProgressView {
   /** How many steps the plan declared, when the log recorded it. */
   readonly plannedSteps: number | null;
   readonly steps: readonly StepView[];
+  /**
+   * What the deterministic gates did, in the order the log recorded them (CAP-13's first tier).
+   *
+   * Rendered because the *skip* is the line a person most needs and the one nothing showed: a
+   * repository that declares no test command has its test gate reported as skipped, and a run whose
+   * gates were all skipped looks — on every other surface — exactly like a run whose gates all
+   * passed. The other two are here so the skip has something to be distinguished from.
+   */
+  readonly gates: readonly GateView[];
+  /**
+   * Why no model-based review was spawned, when one was not (CAP-13's economics).
+   *
+   * The absence of a spawn is what the *test* asserts, because a counter can read zero for reasons
+   * nobody chose. A person reading a screen cannot see an absence, so the run says it out loud.
+   */
+  readonly reviewSkipped: string | null;
+}
+
+/** One deterministic gate, as a person reads it. */
+export interface GateView {
+  readonly gate: string;
+  readonly outcome: 'passed' | 'failed' | 'skipped';
+  /** The exit status, when the command ran and returned one. */
+  readonly exitStatus: number | null;
+  /** Where its output was written (AD-23). Empty when nothing ran. */
+  readonly evidence: string;
 }
 
 /**
@@ -615,6 +656,9 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
   let runMode: RunMode = 'live';
   let autonomy: AutonomyMode = DEFAULT_AUTONOMY_MODE;
   let state: FeatureState | null = null;
+  /** What each gate did, keyed by gate so a re-run's outcome replaces the previous attempt's. */
+  const gates = new Map<string, GateView>();
+  let reviewSkipped: string | null = null;
   let plannedSteps: number | null = null;
   let rateLimitBudgetConsumed: number | null = null;
   let estimateMs: number | null = null;
@@ -678,6 +722,31 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
         plannedSteps = num(payload, TUI_PAYLOAD_KEYS.StepCount) ?? plannedSteps;
         estimateMs = num(payload, TUI_PAYLOAD_KEYS.WallClockMsEstimate) ?? estimateMs;
         state ??= 'drafting';
+        break;
+      }
+
+      case TUI_EVENT_TYPES.GatePassed:
+      case TUI_EVENT_TYPES.GateFailed:
+      case TUI_EVENT_TYPES.GateSkipped: {
+        const gate = text(payload, 'gate');
+        if (gate !== null) {
+          gates.set(gate, {
+            gate,
+            outcome:
+              event.type === TUI_EVENT_TYPES.GatePassed
+                ? 'passed'
+                : event.type === TUI_EVENT_TYPES.GateFailed
+                  ? 'failed'
+                  : 'skipped',
+            exitStatus: num(payload, 'exit_status'),
+            evidence: text(payload, 'evidence') ?? '',
+          });
+        }
+        break;
+      }
+
+      case TUI_EVENT_TYPES.ReviewSkipped: {
+        reviewSkipped = text(payload, 'reason') ?? reviewSkipped;
         break;
       }
 
@@ -963,6 +1032,13 @@ export const foldEvents = (events: readonly EventEnvelope[]): ShellView => {
       currentStep: current?.step ?? null,
       currentStepPhase: current?.phase ?? null,
       nextGate: nextGateFor({ question, state, current }),
+      /**
+       * Keyed by gate, so a re-run replaces rather than appends: a person reading the card wants
+       * what the gates did *this* attempt, and a list growing by three per re-run is a list nobody
+       * can read the current state out of.
+       */
+      gates: [...gates.values()],
+      reviewSkipped,
       stepsStarted: stepViews.filter((step) => step.startedAt !== null).length,
       stepsCompleted: stepViews.filter(
         (step) => step.disposition === COMPLETED_STEP_DISPOSITION,

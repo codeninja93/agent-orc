@@ -40,19 +40,22 @@
  * repository's own business — a test run that writes a coverage file is the repository's script
  * doing what it always does — and it is bounded by the one writable mount AD-20 allows.
  */
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
   MCP_SERVER_NAME,
   MCP_TOOL_CLI_NAMES,
+  ProfileSchema,
   makeError,
+  parseToml,
   toJsonSchema,
 } from '../contracts/index.js';
 import type { MechanicsCommands, OrchError } from '../contracts/index.js';
 import {
   CONTAINER_SUBCOMMANDS,
   containerNameFor,
+  createContainerInvoker,
   createImageResolver,
   createPhaseSequencer,
   ensureSessionDir,
@@ -65,7 +68,14 @@ import type {
   ImageResolver,
   PhasePlan,
 } from '../container/index.js';
-import { EVIDENCE_DIR_NAME, redactValue, resolveOrchHome, runPaths } from '../runtime/index.js';
+import {
+  EVIDENCE_DIR_NAME,
+  redactValue,
+  resolveOrchHome,
+  runConfigPaths,
+  runPaths,
+  worktreeDir,
+} from '../runtime/index.js';
 
 import { DeclaredCommandRequestSchema, declaredCommandFor } from './commands.js';
 import type { DeclaredCommandName } from './commands.js';
@@ -109,6 +119,16 @@ export interface CommandRunResult {
   readonly evidence: string;
   /** The container this command ran in, so the AD-32 sweep and a person can both find it. */
   readonly containerName: string | null;
+  /**
+   * Why the output at {@link evidence} is a placeholder rather than the command's own bytes.
+   *
+   * Absent when the output was written. Present when the AD-21 pass could not prove it clean and it
+   * was dropped — which AD-21 requires ("dropping the artifact and recording a `redaction.failed`
+   * event rather than writing unredacted content") and which nothing here reported: the pointer
+   * resolved to a file, so a dropped gate log was indistinguishable from a written one. The caller
+   * records the event, because this module writes files and not the log (AD-29).
+   */
+  readonly evidenceDropped?: string;
   /** One line stating what happened, for the event the caller records. */
   readonly summary: string;
 }
@@ -145,6 +165,16 @@ export interface CommandRunnerOptions {
   readonly orchHome?: string;
   readonly sessionDir?: string;
   readonly timeoutMs?: number;
+  /**
+   * The AD-21 pass a command's output is written through.
+   *
+   * A port for the reason the container invoker is one: the *decision* this module takes when a
+   * sweep fails — drop the artifact, say so on the result, keep the pointer resolvable — is the
+   * part that matters, and it was unreachable in any test because a string only fails the real
+   * pass by exceeding a sixteen-megabyte serialisation limit. A guard whose failing arm needs a
+   * sixteen-megabyte fixture is a guard nobody exercises.
+   */
+  readonly sweep?: (text: string) => { readonly ok: boolean; readonly value?: string; readonly reason?: string };
   /**
    * Which attempt of the step these gates belong to, so a re-run names a different container.
    *
@@ -204,9 +234,18 @@ export const containedCommandPlan = (request: {
     orchHome: request.orchHome,
   });
 
-/** The evidence file one command's output is written to, relative to the run directory (AD-23). */
-export const evidencePointerFor = (command: string, attempt: number): string =>
-  `${EVIDENCE_DIR_NAME}/${command}-${String(attempt)}.log`;
+/**
+ * The evidence file one command's output is written to, relative to the run directory (AD-23).
+ *
+ * It carries the **step attempt** as well as the repeat, for the reason the container's name does:
+ * a re-run of a verification step runs its gates again, and a pointer that named only the repeat
+ * would have the second attempt overwrite the first's log — so the first termination's pointer,
+ * which is durable in the event log, would resolve to bytes describing a different run of the same
+ * command. `containerFor` folds the same two numbers in, and the two must agree or a container and
+ * its output are filed under different names.
+ */
+export const evidencePointerFor = (command: string, attempt: number, repeat: number): string =>
+  `${EVIDENCE_DIR_NAME}/${command}-${String(attempt)}-${String(repeat)}.log`;
 
 /**
  * The command runner.
@@ -278,7 +317,15 @@ export const createCommandRunner = (options: CommandRunnerOptions): CommandRunne
   const planFor = (command: string): PhasePlan | null => {
     const declared = declaredCommandFor(options.commands, command);
     if (declared.kind === 'skipped') return null;
-    const repeat = nextAttempt(declared.name);
+    /**
+     * Peeked, not consumed.
+     *
+     * `planFor` answers "what would this run", and a caller asking it — a suite asserting the argv,
+     * a person inspecting a plan — must not thereby change what the next real run does. It did:
+     * the counter advanced, so the argv examined through this was the argv of an attempt that never
+     * happened, and the one `run` executed named a different container.
+     */
+    const repeat = (attempts.get(declared.name) ?? 0) + 1;
     return containedCommandPlan({
       image: imageTag(),
       run: options.run,
@@ -372,6 +419,14 @@ export const createCommandRunner = (options: CommandRunnerOptions): CommandRunne
 
     if (result.status === RUNTIME_COULD_NOT_START) {
       /**
+       * The runtime's own complaint, swept before it becomes a message.
+       *
+       * This message travels into `events.jsonl` as an error `cause`, and the same bytes going to
+       * the evidence file are swept on the way — so leaving this path raw meant the one copy AD-21
+       * is strictest about was the unswept one. The pass is the same pattern-only sweep, and a
+       * sweep that fails leaves a placeholder rather than the text it could not prove clean.
+       */
+      /**
        * Nothing ran, so there is no gate outcome to report — and reporting one would be the lie this
        * refusal exists to prevent. `container.start_failed` is `retry-with-backoff`, which is the
        * right answer for a name still held by a container the sweep has not reclaimed yet and for a
@@ -380,19 +435,23 @@ export const createCommandRunner = (options: CommandRunnerOptions): CommandRunne
       throw new CommandRunFailed(
         declared.name,
         `the runtime reported ${String(RUNTIME_COULD_NOT_START)} before the command started: ` +
-          `${result.stderr.trim() === '' ? result.stdout.trim() : result.stderr.trim()}`,
+          sweptForTheLog(result.stderr.trim() === '' ? result.stdout : result.stderr),
       );
     }
 
-    const evidence = evidencePointerFor(declared.name, repeat);
-    writeEvidence(join(paths.runDir, evidence), {
-      runtime: runtimeName,
-      container: containerName,
-      declared: declared.declared,
-      status: result.status,
-      stdout: result.stdout,
-      stderr: result.stderr,
-    });
+    const evidence = evidencePointerFor(declared.name, options.attempt ?? 1, repeat);
+    const dropped = writeEvidence(
+      join(paths.runDir, evidence),
+      {
+        runtime: runtimeName,
+        container: containerName,
+        declared: declared.declared,
+        status: result.status,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      },
+      options.sweep ?? defaultSweep,
+    );
 
     /**
      * A status of `null` is the runtime reporting no exit code at all — a timeout, or a signal.
@@ -409,10 +468,17 @@ export const createCommandRunner = (options: CommandRunnerOptions): CommandRunne
       exitStatus: result.status,
       evidence,
       containerName,
+      ...(dropped === null ? {} : { evidenceDropped: dropped }),
       summary:
         `the ${declared.name} gate ran "${declared.declared}" inside ${containerName} and ` +
-        `${passed ? 'passed' : `failed with exit status ${String(result.status ?? -1)}`}; its output ` +
-        `is at ${evidence}`,
+        `${
+          passed
+            ? 'passed'
+            : result.status === null
+              ? 'failed with no exit status, which is a command that timed out or was signalled'
+              : `failed with exit status ${String(result.status)}`
+        }; its output is at ${evidence}` +
+        `${dropped === null ? '' : ` (the output itself was dropped: ${dropped})`}`,
     };
   };
 
@@ -430,6 +496,14 @@ export const createCommandRunner = (options: CommandRunnerOptions): CommandRunne
  * exists for. Nothing credential-shaped is passed *into* the container in the first place
  * (`composeContainerEnv` refuses it), so this is the second line and not the first.
  */
+/** The real pass: AD-21's shape classes, with the entropy heuristic off. See {@link writeEvidence}. */
+const defaultSweep = (
+  text: string,
+): { readonly ok: boolean; readonly value?: string; readonly reason?: string } => {
+  const swept = redactValue(text, { highEntropyMinLength: Number.POSITIVE_INFINITY });
+  return swept.ok ? { ok: true, value: swept.value } : { ok: false, reason: swept.reason };
+};
+
 const writeEvidence = (
   path: string,
   record: {
@@ -440,33 +514,74 @@ const writeEvidence = (
     readonly stdout: string;
     readonly stderr: string;
   },
-): void => {
-  const body = [
+  sweep: (text: string) => { readonly ok: boolean; readonly value?: string; readonly reason?: string },
+): string | null => {
+  const header = [
     `# command: ${record.declared}`,
     `# container: ${record.container} (${record.runtime})`,
     `# exit status: ${record.status === null ? '(none reported)' : String(record.status)}`,
     '',
-    record.stdout,
-    record.stderr === '' ? '' : `--- stderr ---\n${record.stderr}`,
   ].join('\n');
-  const swept = redactValue(body, { highEntropyMinLength: Number.POSITIVE_INFINITY });
+  /**
+   * Truncated at the cap, not dropped at it.
+   *
+   * The AD-21 pass refuses a value longer than its serialisation limit, and a whole test-suite log
+   * can exceed it — so the pass failing for *length* dropped the entire output, which is the one
+   * case where the bytes are certainly not a credential and certainly are what a person needs. The
+   * head is kept because a failure's first lines are the ones that say what failed, and the
+   * truncation announces itself so nobody reads a partial log as a complete one.
+   */
+  const body = truncatedForEvidence(
+    `${record.stdout}${record.stderr === '' ? '' : `\n--- stderr ---\n${record.stderr}`}`,
+  );
+  const swept = sweep(body);
   mkdirSync(join(path, '..'), { recursive: true });
   /**
-   * A pass that failed drops the artifact and writes why, rather than writing what it could not
-   * prove clean. AD-21 fails closed and says so: "dropping the artifact and recording a
-   * `redaction.failed` event rather than writing unredacted content". The event is the caller's to
+   * A pass that failed for any other reason drops the artifact and writes why, rather than writing
+   * what it could not prove clean. AD-21 fails closed and says so. The event is the caller's to
    * record — this module writes files, not the log (AD-29) — so what lands here is the placeholder
-   * that keeps the pointer resolvable.
+   * that keeps the pointer resolvable, and the reason travels back on the result.
    */
-  writeFileSync(
-    path,
-    swept.ok
-      ? swept.value
-      : `# the output of "${record.declared}" was dropped: the AD-21 redaction pass failed ` +
-          `(${swept.reason}), and AD-21 fails closed rather than writing what it could not prove clean\n`,
-    'utf8',
-  );
+  if (!swept.ok) {
+    writeFileSync(
+      path,
+      `${header}# the output was dropped: the AD-21 redaction pass failed (${swept.reason ?? 'no reason given'}), and ` +
+        'AD-21 fails closed rather than writing what it could not prove clean\n',
+      'utf8',
+    );
+    return swept.reason ?? 'the AD-21 pass failed';
+  }
+  writeFileSync(path, `${header}${swept.value ?? ''}`, 'utf8');
+  return null;
 };
+
+/**
+ * A runtime's own output, made safe to put in a message that will reach the event log.
+ *
+ * The AD-21 pass, pattern classes only, with the same fail-closed direction as everywhere else: a
+ * value it cannot prove clean is replaced rather than passed along. Bounded too, because an error
+ * message is control-plane text and a daemon can be verbose (AD-23).
+ */
+const sweptForTheLog = (text: string): string => {
+  const bounded = text.trim().slice(0, 500);
+  const swept = redactValue(bounded, { highEntropyMinLength: Number.POSITIVE_INFINITY });
+  return swept.ok ? swept.value : '(the runtime\u2019s output could not pass the AD-21 sweep)';
+};
+
+/**
+ * How much of a command's output the evidence file keeps.
+ *
+ * Below the AD-21 pass's own serialisation cap, so a long log is truncated *here*, with a line
+ * saying so, rather than refused *there* and dropped whole.
+ */
+export const EVIDENCE_OUTPUT_LIMIT = 8 * 1024 * 1024;
+
+const truncatedForEvidence = (output: string): string =>
+  output.length <= EVIDENCE_OUTPUT_LIMIT
+    ? output
+    : `${output.slice(0, EVIDENCE_OUTPUT_LIMIT)}\n--- truncated: ${String(
+        output.length - EVIDENCE_OUTPUT_LIMIT,
+      )} further characters were not kept, because an evidence file is bounded (AD-23) ---\n`;
 
 /* ------------------------------------------------------------------ the MCP surface (ADR-004 #2) */
 
@@ -479,11 +594,18 @@ const writeEvidence = (
  */
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
 
-/** The tool's name as the server publishes it, and as `--allowedTools` must pre-approve it. */
-export const RUNNER_TOOL_NAME = 'run_declared_command';
-
-/** The `mcp__<server>__<tool>` spelling, taken from the declared vocabulary and never re-spelled. */
+/** The `mcp__<server>__<tool>` spelling `--allowedTools` pre-approves, from the declared vocabulary. */
 export const RUNNER_ALLOWED_TOOL = MCP_TOOL_CLI_NAMES.RunDeclaredCommand;
+
+/**
+ * The tool's name as the server publishes it — **derived** from the spelling above, not written out.
+ *
+ * It was spelled twice, here and in `MCP_TOOL_CLI_NAMES`, under a comment saying this module imports
+ * the name rather than respelling it. Two spellings of one name is one rename away from a server
+ * publishing a tool the argv does not pre-approve, which under `--restricted` is the wait nobody can
+ * end — the exact failure the pre-approval exists to prevent, arriving through its own paperwork.
+ */
+export const RUNNER_TOOL_NAME = RUNNER_ALLOWED_TOOL.slice(`mcp__${MCP_SERVER_NAME}__`.length);
 
 /** The one tool this server serves. ADR-004: "Its tool surface should stay minimal". */
 export const runnerToolDescriptor = (
@@ -514,12 +636,19 @@ export interface JsonRpcResponse {
   readonly jsonrpc: '2.0';
   readonly id: string | number | null;
   readonly result?: unknown;
-  readonly error?: { readonly code: number; readonly message: string };
+  readonly error?: {
+    readonly code: number;
+    readonly message: string;
+    /** This system's own AD-35 code, when the refusal carries one. */
+    readonly data?: { readonly code: string };
+  };
 }
 
 /** JSON-RPC's own codes, used for what they mean and nothing else. */
 const JSON_RPC_INVALID_PARAMS = -32_602;
 const JSON_RPC_METHOD_NOT_FOUND = -32_601;
+const JSON_RPC_INTERNAL_ERROR = -32_603;
+const JSON_RPC_PARSE_ERROR = -32_700;
 
 /**
  * Answer one MCP request.
@@ -539,10 +668,12 @@ export const handleMcpRequest = (
 ): JsonRpcResponse | null => {
   const id = request.id ?? null;
   const respond = (result: unknown): JsonRpcResponse => ({ jsonrpc: '2.0', id, result });
-  const fail = (code: number, message: string): JsonRpcResponse => ({
+  const fail = (code: number, message: string, orchCode: string | null = null): JsonRpcResponse => ({
     jsonrpc: '2.0',
     id,
-    error: { code, message },
+    // `data` carries this system's own AD-35 code, so a caller can route on the disposition table
+    // rather than on a JSON-RPC number that says only which layer refused.
+    error: { code, message, ...(orchCode === null ? {} : { data: { code: orchCode } }) },
   });
 
   switch (request.method) {
@@ -597,9 +728,27 @@ export const handleMcpRequest = (
           isError: false,
         });
       } catch (thrown: unknown) {
+        /**
+         * The refusal's own code travels, rather than every failure flattening to "invalid params".
+         *
+         * A step that asked for an undeclared command and a step whose daemon was restarting are
+         * the two cases this runner spends a class distinguishing — `config.invalid` against
+         * `container.start_failed`, `escalate-to-human` against `retry-with-backoff` — and folding
+         * both into one JSON-RPC code threw the distinction away at the only boundary a step can
+         * see it through. The *request* was not invalid when the runtime could not start a
+         * container, so it does not say so: that is an internal error, and the code carries the
+         * AD-35 one beside it.
+         */
+        const code =
+          thrown !== null && typeof thrown === 'object' && 'code' in thrown
+            ? String((thrown as { readonly code: unknown }).code)
+            : null;
         return fail(
-          JSON_RPC_INVALID_PARAMS,
+          code === 'config.invalid' || code === null
+            ? JSON_RPC_INVALID_PARAMS
+            : JSON_RPC_INTERNAL_ERROR,
           thrown instanceof Error ? thrown.message : 'the declared command could not be run',
+          code,
         );
       }
     }
@@ -612,50 +761,50 @@ export const handleMcpRequest = (
 };
 
 /**
- * The `--mcp-config` entry that launches this server for a run.
+ * Build a runner for the run and step the environment names, reading the profile the AD-9 snapshot
+ * holds.
  *
- * Built here and *written* by the caller, because AD-9 puts a run's configuration under the run
- * directory and this module writes only the evidence plane. The shape is the CLI's own
- * `mcpServers` map; `--strict-mcp-config` is what makes this the only server that loads, and it is
- * the spawner that passes it.
+ * **It reads the snapshot and never `.orch/`.** AD-34: run scope "is the only configuration a step
+ * reads", and this process is started by a step's own `claude -p`. The profile is parsed with the
+ * contracts' own TOML reader and schema, so the version refusal AD-28 attaches applies here too —
+ * the server refuses to start rather than running commands from a profile it cannot read.
  *
- * The interpreter is the absolute Node AD-28 resolved, never `node` from `PATH`: an MCP server is a
- * child of `claude -p`, which is a child of the engine, and a stale version manager two levels down
- * is exactly the opaque failure AD-28 exists to prevent.
+ * **It imports no engine.** `src/engine/` has a richer reader (`readStepConfiguration`) that also
+ * resolves the roster and the repository's conventions, and none of that is anything a command
+ * runner needs. Reaching for it would put the reconciler on the far side of an import from the one
+ * unit allowed to start a container, for the sake of a field this reads in four lines.
  */
-export const commandRunnerMcpConfig = (server: {
-  readonly nodePath: string;
-  readonly entryPoint: string;
-  readonly run: string;
-  readonly step: string;
-  readonly orchHome: string;
-}): Readonly<Record<string, unknown>> => ({
-  mcpServers: {
-    [MCP_SERVER_NAME]: {
-      command: server.nodePath,
-      args: [server.entryPoint],
-      env: {
-        ORCH_HOME: server.orchHome,
-        ORCH_RUN: server.run,
-        ORCH_STEP: server.step,
-      },
-    },
-  },
-});
+export const createCommandRunnerFromEnvironment = (
+  env: NodeJS.ProcessEnv = process.env,
+): { readonly runner: CommandRunner; readonly commands: MechanicsCommands } => {
+  const run = env['ORCH_RUN'] ?? '';
+  const step = env['ORCH_STEP'] ?? '';
+  if (run === '' || step === '') {
+    throw new CommandRunFailed(
+      'any declared command',
+      'ORCH_RUN and ORCH_STEP name the run and step whose commands this server may run, and one of ' +
+        'them is unset \u2014 a server that guessed would run one step\u2019s gates against another\u2019s ' +
+        'worktree',
+    );
+  }
+  const orchHome = resolveOrchHome(env);
+  const paths = runPaths(run, orchHome);
+  const profile = ProfileSchema.parse(parseToml(readFileSync(runConfigPaths(paths).profile, 'utf8')));
+  const attempt = Number.parseInt(env['ORCH_STEP_ATTEMPT'] ?? '', 10);
+  return {
+    commands: profile.mechanics.commands,
+    runner: createCommandRunner({
+      run,
+      step,
+      commands: profile.mechanics.commands,
+      worktree: worktreeDir(run, orchHome),
+      orchHome,
+      invoke: createContainerInvoker(),
+      ...(Number.isInteger(attempt) ? { attempt } : {}),
+    }),
+  };
+};
 
-/**
- * Serve the runner over a pair of streams, which is what `--mcp-config` starts.
- *
- * MCP's stdio transport is newline-delimited JSON-RPC, so the loop is a split on `\n` and nothing
- * more. It takes the streams rather than reaching for `process.stdin`, for the reason every port in
- * this codebase takes its dependency: a transport that can only be driven by starting a subprocess
- * is a transport nothing asserts, and the one thing that must not be got wrong here — a malformed
- * line must not kill the server, because the step on the other end would then hang for ever waiting
- * for an answer — is only observable from inside.
- *
- * A line that is not whole JSON is answered with a parse error and the loop continues. There is
- * nowhere else to report it: no unit writes diagnostics to stdout, and stdout here is the protocol.
- */
 export const serveCommandRunnerOverStdio = (
   runner: CommandRunner,
   commands: MechanicsCommands,
@@ -666,26 +815,65 @@ export const serveCommandRunnerOverStdio = (
   const send = (message: JsonRpcResponse): void => {
     output.write(`${JSON.stringify(message)}\n`);
   };
+  const answer = (line: string): void => {
+    if (line.trim() === '') return;
+    let request: JsonRpcRequest;
+    try {
+      request = JSON.parse(line) as JsonRpcRequest;
+    } catch {
+      send({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: JSON_RPC_PARSE_ERROR, message: 'the line was not whole JSON and was skipped' },
+      });
+      return;
+    }
+    const response = handleMcpRequest(runner, commands, request);
+    if (response !== null) send(response);
+  };
+
   input.setEncoding('utf8');
   input.on('data', (chunk: string | Buffer) => {
     buffered += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
     const lines = buffered.split('\n');
     buffered = lines.pop() ?? '';
-    for (const line of lines) {
-      if (line.trim() === '') continue;
-      let request: JsonRpcRequest;
-      try {
-        request = JSON.parse(line) as JsonRpcRequest;
-      } catch {
-        send({
-          jsonrpc: '2.0',
-          id: null,
-          error: { code: -32_700, message: 'the line was not whole JSON and was skipped' },
-        });
-        continue;
-      }
-      const response = handleMcpRequest(runner, commands, request);
-      if (response !== null) send(response);
-    }
+    for (const line of lines) answer(line);
+  });
+  /**
+   * A last line with no newline after it is still a request.
+   *
+   * A writer that sends its final message and closes the stream — which is what a client shutting
+   * down does — leaves exactly that, and a loop that only ever acted on complete lines held the
+   * request in a buffer and answered nothing. The step on the other end then waits for a reply that
+   * will never come, which is the failure mode this whole design exists to avoid, arriving one
+   * layer lower than `--allowedTools`.
+   */
+  input.on('end', () => {
+    const remaining = buffered;
+    buffered = '';
+    answer(remaining);
+  });
+  /**
+   * A stream error is answered, not ignored.
+   *
+   * Silence here is the same waiting step by another route: the transport is broken, nobody is
+   * going to read anything further, and the honest last act is to say so on the channel that is
+   * still open. There is nowhere else to report it — stdout *is* the protocol and no unit writes
+   * diagnostics to it.
+   */
+  input.on('error', (cause: Error) => {
+    send({
+      jsonrpc: '2.0',
+      id: null,
+      error: {
+        code: JSON_RPC_INTERNAL_ERROR,
+        message: `the request stream failed, so no further call can be read: ${cause.message}`,
+      },
+    });
+  });
+  output.on('error', () => {
+    // Nothing can be sent on a broken output, so there is nothing to do but not throw: an
+    // unhandled 'error' on a stream takes the process down, and a server that exits mid-call leaves
+    // the step waiting exactly as a silent one does.
   });
 };

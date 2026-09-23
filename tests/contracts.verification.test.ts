@@ -23,6 +23,7 @@ import {
   VERIFICATION_CONTRACT_ID,
   VerificationOutputSchema,
   criteriaNotAccepted,
+  criteriaNotJudged,
   exportContract,
   getContract,
 } from '../src/contracts/index.js';
@@ -41,6 +42,18 @@ const gate = (overrides: Record<string, unknown> = {}): Record<string, unknown> 
   evidence: 'evidence/test-1.log',
   ...overrides,
 });
+
+/**
+ * Every gate CAP-13 names, with one of them overridden.
+ *
+ * A completed verification reports all three, so a fixture carrying one would be refused for the
+ * wrong reason and the case under test would never be reached.
+ */
+const allGates = (overrides: Record<string, unknown> = {}): readonly Record<string, unknown>[] => [
+  gate({ command: 'typecheck', declared: 'npm run typecheck', evidence: 'evidence/typecheck-1.log' }),
+  gate({ command: 'lint', declared: 'npm run lint', evidence: 'evidence/lint-1.log' }),
+  gate(overrides),
+];
 
 const judgement = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
   criterion: ACCEPTED[0],
@@ -61,8 +74,8 @@ const verificationOutput = (overrides: Partial<VerificationOutput> = {}): unknow
   questions: [],
   write_intents: [],
   error: null,
-  gates: [gate()],
-  judgements: [judgement()],
+  gates: allGates(),
+  judgements: [judgement(), judgement({ criterion: ACCEPTED[1] })],
   ...overrides,
 });
 
@@ -78,7 +91,7 @@ describe('step.verification is registered and exports (matrix 14)', () => {
     for (const notAGate of ['build', 'run']) {
       expect(
         VerificationOutputSchema.safeParse(
-          verificationOutput({ gates: [gate({ command: notAGate })] } as never),
+          verificationOutput({ gates: [...allGates(), gate({ command: notAGate })] } as never),
         ).success,
         notAGate,
       ).toBe(false);
@@ -102,7 +115,7 @@ describe('the judgement runs against the acceptance criteria (matrix 17)', () =>
       { criterion: '  ' },
     ]) {
       const result = VerificationOutputSchema.safeParse(
-        verificationOutput({ judgements: [judgement(broken)] } as never),
+        verificationOutput({ judgements: [judgement(broken), judgement({ criterion: ACCEPTED[1] })] } as never),
       );
       expect(result.success, JSON.stringify(broken)).toBe(false);
     }
@@ -192,7 +205,7 @@ describe('a gate with no command is skipped, and a skip is not a pass (matrix 11
     expect(
       VerificationOutputSchema.safeParse(
         verificationOutput({
-          gates: [gate({ declared: '', outcome: 'skipped', exit_status: null, evidence: '' })],
+          gates: allGates({ declared: '', outcome: 'skipped', exit_status: null, evidence: '' }),
         } as never),
       ).success,
     ).toBe(true);
@@ -203,11 +216,11 @@ describe('a gate with no command is skipped, and a skip is not a pass (matrix 11
     // repository whose tests pass.
     const result = VerificationOutputSchema.safeParse(
       verificationOutput({
-        gates: [gate({ declared: '', outcome: 'passed', exit_status: 0, evidence: '' })],
+        gates: allGates({ declared: '', outcome: 'passed', exit_status: 0, evidence: '' }),
       } as never),
     );
     expect(result.success).toBe(false);
-    expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain('gates.0.outcome');
+    expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain('gates.2.outcome');
   });
 
   it('refuses a skipped gate carrying an exit status or a pointer, which would mean it ran', () => {
@@ -216,7 +229,7 @@ describe('a gate with no command is skipped, and a skip is not a pass (matrix 11
       { declared: '', outcome: 'skipped', exit_status: null, evidence: 'evidence/test-1.log' },
     ]) {
       expect(
-        VerificationOutputSchema.safeParse(verificationOutput({ gates: [gate(broken)] } as never))
+        VerificationOutputSchema.safeParse(verificationOutput({ gates: allGates(broken) } as never))
           .success,
         JSON.stringify(broken),
       ).toBe(false);
@@ -230,7 +243,7 @@ describe('a gate with no command is skipped, and a skip is not a pass (matrix 11
       { outcome: 'passed', exit_status: null },
     ]) {
       expect(
-        VerificationOutputSchema.safeParse(verificationOutput({ gates: [gate(broken)] } as never))
+        VerificationOutputSchema.safeParse(verificationOutput({ gates: allGates(broken) } as never))
           .success,
         JSON.stringify(broken),
       ).toBe(false);
@@ -240,9 +253,49 @@ describe('a gate with no command is skipped, and a skip is not a pass (matrix 11
   it('refuses one gate reported twice', () => {
     expect(
       VerificationOutputSchema.safeParse(
-        verificationOutput({ gates: [gate(), gate({ outcome: 'failed', exit_status: 1 })] } as never),
+        verificationOutput({ gates: [...allGates(), gate({ outcome: 'failed', exit_status: 1 })] } as never),
       ).success,
     ).toBe(false);
+  });
+});
+
+describe('a completed verification is complete (matrix 31)', () => {
+  it('refuses an output reporting only some of the gates', () => {
+    /**
+     * The field says "every deterministic gate CAP-13 names, each reported once" and only the
+     * *once* was enforced — so an output mentioning the gate that passed and staying silent about
+     * the one that was skipped parsed, and reads to a person as "everything ran".
+     */
+    for (const reported of [[], [gate()], [gate(), gate({ command: 'lint', declared: 'npm run lint' })]]) {
+      const result = VerificationOutputSchema.safeParse(
+        verificationOutput({ gates: reported } as never),
+      );
+      expect(result.success, JSON.stringify(reported.map((one) => one['command']))).toBe(false);
+      expect(result.error?.issues.map((issue) => issue.path.join('.'))).toContain('gates');
+    }
+    // All three, and it parses: the rule is about coverage, not about a count nobody can satisfy.
+    expect(VerificationOutputSchema.safeParse(verificationOutput()).success).toBe(true);
+  });
+
+  it('leaves a blocked output free to report fewer, because it did not finish', () => {
+    // Refusing the honest refusal would promote the ladder against a step that said it could not
+    // proceed — `step.schema_invalid_output` is `escalate-model-tier`.
+    expect(
+      VerificationOutputSchema.safeParse(
+        verificationOutput({ status: 'blocked', judgements: [], gates: [gate()] } as never),
+      ).success,
+    ).toBe(true);
+  });
+
+  it('requires a verdict for every accepted criterion, not merely no invented ones', () => {
+    // The two directions of one rule. `criteriaNotAccepted` alone let an output judging one of five
+    // complete: a verification that looked at a fifth of the work and reported success.
+    const output = verificationOutput({ judgements: [judgement()] } as never);
+    expect(criteriaNotAccepted(ACCEPTED, output)).toStrictEqual([]);
+    expect(criteriaNotJudged(ACCEPTED, output)).toStrictEqual([ACCEPTED[1]]);
+    expect(criteriaNotJudged(ACCEPTED, verificationOutput())).toStrictEqual([]);
+    // And it says nothing about an output that judged none, which the contract's own rule reports.
+    expect(criteriaNotJudged(ACCEPTED, { judgements: [] })).toStrictEqual([]);
   });
 });
 
@@ -259,7 +312,7 @@ describe('the economics, stated on the artifact as well as in the loop (matrix 1
      */
     const result = VerificationOutputSchema.safeParse(
       verificationOutput({
-        gates: [gate({ outcome: 'failed', exit_status: 1 })],
+        gates: allGates({ outcome: 'failed', exit_status: 1 }),
       } as never),
     );
     expect(result.success).toBe(false);
@@ -272,7 +325,7 @@ describe('the economics, stated on the artifact as well as in the loop (matrix 1
         verificationOutput({
           status: 'failed',
           judgements: [],
-          gates: [gate({ outcome: 'failed', exit_status: 1 })],
+          gates: allGates({ outcome: 'failed', exit_status: 1 }),
         } as never),
       ).success,
     ).toBe(true);
@@ -284,7 +337,7 @@ describe('an evidence pointer stays inside the run’s evidence plane (AD-23)', 
     'refuses a gate pointing at %s',
     (evidence) => {
       expect(
-        VerificationOutputSchema.safeParse(verificationOutput({ gates: [gate({ evidence })] } as never))
+        VerificationOutputSchema.safeParse(verificationOutput({ gates: allGates({ evidence }) } as never))
           .success,
       ).toBe(false);
     },

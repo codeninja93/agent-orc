@@ -2,7 +2,7 @@
   "name": "agent-orcastrator",
   "version": "0.1.0",
   "private": true,
-  "description": "Agent orchestration system — shared contracts: Zod v4 schemas, Command enum, event envelope, error dispositions.",
+  "description": "Agent orchestration system \u2014 shared contracts: Zod v4 schemas, Command enum, event envelope, error dispositions.",
   "license": "UNLICENSED",
   "type": "module",
   "engines": {
@@ -10,7 +10,8 @@
     "npm": "<12"
   },
   "bin": {
-    "orch": "dist/bin/init.js"
+    "orch": "dist/bin/init.js",
+    "orch-runner": "dist/bin/runner.js"
   },
   "exports": {
     ".": {
@@ -20,6 +21,10 @@
     "./installer": {
       "types": "./dist/installer/index.d.ts",
       "import": "./dist/installer/index.js"
+    },
+    "./runner": {
+      "types": "./dist/runner/index.d.ts",
+      "import": "./dist/runner/index.js"
     }
   },
   "types": "./dist/contracts/index.d.ts",

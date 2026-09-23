@@ -74,7 +74,20 @@ const NODE_PACKAGE = JSON.stringify(
   {
     name: 'fixture',
     version: '1.0.0',
-    scripts: { test: 'vitest run', lint: 'eslint .', build: 'tsc', start: 'node .' },
+    /**
+     * A `typecheck` script, because CAP-13 names that gate and nothing detected it.
+     *
+     * Without one here, `detectCommands` had nothing to find, every fixture install wrote
+     * `typecheck = ""` — recorded as *skipped* — and emptying the detection table left the suite
+     * green while the gate was silently absent on every repository that has one.
+     */
+    scripts: {
+      test: 'vitest run',
+      typecheck: 'tsc --noEmit',
+      lint: 'eslint .',
+      build: 'tsc',
+      start: 'node .',
+    },
   },
   null,
   2,

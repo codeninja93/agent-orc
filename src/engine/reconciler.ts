@@ -67,6 +67,8 @@ import type {
   DeflectionSource,
   EventEnvelope,
   FeatureState,
+  GateOutcome,
+  MechanicsCommands,
   ModelRung,
   OrchError,
   Principal,
@@ -77,6 +79,7 @@ import type {
   StepRecord,
 } from '../contracts/index.js';
 import {
+  REDACTION_FAILED_EVENT_TYPE,
   REDACTION_MARKER,
   Recorder,
   isStopCommand,
@@ -179,6 +182,7 @@ import type { TerritoryCandidate, TerritoryDeferral } from './territory.js';
 import { EngineLock } from './lock.js';
 import { resolveAgentGrant } from './agents.js';
 import { readStepConfiguration } from './config-snapshot.js';
+import { ProfileNotFound } from './profile.js';
 import { ModelRungUnrecognised, rungForAttempt } from './promotion.js';
 import { defaultUlidMinter } from './ulid.js';
 import type { UlidMinter } from './ulid.js';
@@ -220,6 +224,16 @@ export const STANDARD_PLAN_STEPS: readonly PlanStep[] = Object.freeze([
   { step: 'verify', contract_id: VERIFICATION_CONTRACT_ID, phase: 'verification' },
 ]);
 export const STEP_INPUT_FILE_NAME = 'input.json';
+
+/**
+ * Where a step's input file sits, relative to the run directory.
+ *
+ * Spelled once because two callers now need it at different moments: `step.started` names it before
+ * the file exists — the gates run between the two, and their outcomes go into it — and `stepInput`
+ * returns it beside the value it wrote.
+ */
+export const stepInputRelativePath = (step: string): string =>
+  `${STEPS_DIR_NAME}/${step}/${STEP_INPUT_FILE_NAME}`;
 
 // -------------------------------------------------------------------------------------------------
 // CAP-2 — the acceptance criteria as lines of the durable truth
@@ -867,6 +881,8 @@ export interface GateOutcomeRecord {
   readonly evidence: string;
   readonly containerName: string | null;
   readonly summary: string;
+  /** Why the evidence file is a placeholder: the AD-21 pass could not prove the output clean. */
+  readonly evidenceDropped?: string;
 }
 
 /** The runner, as the loop needs it: one verb, over a name the profile declares. */
@@ -879,8 +895,14 @@ export interface GateRunRequest {
   readonly run: string;
   readonly step: string;
   readonly worktree: string;
-  /** The profile's declared commands, read from the run's AD-9 snapshot by the loop. */
-  readonly commands: Readonly<Record<string, string>>;
+  /**
+   * The profile's declared commands, read from the run's AD-9 snapshot by the loop.
+   *
+   * `MechanicsCommands` rather than a loose record, so a real assembly hands this straight to
+   * `createCommandRunner` — which wants exactly that type — instead of casting. A port whose shape
+   * needs a cast at the only call site that matters is a port that has not been fitted.
+   */
+  readonly commands: MechanicsCommands;
   /**
    * Which attempt of the step this is.
    *
@@ -892,12 +914,30 @@ export interface GateRunRequest {
   readonly attempt: number;
 }
 
-/** Everything one verification step's first tier did. */
-export interface GateSummary {
-  readonly results: readonly GateOutcomeRecord[];
-  readonly failed: readonly GateOutcomeRecord[];
-  /** True when no declared gate failed. A run whose gates were all skipped has not *passed* them. */
-  readonly passed: boolean;
+/**
+ * The run's profile exists and cannot be read, so which gates it declares is unknown.
+ *
+ * Its own class rather than a re-raise, because the *reason* a gate did not run is the thing a
+ * person needs: "this engine has no runner" and "this profile cannot be read" have different fixes
+ * and only one of them involves the installer. `config.invalid` → `escalate-to-human`, like every
+ * other configuration refusal here — nothing retries its way out of an unreadable profile.
+ */
+export class UnreadableGateConfiguration extends Error {
+  readonly code = 'config.invalid';
+  readonly run: string;
+
+  constructor(run: string, cause: unknown) {
+    super(
+      `Run ${run} has a configuration snapshot whose profile cannot be read: ` +
+        `${cause instanceof Error ? cause.message : String(cause)}. Which deterministic gates this ` +
+        'repository declares is therefore unknown, and CAP-13 requires them to run before any ' +
+        'model-based review — so the review is not spawned and the run stops here rather than ' +
+        'treating an unreadable profile as a repository that declares no gates.',
+      { cause },
+    );
+    this.name = 'UnreadableGateConfiguration';
+    this.run = run;
+  }
 }
 
 export interface ReconcilerOptions {
@@ -2612,6 +2652,23 @@ export class Reconciler {
       case 'resume-step': {
         const record = this.requireStepRecord(state, action.step);
         const planStep = this.planStepFor(plan, action.step);
+        /**
+         * **A resume does not re-run the gates, and that is a decision rather than an omission
+         * (matrix 32).**
+         *
+         * CAP-13's economics are about what a run *spends*: "no review spend occurs on a run that
+         * fails them". A resume continues an attempt whose gates already passed — the review was
+         * spawned, the session id exists, and the turns are already gone — so running the gates
+         * again could not un-spend anything. What it would cost is a second container per gate on
+         * the one path a long-running step reaches most often, which is the cost the ordering
+         * exists to avoid.
+         *
+         * The gates are not skipped, either: their outcomes are on the step input this resume
+         * hands back to the same session, written when the attempt started, so the step still
+         * judges against what the engine observed. A gate that would fail *now* — because the
+         * worktree moved under a crash — is caught where AD-26 catches everything else of that
+         * kind: the next `reset-and-rerun`, which goes through `driveStep` and gates in full.
+         */
         const request = this.startRequest(paths, plan, state, planStep, record, record.model_tier);
 
         this.emit(recorder, {
@@ -2834,7 +2891,6 @@ export class Reconciler {
       });
     }
 
-    const input = this.stepInput(paths, plan, state, options.step, baselineRef);
     const attempt = (existing?.attempts ?? 0) + 1;
 
     this.emit(recorder, {
@@ -2846,7 +2902,7 @@ export class Reconciler {
         contract_id: options.step.contract_id,
         model_tier: tier,
         mode: plan.mode,
-        input: input.relativePath,
+        input: stepInputRelativePath(options.step.step),
       },
       baselineRef,
     });
@@ -2860,18 +2916,26 @@ export class Reconciler {
      * is how the economics are asserted in `tests/engine.gate-economics.test.ts`, by absence rather
      * than by a counter that could read zero because nothing incremented it.
      */
-    if (
-      !this.runGatesBeforeReview(
-        plan,
-        state,
-        options.step,
-        baselineRef,
-        options.transitionTo,
-        attempt,
-      )
-    ) {
-      return;
-    }
+    const gates = this.runGatesBeforeReview(
+      plan,
+      state,
+      options.step,
+      baselineRef,
+      options.transitionTo,
+      attempt,
+    );
+    if (gates === null) return;
+
+    /**
+     * The input is written **after** the gates ran, because it carries what they returned.
+     *
+     * The order is the whole of matrix row 28: the engine has the declared line, the exit status and
+     * the evidence pointer of every gate by this point, and `step.verification` requires the model to
+     * report exactly those. Writing the input first and handing over `evidence: []` left the step two
+     * ways to satisfy its contract — re-run every gate through the command runner, doubling the
+     * container time CAP-13's ordering exists to save, or invent them.
+     */
+    const input = this.stepInput(paths, plan, state, options.step, baselineRef, gates);
 
     const request = this.startRequest(
       paths,
@@ -3181,8 +3245,11 @@ export class Reconciler {
   /**
    * Run the deterministic gates for a verification step, and say whether the review may be spawned.
    *
-   * Returns `true` when the step should go on to spend model turns, `false` when this pass is over
-   * because the step has already been terminated here.
+   * Returns what the gates did when the step should go on to spend model turns — an empty list for a
+   * step that has no gates to run — and `null` when this pass is over because the step has already
+   * been terminated here. The outcomes travel because the step input carries them: the engine is the
+   * only thing that knows what the gates returned, and the verification contract requires the model
+   * to report exactly that.
    *
    * **Why the loop runs them and not the agent.** A spawn is the thing that costs, and a step cannot
    * decline to be spawned: an agent told "run the gates first, and stop if they fail" has already
@@ -3200,9 +3267,31 @@ export class Reconciler {
     baselineRef: string,
     transitionTo: FeatureState,
     attempt: number,
-  ): boolean {
-    if (step.phase !== 'verification') return true;
-    const commands = this.declaredCommands(state.run);
+  ): readonly GateOutcomeRecord[] | null {
+    if (step.phase !== 'verification') return [];
+    let commands: MechanicsCommands | null;
+    try {
+      commands = this.declaredCommands(state.run);
+    } catch (thrown: unknown) {
+      // The refusal is a *step termination*, not an escape: a pass that threw here would leave the
+      // step recorded as in flight and take every other feature's pass down with it.
+      if (!(thrown instanceof UnreadableGateConfiguration)) throw thrown;
+      this.recordTermination(
+        state,
+        step,
+        baselineRef,
+        {
+          step: step.step,
+          disposition: 'failed',
+          sessionId: null,
+          output: null,
+          error: makeError(thrown.code, thrown.message, renderCause(thrown.cause)),
+          usage: null,
+        },
+        { transitionTo },
+      );
+      return null;
+    }
     /**
      * No snapshot or no profile: nothing is declared, so there is no gate to run and none to skip.
      *
@@ -3210,7 +3299,7 @@ export class Reconciler {
      * here. A run with no configuration snapshot is a run that was assembled without one, which the
      * roster's own refusal (`src/engine/agents.ts`) reports at the spawn a moment later.
      */
-    if (commands === null) return true;
+    if (commands === null) return [];
 
     const declared = DETERMINISTIC_GATE_NAMES.filter((name) => (commands[name] ?? '').trim() !== '');
     const recorder = this.recorderFor(state.run, state.feature);
@@ -3244,19 +3333,51 @@ export class Reconciler {
         },
         { transitionTo },
       );
-      return false;
+      return null;
     }
 
-    const runner =
-      this.gates === null
-        ? null
-        : this.gates({
-            run: state.run,
+    /**
+     * A throw from the *factory* is caught for the same reason a throw from `run` is.
+     *
+     * Building a runner resolves an image and locates a runtime, either of which fails on a machine
+     * whose daemon is not answering — and an uncaught throw here escapes the whole pass, leaving
+     * the step recorded as in flight and taking every other feature's pass down with it. It is the
+     * same kind of failure as a container that would not start, so it takes the same code.
+     */
+    let runner: DeterministicGateRunner | null = null;
+    if (this.gates !== null) {
+      try {
+        runner = this.gates({
+          run: state.run,
+          step: step.step,
+          worktree: plan.worktree,
+          commands,
+          attempt,
+        });
+      } catch (thrown: unknown) {
+        this.recordTermination(
+          state,
+          step,
+          baselineRef,
+          {
             step: step.step,
-            worktree: plan.worktree,
-            commands,
-            attempt,
-          });
+            disposition: 'failed',
+            sessionId: null,
+            output: null,
+            error: makeError(
+              'container.start_failed',
+              `The deterministic gates could not be prepared for step "${step.step}": ` +
+                `${renderCause(thrown) ?? 'the gate runner could not be built'}. Nothing ran, so no ` +
+                'gate failed and no review was spawned.',
+              renderCause(thrown),
+            ),
+            usage: null,
+          },
+          { transitionTo },
+        );
+        return null;
+      }
+    }
 
     const results: GateOutcomeRecord[] = [];
     for (const name of DETERMINISTIC_GATE_NAMES) {
@@ -3320,9 +3441,26 @@ export class Reconciler {
           },
           { transitionTo },
         );
-        return false;
+        return null;
       }
       results.push(outcome);
+      /**
+       * AD-21 — a dropped artifact is recorded as `redaction.failed`, never passed over in silence.
+       *
+       * "The pass fails closed, dropping the artifact and recording a `redaction.failed` event
+       * rather than writing unredacted content." The runner does the dropping, because it holds the
+       * bytes; the log line is the engine's, because AD-29 gives the recorder one writer. Without
+       * it a gate whose output was dropped looked exactly like one whose output was written, and
+       * the pointer resolved to a placeholder nobody had been told about.
+       */
+      if (outcome.evidenceDropped !== undefined) {
+        this.emit(recorder, {
+          step: step.step,
+          type: REDACTION_FAILED_EVENT_TYPE,
+          payload: { gate: name, evidence: outcome.evidence, reason: outcome.evidenceDropped },
+          baselineRef,
+        });
+      }
       this.emit(recorder, {
         step: step.step,
         type:
@@ -3345,7 +3483,7 @@ export class Reconciler {
     }
 
     const failed = results.filter((result) => result.outcome === 'failed');
-    if (failed.length === 0) return true;
+    if (failed.length === 0) return results;
 
     /**
      * The failure names which gate and its exit status, which is matrix row 20's other half: a run
@@ -3384,7 +3522,7 @@ export class Reconciler {
       },
       { transitionTo },
     );
-    return false;
+    return null;
   }
 
   /**
@@ -3394,13 +3532,24 @@ export class Reconciler {
    * in this class is: run scope is the only configuration a step's world is built from (AD-34), so a
    * profile edited mid-run changes nothing about a run already under way.
    */
-  private declaredCommands(run: string): Readonly<Record<string, string>> | null {
+  private declaredCommands(run: string): MechanicsCommands | null {
     try {
       return readStepConfiguration(run, { orchHome: this.orchHome }).profile.mechanics.commands;
-    } catch {
-      // No snapshot, no profile, or one this build cannot read. Nothing is declared and nothing is
-      // invented; the refusal a missing snapshot deserves is the roster's, at the spawn.
-      return null;
+    } catch (thrown: unknown) {
+      /**
+       * **Absent and unreadable are different answers, and conflating them disabled the gates.**
+       *
+       * A run with no snapshot declares no commands, so there is no gate to run and none to skip —
+       * an absence, whose refusal is the roster's at the spawn a moment later. A profile that
+       * *exists* and cannot be read is the opposite: it may declare every gate CAP-13 names, and
+       * answering `null` for it spawned the review with no gate events at all and nothing in the log
+       * saying why. A v1 profile — exactly what this story's own version bump creates — raises
+       * `SchemaVersionRefusal` here, so the commonest case was the silent one.
+       *
+       * This is the distinction story 2-3's review drew for the roster directory, one file over.
+       */
+      if (thrown instanceof ProfileNotFound) return null;
+      throw new UnreadableGateConfiguration(run, thrown);
     }
   }
 
@@ -3505,16 +3654,35 @@ export class Reconciler {
     state: RunState,
     step: PlanStep,
     baselineRef: string,
+    gates: readonly GateOutcomeRecord[] = [],
   ): { readonly value: StepInput; readonly relativePath: string } {
     const path = stepInputPath(paths, step.step);
-    const relativePath = `${STEPS_DIR_NAME}/${step.step}/${STEP_INPUT_FILE_NAME}`;
+    const relativePath = stepInputRelativePath(step.step);
+    const recorded = gates.map(
+      (gate): GateOutcome => ({
+        command: gate.command,
+        declared: gate.declared,
+        outcome: gate.outcome,
+        exit_status: gate.exitStatus,
+        evidence: gate.evidence,
+      }),
+    );
 
     if (existsSync(path)) {
       const parsed = StepInputSchema.safeParse(JSON.parse(readFileSync(path, 'utf8')));
       if (
         parsed.success &&
         parsed.data.baseline_ref === baselineRef &&
-        parsed.data.contract_id === step.contract_id
+        parsed.data.contract_id === step.contract_id &&
+        /**
+         * **And the gates it carries are this attempt's.** CAP-6 has a re-run read the same bytes,
+         * and for every other field that is exactly right — the request, the criteria and the
+         * baseline do not change between attempts. The gate outcomes do: re-running a verification
+         * step runs them again, and that is the point of re-running it. An input reused across a
+         * re-run would hand the step the *previous* attempt's exit statuses and evidence pointers,
+         * which is a step judging one run of the gates while the log records another.
+         */
+        JSON.stringify(parsed.data.gates) === JSON.stringify(recorded)
       ) {
         return { value: parsed.data, relativePath };
       }
@@ -3546,8 +3714,18 @@ export class Reconciler {
       acceptance_criteria: [...plan.acceptance_criteria],
       // Story 1-8 supplies the ledger answers; an empty list is the honest value until it does.
       decisions: [],
-      // AD-23 — evidence is referenced by pointer. Nothing this story runs produces one yet.
-      evidence: [],
+      /**
+       * AD-23 — evidence is referenced by pointer, and a gate's output is the first pointer this
+       * system produces. Story 1-8 supplies the rest.
+       */
+      evidence: recorded
+        .filter((gate) => gate.evidence !== '')
+        .map((gate) => ({
+          kind: 'log' as const,
+          path: gate.evidence,
+          description: `the output of the ${gate.command} gate, which ran "${gate.declared}"`,
+        })),
+      gates: recorded,
       budget: {
         steps_remaining: Math.max(plan.steps.length - completed, 0),
         wall_clock_ms_remaining: DECLARED_WALL_CLOCK_MS,

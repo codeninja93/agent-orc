@@ -36,6 +36,7 @@ import {
   RESOURCE_NEEDS,
   REVERSIBILITY_CLASSES,
   RUN_MODES,
+  CURRENT_SCHEMA_VERSION,
   DEFAULT_SCHEMA_VERSION_POLICY,
   PROFILE_SCHEMA_VERSION_POLICY,
   assertRecognisedSchemaVersion,
@@ -108,6 +109,18 @@ const readTomlFile = (path: string): TomlTable | null => {
  * other. A single policy here would either refuse every v1 permissions file or accept a v1 profile
  * whose typecheck gate nobody declared — and the second is the silent one.
  */
+/**
+ * The profile versions an installer re-run may *read answers out of*.
+ *
+ * Every version this build has written, which is the current one and the one before it. It is
+ * deliberately not "anything older": a profile at a version this build never wrote is a file from a
+ * future installer, and re-interviewing from it would be inventing the answers it could not read.
+ */
+const READABLE_FOR_REINTERVIEW: SchemaVersionPolicy = {
+  current: PROFILE_SCHEMA_VERSION_POLICY.current,
+  supported: [...PROFILE_SCHEMA_VERSION_POLICY.supported, CURRENT_SCHEMA_VERSION],
+};
+
 const assertReadableVersion = (
   table: TomlTable,
   artifact: string,
@@ -242,10 +255,23 @@ export const readExistingInstall = (repository: string): ExistingInstall => {
 
   const profile = readTomlFile(paths.profile);
   if (profile !== null) {
+    /**
+     * **The re-run is the migration, so the previous profile is readable for the purpose of asking
+     * again.**
+     *
+     * Story 2-6 advanced the profile past `typecheck`, and the refusal an *engine* raises for a v1
+     * profile says "re-run the installer" — so an installer that refused the same file left every
+     * existing install with no route forward, and the only advice on offer was the thing it had just
+     * refused to do. What is read here is a set of *answers*, each through its own schema, and what
+     * is written is a v2 profile; nothing of the old shape survives the round trip.
+     *
+     * The gate that matters is unchanged: a version this build has never written is still refused,
+     * because that is a file from the future and re-interviewing from it would be guessing.
+     */
     assertReadableVersion(
       profile,
       relativeOrchPath(PROFILE_FILE_NAME),
-      PROFILE_SCHEMA_VERSION_POLICY,
+      READABLE_FOR_REINTERVIEW,
     );
     answers = { ...answers, ...answersFromProfile(profile) };
   }

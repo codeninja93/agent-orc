@@ -22,7 +22,7 @@
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import type { MechanicsCommands, PackageManager } from '../contracts/index.js';
+import type { MechanicsCommandName, MechanicsCommands, PackageManager } from '../contracts/index.js';
 import { MECHANICS_COMMAND_NAMES } from '../contracts/index.js';
 import { firstCommitSha, gitRemote, gitRoot } from '../runtime/repository.js';
 
@@ -94,10 +94,10 @@ const packageScripts = (repositoryPath: string): Readonly<Record<string, string>
  * interview (matrix row 12) — and offering none at all is what leaves CAP-13's typecheck gate
  * declared empty on a repository that has one.
  */
-const SCRIPT_CANDIDATES: Readonly<Record<string, readonly string[]>> = {
-  test: ['test'],
+const SCRIPT_CANDIDATES: Readonly<Record<MechanicsCommandName, readonly string[]>> = {
   typecheck: ['typecheck', 'type-check', 'tsc'],
   lint: ['lint'],
+  test: ['test'],
   build: ['build'],
   run: ['start', 'dev', 'serve'],
 };
@@ -116,13 +116,15 @@ export const detectCommands = (
   const runner = manager === null || manager === 'other' ? 'npm' : manager;
   const commands: Record<string, string> = {};
   for (const name of MECHANICS_COMMAND_NAMES) {
-    const script = (SCRIPT_CANDIDATES[name] ?? []).find((candidate) => candidate in scripts);
+    const script = SCRIPT_CANDIDATES[name].find((candidate) => candidate in scripts);
     commands[name] = script === undefined ? '' : `${runner} run ${script}`;
   }
+  // Spelled out rather than cast, so a name added to the vocabulary is a type error here — which is
+  // where a command nobody detected should be noticed, and not at a gate that turns out empty.
   return {
-    test: commands['test'] ?? '',
     typecheck: commands['typecheck'] ?? '',
     lint: commands['lint'] ?? '',
+    test: commands['test'] ?? '',
     build: commands['build'] ?? '',
     run: commands['run'] ?? '',
   };

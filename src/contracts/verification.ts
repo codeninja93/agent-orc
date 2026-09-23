@@ -38,7 +38,8 @@ import { z } from 'zod';
 
 import { ClaimProvenanceSchema, attributesClaim } from './analysis.js';
 import { DETERMINISTIC_GATE_NAMES } from './installer.js';
-import { StepOutputSchema } from './step.js';
+import { GATE_RESULTS, StepOutputSchema } from './step.js';
+import type { GateOutcome } from './step.js';
 import { isRepositoryRelativePath, normaliseTerritoryPath } from './territory.js';
 
 /** The registry id this contract is registered under (AD-17), spelled once. */
@@ -51,19 +52,26 @@ export const VERIFICATION_CONTRACT_ID = 'step.verification';
  * either of the others loses the one fact a person needs: a repository with no typecheck step is not
  * a repository whose typecheck passed, and it is not a repository whose typecheck failed either.
  */
-export const GATE_OUTCOMES = ['passed', 'failed', 'skipped'] as const;
+export const GATE_OUTCOMES = GATE_RESULTS;
 
-export type GateOutcome = (typeof GATE_OUTCOMES)[number];
+export type GateVerdict = (typeof GATE_OUTCOMES)[number];
 
 /**
  * One deterministic gate, as the step reports it.
  *
- * `declared` is the command the profile declares for this gate, carried verbatim so the report says
- * *what ran* and not only that something did. It is also what makes the skip rule checkable from the
- * artifact alone: an empty declaration is the only thing that may be reported as skipped.
+ * **Copied from the step input, never re-derived.** `StepInput.gates` carries what the engine
+ * observed — the declared line, the exit status and the evidence pointer — because the engine ran
+ * them before deciding to spawn anything at all. A step that re-ran them through the command runner
+ * to fill this in would spend a second container per gate, which is the cost CAP-13's ordering
+ * exists to avoid, and a step that guessed would be reporting something it never saw. So the rule
+ * for this field is: read `gates` from the input and restate it.
  *
- * The engine's own `gate.*` events are authoritative (AD-4); this is the step's report of them, and
- * a report that contradicts itself is refused here rather than believed.
+ * `declared` is carried verbatim so the report says *what ran* and not only that something did. It
+ * is also what makes the skip rule checkable from the artifact alone: an empty declaration is the
+ * only thing that may be reported as skipped.
+ *
+ * The engine's own `gate.*` events are authoritative (AD-4), and {@link gatesDisagreeingWith} is
+ * where the report is held to them. A report that contradicts *itself* is refused here.
  */
 export const GateReportSchema = z.object({
   command: z
@@ -75,8 +83,9 @@ export const GateReportSchema = z.object({
   declared: z
     .string()
     .describe(
-      'The command the profile declares for this gate, verbatim. The empty string means the ' +
-        'repository declares none, and is the only declaration that may be reported as skipped.',
+      'The command the profile declares for this gate, copied verbatim from the `gates` field of ' +
+        'the step input. The empty string means the repository declares none, and is the only ' +
+        'declaration that may be reported as skipped.',
     ),
   outcome: z
     .enum(GATE_OUTCOMES)
@@ -88,8 +97,10 @@ export const GateReportSchema = z.object({
     .number()
     .nullable()
     .describe(
-      'The whole-number exit status the command reported: 0 for a pass, non-zero for a failure, ' +
-        'and null only for a skipped gate, which ran nothing to have a status.',
+      'The whole-number exit status the command reported: 0 for a pass, non-zero for a failure. ' +
+        'Null for a skipped gate, which ran nothing to have a status, and for a gate the runtime ' +
+        'could not get a status from because it timed out or was signalled — which is a failure ' +
+        'with no number, not a pass.',
     ),
   evidence: z
     .string()
@@ -224,13 +235,32 @@ export const VerificationOutputSchema = VerificationOutputShape.superRefine((out
       }
       return;
     }
-    if (gate.exit_status === null || !Number.isInteger(gate.exit_status)) {
+    /**
+     * A gate that ran and produced no status at all is a *failure*, and it has to be sayable.
+     *
+     * A command the runtime killed at the timeout, or one that died on a signal, returns no exit
+     * code — and refusing the artifact for it would leave the step unable to state what happened to
+     * a gate that demonstrably ran. It is reported as failed with a null status, which is the honest
+     * shape; what stays impossible is calling it passed.
+     */
+    if (gate.exit_status === null) {
+      if (gate.outcome !== 'failed') {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['gates', index, 'outcome'],
+          message:
+            `the ${gate.command} gate ran "${gate.declared}" and reported no exit status, which is a ` +
+            'command that timed out or was signalled. That is a failure with no number; it is never ' +
+            'a pass.',
+        });
+      }
+      return;
+    }
+    if (!Number.isInteger(gate.exit_status)) {
       ctx.addIssue({
         code: 'custom',
         path: ['gates', index, 'exit_status'],
-        message:
-          'a gate that ran reports the whole-number exit status its command returned; null is ' +
-          'reserved for a gate that ran nothing',
+        message: 'an exit status is a whole number; a fraction is not a status any command returned',
       });
       return;
     }
@@ -286,6 +316,27 @@ export const VerificationOutputSchema = VerificationOutputShape.superRefine((out
           'a completed verification judges at least one acceptance criterion; an empty list is a ' +
           'verification that verified nothing, and it makes every per-judgement rule pass vacuously. ' +
           'Report "blocked" instead if the criteria could not be judged.',
+      });
+    }
+    /**
+     * Every gate, not merely some gate.
+     *
+     * The field's own description says "every deterministic gate CAP-13 names, each reported once",
+     * and uniqueness alone let an output reporting one gate — or none — complete. A verification
+     * that mentions the gate that passed and stays silent about the one that was skipped is exactly
+     * the report a person would read as "everything ran".
+     */
+    const missing = DETERMINISTIC_GATE_NAMES.filter(
+      (name) => !output.gates.some((gate) => gate.command === name),
+    );
+    if (missing.length > 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['gates'],
+        message:
+          `this output reports no ${missing.join(' and no ')} gate. A completed verification reports ` +
+          `every gate CAP-13 names (${DETERMINISTIC_GATE_NAMES.join(', ')}), copied from the step ` +
+          'input\u2019s own `gates` field — a gate left out of the report reads as a gate that ran.',
       });
     }
   }
@@ -393,4 +444,87 @@ export const criteriaNotAccepted = (
   return parsed.data.judgements
     .map((judgement) => judgement.criterion)
     .filter((criterion) => !accepted.includes(criterion));
+};
+
+/**
+ * The accepted criteria an output **left unjudged**, or an empty list.
+ *
+ * The other direction of the same rule, and the one that was missing: refusing invented criteria
+ * says nothing about coverage, so an output judging one of five criteria completed while four were
+ * never looked at. "Judged against criteria fixed before it was written" is only true if the
+ * criteria are the ones fixed *and* they are all of them.
+ *
+ * It answers about any output that judges criteria, and is silent about one that judges none —
+ * because "judged nothing" is the contract's own `completed` refusal, and reporting it twice would
+ * send a reader to the wrong fault.
+ */
+export const criteriaNotJudged = (
+  accepted: readonly string[],
+  output: unknown,
+): readonly string[] => {
+  const parsed = JudgingOutputSchema.safeParse(output);
+  if (!parsed.success || parsed.data.judgements.length === 0) return [];
+  const judged = new Set(parsed.data.judgements.map((judgement) => judgement.criterion));
+  return accepted.filter((criterion) => !judged.has(criterion));
+};
+
+/** The shape of "an output that reports gates", for the same discriminator reason as above. */
+const GateReportingOutputSchema = z.object({
+  gates: z.array(
+    z.object({
+      command: z.string(),
+      declared: z.string(),
+      outcome: z.string(),
+      exit_status: z.number().nullable(),
+    }),
+  ),
+});
+
+/**
+ * Where a reported gate disagrees with what the engine recorded, one line per disagreement.
+ *
+ * **Internal consistency is not enough, and this is the difference.** The contract can check that a
+ * reported outcome matches the exit status *beside it*; it cannot know whether either is true. The
+ * engine ran the gates and put what it observed in `StepInput.gates`, so a report that says the test
+ * gate passed when the engine recorded it failing is a step describing a run that did not happen —
+ * and, since the gates are what decided the step was spawned at all, it is the one lie about this
+ * artifact that would change what a person does next.
+ *
+ * Compared on the three facts a step is told and asked to restate. The evidence pointer is
+ * deliberately not compared: it is the engine's to mint and a step has no way to get it wrong that
+ * matters, and requiring it byte-for-byte would refuse an output that merely omitted it.
+ */
+export const gatesDisagreeingWith = (
+  recorded: readonly GateOutcome[],
+  output: unknown,
+): readonly string[] => {
+  const parsed = GateReportingOutputSchema.safeParse(output);
+  if (!parsed.success || recorded.length === 0) return [];
+  return parsed.data.gates.flatMap((reported) => {
+    const engine = recorded.find((gate) => gate.command === reported.command);
+    if (engine === undefined) {
+      return [
+        `the ${reported.command} gate is reported but the engine ran no such gate for this step`,
+      ];
+    }
+    if (engine.outcome !== reported.outcome) {
+      return [
+        `the ${reported.command} gate is reported "${reported.outcome}" and the engine recorded ` +
+          `"${engine.outcome}"`,
+      ];
+    }
+    if (engine.exit_status !== reported.exit_status) {
+      return [
+        `the ${reported.command} gate is reported exiting ${String(reported.exit_status)} and the ` +
+          `engine recorded ${String(engine.exit_status)}`,
+      ];
+    }
+    if (engine.declared !== reported.declared) {
+      return [
+        `the ${reported.command} gate is reported as running "${reported.declared}" and the engine ` +
+          `ran "${engine.declared}"`,
+      ];
+    }
+    return [];
+  });
 };

@@ -29,15 +29,24 @@ import { MECHANICS_COMMAND_NAMES, makeError } from '../contracts/index.js';
 import type { MechanicsCommandName, MechanicsCommands, OrchError } from '../contracts/index.js';
 
 /**
- * The names a step may ask for, which are exactly the profile's declared commands.
+ * The names a step may ask for: the profile's declared commands, less the one that never returns.
  *
- * Re-exported under this module's own name because the *role* differs: in the profile these are
- * mechanics a repository records, and here they are the closed set of things a confined step can
- * cause to happen. The list is the same list, deliberately.
+ * **`run` is deliberately absent.** AD-16 records it as a mechanic — it is how a person starts the
+ * application — and a step asking for it gets a process that serves until something kills it, which
+ * here means sitting until {@link DECLARED_COMMAND_TIMEOUT_MS} and then being recorded as a gate
+ * that failed. A tool whose vocabulary includes a command that cannot succeed is a tool with a trap
+ * in it, so the trap is removed from the vocabulary rather than documented.
+ *
+ * What is left is every command that terminates: the three gates CAP-13 names and `build`, which a
+ * testing step legitimately needs before it can run anything. A repository that genuinely needs its
+ * application started for a test declares that as part of the test command, where the profile can
+ * see it.
  */
-export const DECLARED_COMMAND_NAMES = MECHANICS_COMMAND_NAMES;
+export const DECLARED_COMMAND_NAMES = MECHANICS_COMMAND_NAMES.filter(
+  (name): name is Exclude<MechanicsCommandName, 'run'> => name !== 'run',
+);
 
-export type DeclaredCommandName = MechanicsCommandName;
+export type DeclaredCommandName = Exclude<MechanicsCommandName, 'run'>;
 
 /**
  * The tool's input.
@@ -51,7 +60,7 @@ export type DeclaredCommandName = MechanicsCommandName;
  */
 export const DeclaredCommandRequestSchema = z.strictObject({
   command: z
-    .enum(DECLARED_COMMAND_NAMES)
+    .enum(DECLARED_COMMAND_NAMES as [DeclaredCommandName, ...DeclaredCommandName[]])
     .describe(
       'Which of the commands this repository declares to run. A name, not a command line: the ' +
         'command that runs is the one the profile declares for this name, and nothing else can be ' +

@@ -392,7 +392,6 @@ describe('a phase granted the runner carries the served tool (matrix 8)', () => 
       addDir: '/tmp/orch/worktrees/run-1',
       mcpConfigs: configs,
       mcpTools: allowedToolsFor(grant),
-      allowedTools: allowedToolsFor(grant),
     });
 
   it('carries --mcp-config, --strict-mcp-config and the tool in --allowedTools', () => {
@@ -432,7 +431,7 @@ describe('a phase granted the runner carries the served tool (matrix 8)', () => 
 describe('a spawn that would not pre-approve the runner fails visibly (matrix 7)', () => {
   const served = [RUNNER_ALLOWED_TOOL];
 
-  const build = (over: { mcpTools?: readonly string[]; allowedTools?: readonly string[]; mcpConfigs?: readonly string[] }) =>
+  const build = (over: { mcpTools?: readonly string[]; mcpConfigs?: readonly string[] }) =>
     buildStepArgv({
       schema: {},
       prompt: 'p',
@@ -441,28 +440,18 @@ describe('a spawn that would not pre-approve the runner fails visibly (matrix 7)
       addDir: '/tmp/orch/worktrees/run-1',
       mcpConfigs: over.mcpConfigs ?? ['/tmp/run/mcp.json'],
       ...(over.mcpTools === undefined ? {} : { mcpTools: over.mcpTools }),
-      ...(over.allowedTools === undefined ? {} : { allowedTools: over.allowedTools }),
     });
 
-  it('refuses rather than building an argv the step would hang on', () => {
-    expect(() => build({ mcpTools: served })).toThrowError(McpToolNotPreApproved);
-    expect(() => build({ mcpTools: served, allowedTools: [] })).toThrowError(McpToolNotPreApproved);
-    // A different tool pre-approved is the same omission wearing a value.
-    expect(() => build({ mcpTools: served, allowedTools: ['mcp__other__thing'] })).toThrowError(
-      McpToolNotPreApproved,
-    );
-  });
-
-  it('refuses a served grant with no server to serve it, which is the other half of the pairing', () => {
-    expect(() => build({ mcpTools: served, allowedTools: served, mcpConfigs: [] })).toThrowError(
-      McpToolNotPreApproved,
-    );
+  it('refuses a served grant with no server to serve it', () => {
+    // A granted tool with no `--mcp-config` is a tool that does not exist. The step discovers that
+    // by being told the tool is unavailable — which is the loud half; the silent half is below.
+    expect(() => build({ mcpTools: served, mcpConfigs: [] })).toThrowError(McpToolNotPreApproved);
   });
 
   it('names the tool and says why waiting is the failure being prevented', () => {
     let thrown: unknown;
     try {
-      build({ mcpTools: served });
+      build({ mcpTools: served, mcpConfigs: [] });
     } catch (error: unknown) {
       thrown = error;
     }
@@ -473,14 +462,32 @@ describe('a spawn that would not pre-approve the runner fails visibly (matrix 7)
     expect(dispositionFor((thrown as McpToolNotPreApproved).code)).toBe('escalate-to-human');
   });
 
-  it('names the same omission on a vector a wrapper rebuilt, not only on the one it built', () => {
-    // The guard the spawner applies to the *executed* argv. Everything between the build and the
-    // spawn is free to rewrite `args`, and the symptom of getting this wrong is a step that hangs.
-    const argv = build({ mcpTools: served, allowedTools: served });
+  it('names the omission on a vector a wrapper rebuilt, which is where it can still happen', () => {
+    /**
+     * The guard's new home, and the reason it moved.
+     *
+     * `buildStepArgv` used to be handed the grant *and* the pre-approval as two arguments, and the
+     * only production caller passed the same expression to both — so the pair was independent in
+     * the type and identical in fact, and the check between them could not fail where it mattered.
+     * The translation now happens inside, and what can still go wrong is what always could: the
+     * AD-20 wrapper rebuilding `args` between the build and the spawn. So that is what is asserted,
+     * over the executed vector.
+     */
+    const argv = build({ mcpTools: served });
     const rewritten = argv.filter(
       (argument, index) => argument !== '--allowedTools' && argv[index - 1] !== '--allowedTools',
     );
     expect(missingPreApprovals(argv, served)).toStrictEqual([]);
     expect(missingPreApprovals(rewritten, served)).toStrictEqual(served);
+  });
+
+  it('reads every --allowedTools in the vector, not the first one', () => {
+    // A duplicated flag is one a later value wins in, so a check reading the first would report the
+    // pairing as holding while the CLI pre-approves nothing. A trailing flag has no value at all.
+    expect(missingPreApprovals(['--allowedTools', 'mcp__other__thing'], served)).toStrictEqual(served);
+    expect(
+      missingPreApprovals(['--allowedTools', 'mcp__other__thing', '--allowedTools', ...served], served),
+    ).toStrictEqual([]);
+    expect(missingPreApprovals([...served.map(() => '--allowedTools')], served)).toStrictEqual(served);
   });
 });

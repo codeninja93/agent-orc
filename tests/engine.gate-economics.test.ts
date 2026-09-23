@@ -21,7 +21,7 @@
  * and the real `createCommandRunner` is driven here over an injected invoker to prove the two are
  * compatible. What ran the gate is a decision, and a decision is assertable without a daemon.
  */
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -461,5 +461,110 @@ describe('the loop and the real runner fit together', () => {
     const types = eventsOf(accepted.run).map((event) => event.type);
     expect(types).toContain(ENGINE_EVENT_TYPES.GateSkipped);
     expect(types).toContain(ENGINE_EVENT_TYPES.GateFailed);
+  });
+});
+
+describe('the recorder a caller supplied is the caller’s', () => {
+  it('is still usable after the engine closes, because the engine did not close it', () => {
+    /**
+     * AD-29's claim belongs to whoever took it.
+     *
+     * The loop closes the recorders it opened; one handed to it is another unit's, and closing it
+     * would release the single-writer claim out from under a caller still writing through it —
+     * which is exactly the assembly this option exists for, where the spawner holds the same
+     * recorder. Nothing asserted it, and `Recorder.close()` is idempotent, so removing the guard
+     * left every test green.
+     */
+    const plan: FeaturePlan = {
+      feature: 'gate-economics',
+      mode: 'live',
+      territory: ['src'],
+      steps: [{ step: 'verify', contract_id: 'step.output', phase: 'verification' }],
+      request: 'r',
+      acceptance_criteria: ['c'],
+      starting_model_tier: 'claude-haiku-4-5',
+      worktree: '/tmp/unused',
+    };
+    const opened: Recorder[] = [];
+    const reconciler = Reconciler.open({
+      orchHome: home,
+      executor: {
+        start: () => Promise.reject(new Error('unused')),
+        resume: () => Promise.reject(new Error('unused')),
+      },
+      recorderFor: (runId, feature) => {
+        const made = Recorder.open({ runId, feature, orchHome: home });
+        opened.push(made);
+        toClose.push(made);
+        return made;
+      },
+      plans: planProvider(plan),
+    });
+    // The loop has to have *used* the recorder, or its map is empty and `close` closes nothing
+    // either way — which is how the first version of this assertion passed under the mutation.
+    const run = reconciler.acceptFeature(plan).run;
+    const recorder = opened[0];
+    expect(recorder).toBeDefined();
+    reconciler.close();
+
+    /**
+     * The claim, not merely the ability to append.
+     *
+     * `Recorder.close()` is idempotent and a closed recorder still returns from `recordResult`, so
+     * asserting that a line lands proves nothing about ownership. What a close *does* is release
+     * AD-29's exclusive claim — it deletes the lock file — and the sharp observable is therefore
+     * that a second `Recorder.open` on the same run is still refused. If the engine had closed the
+     * caller's recorder, this would succeed, and two writers would be one careless line apart.
+     */
+    expect(() => Recorder.open({ runId: run, feature: 'gate-economics', orchHome: home })).toThrow();
+    expect(existsSync(runPaths(run, home).eventLogLock)).toBe(true);
+
+    // And it still writes, which is the other half of "the caller may go on using it".
+    const recorded = recorder?.recordResult({
+      feature: 'gate-economics',
+      run,
+      step: null,
+      emitter: 'tests',
+      type: 'feature.state_changed',
+      payload: { from: 'drafting', to: 'confirmed', reason: 'the caller still owns its recorder' },
+    });
+    expect(recorded?.dropped).toBe(false);
+    expect(readEventLog(runPaths(run, home).eventLog).length).toBeGreaterThan(0);
+  });
+});
+
+describe('resuming a verification step does not re-run its gates (matrix 32)', () => {
+  it('asks the gate runner nothing on the resume path, and says why in the code', async () => {
+    /**
+     * The decision, pinned so it stays one.
+     *
+     * A resume continues an attempt whose gates already passed: the review was spawned, the session
+     * exists, and the turns are spent, so re-running the gates could not un-spend anything and
+     * would cost a second container per gate on the path a long-running step reaches most often.
+     * What the step judges against is unchanged — the gate outcomes are on the input written when
+     * the attempt started — and a worktree that moved under a crash is caught by the next
+     * `reset-and-rerun`, which goes through `driveStep` and gates in full.
+     */
+    const asked: string[] = [];
+    const watching = (request: GateRunRequest): DeterministicGateRunner => {
+      asked.push(`${request.step}#${String(request.attempt)}`);
+      return { run: (command) => outcome({ command }) };
+    };
+    const { reconciler, plan, repository } = world({
+      gates: watching,
+      steps: [{ step: 'verify', contract_id: 'step.output', phase: 'verification' }],
+    });
+    const accepted = reconciler.acceptFeature(plan);
+    takeConfigSnapshot({ repository, runId: accepted.run, orchHome: home });
+    reconciler.confirm(accepted.run);
+    await reconciler.pass();
+
+    const afterStart = [...asked];
+    expect(afterStart).toStrictEqual(['verify#1']);
+
+    // A resume of the same step: the loop reaches `executor.resume`, and the gate runner is not
+    // asked again. The count is the assertion, and the start above is what stops it being vacuous.
+    await reconciler.pass();
+    expect(asked.filter((entry) => entry === 'verify#1')).toHaveLength(1);
   });
 });

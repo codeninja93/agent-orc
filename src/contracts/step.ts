@@ -135,6 +135,56 @@ export const WriteIntentSchema = z.object({
 export type WriteIntent = z.infer<typeof WriteIntentSchema>;
 
 /**
+ * What one deterministic gate did, as the **engine** recorded it (CAP-13's first tier).
+ *
+ * This shape is on the step *input* because the engine runs the gates before it spawns anything, and
+ * a step that had to discover the outcomes for itself would have to run every one of them again —
+ * doubling the container time the economics exist to save, and inviting it to report facts it never
+ * observed. `step.verification`'s own `gates` field is the model's *report* of these, checked back
+ * against them; this is the record it copies from.
+ *
+ * `command` is a plain string rather than an enum, because this file is written by the engine and
+ * read by a step: the profile's vocabulary lives in `src/contracts/installer.ts`, which imports this
+ * module, so naming the enum here would be a cycle. The names that appear are `typecheck`, `lint`
+ * and `test`, which is what `DETERMINISTIC_GATE_NAMES` declares.
+ */
+export const GATE_RESULTS = ['passed', 'failed', 'skipped'] as const;
+
+export type GateResult = (typeof GATE_RESULTS)[number];
+
+export const GateOutcomeSchema = z.object({
+  command: z
+    .string()
+    .describe('Which gate this is: one of typecheck, lint or test, the gates CAP-13 names.'),
+  declared: z
+    .string()
+    .describe(
+      'The command line the profile declares for this gate, verbatim. Empty when it declares none.',
+    ),
+  outcome: z
+    .enum(GATE_RESULTS)
+    .describe(
+      'What the gate did: "passed" for an exit status of zero, "failed" for anything else, ' +
+        '"skipped" when the profile declares no command and nothing ran.',
+    ),
+  exit_status: z
+    .number()
+    .nullable()
+    .describe(
+      'The exit status the command returned, or null when nothing ran to have one — a skipped gate, ' +
+        'or one the runtime could not get a status from because it timed out or was signalled.',
+    ),
+  evidence: z
+    .string()
+    .describe(
+      'Where this gate\u2019s output was written, relative to the run directory (AD-23). The output ' +
+        'itself never enters the control plane. Empty for a gate that ran nothing.',
+    ),
+});
+
+export type GateOutcome = z.infer<typeof GateOutcomeSchema>;
+
+/**
  * The typed input file a step reads. Written by the engine, on disk, so it carries
  * `schema_version` per AD-28.
  *
@@ -157,6 +207,15 @@ export const StepInputSchema = versioned({
   decisions: z.array(DecisionRecordSchema),
   /** Pointers into the evidence plane the step may read on demand (AD-23). */
   evidence: z.array(EvidencePointerSchema),
+  /**
+   * What the deterministic gates did before this step was spawned, or an empty list.
+   *
+   * Empty for every phase but `verification`, and for a verification step whose run declares no gate
+   * command at all. It is never a step's job to fill this in: the engine ran them, the engine knows
+   * what they returned, and a step that re-derived them would be reporting something it had to spend
+   * a container to find out twice.
+   */
+  gates: z.array(GateOutcomeSchema),
   budget: BudgetSchema,
   created_at: TimestampSchema,
 });

@@ -102,11 +102,18 @@ export const MechanicsCommandsSchema = z.object({
 export type MechanicsCommands = z.infer<typeof MechanicsCommandsSchema>;
 
 /**
- * The command names, in the order `build-sequencing.md` question 3 states them, with `typecheck`
- * placed beside the two other gates CAP-13 names rather than appended after `run`.
+ * The command names, in **one** order, which is the interview's field order and the order the gates
+ * run in.
  *
- * The order is the interview's field order and the order gates run in, which is why it is a list and
- * not an alphabetisation of the record's keys.
+ * It is deliberately *not* the order `build-sequencing.md` question 3 states ("test, lint, build and
+ * run"), and the comment here used to claim it was — while the interview and the detection table
+ * each used a third. Three orders and a false citation is worse than one order stated plainly: what
+ * the document fixes is which answers the question must produce, and it says so itself, so the
+ * sequence is this system's to choose.
+ *
+ * The choice is cheapest-first among the gates CAP-13 names, so a run learns which symbol is wrong
+ * before it spends minutes on a test suite that would have said the same thing less clearly, with
+ * the two non-gate mechanics after them.
  */
 export const MECHANICS_COMMAND_NAMES = ['typecheck', 'lint', 'test', 'build', 'run'] as const;
 
@@ -218,6 +225,45 @@ export const MCP_SERVER_NAME = 'orch';
 export const MCP_TOOL_CLI_NAMES: Readonly<Record<McpGrantableTool, string>> = {
   RunDeclaredCommand: `mcp__${MCP_SERVER_NAME}__run_declared_command`,
 };
+
+/**
+ * The `--mcp-config` entry that launches the command runner for one run and step.
+ *
+ * **Here rather than in `src/runner/`, because two units need it and they may not import each
+ * other.** The engine writes this file before a spawn whose grant names a served tool, and the
+ * runner's entry point is what the file starts; `src/engine/` may not import `src/runner/` — the one
+ * unit allowed to start a container stays one import away from the loop — and a second copy of the
+ * shape in the engine would be two answers to "what does the config say". It sits beside
+ * {@link MCP_SERVER_NAME} and {@link MCP_TOOL_CLI_NAMES} because it is the third half of the same
+ * agreement: what the server is called, what its tool is called, and how it is started.
+ *
+ * The interpreter is the absolute Node AD-28 resolved, never `node` from `PATH`: this server is a
+ * child of `claude -p`, which is a child of the engine, and a stale version manager two levels down
+ * is exactly the opaque failure AD-28 exists to prevent.
+ */
+export const commandRunnerMcpConfig = (server: {
+  readonly nodePath: string;
+  readonly entryPoint: string;
+  readonly run: string;
+  readonly step: string;
+  readonly orchHome: string;
+  readonly attempt?: number;
+}): Readonly<Record<string, unknown>> => ({
+  mcpServers: {
+    [MCP_SERVER_NAME]: {
+      command: server.nodePath,
+      args: [server.entryPoint],
+      env: {
+        ORCH_HOME: server.orchHome,
+        ORCH_RUN: server.run,
+        ORCH_STEP: server.step,
+        // The step attempt, so the container the runner names cannot collide with the one the
+        // previous attempt left behind — AD-20 never removes it while the run is live.
+        ...(server.attempt === undefined ? {} : { ORCH_STEP_ATTEMPT: String(server.attempt) }),
+      },
+    },
+  },
+});
 
 export const GRANTABLE_TOOLS = [...BUILT_IN_GRANTABLE_TOOLS, ...MCP_GRANTABLE_TOOLS] as const;
 

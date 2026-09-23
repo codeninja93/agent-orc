@@ -20,8 +20,12 @@
 import {
   CURRENT_SCHEMA_VERSION,
   FEATURE_STATES,
+  GATE_FAILED_EVENT_TYPE,
+  GATE_PASSED_EVENT_TYPE,
+  GATE_SKIPPED_EVENT_TYPE,
   MODEL_RUNGS,
   OrchErrorSchema,
+  REVIEW_SKIPPED_EVENT_TYPE,
   RUN_MODES,
   STEP_DISPOSITIONS,
   STEP_PHASES,
@@ -96,9 +100,9 @@ export const ENGINE_EVENT_TYPES = {
    * a spawn, and the spawn's own outcome is what the fold already tracks; a gate line that changed
    * step state would be a second authority on a step's disposition (AD-4).
    */
-  GatePassed: 'gate.passed',
-  GateFailed: 'gate.failed',
-  GateSkipped: 'gate.skipped',
+  GatePassed: GATE_PASSED_EVENT_TYPE,
+  GateFailed: GATE_FAILED_EVENT_TYPE,
+  GateSkipped: GATE_SKIPPED_EVENT_TYPE,
   /**
    * The model-based review was not spawned, and why — CAP-13's economics, said out loud.
    *
@@ -106,7 +110,7 @@ export const ENGINE_EVENT_TYPES = {
    * because nothing incremented it), and this is the positive statement beside it: absence alone
    * cannot say whether a review was skipped or the run never got that far.
    */
-  ReviewSkipped: 'verification.review_skipped',
+  ReviewSkipped: REVIEW_SKIPPED_EVENT_TYPE,
 } as const;
 
 export type EngineEventType = (typeof ENGINE_EVENT_TYPES)[keyof typeof ENGINE_EVENT_TYPES];

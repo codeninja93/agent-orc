@@ -45,19 +45,24 @@
  * `events.jsonl`, never assigns `seq` and never writes to stdout.
  */
 import { spawn } from 'node:child_process';
-import { accessSync, constants as fsConstants, statSync } from 'node:fs';
+import { accessSync, existsSync, constants as fsConstants, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { constants as osConstants } from 'node:os';
-import { basename, isAbsolute } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   criteriaNotAccepted,
+  criteriaNotJudged,
   exportContract,
+  gatesDisagreeingWith,
   getContract,
   makeError,
   renderCause,
   StepOutputSchema,
+  commandRunnerMcpConfig,
 } from '../contracts/index.js';
 import type { JsonSchema, ModelRung, OrchError, StepOutput } from '../contracts/index.js';
+import { resolveOrchHome, runPaths } from '../runtime/index.js';
 import type { Recorder } from '../runtime/index.js';
 
 import {
@@ -240,6 +245,34 @@ export class McpToolNotPreApproved extends Error {
   }
 }
 
+/** The per-step MCP config file, beside the step input it is written with. */
+export const MCP_CONFIG_FILE_NAME = 'mcp.json';
+
+/** The directory a step's own files live in, under the run directory (AD-9). */
+const STEPS_DIR_NAME = 'steps';
+
+/**
+ * The compiled command-runner entry point beside this build, or a refusal naming what was missing.
+ *
+ * Resolved relative to this module rather than to the process's working directory, because an
+ * engine is run from wherever a person happens to be standing and the entry point is a fact about
+ * the *installation*. `dist/engine/spawner.js` and `dist/bin/runner.js` are two levels apart, which
+ * is what `package.json`'s `bin` field also names.
+ *
+ * It is checked, not assumed: matrix row 25 is that the config's `entryPoint` names something that
+ * exists, and a config pointing at a missing file is a server that never starts and a step that
+ * waits for a tool nothing serves.
+ */
+const defaultRunnerEntryPoint = (served: readonly string[]): string => {
+  const candidate = fileURLToPath(new URL('../bin/runner.js', import.meta.url));
+  if (existsSync(candidate)) return candidate;
+  throw new McpToolNotPreApproved(
+    served,
+    `the command runner's entry point is not at ${candidate}, so the config would name a file that ` +
+      'does not exist and no server would start. Build the package, or pass `mcpServerFor`',
+  );
+};
+
 export const STREAM_OUTPUT_FORMAT = 'stream-json';
 
 /** How much of the child's stderr is kept, for a refusal message and one bounded event. */
@@ -349,10 +382,40 @@ export interface StepSpawnerOptions {
   readonly cli?: ClaudeCli | (() => ClaudeCli);
   /** The resolved child Node, or a thunk. Defaults to the `node-path.ts` resolution (AD-28). */
   readonly node?: ChildNode | (() => ChildNode);
-  /** AD-20's seam. Story 1-5 supplies the container wrapper here. */
+  /**
+   * A last chance to rewrite the plan before it is executed.
+   *
+   * **It is no longer AD-20's seam, and nothing in this package satisfies it.** Story 1-5's
+   * container wrapper filled this to put `claude -p` inside a container; ADR-004 measured that
+   * impossible — the subscription credential is in the macOS keychain and AD-1 refuses API-key mode
+   * — so the wrapper now takes a plan carrying a *command* and is deliberately not assignable here
+   * (`tests/container.wrapper.test.ts` holds that with a `@ts-expect-error`). What goes inside a
+   * container is reached through `src/runner/` instead.
+   *
+   * It is kept rather than deleted because the *guard* around it is load-bearing and still earns
+   * its keep: whatever rewrites this plan, the executed vector is re-checked for the AD-1 flags,
+   * the grant's value and the served tool's pre-approval. A seam with nothing plugged into it is
+   * cheap; a guard over a vector nobody may rewrite is a guard that cannot fail.
+   */
   readonly wrap?: SpawnWrapper;
-  /** MCP server configs passed with `--mcp-config`. This story passes them; story 2-10 writes them. */
+  /**
+   * MCP server configs passed with `--mcp-config`, on top of the one a served grant needs.
+   *
+   * A caller that already has a config file names it here. A grant that names a served tool gets its
+   * config *written* — see {@link StepSpawnerOptions.mcpServerFor} — because a granted tool with no
+   * server is a spawn this unit refuses, and a story that granted a capability nothing could serve
+   * would have shipped a roster entry that blocks every run it applies to.
+   */
   readonly mcpConfigs?: readonly string[];
+  /**
+   * How the served MCP server is described, for a phase whose grant names one.
+   *
+   * A seam rather than a constant because the entry point is a *deployment* fact — `dist/bin/runner.js`
+   * beside this package in one install, a source path under a test's temp directory in another — and
+   * the one thing this unit must not do is guess at a path and write a config naming a file that does
+   * not exist. The default resolves the compiled entry point beside this module.
+   */
+  readonly mcpServerFor?: (request: StepStartRequest) => Readonly<Record<string, unknown>>;
   /** The environment the child inherits, before the AD-28 Node entries are added. */
   readonly env?: NodeJS.ProcessEnv;
   /** The prompt a step is given. Overridable so a suite can assert argv without asserting prose. */
@@ -452,20 +515,15 @@ export interface StepArgvOptions {
    * The served tools this agent's AD-17 declaration grants, in the CLI's `mcp__<server>__<tool>`
    * spelling (`allowedToolsFor` composes them).
    *
-   * Separate from {@link allowedTools} on purpose, and **not** defaulted from it. These two are the
-   * grant and the pre-approval, and the whole point of the check below is that they can disagree —
-   * deriving one from the other would make the guard unable to fail, which is the defect this
-   * codebase has now found in four consecutive stories.
+   * **One input, not two.** This used to be a pair — the grant and the pre-approval — on the
+   * argument that they must be able to disagree or the guard could not fail. The only production
+   * caller passed the same expression to both, so the pair was independent in the type and derived
+   * in fact, which is a guard that cannot fail wearing the clothes of one that can. The translation
+   * happens here, once, and the check that can genuinely fail is {@link missingPreApprovals} over
+   * the vector that will actually be executed — because what sits between this function and the
+   * spawn is the AD-20 wrapper, which is free to rebuild `args`.
    */
   readonly mcpTools?: readonly string[];
-  /**
-   * What `--allowedTools` will pre-approve.
-   *
-   * Defaults to nothing, never to {@link mcpTools}: a caller that forgets it gets
-   * {@link McpToolNotPreApproved} rather than a silently pre-approved tool, and a caller that
-   * genuinely grants no served tool passes neither and the flag is not emitted at all.
-   */
-  readonly allowedTools?: readonly string[];
   /** Present only for a resume, and only ever the recorded session id (AD-8). */
   readonly resumeSessionId?: string | null;
 }
@@ -476,16 +534,26 @@ export interface StepArgvOptions {
  * Over an argv rather than over the options it was built from, so it can be asked of the vector that
  * will actually be executed — the AD-20 wrapper is free to rebuild `args`, and one that dropped
  * `--allowedTools` would leave a step that hangs rather than one that fails. That is the same reason
- * `missingRequiredFlags` reads the executed vector, and the same failure one flag over.
+ * `missingRequiredFlags` reads the executed vector, and the same failure one flag over. It is also
+ * the *only* place this pairing is checked, now that `buildStepArgv` composes the flag from the
+ * grant rather than being handed both halves.
+ *
+ * **Every occurrence of the flag is read, not the first.** A vector carrying `--allowedTools` twice
+ * is one a later flag wins in, and a check reading the first would report the pairing as holding
+ * while the value the CLI uses pre-approves nothing — the blind spot `firstForbiddenFlag` closes
+ * for the container's flags and `beginExecution` closes for `--network`. A flag at the very end of
+ * the vector has no value at all, and that reads as pre-approving nothing rather than being skipped.
  */
 export const missingPreApprovals = (
   argv: readonly string[],
   granted: readonly string[],
 ): readonly string[] => {
   if (granted.length === 0) return [];
-  const at = argv.indexOf('--allowedTools');
-  const value = at === -1 ? '' : (argv[at + 1] ?? '');
-  const approved = value.split(',').map((name) => name.trim());
+  const approved = argv.flatMap((token, index) =>
+    token === '--allowedTools'
+      ? (argv[index + 1] ?? '').split(',').map((name) => name.trim())
+      : [],
+  );
   return granted.filter((tool) => !approved.includes(tool));
 };
 
@@ -548,23 +616,13 @@ export const buildStepArgv = (options: StepArgvOptions): readonly string[] => {
    * silent half: the step asks, nothing can answer, and it waits.
    */
   const granted = options.mcpTools ?? [];
-  const approved = options.allowedTools ?? [];
-  if (granted.length > 0) {
-    if (configs.length === 0) {
-      throw new McpToolNotPreApproved(
-        granted,
-        'no --mcp-config was supplied, so no server would be started and the tool would not exist',
-      );
-    }
-    const unapproved = granted.filter((tool) => !approved.includes(tool));
-    if (unapproved.length > 0) {
-      throw new McpToolNotPreApproved(
-        unapproved,
-        `--allowedTools would carry ${approved.length === 0 ? 'nothing' : approved.join(', ')}`,
-      );
-    }
+  if (granted.length > 0 && configs.length === 0) {
+    throw new McpToolNotPreApproved(
+      granted,
+      'no --mcp-config was supplied, so no server would be started and the tool would not exist',
+    );
   }
-  if (approved.length > 0) argv.push('--allowedTools', approved.join(','));
+  if (granted.length > 0) argv.push('--allowedTools', granted.join(','));
   const resume = options.resumeSessionId ?? null;
   if (resume !== null) argv.push('--resume', resume);
   return argv;
@@ -788,6 +846,40 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
         ...(options.orchHome === undefined ? {} : { orchHome: options.orchHome }),
       }));
   const promptFor = options.promptFor ?? defaultPromptFor;
+  const orchHome = options.orchHome ?? resolveOrchHome(options.env ?? process.env);
+
+  /**
+   * Write the MCP config a served grant needs, and answer with the path, or with nothing.
+   *
+   * Written under the step's own directory rather than into `runs/<run-id>/config/`: that directory
+   * is AD-9's *snapshot*, taken once at run start, and `tests/engine.config-snapshot.test.ts` holds
+   * it byte-identical for the life of the run. A file this unit adds per attempt belongs beside the
+   * step input it is written with.
+   *
+   * The entry point is checked to exist rather than assumed. A config naming a file that is not
+   * there starts no server, and the step then asks for a tool nothing serves — which under
+   * `--restricted` is the wait nobody can end. Failing here is the visible version of that, and it
+   * is the same refusal the missing pre-approval takes.
+   */
+  const mcpConfigsFor = (request: StepStartRequest, grant: AgentGrant): readonly string[] => {
+    const served = allowedToolsFor(grant);
+    if (served.length === 0) return [];
+    const paths = runPaths(request.run, orchHome);
+    const server =
+      options.mcpServerFor?.(request) ??
+      commandRunnerMcpConfig({
+        nodePath: node().path,
+        entryPoint: defaultRunnerEntryPoint(served),
+        run: request.run,
+        step: request.step,
+        orchHome,
+        attempt: request.attempt,
+      });
+    const path = join(paths.runDir, STEPS_DIR_NAME, request.step, MCP_CONFIG_FILE_NAME);
+    mkdirSync(join(path, '..'), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(server, null, 2)}\n`, 'utf8');
+    return [path];
+  };
 
   /**
    * Emit one event through the recorder. Identifiers go in envelope fields, never in the payload.
@@ -894,6 +986,16 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
      * AD-35 code rather than being relabelled retryable.
      */
     const grant = grantFor(request);
+    /**
+     * A served grant gets its server written, here, before the argv that pre-approves it exists.
+     *
+     * ADR-004 grants the command runner "by being served", and until this call nothing served it:
+     * the roster declared `RunDeclaredCommand` for two agents, `buildStepArgv` refused any argv
+     * granting a tool with no `--mcp-config`, and no caller supplied one — so the shipped behaviour
+     * of a default `testing` or `verification` spawn was a refusal. A capability nothing can serve is
+     * not a capability.
+     */
+    const configs = [...(options.mcpConfigs ?? []), ...mcpConfigsFor(request, grant)];
     const cliArgs = buildStepArgv({
       schema: schemaFor(request.contractId),
       prompt: promptFor(request),
@@ -902,7 +1004,7 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
       // ADR-001: scoped to the run worktree, which is also the cwd — the flag is what keeps that true
       // after a wrapper has had the plan.
       addDir: request.worktree,
-      ...(options.mcpConfigs === undefined ? {} : { mcpConfigs: options.mcpConfigs }),
+      mcpConfigs: configs,
       /**
        * The served half of the AD-17 grant, granted and pre-approved in one breath.
        *
@@ -912,7 +1014,6 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
        * without the other is refused rather than accommodated — see {@link McpToolNotPreApproved}.
        */
       mcpTools: allowedToolsFor(grant),
-      allowedTools: allowedToolsFor(grant),
       resumeSessionId,
     });
 
@@ -1409,6 +1510,44 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
           'the run was not accepted with. A step is judged against criteria fixed before it was ' +
           'written (CAP-13), so a criterion it introduced is one it set for itself — copy the ' +
           'criteria from the step input verbatim, and raise a question rather than re-wording one.',
+      };
+    }
+    /**
+     * And the other direction: every accepted criterion was judged.
+     *
+     * Refusing invented criteria says nothing about coverage — an output judging one of five
+     * completed while four were never looked at, which is a verification that verified a fifth of
+     * the work and reported success.
+     */
+    const unjudged = criteriaNotJudged(request.input.acceptance_criteria, first.data);
+    if (unjudged.length > 0) {
+      return {
+        ok: false,
+        code: 'step.schema_invalid_output',
+        detail:
+          `the output leaves ${unjudged.map((criterion) => `"${criterion}"`).join(', ')} unjudged. ` +
+          'A verification judges every criterion the run was accepted with; report "undetermined" ' +
+          'for one nothing settles rather than leaving it out.',
+      };
+    }
+    /**
+     * A reported gate has to agree with the gate the engine ran.
+     *
+     * The contract checks a report against itself — an outcome against the exit status beside it —
+     * and cannot know whether either is true. The engine ran the gates before deciding to spawn
+     * anything at all and put what it observed in `StepInput.gates`, so this is the comparison that
+     * makes the report a restatement rather than an assertion. It is the one disagreement about this
+     * artifact that would change what a person does next.
+     */
+    const disagreements = gatesDisagreeingWith(request.input.gates, first.data);
+    if (disagreements.length > 0) {
+      return {
+        ok: false,
+        code: 'step.schema_invalid_output',
+        detail:
+          `the gate report disagrees with what the engine recorded: ${disagreements.join('; ')}. ` +
+          'The gates ran before this step was spawned and their outcomes are in the step input; ' +
+          'copy them rather than re-deriving them.',
       };
     }
     /**

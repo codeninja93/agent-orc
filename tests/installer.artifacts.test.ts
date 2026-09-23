@@ -301,6 +301,57 @@ describe('an .orch/ from an unrecognised schema_version is refused, never read a
     expect(readFileSync(profilePath, 'utf8')).toBe(future);
   });
 
+  it('re-runs over a v1 install rather than refusing the one thing it advises (matrix 34)', async () => {
+    /**
+     * The route forward this story would otherwise have closed.
+     *
+     * Story 2-6 advanced the profile past `typecheck`, and the refusal an engine raises for a v1
+     * profile ends "Re-run the installer to migrate" — so an installer that refused the same file
+     * left every existing installation with no way through, and the only advice on offer was the
+     * thing it had just refused to do. The re-run *is* the migration: it reads answers, each through
+     * its own schema, and writes a v2 profile.
+     */
+    const repo = repository();
+    await runInit({ repository: repo, io: scriptedIo() });
+    const profilePath = join(repo, '.orch', 'profile.toml');
+    writeFileSync(
+      profilePath,
+      readFileSync(profilePath, 'utf8').replace(
+        `schema_version = ${String(PROFILE_SCHEMA_VERSION)}`,
+        `schema_version = ${String(CURRENT_SCHEMA_VERSION)}`,
+      ),
+      'utf8',
+    );
+    expect(readFileSync(profilePath, 'utf8')).toContain(
+      `schema_version = ${String(CURRENT_SCHEMA_VERSION)}`,
+    );
+
+    await expect(runInit({ repository: repo, io: scriptedIo() })).resolves.toBeDefined();
+    // And what it wrote is the current shape, not the one it read.
+    const rewritten = parseToml(readFileSync(profilePath, 'utf8'));
+    expect(rewritten['schema_version']).toBe(PROFILE_SCHEMA_VERSION);
+    expect(ProfileSchema.safeParse(rewritten).success).toBe(true);
+  });
+
+  it('still refuses a profile from a version it has never written', async () => {
+    // The gate that must not weaken: a file from a *future* installer is not something to
+    // re-interview from, because the answers it holds are ones this build cannot read.
+    const repo = repository();
+    await runInit({ repository: repo, io: scriptedIo() });
+    const profilePath = join(repo, '.orch', 'profile.toml');
+    writeFileSync(
+      profilePath,
+      readFileSync(profilePath, 'utf8').replace(
+        `schema_version = ${String(PROFILE_SCHEMA_VERSION)}`,
+        `schema_version = ${String(PROFILE_SCHEMA_VERSION + 1)}`,
+      ),
+      'utf8',
+    );
+    await expect(runInit({ repository: repo, io: scriptedIo() })).rejects.toThrow(
+      SchemaVersionRefusal,
+    );
+  });
+
   it('names the artifact and the installer versions involved', async () => {
     const repo = repository();
     await runInit({ repository: repo, io: scriptedIo() });

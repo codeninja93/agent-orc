@@ -71,6 +71,29 @@ export const stepStarted = (step: string, phase = 'implementation'): EventSpec =
   payload: { attempt: 1, phase, contract_id: 'step.output', model_tier: 'claude-haiku-4-5' },
 });
 
+/** One deterministic gate's outcome, as the engine records it (CAP-13's first tier, story 2-6). */
+export const gateRecorded = (
+  gate: string,
+  outcome: 'passed' | 'failed' | 'skipped',
+  overrides: { readonly exit_status?: number | null; readonly evidence?: string } = {},
+): EventSpec => ({
+  type: `gate.${outcome}`,
+  step: 'verify',
+  payload: {
+    gate,
+    exit_status: overrides.exit_status ?? (outcome === 'skipped' ? null : outcome === 'passed' ? 0 : 1),
+    evidence: overrides.evidence ?? (outcome === 'skipped' ? '' : `evidence/${gate}-1-1.log`),
+    reason: `the ${gate} gate ${outcome}`,
+  },
+});
+
+/** No model-based review was spawned, and why (CAP-13's economics). */
+export const reviewSkipped = (reason: string): EventSpec => ({
+  type: 'verification.review_skipped',
+  step: 'verify',
+  payload: { reason, failed_gates: ['test'] },
+});
+
 export const stepTerminated = (step: string, disposition = 'completed'): EventSpec => ({
   type: 'step.terminated',
   step,

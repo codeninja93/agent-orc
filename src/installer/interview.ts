@@ -390,7 +390,8 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
       if (!(PACKAGE_MANAGERS as readonly string[]).includes(manager)) {
         return refuse(
           `"${manager}" is not one of ${PACKAGE_MANAGERS.join(', ')}. Pick "other" for a repository ` +
-            'built by something else; the four commands beside it are free text.',
+            `built by something else; the ${String(MECHANICS_COMMAND_NAMES.length)} commands beside ` +
+            'it are free text.',
         );
       }
       /**
@@ -400,9 +401,9 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
        * whose gate turns out to have nothing declared for it.
        */
       const commands: MechanicsCommands = {
-        test: field(raw, 'test'),
         typecheck: field(raw, 'typecheck'),
         lint: field(raw, 'lint'),
+        test: field(raw, 'test'),
         build: field(raw, 'build'),
         run: field(raw, 'run'),
       };

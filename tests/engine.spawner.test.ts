@@ -15,14 +15,21 @@
  * a test could notice, so the argv is compared against the declared constant and the child is asked
  * what it actually received.
  */
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { dispositionFor, exportContract, StepInputSchema } from '../src/contracts/index.js';
+import {
+  MCP_SERVER_NAME,
+  VERIFICATION_CONTRACT_ID,
+  commandRunnerMcpConfig,
+  dispositionFor,
+  exportContract,
+  StepInputSchema,
+} from '../src/contracts/index.js';
 import type { StepInput } from '../src/contracts/index.js';
 import {
   REDACTION_MARKER,
@@ -45,6 +52,7 @@ import {
   signalFromExitCode,
   resolveClaudeCli,
   ResumeRefused,
+  MCP_CONFIG_FILE_NAME,
   SPAWN_GRANT_PAYLOAD_KEYS,
   SPAWNER_EMITTER,
   SPAWNER_EVENT_TYPES,
@@ -127,6 +135,7 @@ const open = (
     readonly fakeEnv?: NodeJS.ProcessEnv;
     readonly cli?: ClaudeCli | (() => ClaudeCli);
     readonly mcpConfigs?: readonly string[];
+    readonly mcpServerFor?: () => Readonly<Record<string, unknown>>;
     readonly wrap?: (plan: SpawnPlan) => SpawnPlan;
     /** Run the fake through a `#!/bin/sh` shim, so the `direct` interpreter branch really executes. */
     readonly direct?: boolean;
@@ -190,6 +199,8 @@ const open = (
     env,
     grantFor: () => grant,
     ...(options.mcpConfigs === undefined ? {} : { mcpConfigs: options.mcpConfigs }),
+    ...(options.mcpServerFor === undefined ? {} : { mcpServerFor: options.mcpServerFor }),
+    orchHome: home,
     ...(options.wrap === undefined ? {} : { wrap: options.wrap }),
     ...(options.attemptTimeoutMs === undefined ? {} : { attemptTimeoutMs: options.attemptTimeoutMs }),
     ...(options.killGraceMs === undefined ? {} : { killGraceMs: options.killGraceMs }),
@@ -1385,11 +1396,21 @@ describe('a spawn for a phase granted the runner carries it (ADR-004, matrix 8)'
     elevated: ['RunDeclaredCommand'],
   });
 
+  /** The server description a deployment supplies; the default resolves the compiled entry point. */
+  const servedBy = (): Readonly<Record<string, unknown>> =>
+    commandRunnerMcpConfig({
+      nodePath: process.execPath,
+      entryPoint: FAKE_CLI_PATH,
+      run: '01JSPAWNER000000000000000A',
+      step: 'implement',
+      orchHome: '/tmp/orch',
+    });
+
   it('names the served tool in --allowedTools on the vector the child received', async () => {
     const harness = openTracked({
       fixture: 'completed.jsonl',
       grant: grantWithRunner(),
-      mcpConfigs: ['/tmp/run/mcp.json'],
+      mcpServerFor: servedBy,
     });
     await harness.spawner.start(harness.request());
 
@@ -1410,13 +1431,158 @@ describe('a spawn for a phase granted the runner carries it (ADR-004, matrix 8)'
     expect(spawnedEvent?.payload?.['pre_approved_tools']).toStrictEqual([RUNNER_ALLOWED_TOOL]);
   });
 
-  it('refuses the spawn when no server would be started, rather than granting a tool that cannot exist', async () => {
-    // No `--mcp-config`, so nothing serves the tool the roster granted. The refusal is loud and
-    // keeps `config.invalid`; a spawn that went ahead would leave the step asking for a tool that
-    // does not exist, which under `--restricted` is a wait nobody can end.
+  it('writes the config under the step\u2019s own directory and passes that path (matrix 26)', async () => {
+    /**
+     * The grant is served rather than inert.
+     *
+     * Before this, `mcpConfigs` was supplied nowhere in `src/`, so a default `testing` or
+     * `verification` spawn refused on every run: the roster granted a tool and nothing started a
+     * server for it. The file goes beside the step input rather than into `runs/<run-id>/config/`,
+     * which is AD-9's snapshot and is held byte-identical for the life of the run.
+     */
+    const harness = openTracked({
+      fixture: 'completed.jsonl',
+      grant: grantWithRunner(),
+      mcpServerFor: servedBy,
+    });
+    await harness.spawner.start(harness.request());
+
+    const argv = harness.argvSeenByChild();
+    const written = argv[argv.indexOf('--mcp-config') + 1] ?? '';
+    expect(written).toBe(
+      join(runPaths(harness.run, harness.home).runDir, 'steps', 'implement', MCP_CONFIG_FILE_NAME),
+    );
+    expect(existsSync(written)).toBe(true);
+    const config = JSON.parse(readFileSync(written, 'utf8')) as Record<string, Record<string, unknown>>;
+    expect(Object.keys(config['mcpServers'] ?? {})).toStrictEqual([MCP_SERVER_NAME]);
+  });
+
+  it('refuses when the entry point does not exist, rather than naming a file nothing starts (matrix 25)', async () => {
+    // A config pointing at a missing file starts no server, and the step then asks for a tool
+    // nothing serves — which under `--restricted` is the wait nobody can end. The default resolves
+    // the *compiled* entry point beside this module, which a source-tree run does not have.
     const harness = openTracked({ fixture: 'completed.jsonl', grant: grantWithRunner() });
     await expect(harness.spawner.start(harness.request())).rejects.toThrowError(
       McpToolNotPreApproved,
     );
+    await expect(harness.spawner.start(harness.request())).rejects.toThrowError(/entry point/);
+  });
+});
+
+/**
+ * CAP-13, matrix 19 — a step cannot invent what it is judged against, asserted through a real spawn.
+ *
+ * The refusal lives in the spawner's re-parse, because that is the one place holding both halves:
+ * the criteria the run was accepted with, on the step input, and the output the child produced. Only
+ * the pure helper was covered before, and no recorded transcript carried `judgements` at all — so
+ * the non-empty branch of the check was unreachable in every suite, and deleting it would have left
+ * the whole repository green while a step could pass against a standard it wrote for itself.
+ */
+describe('a verification output that invents a criterion is refused (matrix 19)', () => {
+  const verificationRequest = (harness: Harness): StepStartRequest => {
+    const input = stepInputFixture();
+    return harness.request({
+      step: 'verify',
+      phase: 'verification',
+      contractId: VERIFICATION_CONTRACT_ID,
+      input: {
+        ...input,
+        contract_id: VERIFICATION_CONTRACT_ID,
+        step: 'verify',
+        acceptance_criteria: ['the loop takes at most one action per pass'],
+        gates: [],
+      },
+    });
+  };
+
+  it('fails the step naming the criterion the run was not accepted with', async () => {
+    const harness = openTracked({ fixture: 'verification-invented-criterion.jsonl' });
+    const termination = await harness.spawner.start(verificationRequest(harness));
+
+    expect(termination.disposition).toBe('failed');
+    expect(termination.error?.code).toBe('step.schema_invalid_output');
+    // The reason travels as the error's `cause` and on `agent.output_rejected`, which is where
+    // every other re-parse refusal puts it: the message names the contract, the cause names the
+    // fault.
+    expect(termination.error?.cause).toContain('the code reads well');
+    // The criterion it *was* accepted with is not named: the refusal is about the one it added.
+    expect(termination.error?.cause).not.toContain('at most one action per pass\", ');
+    expect(
+      harness.eventsOfType(SPAWNER_EVENT_TYPES.AgentOutputRejected)[0]?.payload?.['detail'],
+    ).toContain('the code reads well');
+    // And the output never reaches the loop, which is what "refused" has to mean here.
+    expect(termination.output).toBeNull();
+  });
+
+  it('accepts the same output once the run is accepted with both criteria', async () => {
+    /**
+     * The positive control. Without it this suite would pass just as happily against a re-parse
+     * that refused every verification output, or one that refused for the gate report instead —
+     * and the assertion above would be about nothing in particular.
+     */
+    const harness = openTracked({ fixture: 'verification-invented-criterion.jsonl' });
+    const request = verificationRequest(harness);
+    const termination = await harness.spawner.start({
+      ...request,
+      input: {
+        ...request.input,
+        acceptance_criteria: ['the loop takes at most one action per pass', 'the code reads well'],
+      },
+    });
+
+    expect(termination.error).toBeNull();
+    expect(termination.disposition).toBe('completed');
+  });
+
+  it('refuses an output that leaves an accepted criterion unjudged', async () => {
+    // The other direction of the same rule: judging one of two completes a verification that looked
+    // at half the work and reported success.
+    const harness = openTracked({ fixture: 'verification-invented-criterion.jsonl' });
+    const request = verificationRequest(harness);
+    const termination = await harness.spawner.start({
+      ...request,
+      input: {
+        ...request.input,
+        acceptance_criteria: [
+          'the loop takes at most one action per pass',
+          'the code reads well',
+          'a restart converges on the same state',
+        ],
+      },
+    });
+
+    expect(termination.error?.cause).toContain('unjudged');
+    expect(termination.error?.cause).toContain('a restart converges on the same state');
+  });
+
+  it('refuses a gate report that disagrees with what the engine recorded (matrix 30)', async () => {
+    /**
+     * The fixture reports all three gates skipped. A step input saying the engine *ran* the test
+     * gate and watched it fail makes the report a claim about a run that did not happen — and it is
+     * the one disagreement that would change what a person does next, because the gates are what
+     * decided the step was spawned at all.
+     */
+    const harness = openTracked({ fixture: 'verification-invented-criterion.jsonl' });
+    const request = verificationRequest(harness);
+    const termination = await harness.spawner.start({
+      ...request,
+      input: {
+        ...request.input,
+        acceptance_criteria: ['the loop takes at most one action per pass', 'the code reads well'],
+        gates: [
+          {
+            command: 'test',
+            declared: 'npm test',
+            outcome: 'failed',
+            exit_status: 1,
+            evidence: 'evidence/test-1.log',
+          },
+        ],
+      },
+    });
+
+    expect(termination.error?.code).toBe('step.schema_invalid_output');
+    expect(termination.error?.cause).toContain('disagrees with what the engine recorded');
+    expect(termination.error?.cause).toContain('test');
   });
 });

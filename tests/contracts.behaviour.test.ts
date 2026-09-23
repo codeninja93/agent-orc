@@ -26,6 +26,7 @@ import {
   SCHEMA_VERSION_UNRECOGNISED_CODE,
   PROFILE_SCHEMA_VERSION,
   ProfileSchema,
+  installerVersionFor,
   RunStateSchema,
   SchemaVersionRefusal,
   TimestampSchema,
@@ -439,6 +440,39 @@ describe('AD-28 — schema_version', () => {
           (issue) => issue.path.join('.') === 'schema_version',
         ),
       ).toBe(false);
+    });
+
+    it('names the installer that wrote the profile\u2019s own version (ADR-005)', () => {
+      /**
+       * A refusal has to be able to say who wrote what it is refusing (AD-28), and once versions
+       * advance per artifact a *number* no longer identifies one. Both halves are asserted: the
+       * profile's version has a known writer, and the same number carried by an artifact that has
+       * never reached it has none — because telling a person their command intent "was written by
+       * installer 0.1.0" is a confident false statement about a build that does not exist.
+       */
+      expect(installerVersionFor(PROFILE_SCHEMA_VERSION)).toBe(PACKAGE_VERSION);
+      expect(installerVersionFor(CURRENT_SCHEMA_VERSION)).toBe(PACKAGE_VERSION);
+
+      let fromProfile: SchemaVersionRefusal | null = null;
+      try {
+        parseVersionedArtifact(ProfileSchema, { schema_version: 99 }, '.orch/profile.toml');
+      } catch (error: unknown) {
+        fromProfile = error instanceof SchemaVersionRefusal ? error : null;
+      }
+      expect(fromProfile?.writtenBy).toBeNull();
+
+      let fromIntent: SchemaVersionRefusal | null = null;
+      try {
+        parseVersionedArtifact(
+          CommandIntentSchema,
+          { ...artifact, schema_version: PROFILE_SCHEMA_VERSION },
+          'a command intent',
+        );
+      } catch (error: unknown) {
+        fromIntent = error instanceof SchemaVersionRefusal ? error : null;
+      }
+      expect(fromIntent).not.toBeNull();
+      expect(fromIntent?.writtenBy).toBeNull();
     });
 
     it('names the artifact in the refusal a per-artifact policy raises', () => {

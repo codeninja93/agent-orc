@@ -178,6 +178,9 @@ describe('planning re-grounds on the request, because there is nothing else to r
       acceptance_criteria: ['--tools carries the roster grant'],
       decisions: [],
       evidence: [],
+      // Empty for every phase but `verification`: the gates the engine ran before it spawned a
+      // review (story 2-6), and a planning step is spawned before any of them exist.
+      gates: [],
       budget: { steps_remaining: 3, wall_clock_ms_remaining: 1000, rate_limit_budget_consumed: 0.1 },
       created_at: '2026-09-22T09:00:00.000Z',
     });

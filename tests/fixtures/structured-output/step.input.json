@@ -31,6 +31,7 @@
       "description": "Stream-json transcript from the planning step that produced story 1-1 and passed the Ready-for-Development gate, including the decision on the fixture leg."
     }
   ],
+  "gates": [],
   "budget": {
     "steps_remaining": 9,
     "wall_clock_ms_remaining": 5400000,

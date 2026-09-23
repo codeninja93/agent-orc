@@ -57,7 +57,9 @@ import {
   questionAsked,
   questionDeflected,
   questionResolved,
+  gateRecorded,
   redactionFailed,
+  reviewSkipped,
   runCreated,
   stepStarted,
   stepTerminated,
@@ -106,6 +108,65 @@ describe('an empty log folds to a coherent idle view', () => {
   });
 });
 
+describe('what the deterministic gates did is on the screen (CAP-13, story 2-6)', () => {
+  /**
+   * The skip is the line a person most needs, and it was the one nothing rendered.
+   *
+   * A repository that declares no test command has its test gate recorded as *skipped*, and on
+   * every surface but this one that looked exactly like a gate that passed — so a run over a
+   * repository with no tests read as fully verified. The engine has recorded these since story 2-6
+   * and no renderer folded them.
+   */
+  const gatedLog = (): ReturnType<typeof buildLog> =>
+    buildLog([
+      runCreated(),
+      featureStateChanged('confirmed'),
+      featureStateChanged('running', 'confirmed'),
+      stepStarted('verify', 'verification'),
+      gateRecorded('typecheck', 'passed'),
+      gateRecorded('lint', 'skipped'),
+      gateRecorded('test', 'failed', { exit_status: 2 }),
+      reviewSkipped('the deterministic gates failed, so no model-based review was spawned'),
+    ]);
+
+  it('names each gate, what it did, and where its output went', () => {
+    const view = foldEvents(gatedLog());
+    expect(view.progress.gates).toStrictEqual([
+      { gate: 'typecheck', outcome: 'passed', exitStatus: 0, evidence: 'evidence/typecheck-1-1.log' },
+      { gate: 'lint', outcome: 'skipped', exitStatus: null, evidence: '' },
+      { gate: 'test', outcome: 'failed', exitStatus: 2, evidence: 'evidence/test-1-1.log' },
+    ]);
+    // A skip is not a pass on the screen either: the two carry different words and the skipped one
+    // has no exit status to show.
+    const skipped = view.progress.gates.find((gate) => gate.gate === 'lint');
+    expect(skipped?.outcome).not.toBe('passed');
+  });
+
+  it('says out loud that no review was spawned, because an absence cannot be seen', () => {
+    expect(foldEvents(gatedLog()).progress.reviewSkipped).toContain('no model-based review');
+    // And says nothing when a review was not skipped, so the line means something when it appears.
+    expect(foldEvents(midStepLog()).progress.reviewSkipped).toBeNull();
+    expect(foldEvents(midStepLog()).progress.gates).toStrictEqual([]);
+  });
+
+  it('replaces a gate\u2019s outcome on a re-run rather than appending to it', () => {
+    // A person reads the card for what the gates did *this* attempt; a list growing by three per
+    // re-run is a list nobody can read the current state out of.
+    const rerun = foldEvents(
+      buildLog([
+        runCreated(),
+        featureStateChanged('confirmed'),
+        featureStateChanged('running', 'confirmed'),
+        stepStarted('verify', 'verification'),
+        gateRecorded('test', 'failed', { exit_status: 2 }),
+        gateRecorded('test', 'passed'),
+      ]),
+    );
+    expect(rerun.progress.gates).toHaveLength(1);
+    expect(rerun.progress.gates[0]?.outcome).toBe('passed');
+  });
+});
+
 describe('a run in progress shows the step name and the next gate, never a share of a whole', () => {
   const view = foldEvents(midStepLog());
 
@@ -146,6 +207,20 @@ describe('a run in progress shows the step name and the next gate, never a share
       );
       expect(folded.progress.currentStepPhase).toBe(phase);
       expect(folded.progress.currentStep).toBe(`step-${phase}`);
+    });
+
+    it('says a run in the testing phase is waiting for verification, not for the tests', () => {
+      // Pinned because the sentence for each phase is the one thing a person reads about where the
+      // run is, and `testing` arrived with story 2-6 into a map nothing asserted entry-by-entry.
+      const folded = foldEvents(
+        buildLog([
+          runCreated(),
+          featureStateChanged('confirmed'),
+          featureStateChanged('running', 'confirmed'),
+          stepStarted('test', 'testing'),
+        ]),
+      );
+      expect(folded.progress.nextGate).toBe('verification, once the tests are written');
     });
 
     it.each(STEP_PHASES)('says what a run in %s is waiting for, without claiming a later phase', (phase) => {

@@ -1,7 +1,7 @@
 ---
 name: 'Schema versions advance per artifact, not all at once'
 type: architecture-decision-record
-status: proposed
+status: accepted
 created: '2026-09-22'
 decides:
   - 'AD-28 (the shape of the version, not its intent)'
@@ -11,7 +11,7 @@ raised-by:
 
 # ADR-005 — Schema versions advance per artifact, not all at once
 
-**Status: proposed.** Implemented and verified in story 2-6; awaiting acceptance.
+**Status: accepted 2026-09-22 by Deep.** Implemented and verified in story 2-6.
 
 ## The problem, measured
 
@@ -61,9 +61,15 @@ honestly.
   artifact's name, rather than re-deciding the version against a policy it was handed — which had become a
   second authority the moment one artifact moved, and returned a v1 profile as a Zod shape error instead of
   `config.schema_version_unrecognised`.
-- **`INSTALLER_VERSION_BY_SCHEMA_VERSION` now maps two profile versions to one installer version** (`0.1.0`),
-  so a v1 profile's refusal reads "written by installer version 0.1.0; installer version 0.1.0 is reading
-  it". Accurate and odd. The package version should be bumped before release; that is a release decision.
+- **`INSTALLER_VERSION_BY_SCHEMA_VERSION` must gain the profile's new version**, and as first written did
+  not: the map held only `{1: '0.1.0'}`, so `installerVersionFor(2)` answered `null` and a build refusing a
+  v2 profile would say "written by an installer older than X" instead of naming the version that wrote it —
+  losing the provenance the map exists for. Story 2-6's review caught it.
+
+  Worth recording as a failure of this document rather than of the code: the paragraph above originally
+  stated that consequence as already handled. It was the second architecture record in two stories to assert
+  an intended consequence as an accomplished fact — ADR-004 did the same about an amendment to ADR-003. A
+  consequence written in the past tense reads as verified, and neither was.
 
 ## Open question this ADR does NOT decide
 

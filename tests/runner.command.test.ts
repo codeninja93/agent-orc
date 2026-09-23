@@ -29,7 +29,14 @@ import { fileURLToPath } from 'node:url';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { MCP_SERVER_NAME, dispositionFor, toJsonSchema } from '../src/contracts/index.js';
+import {
+  MCP_SERVER_NAME,
+  VerificationOutputSchema,
+  commandRunnerMcpConfig,
+  dispositionFor,
+  serialiseToml,
+  toJsonSchema,
+} from '../src/contracts/index.js';
 import type { MechanicsCommands } from '../src/contracts/index.js';
 import { AD20_REQUIRED_FLAGS, missingAd20Flags, mountsOf } from '../src/container/index.js';
 import type { ContainerInvocation, ContainerResult } from '../src/container/index.js';
@@ -42,11 +49,14 @@ import {
   CommandRunFailed,
   UndeclaredCommandError,
   createCommandRunner,
+  createCommandRunnerFromEnvironment,
   declaredCommandFor,
   handleMcpRequest,
   runnerToolDescriptor,
   serveCommandRunnerOverStdio,
 } from '../src/runner/index.js';
+
+import { fixtureProfile } from './helpers/config-fixture.js';
 
 const RUN = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 const IMAGE = 'orch-executor:0123456789abcdef';
@@ -380,7 +390,9 @@ describe('the output is an evidence pointer, never the control plane (matrix 4)'
     });
 
     const result = runner.run('test');
-    expect(result.evidence).toBe('evidence/test-1.log');
+    // The pointer carries the step attempt as well as the repeat, so a re-run cannot overwrite the
+    // log the first attempt's termination already points at.
+    expect(result.evidence).toBe('evidence/test-1-1.log');
     const written = readFileSync(join(orchHome, 'runs', RUN, result.evidence), 'utf8');
     expect(written).toContain('ran 214 tests');
     // The pointer is relative to the run directory and resolves inside it: an absolute path in the
@@ -557,6 +569,86 @@ describe('the MCP surface ADR-004 describes', () => {
   });
 });
 
+describe('the server the config starts is one that exists (matrix 25, 27)', () => {
+  it('describes a server the CLI can start: an absolute interpreter, one argument, the run in env', () => {
+    /**
+     * The shape nothing asserted, on the artifact that decides whether the granted tool exists.
+     *
+     * A config is a promise about a process: this interpreter, that file, this environment. Every
+     * part of it can be wrong in a way that shows up only as a step waiting for a tool nothing
+     * serves — so the parts are checked here rather than being read back from the same builder.
+     */
+    const config = commandRunnerMcpConfig({
+      nodePath: '/usr/local/bin/node',
+      entryPoint: '/opt/orch/dist/bin/runner.js',
+      run: RUN,
+      step: 'verify',
+      orchHome: '/tmp/orch-home',
+      attempt: 3,
+    });
+    const servers = config['mcpServers'] as Record<string, Record<string, unknown>>;
+    // One server, under the name `--allowedTools` spells the tool with. A second would be a server
+    // `--strict-mcp-config` admits and nobody declared.
+    expect(Object.keys(servers)).toStrictEqual([MCP_SERVER_NAME]);
+    const server = servers[MCP_SERVER_NAME] ?? {};
+    // AD-28: the absolute Node, never `node` from a PATH two processes deep.
+    expect(server['command']).toBe('/usr/local/bin/node');
+    expect(server['args']).toStrictEqual(['/opt/orch/dist/bin/runner.js']);
+    // The environment is what tells the server which run and step it may run commands for — a
+    // server without them would have to guess, and a guess is one step's gates against another's
+    // worktree.
+    expect(server['env']).toStrictEqual({
+      ORCH_HOME: '/tmp/orch-home',
+      ORCH_RUN: RUN,
+      ORCH_STEP: 'verify',
+      ORCH_STEP_ATTEMPT: '3',
+    });
+    // And the tool the argv pre-approves is this server's, by construction rather than by spelling.
+    expect(RUNNER_ALLOWED_TOOL.startsWith(`mcp__${MCP_SERVER_NAME}__`)).toBe(true);
+  });
+
+  it('leaves the attempt out when there is none, rather than writing a placeholder', () => {
+    const servers = commandRunnerMcpConfig({
+      nodePath: '/usr/local/bin/node',
+      entryPoint: '/opt/orch/dist/bin/runner.js',
+      run: RUN,
+      step: 'verify',
+      orchHome: '/tmp/orch-home',
+    })['mcpServers'] as Record<string, Record<string, unknown>>;
+    expect(Object.keys(servers[MCP_SERVER_NAME]?.['env'] ?? {})).not.toContain('ORCH_STEP_ATTEMPT');
+  });
+
+  it('assembles itself from the environment the config sets, reading the run\u2019s own snapshot', () => {
+    /**
+     * Matrix 27 from the server's side: the entry point has to be able to build a runner from
+     * nothing but what the config hands it, or the tool is inert however well the argv is composed.
+     */
+    const { orchHome, worktree } = world('from-env');
+    const configDir = join(orchHome, 'runs', RUN, 'config');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, 'profile.toml'), serialiseToml(fixtureProfile()), 'utf8');
+
+    const assembled = createCommandRunnerFromEnvironment({
+      ORCH_HOME: orchHome,
+      ORCH_RUN: RUN,
+      ORCH_STEP: 'verify',
+      ORCH_STEP_ATTEMPT: '2',
+    });
+    expect(assembled.commands.typecheck).toBe('npm run typecheck');
+    // It read the *snapshot*, which is the only configuration a step reads (AD-34).
+    expect(assembled.runner.planFor('typecheck')?.args.some((argument) => argument.includes(worktree))).toBe(
+      true,
+    );
+  });
+
+  it('refuses to start when the environment names no run or no step', () => {
+    // A server that guessed would run one step's gates against another's worktree.
+    for (const env of [{ ORCH_STEP: 'verify' }, { ORCH_RUN: RUN }, {}]) {
+      expect(() => createCommandRunnerFromEnvironment(env)).toThrow(CommandRunFailed);
+    }
+  });
+});
+
 /**
  * Matrix 6 — nothing but the runner starts a container.
  *
@@ -729,5 +821,202 @@ describe('the guard fixture leaves the repository alone', () => {
   it('writes only under the temp directory', () => {
     const repoRoot = fileURLToPath(new URL('../', import.meta.url));
     for (const home of homes) expect(home.startsWith(repoRoot)).toBe(false);
+  });
+});
+
+describe('what the AD-21 pass could not sweep is reported, not silently dropped (matrix 37)', () => {
+  /**
+   * A pass that refuses, driven through the port rather than through a sixteen-megabyte fixture.
+   *
+   * AD-21 requires a failure to be acted on — "dropping the artifact and recording a
+   * `redaction.failed` event rather than writing unredacted content" — and the real pass refuses a
+   * *string* only by exceeding its serialisation limit. A guard whose failing arm needs a fixture
+   * that large is a guard nobody exercises, which is why the pass is a port here.
+   */
+  const refusingSweep = (): { readonly ok: boolean; readonly reason: string } => ({
+    ok: false,
+    reason: 'size-exceeded',
+  });
+
+  it('writes a placeholder and says on the result that the output was dropped', () => {
+    const { orchHome, worktree } = world('dropped');
+    const secretish = 'ghp_0123456789abcdefghijABCDEFGHIJ01';
+    const runner = createCommandRunner({
+      run: RUN,
+      step: 'verify',
+      commands: commands(),
+      worktree,
+      orchHome,
+      image: IMAGE,
+      invoke: scriptedInvoker([], 1, `built with ${secretish}\n`),
+      sweep: refusingSweep,
+    });
+
+    const result = runner.run('test');
+    expect(result.evidenceDropped).toBe('size-exceeded');
+    // The gate's own outcome is unaffected: the command ran and failed, and that is still reported.
+    expect(result.outcome).toBe('failed');
+    expect(result.summary).toContain('dropped');
+    // The pointer still resolves, to a file that says why it holds nothing — and holds none of the
+    // text the pass could not prove clean, which is the whole of failing closed.
+    const written = readFileSync(join(orchHome, 'runs', RUN, result.evidence), 'utf8');
+    expect(written).toContain('the output was dropped');
+    expect(written).toContain('size-exceeded');
+    expect(written).not.toContain(secretish);
+  });
+
+  it('says nothing about a drop when the output was written', () => {
+    // The control: without it, a field that was always set would satisfy the assertion above.
+    const { orchHome, worktree } = world('kept');
+    const result = createCommandRunner({
+      run: RUN,
+      step: 'verify',
+      commands: commands(),
+      worktree,
+      orchHome,
+      image: IMAGE,
+      invoke: scriptedInvoker([], 0, 'ran 214 tests\n'),
+    }).run('test');
+    expect(result.evidenceDropped).toBeUndefined();
+    expect(readFileSync(join(orchHome, 'runs', RUN, result.evidence), 'utf8')).toContain('214');
+  });
+});
+
+describe('a gate the runtime could not get a status from is reportable (matrix 36)', () => {
+  it('reports failed with a null status, which the contract accepts', () => {
+    // A command killed at the timeout or on a signal returns no exit code. It ran, so it is a
+    // failure; it has no number, so the step must be able to say that rather than being refused for
+    // reporting what happened.
+    const { orchHome, worktree } = world('signalled');
+    const result = createCommandRunner({
+      run: RUN,
+      step: 'verify',
+      commands: commands(),
+      worktree,
+      orchHome,
+      image: IMAGE,
+      invoke: (invocation: ContainerInvocation): ContainerResult => ({
+        status: null,
+        stdout: '',
+        stderr: 'killed',
+        argv: [...invocation.subcommand],
+      }),
+    }).run('test');
+
+    expect(result.outcome).toBe('failed');
+    expect(result.exitStatus).toBeNull();
+    expect(result.summary).toContain('timed out or was signalled');
+
+    // And `step.verification` takes that report rather than refusing it, which is the half that
+    // makes the step able to state what happened.
+    const reported = VerificationOutputSchema.safeParse({
+      contract_id: 'step.verification',
+      step: 'verify',
+      status: 'failed',
+      summary: 'the test gate was signalled',
+      provenance: ['verify: evidence/test-1-1.log'],
+      decisions: [],
+      artifacts: [],
+      questions: [],
+      write_intents: [],
+      error: null,
+      gates: [
+        { command: 'typecheck', declared: '', outcome: 'skipped', exit_status: null, evidence: '' },
+        { command: 'lint', declared: '', outcome: 'skipped', exit_status: null, evidence: '' },
+        {
+          command: 'test',
+          declared: 'npm test',
+          outcome: 'failed',
+          exit_status: null,
+          evidence: result.evidence,
+        },
+      ],
+      judgements: [],
+    });
+    expect(reported.success, JSON.stringify(reported.error?.issues ?? [])).toBe(true);
+  });
+
+  it('refuses the same gate reported as passed, because a signal is never a pass', () => {
+    const passed = VerificationOutputSchema.safeParse({
+      contract_id: 'step.verification',
+      step: 'verify',
+      status: 'failed',
+      summary: 's',
+      provenance: [],
+      decisions: [],
+      artifacts: [],
+      questions: [],
+      write_intents: [],
+      error: null,
+      gates: [
+        { command: 'typecheck', declared: '', outcome: 'skipped', exit_status: null, evidence: '' },
+        { command: 'lint', declared: '', outcome: 'skipped', exit_status: null, evidence: '' },
+        {
+          command: 'test',
+          declared: 'npm test',
+          outcome: 'passed',
+          exit_status: null,
+          evidence: 'evidence/test-1-1.log',
+        },
+      ],
+      judgements: [],
+    });
+    expect(passed.success).toBe(false);
+  });
+});
+
+describe('the runner offers no command that cannot finish', () => {
+  it('does not let a step ask for the application to be started', () => {
+    /**
+     * `run` is a mechanic AD-16 records — it is how a person starts the application — and a step
+     * asking for it gets a process that serves until something kills it: fifteen minutes at the
+     * timeout, recorded as a gate that failed. A vocabulary containing a command that cannot
+     * succeed is a trap, so it is removed from the vocabulary rather than documented.
+     */
+    expect([...DECLARED_COMMAND_NAMES]).toStrictEqual(['typecheck', 'lint', 'test', 'build']);
+    expect(DeclaredCommandRequestSchema.safeParse({ command: 'run' }).success).toBe(false);
+    const { orchHome, worktree } = world('no-run');
+    const seen: ContainerInvocation[] = [];
+    expect(() =>
+      createCommandRunner({
+        run: RUN,
+        step: 'verify',
+        commands: commands(),
+        worktree,
+        orchHome,
+        image: IMAGE,
+        invoke: scriptedInvoker(seen),
+      }).run('run'),
+    ).toThrow(UndeclaredCommandError);
+    expect(seen).toStrictEqual([]);
+    // And the profile still declares it, because the profile is about the repository and not about
+    // what a step may ask for (AD-16).
+    expect(commands().run).toBe('npm start');
+  });
+});
+
+describe('planFor answers without changing what the next run does', () => {
+  it('leaves the attempt counter where it found it', () => {
+    // It answers "what would this run". A caller asking — a suite asserting the argv, a person
+    // inspecting a plan — must not thereby make the argv it examined the argv of an attempt that
+    // never happened, leaving the real one to name a different container.
+    const { orchHome, worktree } = world('peek');
+    const seen: ContainerInvocation[] = [];
+    const runner = createCommandRunner({
+      run: RUN,
+      step: 'verify',
+      commands: commands(),
+      worktree,
+      orchHome,
+      image: IMAGE,
+      invoke: scriptedInvoker(seen),
+    });
+    const planned = runner.planFor('test');
+    const planned2 = runner.planFor('test');
+    const executed = runner.run('test');
+
+    expect(planned?.args).toStrictEqual(planned2?.args);
+    expect(seen[0]?.args).toStrictEqual([...(planned?.args ?? [])]);
+    expect(executed.evidence).toBe('evidence/test-1-1.log');
   });
 });

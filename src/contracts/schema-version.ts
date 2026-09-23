@@ -59,6 +59,17 @@ export const INSTALLER_VERSION: string = PACKAGE_VERSION;
  */
 export const INSTALLER_VERSION_BY_SCHEMA_VERSION: Readonly<Record<number, string>> = {
   [CURRENT_SCHEMA_VERSION]: INSTALLER_VERSION,
+  /**
+   * The profile's own version (ADR-005), which advanced ahead of the rest when `mechanics.commands`
+   * gained `typecheck`.
+   *
+   * Listed here so `installerVersionFor` can name a writer for it: a refusal that says "written by
+   * an installer newer than 0.1.0" about a version *this* installer writes is telling a person to
+   * upgrade to the build they are already running. The number is spelled rather than imported,
+   * because `installer.ts` imports this module and the reverse would be a cycle —
+   * `tests/contracts.behaviour.test.ts` holds the two to each other so they cannot drift.
+   */
+  2: INSTALLER_VERSION,
 };
 
 /**
@@ -76,6 +87,20 @@ export const SCHEMA_VERSION_UNRECOGNISED_CODE = 'config.schema_version_unrecogni
 export const installerVersionFor = (schemaVersion: number): string | null =>
   INSTALLER_VERSION_BY_SCHEMA_VERSION[schemaVersion] ?? null;
 
+/**
+ * The installer known to have written this version **of this artifact**, or `null`.
+ *
+ * Once versions advance per artifact (ADR-005), a number alone no longer identifies one: version 2
+ * is a profile this installer wrote and is nothing any `state.json` has ever carried. A lookup by
+ * number alone therefore tells a person a command intent at version 2 "was written by installer
+ * 0.1.0", which is a confident false statement about a file from a build that does not exist.
+ *
+ * So the artifact's own policy bounds the answer: a version past what this build writes *for that
+ * artifact* has no known writer, whatever the shared table says about the number.
+ */
+const writerOf = (schemaVersion: number, policy: SchemaVersionPolicy): string | null =>
+  schemaVersion > policy.current ? null : installerVersionFor(schemaVersion);
+
 export const isRecognisedSchemaVersion = (
   schemaVersion: number,
   policy: SchemaVersionPolicy = DEFAULT_SCHEMA_VERSION_POLICY,
@@ -86,7 +111,7 @@ export const schemaVersionRefusalMessage = (
   schemaVersion: number,
   policy: SchemaVersionPolicy = DEFAULT_SCHEMA_VERSION_POLICY,
 ): string => {
-  const writer = installerVersionFor(schemaVersion);
+  const writer = writerOf(schemaVersion, policy);
   const provenance =
     writer !== null
       ? `It was written by installer version ${writer}`
@@ -136,7 +161,10 @@ export const schemaVersionFieldFor = (
           typeof issue.input === 'number' ? issue.input : Number.NaN,
           policy,
         )}`,
-      params: { code: SCHEMA_VERSION_UNRECOGNISED_CODE },
+      // The policy travels *with* the issue, so a reader does not have to recover it from the
+      // message. Recovering it by string surgery is what this did, and a refusal whose meaning
+      // depends on the wording of its own sentence is one nobody may rephrase.
+      params: { code: SCHEMA_VERSION_UNRECOGNISED_CODE, policy },
     });
 
 /** The field for an artifact whose shape this build has never changed. */
@@ -192,10 +220,44 @@ export const assertRecognisedSchemaVersion = (
       schemaVersionRefusalMessage(artifact, schemaVersion, policy),
       artifact,
       schemaVersion,
-      installerVersionFor(schemaVersion),
+      writerOf(schemaVersion, policy),
     );
   }
 };
+
+/** The policy a `schema_version` issue was raised under, when it carries one. */
+const policyOfIssue = (issue: z.core.$ZodIssue): SchemaVersionPolicy | null => {
+  const params = (issue as { readonly params?: Record<string, unknown> }).params;
+  const policy = params?.['policy'];
+  return typeof policy === 'object' &&
+    policy !== null &&
+    'current' in policy &&
+    'supported' in policy
+    ? (policy as SchemaVersionPolicy)
+    : null;
+};
+
+/**
+ * The policy a versioned schema applies, found by asking it to refuse an impossible version.
+ *
+ * A schema cannot be introspected for the policy its field closed over, so it is *asked*: a version
+ * no build will ever write is refused, and the issue that comes back carries the policy. A schema
+ * whose field carries no policy answers the default, which is the conservative direction — it means
+ * the success-path assertion below holds a hand-rolled schema to the shared version rather than to
+ * none at all.
+ */
+const policyOf = (schema: z.ZodType<{ schema_version: number }>): SchemaVersionPolicy => {
+  const probe = schema.safeParse({ schema_version: IMPOSSIBLE_SCHEMA_VERSION });
+  const issue = probe.success
+    ? undefined
+    : probe.error.issues.find(
+        (candidate) => candidate.path.length === 1 && candidate.path[0] === 'schema_version',
+      );
+  return (issue === undefined ? null : policyOfIssue(issue)) ?? DEFAULT_SCHEMA_VERSION_POLICY;
+};
+
+/** A version no artifact carries, used only to ask a schema which policy it applies. */
+const IMPOSSIBLE_SCHEMA_VERSION = -1;
 
 /** The `schema_version` a candidate artifact declares, or `null` when it declares no number. */
 const declaredSchemaVersion = (value: unknown): number | null => {
@@ -227,7 +289,20 @@ export const parseVersionedArtifact = <Schema extends z.ZodType<{ schema_version
   artifact: string,
 ): z.output<Schema> => {
   const parsed = schema.safeParse(value);
-  if (parsed.success) return parsed.data;
+  if (parsed.success) {
+    /**
+     * The AD-28 check on the way out, kept for the reason it was written.
+     *
+     * It is unreachable while the field carries the refinement — and this helper is the gate
+     * callers *name* when they mean AD-28, so a gate that held only because another module still
+     * had a refinement in it would be lost by one edit somewhere else. A hand-rolled versioned
+     * schema that forgot {@link schemaVersionFieldFor} gets the check here instead of silently
+     * getting none. The policy is the artifact's own, read off the issue its field would have
+     * raised; a schema that raises none is held to the default, which is the conservative answer.
+     */
+    assertRecognisedSchemaVersion(parsed.data.schema_version, artifact, policyOf(schema));
+    return parsed.data;
+  }
   const versionIssue = parsed.error.issues.find(
     (issue) =>
       issue.path.length === 1 &&
@@ -239,13 +314,20 @@ export const parseVersionedArtifact = <Schema extends z.ZodType<{ schema_version
   // installer for a fault the installer has nothing to do with.
   if (versionIssue !== undefined) {
     const declared = declaredSchemaVersion(value);
+    /**
+     * The message is **rebuilt** from the policy the issue carries, not recovered from its text.
+     *
+     * This used to substitute the artifact's name into the sentence the field had already written,
+     * which made a refusal's correctness depend on two strings agreeing — so rewording either one
+     * silently produced a refusal naming `this versioned artifact`. The policy travels on the
+     * issue's `params`, so the named refusal is composed the same way the anonymous one was.
+     */
+    const issuePolicy = policyOfIssue(versionIssue) ?? DEFAULT_SCHEMA_VERSION_POLICY;
     throw new SchemaVersionRefusal(
-      versionIssue.message
-        .slice(`${SCHEMA_VERSION_UNRECOGNISED_CODE}: `.length)
-        .replace(`Refusing ${UNNAMED_ARTIFACT}:`, `Refusing ${artifact}:`),
+      schemaVersionRefusalMessage(artifact, declared ?? Number.NaN, issuePolicy),
       artifact,
       declared ?? Number.NaN,
-      declared === null ? null : installerVersionFor(declared),
+      declared === null ? null : writerOf(declared, issuePolicy),
     );
   }
   throw parsed.error;

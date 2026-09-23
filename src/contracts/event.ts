@@ -97,6 +97,14 @@ export const DECLARATION_PAYLOAD_KEYS = {
   AskedAt: 'asked_at',
 } as const;
 
+/** CAP-13's first tier, one type per outcome so a skip is legible without reading a payload. */
+export const GATE_PASSED_EVENT_TYPE = 'gate.passed';
+export const GATE_FAILED_EVENT_TYPE = 'gate.failed';
+export const GATE_SKIPPED_EVENT_TYPE = 'gate.skipped';
+
+/** The review that was not spawned, and why (CAP-13: no review spend on a failing run). */
+export const REVIEW_SKIPPED_EVENT_TYPE = 'verification.review_skipped';
+
 /**
  * The declared event vocabulary. Dot-namespaced and past-tense. The vocabulary is open by
  * design: a reader meeting a type absent from this list accepts the envelope and ignores the
@@ -144,6 +152,20 @@ export const EVENT_TYPES = [
    * AD-21 does to this payload that a reader has to expect.
    */
   FEATURE_TERRITORY_DECLARED_EVENT_TYPE,
+  /**
+   * What each deterministic gate did before a verification step was spawned (CAP-13, story 2-6).
+   *
+   * Three types rather than one carrying an outcome, because `gate.skipped` is the one a person most
+   * needs to see: a repository that declares no test command has not passed its tests, and on every
+   * surface but this one the two look alike. Declared here — rather than only in the engine's own
+   * table — because both renderers read them, and AD-5's ignore-unknown rule would otherwise have a
+   * screen quietly drop the line that says a gate did not run.
+   */
+  GATE_PASSED_EVENT_TYPE,
+  GATE_FAILED_EVENT_TYPE,
+  GATE_SKIPPED_EVENT_TYPE,
+  /** No model-based review was spawned, and why (CAP-13's economics, said out loud). */
+  REVIEW_SKIPPED_EVENT_TYPE,
 ] as const;
 
 export type DeclaredEventType = (typeof EVENT_TYPES)[number];
