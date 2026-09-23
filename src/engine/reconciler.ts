@@ -34,6 +34,7 @@ import { join } from 'node:path';
 
 import {
   ANALYSIS_CONTRACT_ID,
+  COMMITTING_CONTRACT_ID,
   DETERMINISTIC_GATE_NAMES,
   IMPLEMENTATION_CONTRACT_ID,
   TESTING_CONTRACT_ID,
@@ -183,6 +184,13 @@ import { EngineLock } from './lock.js';
 import { resolveAgentGrant } from './agents.js';
 import { readStepConfiguration } from './config-snapshot.js';
 import { ProfileNotFound } from './profile.js';
+import {
+  BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
+  BRANCH_PROTECTION_NOT_CONFIGURED,
+  BRANCH_PROTECTION_PAYLOAD_KEYS,
+  assertBranchProtection,
+} from './protection.js';
+import type { BranchProtectionRequest } from './protection.js';
 import { ModelRungUnrecognised, rungForAttempt } from './promotion.js';
 import { defaultUlidMinter } from './ulid.js';
 import type { UlidMinter } from './ulid.js';
@@ -222,6 +230,10 @@ export const STANDARD_PLAN_STEPS: readonly PlanStep[] = Object.freeze([
   // one that mattered most: `step.verification` is what makes a gate outcome and a per-criterion
   // verdict sayable at all, and under `step.output` every refusal it adds was unreachable.
   { step: 'verify', contract_id: VERIFICATION_CONTRACT_ID, phase: 'verification' },
+  // Story 2-7. `committing` was a declared agent with no phase and no step, so the standard plan ended at
+  // the verdict and nothing in it ever reached AD-22's note — the one record that survives the worktree.
+  // It is last because the note is written on the merge commit, which is the end of the run.
+  { step: 'commit', contract_id: COMMITTING_CONTRACT_ID, phase: 'committing' },
 ]);
 export const STEP_INPUT_FILE_NAME = 'input.json';
 
@@ -1020,6 +1032,14 @@ export interface ReconcilerOptions {
    * information — a timeout, an agent — passes it per command instead.
    */
   readonly principal?: Principal;
+  /**
+   * The run-start branch-protection assertion (ADR-001), or `null` when nothing can make it.
+   *
+   * Absent is *not* "protected": `acceptFeature` records the outcome as `unknown` and starts the run,
+   * because refusing every repository the engine cannot reach would stop an offline machine running at
+   * all. `src/engine/protection.ts` holds the three outcomes and the judgement.
+   */
+  readonly branchProtection?: BranchProtectionRequest | null;
 }
 
 /**
@@ -1090,6 +1110,7 @@ export class Reconciler {
   private readonly tornGraceMs: number;
   private readonly worktreeGit: WorktreeGit;
   private readonly principal: Principal;
+  private readonly branchProtection: BranchProtectionRequest | null;
   /** Open recorders, keyed by run id. An I/O handle, not run state: nothing is read back from it. */
   private readonly recorders = new Map<string, Recorder>();
   private closed = false;
@@ -1135,6 +1156,7 @@ export class Reconciler {
     this.tornGraceMs = options.tornIntentGraceMs ?? TORN_INTENT_GRACE_MS;
     this.worktreeGit = options.worktreeGit ?? execFileWorktreeGit;
     this.principal = options.principal ?? { kind: 'user', id: 'local' };
+    this.branchProtection = options.branchProtection ?? null;
   }
 
   /**
@@ -1225,6 +1247,33 @@ export class Reconciler {
       step: null,
       type: TERRITORY_DECLARED_EVENT_TYPE,
       payload: territoryDeclaredPayload(plan.territory),
+    });
+
+    /**
+     * ADR-001 — branch protection on the default branch, asserted at run start.
+     *
+     * Last of the four lines and not first, because the assertion is *about this run* and has to be
+     * recorded against it: a refusal raised before `run.created` would leave a person with a refusal and
+     * no run to read it on, and the three lines above are what makes the run readable at all. The
+     * refusal still happens before anything is spawned, which is what "at run start" is for.
+     *
+     * An `unknown` outcome is recorded and the run continues. That is the honest degradation
+     * `src/engine/protection.ts` exists for: a repository with no remote, or a host the engine cannot
+     * reach, cannot be asserted against, and reporting that as satisfied would be a guarantee nobody
+     * checked reading exactly like one somebody did.
+     */
+    const protection =
+      this.branchProtection === null
+        ? BRANCH_PROTECTION_NOT_CONFIGURED
+        : assertBranchProtection(this.branchProtection);
+    this.emit(recorder, {
+      step: null,
+      type: BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
+      payload: {
+        [BRANCH_PROTECTION_PAYLOAD_KEYS.Outcome]: protection.outcome,
+        [BRANCH_PROTECTION_PAYLOAD_KEYS.Branch]: protection.branch,
+        [BRANCH_PROTECTION_PAYLOAD_KEYS.Reason]: protection.reason,
+      },
     });
 
     return { run, state: this.checkpointFromLog(paths, plan) };

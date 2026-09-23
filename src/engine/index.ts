@@ -44,7 +44,13 @@
  *   under `src/engine/` may import the installer's `BUILT_IN_AGENTS`, which a recursive import guard in
  *   `tests/engine.roster.test.ts` asserts;
  * - `config-snapshot` — AD-9's run-start snapshot and the step-side reader, which are the only two
- *   callers of a profile there are: a step reads `runs/<run-id>/config/` and never `.orch/`.
+ *   callers of a profile there are: a step reads `runs/<run-id>/config/` and never `.orch/`;
+ * - `committer` — AD-22's branch naming, git note and the three write intents a committing step declares.
+ *   It composes them and performs none: AD-15 makes the engine the executor, and that executor is story
+ *   2-11's along with the durability rule that a `write.attempted` record is durable before the call;
+ * - `protection` — ADR-001's run-start assertion that the default branch is protected, with three
+ *   outcomes rather than two, because a repository the engine cannot ask about is *unknown* and never
+ *   satisfied.
  *
  * The steering and command modules are what stories 1-9 and 1-10 write against. A renderer needs
  * `writeCommandIntent`, `newCommandIntent` and `mintIntentId` and nothing else: it never learns the
@@ -85,4 +91,6 @@ export * from './profile.js';
 export * from './roster.js';
 export * from './agents.js';
 export * from './config-snapshot.js';
+export * from './committer.js';
+export * from './protection.js';
 export * from './reconciler.js';

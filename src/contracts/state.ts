@@ -99,6 +99,11 @@ export const STEP_PHASES = [
   // standard plan runs them, which is also the order a person reads a run in.
   'testing',
   'verification',
+  // Story 2-7, and the same gap one phase later: `committing` was a declared agent with no phase, so
+  // nothing could spawn it — the roster offered it and ADR-003 fixed its grant, while the one word that
+  // lets a step be planned for it was missing. It is last because AD-22 has the committer write the note
+  // on the merge commit, which is the end of the run and nothing else's input.
+  'committing',
 ] as const;
 
 export type StepPhase = (typeof STEP_PHASES)[number];

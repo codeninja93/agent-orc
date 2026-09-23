@@ -132,6 +132,43 @@ export const DETERMINISTIC_GATE_NAMES = ['typecheck', 'lint', 'test'] as const;
 export type DeterministicGateName = (typeof DETERMINISTIC_GATE_NAMES)[number];
 
 /**
+ * The placeholders a `branch_pattern` puts the feature slug at, declared here because two units read
+ * them and neither may import the other.
+ *
+ * AD-22 has the committer own branch naming and the *profile* declare the pattern once. The installer
+ * interviews for it and writes it; `src/engine/committer.ts` reads it and names the branch. The engine
+ * imports only `src/contracts/`, `src/runtime/` and `node:` builtins, so a vocabulary spelled in
+ * `src/installer/interview.ts` — where it started — is one the unit that acts on it cannot see, and the
+ * two would have been free to disagree about what a valid pattern is.
+ *
+ * **Two spellings, one placeholder, and this is the reason.** The installer's own default is
+ * `feature/<slug>`; AD-22 and every profile fixture written against it spell the same thing
+ * `feature/<feature-slug>`. Refusing the spelling the architecture document itself uses would refuse a
+ * profile written to the architecture, so both are accepted — declared once, here, rather than each
+ * reader deciding. The longer spelling is listed first because substitution replaces in this order and
+ * `<slug>` does not occur inside `<feature-slug>`, so the longest match has to be tried first for the
+ * shorter one not to miss it.
+ */
+export const BRANCH_SLUG_PLACEHOLDERS = ['<feature-slug>', '<slug>'] as const;
+
+export type BranchSlugPlaceholder = (typeof BRANCH_SLUG_PLACEHOLDERS)[number];
+
+/** AD-22 — "defaulting to `feature/<feature-slug>`", in the installer's own spelling of the placeholder. */
+export const DEFAULT_BRANCH_PATTERN = 'feature/<slug>';
+
+/**
+ * True when a pattern can name more than one branch.
+ *
+ * A pattern with no placeholder is a defect and not a preference: every feature would land on the same
+ * branch, so the second feature's work would be pushed onto the first's and AD-22's "the committer is
+ * the only unit that creates or names a branch" would be satisfied by a committer that names one branch
+ * for ever. The refusals are the interview's (at the moment a person types it) and the committer's (at
+ * the moment it is read), and both ask this one question.
+ */
+export const branchPatternVaries = (pattern: string): boolean =>
+  BRANCH_SLUG_PLACEHOLDERS.some((placeholder) => pattern.includes(placeholder));
+
+/**
  * AD-24 — three ceilings and no currency dimension, which R10 restates as "cost is subscription
  * usage, never currency". So the third ceiling is a share of the rate-limit window in percent, and
  * there is deliberately no dollar field for a user to put a number in.

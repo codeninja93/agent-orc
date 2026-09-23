@@ -106,6 +106,18 @@ export const GATE_SKIPPED_EVENT_TYPE = 'gate.skipped';
 export const REVIEW_SKIPPED_EVENT_TYPE = 'verification.review_skipped';
 
 /**
+ * The branch-protection assertion taken at run start, and what it concluded (ADR-001, story 2-7).
+ *
+ * One type carrying an outcome rather than three, which is the opposite of what the gate lines do, and the
+ * difference is that a gate is one of several and this is one assertion per run: a reader asking "was
+ * protection asserted, and what came back" reads one line either way, so splitting it would buy nothing
+ * and leave a reader to check three names to find out it was never recorded. The outcome that matters most
+ * is `unknown`, and it is the one this line exists to make sayable — an unverifiable protection reported as
+ * satisfied is indistinguishable from a verified one on every surface.
+ */
+export const BRANCH_PROTECTION_ASSERTED_EVENT_TYPE = 'branch.protection_asserted';
+
+/**
  * The declared event vocabulary. Dot-namespaced and past-tense. The vocabulary is open by
  * design: a reader meeting a type absent from this list accepts the envelope and ignores the
  * event, so later stories add types without a breaking change.
@@ -166,6 +178,8 @@ export const EVENT_TYPES = [
   GATE_SKIPPED_EVENT_TYPE,
   /** No model-based review was spawned, and why (CAP-13's economics, said out loud). */
   REVIEW_SKIPPED_EVENT_TYPE,
+  /** What the run-start branch-protection assertion concluded, including that it could not be made. */
+  BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
 ] as const;
 
 export type DeclaredEventType = (typeof EVENT_TYPES)[number];

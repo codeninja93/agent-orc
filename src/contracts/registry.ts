@@ -11,7 +11,9 @@
 import { z } from 'zod';
 
 import { ANALYSIS_CONTRACT_ID, AnalysisOutputSchema } from './analysis.js';
+import { COMMITTING_CONTRACT_ID, CommittingOutputSchema } from './committing.js';
 import { CommandIntentSchema } from './command.js';
+import { NOTE_CONTRACT_ID, GitNoteSchema } from './note.js';
 import { EventEnvelopeSchema } from './event.js';
 import { OrchErrorSchema } from './error.js';
 import { FetchRecordSchema } from './fetch.js';
@@ -229,6 +231,42 @@ export const CONTRACTS = {
       'verdict on each acceptance criterion the run was accepted with.',
     model_produced: true,
     schema: VerificationOutputSchema,
+  },
+  /**
+   * Story 2-7's committing agent, registered for the reason the five above are — AD-17 has a roster entry
+   * reference a contract by id, and `step.output` cannot tell a committing agent from any other.
+   *
+   * The shape differs by what it *omits*: it is prose and nothing else, because AD-22's note carries facts
+   * the engine holds and a field asking a model for one is a field it will invent. It is also the one step
+   * contract that refuses an unknown key rather than stripping it, which is what makes that omission a
+   * refusal instead of a silent deletion.
+   */
+  [COMMITTING_CONTRACT_ID]: {
+    id: COMMITTING_CONTRACT_ID,
+    kind: 'step',
+    description:
+      'The committing agent\'s output: the pull-request title and body, in prose. It states no step ' +
+      'disposition, no gate outcome and no usage total — the engine supplies those from the run\'s ' +
+      'record — and declares no write intent, which AD-22 reserves to the committer unit.',
+    model_produced: true,
+    schema: CommittingOutputSchema,
+  },
+  /**
+   * AD-22's git note, the in-repository durable record written on the merge commit.
+   *
+   * An `artifact` and not a `step`: no model produces it. The engine composes it from `events.jsonl` and
+   * `state.json`, and `src/engine/committer.ts` is its only composer, as AD-22 makes the committer its
+   * only writer. It carries its own `schema_version` per ADR-005.
+   */
+  [NOTE_CONTRACT_ID]: {
+    id: NOTE_CONTRACT_ID,
+    kind: 'artifact',
+    description:
+      'The AD-22 git note written on the merge commit under a single named ref, carrying the run id, ' +
+      'the ordered steps with dispositions, the acceptance criteria, usage totals and the decisions ' +
+      'taken (AD-22, ADR-005).',
+    model_produced: false,
+    schema: GitNoteSchema,
   },
 } as const satisfies Readonly<Record<string, ContractEntry>>;
 

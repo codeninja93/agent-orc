@@ -20,6 +20,9 @@
  * typed and never learns what it holds.
  */
 import {
+  BRANCH_SLUG_PLACEHOLDERS,
+  COMMITTING_CONTRACT_ID,
+  DEFAULT_BRANCH_PATTERN,
   ENV_VAR_NAME_PATTERN,
   MAX_ENV_VAR_NAME_LENGTH,
   MECHANICS_COMMAND_NAMES,
@@ -28,6 +31,7 @@ import {
   RESOURCE_NEEDS,
   REVERSIBILITY_CLASSES,
   RUN_MODES,
+  branchPatternVaries,
   isContractId,
 } from '../contracts/index.js';
 import type {
@@ -162,9 +166,11 @@ const noSuggestion = (): null => null;
  * the installer's list of what it can *write*, not the system's list of what exists. An agent added
  * here becomes an offer at question 10 and nothing else; the implementations are stories 2-3 to 2-7.
  *
- * Each references a *registered* contract id (AD-17), never an inline schema. One of the six still
- * references `step.output`, the shared step envelope: a roster member that needs a genuinely new contract
- * shape needs an engine change, and `committing` does not. The other five do. Story 2-4 registered
+ * Each references a *registered* contract id (AD-17), never an inline schema, and since story 2-7 none of
+ * the six references `step.output`. `committing` was the last that did, on the reasoning that it needed no
+ * new shape — which was the same mistake one row over: its output is prose alone, and under the shared
+ * envelope nothing stopped it declaring a write intent or restating a step's disposition, both of which
+ * AD-22 reserves to the engine. Story 2-4 registered
  * `step.analysis` and `step.planning`, whose shapes carry per-claim provenance and a declared territory;
  * story 2-5 registered `step.implementation`, which describes the files changed and leaves no field through
  * which a path outside the run worktree can be returned; and story 2-6 registered `step.testing` and
@@ -242,12 +248,16 @@ export const BUILT_IN_AGENTS: readonly AgentDeclarationInput[] = Object.freeze([
   {
     id: 'committing',
     // AD-15 names the committer while forbidding exactly this: pull request creation, `git push`, notes
-    // and tags are engine-executed write intents that no agent may perform. So this agent reads the diff
-    // and composes the intent; the engine executes it once against an idempotency key. It holds no `Bash`,
-    // because that is the one tool that would let the roster's only irreversible agent do the write itself
-    // (ADR-003).
-    purpose: 'Read the change and compose the write intent the engine executes to open the pull request and record the AD-22 note.',
-    contract: 'step.output',
+    // and tags are engine-executed write intents that no agent may perform. It holds no `Bash`, because
+    // that is the one tool that would let the roster's only irreversible agent do the write itself
+    // (ADR-003), and no command runner either, because it runs no gate (ADR-004).
+    //
+    // Story 2-7 narrowed the purpose with the contract. This agent composes *prose* and not the intent:
+    // AD-22 gives the committer unit sole ownership of branch naming and makes it the note's only writer,
+    // so `src/engine/committer.ts` composes the push, the pull request and the note from the run's own
+    // record. A purpose promising to compose the intent described a job `step.committing` now refuses.
+    purpose: 'Read the change and compose the pull-request prose the engine opens the pull request with; the engine records the AD-22 note from the run\u2019s own record.',
+    contract: COMMITTING_CONTRACT_ID,
     tools: ['Read', 'Grep', 'Glob'],
     mcp_domains: [],
     reversibility: 'irreversible',
@@ -302,7 +312,15 @@ export const MAX_RATE_LIMIT_BUDGET_PERCENT = 100;
 export const MAX_CEILING_STEPS = 10_000;
 export const MAX_CEILING_WALL_CLOCK_MINUTES = 10_080;
 
-export const DEFAULT_BRANCH_PATTERN = 'feature/<slug>';
+/**
+ * Re-exported rather than declared, since story 2-7 moved the vocabulary to `src/contracts/installer.ts`.
+ *
+ * The committer reads the pattern and the engine may not import the installer, so the default and the
+ * placeholders had to live where both units can see them — and a second copy here would be the two
+ * answers to "what is a valid pattern" that moving it was meant to end. Nothing that imports this name
+ * changed.
+ */
+export { DEFAULT_BRANCH_PATTERN };
 
 /** The thirteen, in `build-sequencing.md`'s order. */
 export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
@@ -511,10 +529,13 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     },
     parse: (raw) => {
       const pattern = field(raw, 'pattern');
-      if (!pattern.includes('<slug>')) {
+      // The same question `src/engine/committer.ts` asks when it reads the pattern, asked here so a
+      // person is told at the moment they type it rather than at the moment a run tries to name a branch.
+      if (!branchPatternVaries(pattern)) {
         return refuse(
-          `"${pattern}" carries no <slug>, so every feature would land on the same branch. The ` +
-            'pattern is a template: <slug> is replaced by the feature slug.',
+          `"${pattern}" carries no ${BRANCH_SLUG_PLACEHOLDERS.join(' and no ')}, so every feature ` +
+            'would land on the same branch. The pattern is a template: the placeholder is replaced by ' +
+            'the feature slug.',
         );
       }
       return { ok: true, value: { branch_pattern: pattern } };

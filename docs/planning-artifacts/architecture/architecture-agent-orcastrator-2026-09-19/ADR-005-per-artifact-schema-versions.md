@@ -71,6 +71,17 @@ honestly.
   an intended consequence as an accomplished fact — ADR-004 did the same about an amendment to ADR-003. A
   consequence written in the past tense reads as verified, and neither was.
 
+- **A version number alone no longer identifies a writer, and the fix for the paragraph above was
+  incomplete.** Adding `2` to the shared table makes `installerVersionFor(2)` name this installer — which is
+  right for the profile and wrong for everything else, because no `state.json`, lease or command intent has
+  ever reached version 2. Taken literally, this document's own correction would have had the code tell a
+  person that a v2 command intent "was written by installer 0.1.0": a confident statement about a build that
+  does not exist. So the table entry stands *and* the refusal's writer lookup is bounded by the artifact's
+  own policy — a version past what this build writes **for that artifact** has no known writer, whatever the
+  shared table says about the number. Both directions are asserted. This is the consequence of the decision
+  that took two attempts to state correctly, which is itself the argument for per-artifact versions: a
+  number that means different things for different artifacts cannot be read on its own.
+
 ## Open question this ADR does NOT decide
 
 **Whether an artifact may ever read a version older than its current one.** Today every artifact recognises

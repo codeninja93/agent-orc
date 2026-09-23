@@ -123,14 +123,51 @@ export const WRITE_INTENT_KINDS = [
 
 export type WriteIntentKind = (typeof WRITE_INTENT_KINDS)[number];
 
-export const WriteIntentSchema = z.object({
-  /** Combined with the run id, this is the AD-15 idempotency key. */
-  intent_id: z.string(),
-  kind: z.enum(WRITE_INTENT_KINDS),
-  target: z.string(),
-  summary: z.string(),
-  reversibility: z.enum(REVERSIBILITY_CLASSES),
-});
+/**
+ * One declared write, in the only shape the engine executes one from.
+ *
+ * **A force-push is inexpressible here, and that is the design rather than an omission.** ADR-001 states
+ * flatly that "force-push is never permitted". The weaker way to hold that is a `force` field the
+ * executor is trusted to ignore — which leaves the refusal in a unit nobody reads while the artifact goes
+ * on saying a force was asked for. This shape has no boolean at all: `kind` is a closed vocabulary,
+ * `target` names *what* is written and `summary` says why, and there is nowhere to put a flag that
+ * changes how. It is the same choice story 2-6 made for the command runner, where an arbitrary command is
+ * structurally impossible rather than rejected, and `tests/contracts.committing.test.ts` holds the field
+ * list to exactly these five so a later story cannot add one back without a test failing.
+ *
+ * **Strict, so an extra key is refused rather than stripped.** The draft-7 export already carries
+ * `additionalProperties: false`, so `claude -p` refuses an intent carrying a sixth field — but the Zod
+ * re-parse AD-1 performs on the way back in *stripped* it silently, and the two halves of one contract
+ * disagreed on exactly the field this shape exists not to have. An intent carrying `force: true` is now
+ * refused by both.
+ */
+export const WriteIntentSchema = z
+  .object({
+    /** Combined with the run id, this is the AD-15 idempotency key. */
+    intent_id: z
+      .string()
+      .describe(
+        'This intent’s id. With the run id it is AD-15’s idempotency key, which is how the ' +
+          'executor recognises a re-run of the same step as a repeat rather than as a second write, so ' +
+          'it is derived from what the intent is and never from a clock, a counter or randomness.',
+      ),
+    kind: z
+      .enum(WRITE_INTENT_KINDS)
+      .describe('Which member of AD-15’s enumerated write surface this is.'),
+    target: z
+      .string()
+      .describe(
+        'What is written: the branch for a push, the branch a pull request is opened from, the single ' +
+          'named ref for a note. Never blank.',
+      ),
+    summary: z
+      .string()
+      .describe('What this write does and why, in one line that stands alone. Never blank.'),
+    reversibility: z
+      .enum(REVERSIBILITY_CLASSES)
+      .describe('The blast-radius class that decides which gate this write stops at (AD-12).'),
+  })
+  .strict();
 
 export type WriteIntent = z.infer<typeof WriteIntentSchema>;
 
