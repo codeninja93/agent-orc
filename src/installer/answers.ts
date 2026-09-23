@@ -25,6 +25,7 @@ import {
   AGENTS_DIR_NAME,
   CeilingsSchema,
   ExternalDomainSchema,
+  JiraToolServerSchema,
   MANIFEST_FILE_NAME,
   MODEL_RUNGS,
   MechanicsCommandsSchema,
@@ -154,6 +155,9 @@ const RiskAnswerSchema = z.object({
   conflict_domains: z.array(z.string()),
 });
 
+/** Story 2-10, question 14's answer: whether Jira is enabled, and if so, its two fields. */
+const ToolServersAnswerSchema = z.object({ jira: JiraToolServerSchema });
+
 const AgentFileSchema = z.object({
   id: z.string(),
   purpose: z.string(),
@@ -176,6 +180,7 @@ const answersFromProfile = (table: TomlTable): PartialAnswers => {
   const branch = pick(z.string(), table['branch_pattern']);
   const autonomy = pick(z.enum(RUN_MODES), table['autonomy_start']);
   const ceilings = pick(CeilingsSchema, table['ceilings']);
+  const toolServers = pick(ToolServersAnswerSchema, table['tool_servers']);
 
   return {
     ...(project === undefined
@@ -201,6 +206,7 @@ const answersFromProfile = (table: TomlTable): PartialAnswers => {
     ...(branch === undefined ? {} : { branch_pattern: branch }),
     ...(autonomy === undefined ? {} : { autonomy_start: autonomy }),
     ...(ceilings === undefined ? {} : { ceilings }),
+    ...(toolServers === undefined ? {} : { jira: toolServers.jira }),
   };
 };
 

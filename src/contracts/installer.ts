@@ -26,6 +26,8 @@ import { versioned } from './schema-version.js';
 import type { SchemaVersionPolicy } from './schema-version.js';
 import { MODEL_RUNGS } from './state.js';
 import { REVERSIBILITY_CLASSES, RUN_MODES } from './step.js';
+import { mcpToolCliNamesFor } from './tool-server.js';
+import type { ToolServerDefinition } from './tool-server.js';
 
 /** The one directory the installer writes inside a target repository, per AD-9. */
 export const ORCH_DIR_NAME = '.orch';
@@ -346,8 +348,28 @@ export type BuiltInGrantableTool = (typeof BUILT_IN_GRANTABLE_TOOLS)[number];
  * It is declared here, beside the built-ins, because AD-17 requires a granted tool name to be "a
  * name declared in `src/contracts/`" — the declaration is what makes a typo a refusal at parse
  * rather than a grant that silently does nothing.
+ *
+ * **Story 2-10 generalises this from a single server's tool to the union of every registered
+ * server's tools.** `RunDeclaredCommand` was the whole of this list because the command-runner was
+ * the only tool server this codebase built; Jira's two read-only operations
+ * ({@link JIRA_TOOL_NAMES}) are the second, and {@link TOOL_SERVERS} is the registry both are read
+ * from — a third domain adds a row there, not a second list here.
  */
-export const MCP_GRANTABLE_TOOLS = ['RunDeclaredCommand'] as const;
+export const RUN_DECLARED_COMMAND_TOOL = 'RunDeclaredCommand';
+
+/**
+ * Jira's read-only vocabulary (story 2-10, CAP-7's "reads only" scope for this first tool server).
+ *
+ * A closed enum of two names, mirroring `DECLARED_COMMAND_NAMES`'s own reasoning: an arbitrary Jira
+ * call is not merely refused, it is unsayable, because the roster can grant nothing outside this list
+ * and the server's own request schema (`src/tool-servers/jira/operations.ts`) admits nothing else
+ * either.
+ */
+export const JIRA_TOOL_NAMES = ['get_issue', 'search_issues'] as const;
+
+export type JiraToolName = (typeof JIRA_TOOL_NAMES)[number];
+
+export const MCP_GRANTABLE_TOOLS = [RUN_DECLARED_COMMAND_TOOL, ...JIRA_TOOL_NAMES] as const;
 
 export type McpGrantableTool = (typeof MCP_GRANTABLE_TOOLS)[number];
 
@@ -362,8 +384,45 @@ export type McpGrantableTool = (typeof MCP_GRANTABLE_TOOLS)[number];
  */
 export const MCP_SERVER_NAME = 'orch';
 
+/** Jira's own MCP server name: its own `--mcp-config` key and its own `--allowedTools` prefix. */
+export const JIRA_SERVER_NAME = 'jira';
+
+/**
+ * The command-runner, as the first entry of the per-server registry ADR-004's singular wiring
+ * generalises into. Its shape and behaviour are exactly what they were before this story: one server,
+ * one served tool, `RunDeclaredCommand` on the roster and `run_declared_command` on the wire.
+ */
+export const COMMAND_RUNNER_SERVER: ToolServerDefinition<typeof RUN_DECLARED_COMMAND_TOOL> = {
+  domain: 'command-runner',
+  serverName: MCP_SERVER_NAME,
+  tools: { [RUN_DECLARED_COMMAND_TOOL]: 'run_declared_command' },
+};
+
+/**
+ * Jira, the second tool server and this story's proof that the pattern generalises: its two grantable
+ * names are also the names it publishes over the wire, so no translation table is needed beyond the
+ * one every server gets from {@link mcpToolCliNamesFor}.
+ */
+export const JIRA_SERVER: ToolServerDefinition<JiraToolName> = {
+  domain: 'jira',
+  serverName: JIRA_SERVER_NAME,
+  tools: { get_issue: 'get_issue', search_issues: 'search_issues' },
+};
+
+/**
+ * The per-server registry `MCP_SERVER_NAME`/`MCP_TOOL_CLI_NAMES`/`commandRunnerMcpConfig` used to be
+ * singular in place of. A step's `--mcp-config` is composed in `src/engine/spawner.ts` from exactly the
+ * servers a grant's tools implicate ({@link serversForTools} in `tool-server.ts`), never from a server
+ * named by hand — so a domain added here, with its own `src/tool-servers/<domain>/` server module, is
+ * reachable without touching that composition again (this story's own scope: prove the pattern once,
+ * "generalized enough to add a second domain later without touching `RunFetchRecord`,
+ * `src/contracts/fetch.ts`, or `src/runtime/redaction.ts` again").
+ */
+export const TOOL_SERVERS: readonly ToolServerDefinition[] = [COMMAND_RUNNER_SERVER, JIRA_SERVER];
+
 export const MCP_TOOL_CLI_NAMES: Readonly<Record<McpGrantableTool, string>> = {
-  RunDeclaredCommand: `mcp__${MCP_SERVER_NAME}__run_declared_command`,
+  ...mcpToolCliNamesFor(COMMAND_RUNNER_SERVER),
+  ...mcpToolCliNamesFor(JIRA_SERVER),
 };
 
 /**
@@ -405,6 +464,95 @@ export const commandRunnerMcpConfig = (server: {
   },
 });
 
+/**
+ * Environment keys a `credential_env` must never name: the fixed keys {@link jiraMcpConfig} itself
+ * sets, plus the host/interpreter keys whose value the Jira child's own process trusts structurally.
+ *
+ * **Amended after review pass 1.** A profile's `credential_env` naming one of the `ORCH_*` keys would
+ * have its own object-spread entry land last in `jiraMcpConfig`'s `env` object literal below, silently
+ * overwriting whichever fixed key it collided with.
+ *
+ * **Amended a second time, same review.** `ORCH_*` was not the whole risk: `credential_env` naming
+ * `PATH`, `HOME`, `NODE_OPTIONS`, `NODE_PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
+ * `DYLD_INSERT_LIBRARIES` or `DYLD_LIBRARY_PATH` would still overwrite *that* key in the spawned Jira
+ * child's environment with the credential value — not colliding with anything `jiraMcpConfig` sets, but
+ * corrupting how the child process itself resolves commands and loads code (`NODE_OPTIONS`/`NODE_PATH`
+ * are read by Node's own startup; `LD_PRELOAD`/`LD_LIBRARY_PATH`/`DYLD_INSERT_LIBRARIES`/
+ * `DYLD_LIBRARY_PATH` are the loader-hijacking family on Linux and macOS). Declared once here,
+ * immediately beside the function whose keys these are, so the two can never drift apart;
+ * {@link JiraToolServerSchema} refuses a colliding name before it can reach this object literal at all.
+ */
+export const JIRA_RESERVED_ENV_KEYS = [
+  'ORCH_HOME',
+  'ORCH_RUN',
+  'ORCH_STEP',
+  'ORCH_FEATURE',
+  'ORCH_STEP_ATTEMPT',
+  'ORCH_JIRA_BASE_URL',
+  'ORCH_JIRA_CREDENTIAL_ENV',
+  'PATH',
+  'HOME',
+  'NODE_OPTIONS',
+  'NODE_PATH',
+  'LD_PRELOAD',
+  'LD_LIBRARY_PATH',
+  'DYLD_INSERT_LIBRARIES',
+  'DYLD_LIBRARY_PATH',
+] as const;
+
+/**
+ * The `--mcp-config` entry that launches the Jira tool server for one run and step (story 2-10).
+ *
+ * Structurally the command-runner's twin above, with the two things Jira's server needs that the
+ * command-runner never did:
+ *
+ * - `credentialEnvVar` — the *name* the profile records for the Jira credential, never the value
+ *   (this story's own Boundary), so the spawned server knows which of its own environment entries to
+ *   read;
+ * - `credentialValue` — the actual value, which the caller (`src/engine/spawner.ts`) reads from the
+ *   engine's own process environment at spawn time and hands here to be injected into this one
+ *   child's environment and nowhere else. The AD-20 step-executor container's env allow-list keeps
+ *   refusing anything credential-shaped, because the Jira server does not run inside that boundary —
+ *   it exists to guarantee the opposite.
+ *
+ * A blank `credentialEnvVar` (Jira not configured in this profile) is passed through rather than
+ * refused here: the server itself refuses to start on an unset or blank credential (matrix row 7), so
+ * there is exactly one place — the server's own startup — that refusal is decided.
+ */
+export const jiraMcpConfig = (server: {
+  readonly nodePath: string;
+  readonly entryPoint: string;
+  readonly run: string;
+  readonly step: string;
+  readonly feature: string;
+  readonly orchHome: string;
+  readonly attempt?: number;
+  readonly credentialEnvVar: string;
+  readonly credentialValue: string;
+  readonly baseUrl: string;
+}): Readonly<Record<string, unknown>> => ({
+  mcpServers: {
+    [JIRA_SERVER_NAME]: {
+      command: server.nodePath,
+      args: [server.entryPoint],
+      env: {
+        ORCH_HOME: server.orchHome,
+        ORCH_RUN: server.run,
+        ORCH_STEP: server.step,
+        ORCH_FEATURE: server.feature,
+        ...(server.attempt === undefined ? {} : { ORCH_STEP_ATTEMPT: String(server.attempt) }),
+        ORCH_JIRA_BASE_URL: server.baseUrl,
+        // The name the server reads its own credential entry by, since that name is a per-profile
+        // choice and the server cannot otherwise know which of its environment entries is the one.
+        ORCH_JIRA_CREDENTIAL_ENV: server.credentialEnvVar,
+        ...(server.credentialEnvVar === ''
+          ? {}
+          : { [server.credentialEnvVar]: server.credentialValue }),
+      },
+    },
+  },
+});
+
 export const GRANTABLE_TOOLS = [...BUILT_IN_GRANTABLE_TOOLS, ...MCP_GRANTABLE_TOOLS] as const;
 
 export type GrantableTool = (typeof GRANTABLE_TOOLS)[number];
@@ -426,6 +574,103 @@ export const AgentDeclarationSchema = versioned({
 });
 
 export type AgentDeclaration = z.infer<typeof AgentDeclarationSchema>;
+
+/**
+ * Blank, for a tool-server profile field: exact emptiness after trimming whitespace.
+ *
+ * **Amended after review pass 1.** The interview's own blank-check for question 14's `base_url` and
+ * {@link JiraToolServerSchema}'s cross-field refine used two different definitions of blank — exact
+ * `=== ''` in the interview, trimmed in the schema — so a whitespace-only base URL passed the
+ * interview's own guard and only failed later, as an unhandled Zod error instead of the friendly
+ * re-prompt every other refusal in that question gets. Both now call this one function, so the two
+ * can never disagree again.
+ */
+export const isBlankToolServerField = (value: string): boolean => value.trim() === '';
+
+/**
+ * Whether a string parses as an absolute `http(s)` URL.
+ *
+ * A probe with `URL`, not a field type of its own: {@link JiraToolServerSchema}'s `base_url` stays a
+ * plain string on the wire (TOML has no URL type), and this is what decides whether a non-blank value
+ * is refused at interview/write time rather than failing later, deep inside `callJiraApi`, as an
+ * opaque runtime error.
+ */
+export const isHttpUrl = (value: string): boolean => {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * The Jira tool server's own section of the profile (story 2-10): the *name* of the env var holding
+ * its credential, never the value (AD-12, this story's own Boundary), and the base URL its read-only
+ * operations are issued against.
+ *
+ * Both fields are blank together, which is how "Jira is not enabled" is recorded — the same convention
+ * `mechanics.commands`'s empty string and `project.remote`'s empty string already use for "this
+ * repository has none" rather than "nobody was asked". A blank pair reaches the spawned server exactly
+ * as an unset credential does, so it refuses to start (matrix row 7) without this schema needing an
+ * `enabled` flag of its own to keep in step with the other two.
+ */
+export const JiraToolServerSchema = z
+  .object({
+    /** Blank means Jira is not configured; otherwise the shape {@link EnvVarNameSchema} admits. */
+    credential_env: z.union([z.literal(''), EnvVarNameSchema]),
+    /** Blank means Jira is not configured; otherwise a URL {@link isHttpUrl} accepts. */
+    base_url: z.string(),
+  })
+  .refine(
+    (jira) => isBlankToolServerField(jira.credential_env) === isBlankToolServerField(jira.base_url),
+    {
+      message:
+        'tool_servers.jira.credential_env and tool_servers.jira.base_url must either both be set or ' +
+        'both be blank — a domain that is half-configured is not a domain a server could start against',
+      path: ['base_url'],
+    },
+  )
+  .refine(
+    (jira) =>
+      isBlankToolServerField(jira.credential_env) ||
+      !(JIRA_RESERVED_ENV_KEYS as readonly string[]).includes(jira.credential_env),
+    {
+      // Amended after review pass 1: a colliding name must never reach jiraMcpConfig's own object
+      // literal, where its object-spread entry would silently overwrite one of the fixed keys.
+      message:
+        `tool_servers.jira.credential_env must not be one of ${JIRA_RESERVED_ENV_KEYS.join(', ')} — ` +
+        'those are environment keys jiraMcpConfig itself sets on the Jira server’s child ' +
+        'environment, and a credential_env naming one of them would silently overwrite it',
+      path: ['credential_env'],
+    },
+  )
+  .refine((jira) => isBlankToolServerField(jira.base_url) || isHttpUrl(jira.base_url), {
+    // Amended after review pass 1: a malformed base_url is refused here, at interview/write time,
+    // rather than failing later inside callJiraApi as an opaque runtime error.
+    message: 'tool_servers.jira.base_url must be a valid http(s) URL, e.g. https://your-domain.atlassian.net',
+    path: ['base_url'],
+  });
+
+export type JiraToolServer = z.infer<typeof JiraToolServerSchema>;
+
+/** The state every profile had before this story: no tool-server domain configured at all. */
+export const DISABLED_JIRA_TOOL_SERVER: JiraToolServer = { credential_env: '', base_url: '' };
+
+/**
+ * The tool-server domains a profile can enable — one key today, and the point at which a later domain
+ * (Stage 5's "tool domains beyond Jira") adds its own key beside `jira` rather than a sibling section.
+ *
+ * Defaulted, like {@link CeilingsSchema}'s `rate_limit_window_tokens`, rather than added at a new
+ * `PROFILE_SCHEMA_VERSION`: a profile written before this story asserts nothing about Jira one way or
+ * the other, and "no tool-server domain is configured" is the honest, additive reading of that silence
+ * — not a fact an upgrade would have to ask a person to restate.
+ */
+export const ToolServersSchema = z.object({
+  jira: JiraToolServerSchema.default(DISABLED_JIRA_TOOL_SERVER),
+});
+
+export type ToolServers = z.infer<typeof ToolServersSchema>;
 
 /**
  * `<target-repo>/.orch/profile.toml` — the mechanics AD-16 makes the profile authoritative for.
@@ -514,6 +759,12 @@ export const ProfileSchema = versioned(
      */
     autonomy_start: z.enum(RUN_MODES),
     ceilings: CeilingsSchema,
+    /**
+     * Story 2-10 — the tool-server domains this profile enables. Defaulted for the reason
+     * {@link ToolServersSchema} gives: a profile written before this story configured no domain, and
+     * that silence is read as "none enabled" rather than refused.
+     */
+    tool_servers: ToolServersSchema.default({ jira: DISABLED_JIRA_TOOL_SERVER }),
     /**
      * AD-16's project knowledge — and the one field of this artifact that is optional.
      *

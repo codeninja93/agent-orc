@@ -1470,6 +1470,149 @@ describe('a spawn for a phase granted the runner carries it (ADR-004, matrix 8)'
 });
 
 /**
+ * Story 2-10, review pass 1's finding — nothing exercised `src/engine/spawner.ts`'s real Jira
+ * `configFor` branch: the code that reads the profile, reads the credential's value from the engine's
+ * own environment, and writes it into the step's `--mcp-config` file. Matrix rows 3 and 8 were proven
+ * only against the underlying pure registry functions (`serversForTools`, `mergeMcpServerConfigs`) in
+ * `tests/contracts.agent-grants.test.ts`, never through `createStepSpawner(...).start()`. This is that
+ * real surface.
+ */
+describe('story 2-10 — a spawn for a phase granted a Jira operation reaches the real dispatch', () => {
+  /** A repository whose profile enables Jira, and whose one agent is granted a Jira read. */
+  const jiraRepository = (credentialEnvVar: string): string => {
+    const repository = mkdtempSync(join(tmpdir(), 'orch-spawner-jira-repo-'));
+    writeProfile(
+      repository,
+      fixtureProfile({
+        tool_servers: {
+          jira: { credential_env: credentialEnvVar, base_url: 'https://example.atlassian.net' },
+        },
+      }),
+    );
+    writeAgentFile(
+      repository,
+      'implementation.toml',
+      fixtureAgent({ id: 'implementation', tools: ['Read', 'get_issue'] }),
+    );
+    return repository;
+  };
+
+  it('writes the resolved credential, base URL and ORCH_FEATURE/ORCH_RUN/ORCH_STEP into the Jira entry', async () => {
+    const harness = openTracked({ fixture: 'completed.jsonl' });
+    const repository = jiraRepository('JIRA_API_TOKEN');
+    takeConfigSnapshot({ repository, runId: harness.run, orchHome: harness.home });
+
+    const spawner = createStepSpawner({
+      recorderFor: () => harness.recorder,
+      cli: fakeCli,
+      node: childNode,
+      // The credential's *value* lives only in this engine's own environment (this story's Boundary);
+      // the profile names only which key to read it from.
+      env: { ...harness.env, JIRA_API_TOKEN: 'a-real-secret-value' },
+      orchHome: harness.home,
+      // The entry point is a deployment fact `defaultJiraServerEntryPoint` resolves beside the
+      // compiled module, which a source-tree test run does not have — the same reason
+      // `mcpServerFor` exists for the command-runner above.
+      jiraServerEntryPoint: FAKE_CLI_PATH,
+    });
+
+    await spawner.start(harness.request({ phase: 'implementation' }));
+
+    const written = join(harness.home, 'runs', harness.run, 'steps', 'implement', MCP_CONFIG_FILE_NAME);
+    expect(existsSync(written)).toBe(true);
+    const config = JSON.parse(readFileSync(written, 'utf8')) as {
+      readonly mcpServers: Readonly<Record<string, { readonly env?: Readonly<Record<string, string>> }>>;
+    };
+    const jiraEntry = config.mcpServers['jira'];
+    expect(jiraEntry).toBeDefined();
+    const jiraEnv = jiraEntry?.env ?? {};
+    expect(jiraEnv['JIRA_API_TOKEN']).toBe('a-real-secret-value');
+    expect(jiraEnv['ORCH_JIRA_BASE_URL']).toBe('https://example.atlassian.net');
+    expect(jiraEnv['ORCH_JIRA_CREDENTIAL_ENV']).toBe('JIRA_API_TOKEN');
+    expect(jiraEnv['ORCH_FEATURE']).toBe(harness.feature);
+    expect(jiraEnv['ORCH_RUN']).toBe(harness.run);
+    expect(jiraEnv['ORCH_STEP']).toBe('implement');
+  });
+
+  it('names only the Jira server for a grant naming only a Jira operation (matrix row 3)', async () => {
+    const harness = openTracked({ fixture: 'completed.jsonl' });
+    const repository = jiraRepository('JIRA_API_TOKEN');
+    takeConfigSnapshot({ repository, runId: harness.run, orchHome: harness.home });
+
+    const spawner = createStepSpawner({
+      recorderFor: () => harness.recorder,
+      cli: fakeCli,
+      node: childNode,
+      env: { ...harness.env, JIRA_API_TOKEN: 'a-real-secret-value' },
+      orchHome: harness.home,
+      jiraServerEntryPoint: FAKE_CLI_PATH,
+    });
+
+    await spawner.start(harness.request({ phase: 'implementation' }));
+
+    const argv = spawner.lastPlan()?.args ?? [];
+    expect(argv[argv.indexOf('--allowedTools') + 1]).toBe('mcp__jira__get_issue');
+    const written = join(harness.home, 'runs', harness.run, 'steps', 'implement', MCP_CONFIG_FILE_NAME);
+    const config = JSON.parse(readFileSync(written, 'utf8')) as {
+      readonly mcpServers: Readonly<Record<string, unknown>>;
+    };
+    expect(Object.keys(config.mcpServers)).toStrictEqual(['jira']);
+  });
+
+  it('names both servers, each its own entry, for a grant naming both domains (matrix row 8)', async () => {
+    const harness = openTracked({ fixture: 'completed.jsonl' });
+    const repository = jiraRepository('JIRA_API_TOKEN');
+    writeAgentFile(
+      repository,
+      'implementation.toml',
+      fixtureAgent({ id: 'implementation', tools: ['Read', 'RunDeclaredCommand', 'get_issue'] }),
+    );
+    takeConfigSnapshot({ repository, runId: harness.run, orchHome: harness.home });
+
+    const spawner = createStepSpawner({
+      recorderFor: () => harness.recorder,
+      cli: fakeCli,
+      node: childNode,
+      env: { ...harness.env, JIRA_API_TOKEN: 'a-real-secret-value' },
+      orchHome: harness.home,
+      jiraServerEntryPoint: FAKE_CLI_PATH,
+      // The command-runner half of the same file: the seam that already exists for it.
+      mcpServerFor: () =>
+        commandRunnerMcpConfig({
+          nodePath: process.execPath,
+          entryPoint: FAKE_CLI_PATH,
+          run: harness.run,
+          step: 'implement',
+          orchHome: harness.home,
+        }),
+    });
+
+    await spawner.start(harness.request({ phase: 'implementation' }));
+
+    const written = join(harness.home, 'runs', harness.run, 'steps', 'implement', MCP_CONFIG_FILE_NAME);
+    const config = JSON.parse(readFileSync(written, 'utf8')) as {
+      readonly mcpServers: Readonly<Record<string, unknown>>;
+    };
+    expect(Object.keys(config.mcpServers).sort()).toStrictEqual([MCP_SERVER_NAME, 'jira'].sort());
+  });
+
+  /**
+   * Amended after review pass 1 — a `credential_env` colliding with one of `jiraMcpConfig`'s own fixed
+   * keys must never reach the object literal it builds, where a later key would silently overwrite an
+   * earlier one. Refused at the schema boundary, before a profile carrying it can even be written.
+   */
+  it('refuses a credential_env colliding with a reserved key before it can reach the written config', () => {
+    expect(() =>
+      fixtureProfile({
+        tool_servers: {
+          jira: { credential_env: 'ORCH_RUN', base_url: 'https://example.atlassian.net' },
+        },
+      }),
+    ).toThrow();
+  });
+});
+
+/**
  * CAP-13, matrix 19 — a step cannot invent what it is judged against, asserted through a real spawn.
  *
  * The refusal lives in the spawner's re-parse, because that is the one place holding both halves:

@@ -169,6 +169,7 @@ export const renderProfile = (answers: Answers, repositoryPath: string): Profile
     branch_pattern: answers.branch_pattern,
     autonomy_start: answers.autonomy_start,
     ceilings: answers.ceilings,
+    tool_servers: { jira: answers.jira },
     // Carried through rather than rebuilt: no answer produces one, so the copy on disk is the only copy.
     ...(knowledge === undefined ? {} : { knowledge }),
   };

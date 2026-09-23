@@ -51,17 +51,23 @@ import { basename, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  COMMAND_RUNNER_SERVER,
+  JIRA_SERVER,
+  TOOL_SERVERS,
   criteriaNotAccepted,
   criteriaNotJudged,
   exportContract,
   gatesDisagreeingWith,
   getContract,
+  jiraMcpConfig,
   makeError,
+  mergeMcpServerConfigs,
   renderCause,
+  serversForTools,
   StepOutputSchema,
   commandRunnerMcpConfig,
 } from '../contracts/index.js';
-import type { JsonSchema, ModelRung, OrchError, StepOutput } from '../contracts/index.js';
+import type { JsonSchema, ModelRung, OrchError, StepOutput, ToolServerDefinition } from '../contracts/index.js';
 import { resolveOrchHome, runPaths } from '../runtime/index.js';
 import type { Recorder } from '../runtime/index.js';
 
@@ -73,6 +79,7 @@ import {
   resolveClaudeCliOnce,
 } from './cli.js';
 import type { ClaudeCli } from './cli.js';
+import { readStepConfiguration } from './config-snapshot.js';
 import {
   ChildNodeUnavailableError,
   childEnvWithNode,
@@ -82,6 +89,7 @@ import type { ChildNode } from './node-path.js';
 import {
   AgentGrantUnresolved,
   allowedToolsFor,
+  mcpGrantsOf,
   resolveAgentGrant,
   toolsArgumentFor,
 } from './agents.js';
@@ -245,6 +253,32 @@ export class McpToolNotPreApproved extends Error {
   }
 }
 
+/**
+ * A profile names a Jira credential env var this engine's own process environment does not set.
+ *
+ * Refusing the spawn rather than writing an empty credential value: `jiraMcpConfig` would otherwise
+ * inject `""` under the named key, and the whole failure would defer to the spawned Jira server's own
+ * startup refusal — a config that names a file which exists but starts a server with no way to do its
+ * one job. `config.invalid` → `escalate-to-human`: no retry exports a variable into this engine's own
+ * environment, so it is in {@link KEEPS_ITS_OWN_CODE} and never relabelled `retry-with-backoff`.
+ */
+export class JiraCredentialUnset extends Error {
+  readonly code = 'config.invalid';
+  readonly credentialEnvVar: string;
+
+  constructor(credentialEnvVar: string) {
+    super(
+      `Refusing to spawn: the profile names "${credentialEnvVar}" as the environment variable holding ` +
+        'the Jira credential, but this engine’s own process environment does not set it (or sets ' +
+        'it blank). Export it where the engine runs, or disable the Jira tool domain in ' +
+        '.orch/profile.toml — a spawn must not write an empty credential value and defer the ' +
+        'failure to the Jira server’s own startup.',
+    );
+    this.name = 'JiraCredentialUnset';
+    this.credentialEnvVar = credentialEnvVar;
+  }
+}
+
 /** The per-step MCP config file, beside the step input it is written with. */
 export const MCP_CONFIG_FILE_NAME = 'mcp.json';
 
@@ -270,6 +304,21 @@ const defaultRunnerEntryPoint = (served: readonly string[]): string => {
     served,
     `the command runner's entry point is not at ${candidate}, so the config would name a file that ` +
       'does not exist and no server would start. Build the package, or pass `mcpServerFor`',
+  );
+};
+
+/**
+ * The compiled Jira tool server entry point beside this build, or a refusal naming what was missing.
+ *
+ * `defaultRunnerEntryPoint`'s own reasoning, one domain over (story 2-10).
+ */
+const defaultJiraServerEntryPoint = (served: readonly string[]): string => {
+  const candidate = fileURLToPath(new URL('../bin/jira-server.js', import.meta.url));
+  if (existsSync(candidate)) return candidate;
+  throw new McpToolNotPreApproved(
+    served,
+    `the Jira tool server's entry point is not at ${candidate}, so the config would name a file ` +
+      'that does not exist and no server would start. Build the package, or pass `mcpServerFor`',
   );
 };
 
@@ -416,6 +465,18 @@ export interface StepSpawnerOptions {
    * not exist. The default resolves the compiled entry point beside this module.
    */
   readonly mcpServerFor?: (request: StepStartRequest) => Readonly<Record<string, unknown>>;
+  /**
+   * Story 2-10 — the Jira tool server's own entry point, overriding {@link defaultJiraServerEntryPoint}.
+   *
+   * A narrower seam than {@link mcpServerFor}, deliberately: Jira's `--mcp-config` entry also carries
+   * the credential this unit resolves for real from the run's own AD-9 snapshot and this engine's own
+   * environment (`jiraMcpConfig`), and a caller overriding the *whole* entry would have to reproduce
+   * that resolution just to test it — proving nothing about the real dispatch. This overrides only the
+   * file `--mcp-config` names, the same "entry point is a deployment fact" reason `mcpServerFor` exists
+   * for the command-runner, so a suite can drive the real Jira `configFor` branch without a compiled
+   * `dist/bin/jira-server.js` on disk.
+   */
+  readonly jiraServerEntryPoint?: string;
   /** The environment the child inherits, before the AD-28 Node entries are added. */
   readonly env?: NodeJS.ProcessEnv;
   /** The prompt a step is given. Overridable so a suite can assert argv without asserting prose. */
@@ -711,6 +772,9 @@ const KEEPS_ITS_OWN_CODE = [
   ProfileUnreadable,
   // A worktree that is not an absolute path is a misconfigured run, not a transient spawn failure.
   AddDirNotAbsolute,
+  // A Jira credential named but not exported into this engine's own environment is a misconfigured
+  // machine, not a transient one: retrying spawns the same missing variable again.
+  JiraCredentialUnset,
 ] as const;
 
 /**
@@ -847,37 +911,104 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
       }));
   const promptFor = options.promptFor ?? defaultPromptFor;
   const orchHome = options.orchHome ?? resolveOrchHome(options.env ?? process.env);
+  /**
+   * The engine's own environment, read once so a Jira credential is read from exactly one place.
+   *
+   * Story 2-10's boundary: the Jira credential exists only in the Jira server process's own
+   * environment, injected here from an env-var *name* the profile names — never a value this unit
+   * reads from anywhere but its own environment, and never a value that reaches any other child.
+   */
+  const hostEnv = options.env ?? process.env;
 
   /**
-   * Write the MCP config a served grant needs, and answer with the path, or with nothing.
+   * Build one server's `--mcp-config` entry, dispatching on which registered {@link TOOL_SERVERS}
+   * entry it is.
+   *
+   * Story 2-10 generalises this from a single hardcoded server to a per-domain dispatch: adding a
+   * third tool server means adding a branch here and a row to {@link TOOL_SERVERS}, never touching
+   * the composition in {@link mcpConfigsFor} below.
+   */
+  const configFor = (
+    server: ToolServerDefinition,
+    request: StepStartRequest,
+    served: readonly string[],
+  ): Readonly<Record<string, unknown>> => {
+    if (server.serverName === COMMAND_RUNNER_SERVER.serverName) {
+      // Unchanged from before this story: the same seam, the same default builder, the same argv.
+      return (
+        options.mcpServerFor?.(request) ??
+        commandRunnerMcpConfig({
+          nodePath: node().path,
+          entryPoint: defaultRunnerEntryPoint(served),
+          run: request.run,
+          step: request.step,
+          orchHome,
+          attempt: request.attempt,
+        })
+      );
+    }
+    if (server.serverName === JIRA_SERVER.serverName) {
+      /**
+       * The run's own AD-9 snapshot, read for the one section this unit did not need before: which
+       * env var the profile names for the Jira credential, and Jira's base URL. Neither is a secret;
+       * the credential's *value* is read next, from this engine's own environment, and handed to
+       * {@link jiraMcpConfig} to be injected only into the Jira server's own child environment.
+       */
+      const jira = readStepConfiguration(request.run, { orchHome }).profile.profile.tool_servers.jira;
+      const credentialValue =
+        jira.credential_env === '' ? '' : (hostEnv[jira.credential_env] ?? '').trim();
+      // Refused here rather than written as an empty string: `jiraMcpConfig` would otherwise inject
+      // `""` under the named key, deferring the whole failure to the spawned server's own startup.
+      if (jira.credential_env !== '' && credentialValue === '') {
+        throw new JiraCredentialUnset(jira.credential_env);
+      }
+      return jiraMcpConfig({
+        nodePath: node().path,
+        entryPoint: options.jiraServerEntryPoint ?? defaultJiraServerEntryPoint(served),
+        run: request.run,
+        step: request.step,
+        feature: request.feature,
+        orchHome,
+        attempt: request.attempt,
+        credentialEnvVar: jira.credential_env,
+        credentialValue,
+        baseUrl: jira.base_url,
+      });
+    }
+    // Unreachable while TOOL_SERVERS names only the two above; a third domain's registration adds
+    // its own branch here rather than falling through to this refusal.
+    throw new Error(`no --mcp-config builder is registered for the "${server.domain}" tool server`);
+  };
+
+  /**
+   * Write the MCP config every server a served grant names needs, and answer with the path, or with
+   * nothing.
    *
    * Written under the step's own directory rather than into `runs/<run-id>/config/`: that directory
    * is AD-9's *snapshot*, taken once at run start, and `tests/engine.config-snapshot.test.ts` holds
    * it byte-identical for the life of the run. A file this unit adds per attempt belongs beside the
    * step input it is written with.
    *
-   * The entry point is checked to exist rather than assumed. A config naming a file that is not
-   * there starts no server, and the step then asks for a tool nothing serves — which under
-   * `--restricted` is the wait nobody can end. Failing here is the visible version of that, and it
-   * is the same refusal the missing pre-approval takes.
+   * **One file, naming every server the grant implicates (story 2-10, matrix row 8).** A grant naming
+   * both the command-runner and Jira gets both as separate entries of the one file
+   * `--strict-mcp-config` reads — never two files, and never one server's tools mistaken for
+   * another's. A grant naming only the command-runner produces exactly the file this unit always
+   * wrote (matrix row 3, and this story's own "unchanged from before" requirement).
+   *
+   * Each entry's own entry point is checked to exist rather than assumed. A config naming a file that
+   * is not there starts no server, and the step then asks for a tool nothing serves — which under
+   * `--restricted` is the wait nobody can end. Failing here is the visible version of that, and it is
+   * the same refusal the missing pre-approval takes.
    */
   const mcpConfigsFor = (request: StepStartRequest, grant: AgentGrant): readonly string[] => {
     const served = allowedToolsFor(grant);
     if (served.length === 0) return [];
     const paths = runPaths(request.run, orchHome);
-    const server =
-      options.mcpServerFor?.(request) ??
-      commandRunnerMcpConfig({
-        nodePath: node().path,
-        entryPoint: defaultRunnerEntryPoint(served),
-        run: request.run,
-        step: request.step,
-        orchHome,
-        attempt: request.attempt,
-      });
+    const servers = serversForTools(TOOL_SERVERS, mcpGrantsOf(grant));
+    const merged = mergeMcpServerConfigs(servers.map((server) => configFor(server, request, served)));
     const path = join(paths.runDir, STEPS_DIR_NAME, request.step, MCP_CONFIG_FILE_NAME);
     mkdirSync(join(path, '..'), { recursive: true });
-    writeFileSync(path, `${JSON.stringify(server, null, 2)}\n`, 'utf8');
+    writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`, 'utf8');
     return [path];
   };
 

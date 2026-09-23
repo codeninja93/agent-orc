@@ -55,7 +55,10 @@ afterAll(() => {
   else process.env['ORCH_HOME'] = realOrchHome;
 });
 
-/** The thirteen ids, in the order `build-sequencing.md` states the questions. */
+/**
+ * The ids, in the order `build-sequencing.md` states its thirteen questions, plus story 2-10's
+ * fourteenth: whether the Jira tool domain is enabled.
+ */
 const EXPECTED_ORDER: readonly QuestionId[] = [
   'target_path',
   'project',
@@ -70,13 +73,14 @@ const EXPECTED_ORDER: readonly QuestionId[] = [
   'custom_agents',
   'autonomy_start',
   'ceilings',
+  'jira',
 ];
 
 describe('the interview is data, and the data is build-sequencing.md’s thirteen questions', () => {
-  it('yields thirteen questions in the documented order', () => {
+  it('yields the documented fourteen questions in order', () => {
     expect(INTERVIEW.map((entry) => entry.id)).toStrictEqual(EXPECTED_ORDER);
     expect(INTERVIEW.map((entry) => entry.order)).toStrictEqual([
-      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
     ]);
   });
 
@@ -114,7 +118,7 @@ describe('the interview is data, and the data is build-sequencing.md’s thirtee
 });
 
 describe('a repository with no .orch/ is asked everything, in order', () => {
-  it('puts all thirteen questions and writes the four artifacts (matrix 1)', async () => {
+  it('puts all fourteen questions and writes the four artifacts (matrix 1)', async () => {
     const repo = repository();
     const io = scriptedIo();
     const outcome = await runInit({ repository: repo, io });
@@ -346,5 +350,158 @@ describe('a re-run asks only the question whose answer is missing (matrix 3)', (
 
     expect(second.asked).toStrictEqual([]);
     expect(io.asked).toStrictEqual([]);
+  });
+});
+
+/**
+ * Story 2-10, question 14 — enable the Jira tool domain, and if so, its credential's env-var *name*
+ * and its base URL. Never a credential value: AD-12 forbids the installer bundling one, and question
+ * 14 asks for a name for the same reason question 9 does.
+ */
+describe('question 14 — the Jira tool domain is enabled by name, never by value', () => {
+  it('defaults to not enabled, recording both fields blank, when nobody answers', async () => {
+    const repo = repository();
+    await runInit({ repository: repo, io: scriptedIo() });
+
+    const profile = parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8'));
+    expect(profile['tool_servers']).toEqual({ jira: { credential_env: '', base_url: '' } });
+  });
+
+  it('writes only the env-var name and the base URL, never a value, when enabled', async () => {
+    const repo = repository();
+    await runInit({
+      repository: repo,
+      io: scriptedIo({
+        'jira.enabled': 'yes',
+        'jira.credential_env': 'JIRA_API_TOKEN',
+        'jira.base_url': 'https://your-domain.atlassian.net',
+      }),
+    });
+
+    const profileText = readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8');
+    const profile = parseToml(profileText);
+    // Exactly the name and the URL — no third field a value could have landed in.
+    expect(profile['tool_servers']).toEqual({
+      jira: { credential_env: 'JIRA_API_TOKEN', base_url: 'https://your-domain.atlassian.net' },
+    });
+    const jiraTable = (profile['tool_servers'] as { readonly jira: object }).jira;
+    expect(Object.keys(jiraTable).sort()).toStrictEqual(['base_url', 'credential_env']);
+  });
+
+  it('discards any credential-env or base-URL text typed alongside "no"', async () => {
+    const repo = repository();
+    await runInit({
+      repository: repo,
+      io: scriptedIo({
+        'jira.enabled': 'no',
+        'jira.credential_env': 'JIRA_API_TOKEN',
+        'jira.base_url': 'https://your-domain.atlassian.net',
+      }),
+    });
+
+    const profile = parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8'));
+    expect(profile['tool_servers']).toEqual({ jira: { credential_env: '', base_url: '' } });
+  });
+
+  it('refuses a malformed base URL, at interview time rather than writing it', async () => {
+    const repo = repository();
+    // Every field is re-asked on a refused attempt (`askQuestion` re-collects the whole entry), so
+    // "yes" and the credential name are scripted for both the refused attempt and the one that holds.
+    const io = scriptedIo({
+      'jira.enabled': ['yes', 'yes'],
+      'jira.credential_env': ['JIRA_API_TOKEN', 'JIRA_API_TOKEN'],
+      'jira.base_url': ['not-a-url', 'https://your-domain.atlassian.net'],
+    });
+    await runInit({ repository: repo, io });
+
+    expect(io.said.some((line) => line.includes('not a valid http'))).toBe(true);
+    const profile = parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8'));
+    expect(profile['tool_servers']).toEqual({
+      jira: { credential_env: 'JIRA_API_TOKEN', base_url: 'https://your-domain.atlassian.net' },
+    });
+  });
+
+  /**
+   * Amended after review pass 1 — the interview's own blank-check and `JiraToolServerSchema`'s refine
+   * now share one definition of blank (`isBlankToolServerField`), so a whitespace-only base URL is
+   * refused here, the friendly way, the same as an empty one — never as an unhandled schema error at
+   * write time.
+   */
+  it('refuses a whitespace-only base URL the same way an empty one is refused', async () => {
+    const repo = repository();
+    const io = scriptedIo({
+      'jira.enabled': ['yes', 'yes'],
+      'jira.credential_env': ['JIRA_API_TOKEN', 'JIRA_API_TOKEN'],
+      'jira.base_url': ['   ', 'https://your-domain.atlassian.net'],
+    });
+    await runInit({ repository: repo, io });
+
+    expect(io.said.some((line) => line.includes('base URL is required'))).toBe(true);
+  });
+
+  it('refuses a credential_env that is not a valid environment-variable name', async () => {
+    const repo = repository();
+    const io = scriptedIo({
+      'jira.enabled': ['yes', 'yes'],
+      'jira.credential_env': ['lower-case-not-allowed', 'JIRA_API_TOKEN'],
+      'jira.base_url': ['https://your-domain.atlassian.net', 'https://your-domain.atlassian.net'],
+    });
+    await runInit({ repository: repo, io });
+
+    expect(io.said.some((line) => line.includes('is not the name of an environment variable'))).toBe(
+      true,
+    );
+  });
+
+  /**
+   * Amended after review pass 1's second finding on this question: a reserved name is now caught by
+   * the interview's own `parse`, not only by the schema at final write time, so it gets the same
+   * friendly re-prompt every other refusal in this question gets rather than an unhandled `ZodError`.
+   */
+  it('refuses a credential_env that collides with one of jiraMcpConfig’s own fixed keys', async () => {
+    const repo = repository();
+    const io = scriptedIo({
+      'jira.enabled': ['yes', 'yes'],
+      'jira.credential_env': ['ORCH_RUN', 'JIRA_API_TOKEN'],
+      'jira.base_url': ['https://your-domain.atlassian.net', 'https://your-domain.atlassian.net'],
+    });
+    await runInit({ repository: repo, io });
+
+    expect(io.said.some((line) => line.includes('ORCH_RUN'))).toBe(true);
+    const profile = parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8'));
+    expect(profile['tool_servers']).toEqual({
+      jira: { credential_env: 'JIRA_API_TOKEN', base_url: 'https://your-domain.atlassian.net' },
+    });
+  });
+
+  /**
+   * A re-run must not re-ask question 14 once it has a real, enabled answer on disk — the same
+   * round trip `tests/installer.idempotence.test.ts` proves for the disabled default, now for the
+   * enabled case, which every other test in this file leaves unexercised.
+   */
+  it('is not re-asked on a re-run once enabled, and the profile’s answer is unchanged', async () => {
+    const repo = repository();
+    await runInit({
+      repository: repo,
+      io: scriptedIo({
+        'jira.enabled': 'yes',
+        'jira.credential_env': 'JIRA_API_TOKEN',
+        'jira.base_url': 'https://your-domain.atlassian.net',
+      }),
+    });
+    const before = parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8'))[
+      'tool_servers'
+    ];
+
+    const io = scriptedIo();
+    const second = await runInit({ repository: repo, io });
+
+    expect(second.asked).not.toContain('jira');
+    expect(io.asked.some((id) => id.startsWith('jira.'))).toBe(false);
+    const after = parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8'))['tool_servers'];
+    expect(after).toEqual(before);
+    expect(after).toEqual({
+      jira: { credential_env: 'JIRA_API_TOKEN', base_url: 'https://your-domain.atlassian.net' },
+    });
   });
 });

@@ -22,13 +22,19 @@ import { describe, expect, it } from 'vitest';
 
 import {
   AgentDeclarationSchema,
+  COMMAND_RUNNER_SERVER,
   GRANTABLE_TOOLS,
+  JIRA_SERVER,
+  TOOL_SERVERS,
   getContract,
   isContractId,
+  mergeMcpServerConfigs,
+  serversForTools,
 } from '../src/contracts/index.js';
-import { READ_ONLY_TOOLS, isElevatedTool } from '../src/engine/index.js';
+import { READ_ONLY_TOOLS, allowedToolsFor, isElevatedTool, mcpGrantsOf } from '../src/engine/index.js';
 import { BUILT_IN_AGENTS } from '../src/installer/interview.js';
 import { DeclaredCommandRequestSchema } from '../src/runner/index.js';
+import { fixtureGrant } from './helpers/agent-grant.js';
 
 /**
  * The table ADR-003 fixes and ADR-004 amends, and the contract each agent answers against. A row changing
@@ -281,5 +287,70 @@ describe('a granted tool name must be a declared name', () => {
     // Accepted, and not accepted quietly: the name classifies as one that can change something.
     expect(isElevatedTool('Bash')).toBe(true);
     expect(READ_ONLY_TOOLS).not.toContain('Bash');
+  });
+});
+
+/**
+ * Story 2-10 — the per-server registry's pure half: which of `TOOL_SERVERS` a grant's tool names
+ * implicate, and how their individual `--mcp-config` entries merge into one file. Matrix rows 3 and 8,
+ * over the registry functions the real `createStepSpawner(...).start()` path is built from;
+ * `tests/engine.spawner.test.ts` proves the same two rows through that real surface.
+ */
+describe('a step’s grant reaches the right tool servers, and only those (matrix rows 3, 8)', () => {
+  it('names no tool server for a grant with no served tool at all (matrix row 3)', () => {
+    const grant = fixtureGrant({ tools: ['Read', 'Grep', 'Glob'], elevated: [] });
+    expect(serversForTools(TOOL_SERVERS, mcpGrantsOf(grant))).toStrictEqual([]);
+    expect(allowedToolsFor(grant)).toStrictEqual([]);
+  });
+
+  it('names only the command-runner for a grant naming only RunDeclaredCommand (matrix row 3)', () => {
+    const grant = fixtureGrant({
+      tools: ['Read', 'Grep', 'Glob', 'RunDeclaredCommand'],
+      elevated: [],
+    });
+    const servers = serversForTools(TOOL_SERVERS, mcpGrantsOf(grant));
+    expect(servers).toStrictEqual([COMMAND_RUNNER_SERVER]);
+    expect(servers).not.toContain(JIRA_SERVER);
+  });
+
+  it('names only Jira for a grant naming only a Jira operation, absent for one with no Jira grant', () => {
+    const jiraGrant = fixtureGrant({ tools: ['Read', 'Grep', 'Glob', 'get_issue'], elevated: [] });
+    expect(serversForTools(TOOL_SERVERS, mcpGrantsOf(jiraGrant))).toStrictEqual([JIRA_SERVER]);
+
+    const noJiraGrant = fixtureGrant({
+      tools: ['Read', 'Write', 'Edit', 'Grep', 'Glob', 'RunDeclaredCommand'],
+      elevated: ['Write', 'Edit'],
+    });
+    // Matrix row 3, the other direction: an agent with no Jira grant never sees the Jira server.
+    expect(serversForTools(TOOL_SERVERS, mcpGrantsOf(noJiraGrant))).not.toContain(JIRA_SERVER);
+  });
+
+  it('names both servers, each with its own entry, for a grant naming both domains (matrix row 8)', () => {
+    const grant = fixtureGrant({
+      tools: ['Read', 'Grep', 'Glob', 'RunDeclaredCommand', 'get_issue', 'search_issues'],
+      elevated: [],
+    });
+    const servers = serversForTools(TOOL_SERVERS, mcpGrantsOf(grant));
+    expect(servers).toHaveLength(2);
+    expect(servers).toContain(COMMAND_RUNNER_SERVER);
+    expect(servers).toContain(JIRA_SERVER);
+
+    // The `--allowedTools` half of the same row: every served tool pre-approved, from both servers.
+    const approved = allowedToolsFor(grant);
+    expect(approved).toContain('mcp__orch__run_declared_command');
+    expect(approved).toContain('mcp__jira__get_issue');
+    expect(approved).toContain('mcp__jira__search_issues');
+  });
+
+  it('merges two single-server configs into one file naming both, never one overwriting the other', () => {
+    const commandRunnerConfig = { mcpServers: { orch: { command: 'node', args: ['runner.js'], env: {} } } };
+    const jiraConfig = { mcpServers: { jira: { command: 'node', args: ['jira-server.js'], env: {} } } };
+    const merged = mergeMcpServerConfigs([commandRunnerConfig, jiraConfig]);
+    expect(merged).toStrictEqual({
+      mcpServers: {
+        orch: { command: 'node', args: ['runner.js'], env: {} },
+        jira: { command: 'node', args: ['jira-server.js'], env: {} },
+      },
+    });
   });
 });

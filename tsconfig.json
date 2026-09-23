@@ -32,7 +32,8 @@
     // build has happened; `tsconfig.bin.json` clears the mapping, because by then one has.
     "paths": {
       "agent-orcastrator/installer": ["./src/installer/index.ts"],
-      "agent-orcastrator/runner": ["./src/runner/index.ts"]
+      "agent-orcastrator/runner": ["./src/runner/index.ts"],
+      "agent-orcastrator/tool-servers/jira": ["./src/tool-servers/jira/index.ts"]
     }
   },
   "include": [

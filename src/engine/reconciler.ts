@@ -96,9 +96,12 @@ import type {
   StepRecord,
 } from '../contracts/index.js';
 import {
+  FETCH_RECORDED_EVENT_TYPE,
   REDACTION_FAILED_EVENT_TYPE,
   REDACTION_MARKER,
   Recorder,
+  RunFetchRecord,
+  fetchRecordedEventPayload,
   isStopCommand,
   readEventLog,
   resolveOrchHome,
@@ -3838,6 +3841,45 @@ export class Reconciler {
           to: 'interrupted',
           reason: `step "${step.step}" reported an interruption, which is the one resumable disposition`,
         },
+      });
+    }
+
+    // Story 2-10 — a tool server (the Jira MCP child, spawned for the step just terminated) may have
+    // served reads through RunFetchRecord's standalone construction path, which writes
+    // `fetch-record.json` directly but appends nothing to `events.jsonl` (it holds no AD-29 claim).
+    // This is the point in the pass where a live Recorder is already held for the run, so any entry
+    // not yet mirrored is backfilled here — on a short delay, never silently.
+    this.backfillFetchRecordEvents(recorder);
+  }
+
+  /**
+   * Mirror any `fetch-record.json` entries `events.jsonl` does not yet carry a `fetch.recorded` line
+   * for, into the log this call already holds a live `Recorder` for.
+   *
+   * AD-13's "every external read is recorded to events.jsonl" stays true for a read a standalone tool
+   * server served — on this short delay rather than not at all. The record on disk was already the
+   * durable, authoritative source of "was this served from record" the moment it was written; this is
+   * only the convenience mirror for a reader of `events.jsonl` alone.
+   */
+  private backfillFetchRecordEvents(recorder: Recorder): void {
+    const fetchRecord = RunFetchRecord.open({ recorder });
+    if (fetchRecord.entries.length === 0) return;
+
+    const mirrored = new Set(
+      readEventLog(recorder.paths.eventLog)
+        .filter((event) => event.type === FETCH_RECORDED_EVENT_TYPE)
+        .map((event) => (typeof event.payload['key'] === 'string' ? event.payload['key'] : null))
+        .filter((key): key is string => key !== null),
+    );
+
+    for (const entry of fetchRecord.entries) {
+      if (mirrored.has(entry.key)) continue;
+      // `source: 'domain'` is accurate even on this delay: the response genuinely came from
+      // contacting the domain, only through a process other than this one.
+      this.emit(recorder, {
+        step: entry.recorded_by_step,
+        type: FETCH_RECORDED_EVENT_TYPE,
+        payload: fetchRecordedEventPayload(entry, 'domain'),
       });
     }
   }

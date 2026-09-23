@@ -23,7 +23,7 @@ import {
   makeError,
 } from '../src/contracts/index.js';
 import type { ModelRung, OrchError, StepDisposition } from '../src/contracts/index.js';
-import { Recorder, readEventLog, runPaths, runsDir } from '../src/runtime/index.js';
+import { Recorder, RunFetchRecord, readEventLog, runPaths, runsDir } from '../src/runtime/index.js';
 import {
   BaselineResetError,
   ENGINE_EMITTER,
@@ -305,6 +305,49 @@ describe('AD-7 — at most one action per pass', () => {
     expect(executor.started).toHaveLength(2);
     expect(executor.started[1]?.input).toStrictEqual(executor.started[0]?.input);
     expect(executor.started[1]?.inputPath).toBe(inputPath);
+  });
+});
+
+/**
+ * Story 2-10, task 5 — the Jira tool server's standalone fetch-record writes are mirrored into
+ * `events.jsonl` once the reconciler next holds its own live `Recorder` for the run, at the point in
+ * its own pass where it already processes a step's disposition.
+ */
+describe('story 2-10 — a standalone fetch-record write is backfilled into events.jsonl', () => {
+  it('mirrors an entry a standalone Jira server wrote before the step it belongs to terminates', async () => {
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+
+    // What the Jira MCP child of the about-to-run "implement" step would have done: served a read
+    // through its own dedicated lock, with no Recorder of its own and so no events.jsonl append.
+    const standalone = RunFetchRecord.openStandalone({ runId: accepted.run, orchHome: home, step: 'implement' });
+    await standalone.serve(
+      { domain: 'jira', operation: 'get_issue', parameters: { key: 'PROJ-1' } },
+      () => ({ ok: true, status: 200, body: { key: 'PROJ-1' } }),
+    );
+    standalone.close();
+    expect(eventTypes(accepted.run)).not.toContain('fetch.recorded');
+
+    // The pass that runs "implement" to completion also processes its disposition, which is where
+    // the backfill happens.
+    await reconciler.pass();
+
+    const events = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === 'fetch.recorded',
+    );
+    expect(events).toHaveLength(1);
+    expect(events[0]?.payload['domain']).toBe('jira');
+    expect(events[0]?.payload['operation']).toBe('get_issue');
+    expect(events[0]?.payload['source']).toBe('domain');
+    expect(events[0]?.step).toBe('implement');
+
+    // Backfilling is idempotent: a later pass must not re-mirror the same entry a second time.
+    await reconciler.pass();
+    const afterSecondPass = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === 'fetch.recorded',
+    );
+    expect(afterSecondPass).toHaveLength(1);
   });
 });
 

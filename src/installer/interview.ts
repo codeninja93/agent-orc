@@ -36,13 +36,17 @@ import {
   RESOURCE_NEEDS,
   REVERSIBILITY_CLASSES,
   RUN_MODES,
+  JIRA_RESERVED_ENV_KEYS,
   branchPatternProblem,
   branchPatternVaries,
+  isBlankToolServerField,
   isContractId,
+  isHttpUrl,
 } from '../contracts/index.js';
 import type {
   Ceilings,
   ExternalDomain,
+  JiraToolServer,
   MechanicsCommands,
   PackageManager,
   ResourceNeed,
@@ -88,6 +92,8 @@ export interface Answers {
   readonly custom_agents: readonly AgentDeclarationInput[];
   readonly autonomy_start: RunMode;
   readonly ceilings: Ceilings;
+  /** Story 2-10 — question 14: whether the Jira tool domain is enabled, and if so, its two fields. */
+  readonly jira: JiraToolServer;
 }
 
 export type QuestionId = keyof Answers;
@@ -795,6 +801,74 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
           },
         },
       };
+    },
+  }),
+  question({
+    order: 14,
+    id: 'jira',
+    prompt: 'Should the Jira tool domain be enabled, and if so, where is its credential and API?',
+    form: {
+      kind: 'fields',
+      fields: [
+        {
+          key: 'enabled',
+          prompt: 'Enable the Jira tool domain? (yes/no)',
+          defaultSource: fixed('no'),
+          suggest: always('no'),
+        },
+        {
+          key: 'credential_env',
+          prompt: 'Environment variable NAME holding the Jira credential (blank if not enabling)',
+          defaultSource: noDefault,
+          suggest: noSuggestion,
+        },
+        {
+          key: 'base_url',
+          prompt: 'Jira base URL, e.g. https://your-domain.atlassian.net (blank if not enabling)',
+          defaultSource: noDefault,
+          suggest: noSuggestion,
+        },
+      ],
+    },
+    parse: (raw) => {
+      const enabled = field(raw, 'enabled').toLowerCase();
+      if (!['yes', 'no', 'y', 'n'].includes(enabled)) {
+        return refuse(`"${enabled}" is not yes or no.`);
+      }
+      if (enabled === 'no' || enabled === 'n') {
+        // Blank together is how "not enabled" is recorded (ToolServersSchema's own convention), and
+        // any credential-env or base-URL text typed alongside "no" is discarded rather than kept
+        // half-recorded: a domain a person just disabled must not still name where its credential is.
+        return { ok: true, value: { jira: { credential_env: '', base_url: '' } } };
+      }
+      const name = field(raw, 'credential_env');
+      if (!isEnvVarName(name)) return refuse(credentialNameRefusal(name));
+      // A second review-pass-1 amendment: caught here too, not only by the schema at write time. A
+      // reserved name still reaching JiraToolServerSchema's own refine would fail as an unhandled
+      // ZodError instead of the friendly re-prompt every other refusal in this question gets — the
+      // same reasoning behind the base_url check just below.
+      if ((JIRA_RESERVED_ENV_KEYS as readonly string[]).includes(name)) {
+        return refuse(
+          `"${name}" is one of ${JIRA_RESERVED_ENV_KEYS.join(', ')}, which the Jira tool server’s own ` +
+            'environment already uses — naming it here would overwrite that key in the spawned ' +
+            'server’s environment with the credential value. Give a name of your own, e.g. ' +
+            'JIRA_API_TOKEN.',
+        );
+      }
+      // Amended after review pass 1: trimmed, the same definition of blank JiraToolServerSchema's own
+      // refine uses, so a whitespace-only base URL is refused here rather than passing this guard and
+      // failing later as an unhandled schema error.
+      const baseUrl = field(raw, 'base_url').trim();
+      if (isBlankToolServerField(baseUrl)) {
+        return refuse('A Jira base URL is required when the Jira tool domain is enabled.');
+      }
+      if (!isHttpUrl(baseUrl)) {
+        return refuse(
+          `"${baseUrl}" is not a valid http(s) URL. Give the API root, e.g. ` +
+            'https://your-domain.atlassian.net.',
+        );
+      }
+      return { ok: true, value: { jira: { credential_env: name, base_url: baseUrl } } };
     },
   }),
 ]);
