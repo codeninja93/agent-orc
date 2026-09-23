@@ -210,14 +210,54 @@ export const branchPatternProblem = (pattern: string): string | null => {
 };
 
 /**
+ * The rate-limit window size a profile gets when nobody has stated one. **A placeholder.**
+ *
+ * Nothing in the spec, the CLI's result line or any published figure sizes a subscription's rate-limit
+ * window in tokens, and story 2-9 needs one to turn `rate_limit_budget_percent` into an allowance its
+ * recorded token counts can be measured against. The user decided to make the size a declared profile
+ * field rather than guess it in engine code (story 2-9). This number is what a profile carries until
+ * real usage data says what a window actually holds — it is not a measurement and must not be read as
+ * one. A multiple of a hundred, so the default allowance is a whole number of tokens.
+ */
+export const PLACEHOLDER_RATE_LIMIT_WINDOW_TOKENS = 10_000_000;
+
+/**
+ * The largest window size a profile may declare.
+ *
+ * A bound so a typo cannot declare a window no run could fill, and so the ceiling arithmetic stays exact:
+ * story 2-9 compares `tokens × 100 × 100` against `window × percent × threshold` in whole numbers, and at
+ * ten billion tokens that product still sits well inside `Number.MAX_SAFE_INTEGER`.
+ */
+export const MAX_RATE_LIMIT_WINDOW_TOKENS = 10_000_000_000;
+
+/**
  * AD-24 — three ceilings and no currency dimension, which R10 restates as "cost is subscription
  * usage, never currency". So the third ceiling is a share of the rate-limit window in percent, and
  * there is deliberately no dollar field for a user to put a number in.
+ *
+ * **`rate_limit_window_tokens` is how big that window is, and it is additive.** Story 2-9 added it with a
+ * default rather than advancing {@link PROFILE_SCHEMA_VERSION}, and the difference from story 2-6's
+ * `typecheck` is the reason. A defaulted `typecheck` would have *asserted a fact about the repository* —
+ * "declares no typecheck step" — that nobody stated, so a pre-2-6 profile had to be refused. A defaulted
+ * window asserts nothing about the project: it is the same placeholder the engine would otherwise have to
+ * hold itself, and every existing profile's three ceilings keep exactly the meaning they had. Refusing
+ * every v2 profile to ask a question whose honest answer is still "not known yet" would be a migration
+ * with nothing to migrate.
  */
 export const CeilingsSchema = z.object({
   steps: z.int(),
   wall_clock_minutes: z.int(),
   rate_limit_budget_percent: z.int(),
+  rate_limit_window_tokens: z
+    .int()
+    .refine((tokens) => tokens >= 1 && tokens <= MAX_RATE_LIMIT_WINDOW_TOKENS, {
+      message: `rate_limit_window_tokens must be between 1 and ${String(MAX_RATE_LIMIT_WINDOW_TOKENS)}`,
+    })
+    .default(PLACEHOLDER_RATE_LIMIT_WINDOW_TOKENS)
+    .describe(
+      'How many tokens one rate-limit window holds, a whole number from 1 to 10,000,000,000. ' +
+        'rate_limit_budget_percent is a share of this. Defaults to a placeholder, not a measurement.',
+    ),
 });
 
 export type Ceilings = z.infer<typeof CeilingsSchema>;

@@ -3,7 +3,7 @@
  *
  * The table itself is story 1-3's and its wording is unchanged; what story 1-10 changed is where it
  * lives. The kill card is specified to offer `continue / narrow / kill / take over`, and `narrow` is
- * `{ kind: 'awaiting', owner: 'story 2-9…' }` — the intent file is written and deliberately left
+ * `{ kind: 'awaiting', owner: 'story 2-11…' }` — the intent file is written and deliberately left
  * unconsumed. A card that said so from a string of its own would drift the day the table changed, and a
  * card that hid the control would be worse: AD-19 makes the intent durable precisely so it is not lost,
  * and a person who presses a key deserves to know the file is written and who will act on it.
@@ -60,10 +60,17 @@ export const COMMAND_HANDLING: CommandMap<CommandHandling> = {
     kind: 'acknowledge',
     note: 'the run continues unchanged; the command is recorded so the decision is attributable',
   },
-  narrow: { kind: 'awaiting', owner: 'story 2-9, which owns scope narrowing and the ceilings' },
+  narrow: {
+    kind: 'awaiting',
+    owner:
+      'story 2-11, which assembles the run this command would act on — story 2-9 built the ' +
+      'ceilings\' own automatic scope-narrowing, never a person-initiated one',
+  },
   pause: {
     kind: 'awaiting',
-    owner: 'story 2-9, which owns hibernation — the lifecycle has no non-terminal halted state yet',
+    owner:
+      'story 2-11, which assembles the run this command would act on — the lifecycle still has no ' +
+      'non-terminal halted state, and story 2-9\'s hibernation is a terminal one, not this',
   },
   inject_note: { kind: 'awaiting', owner: 'story 2-10, which owns a running agent’s next input' },
   kill: { kind: 'effect' },

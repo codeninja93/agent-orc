@@ -18,6 +18,9 @@
  * low-entropy values: an enum member, a dotted contract id, a small count, a run-relative path.
  */
 import {
+  BUDGET_DEGRADED_EVENT_TYPE,
+  BUDGET_PAYLOAD_KEYS,
+  CEILING_DIMENSIONS,
   CURRENT_SCHEMA_VERSION,
   FEATURE_STATES,
   GATE_FAILED_EVENT_TYPE,
@@ -32,6 +35,7 @@ import {
   formatTimestamp,
 } from '../contracts/index.js';
 import type {
+  Degradation,
   EventEnvelope,
   FeatureState,
   Handoff,
@@ -88,6 +92,20 @@ export const ENGINE_EVENT_TYPES = {
   StepApproved: 'step.approved',
   /** A run stopped and explained itself rather than thrashing (CAP-23, AD-35). */
   HandoffRecorded: 'handoff.recorded',
+  /**
+   * AD-24 — the run crossed eighty percent of a ceiling. Folded into `degradation`, once: the first line
+   * stands and a later one changes nothing, because degradation is a standing condition (story 2-9).
+   */
+  BudgetDegraded: BUDGET_DEGRADED_EVENT_TYPE,
+  /**
+   * AD-24 — a step was put on a lower rung because the run is degraded, not because it failed.
+   *
+   * Its own type rather than `step.tier_promoted` with a direction, because the two have different triggers
+   * — a failed gate climbs, budget pressure descends — and a reader counting promotions against the Stack's
+   * one-per-step ceiling must never count a downshift as one. Not folded: `step.started` already carries the
+   * rung the attempt ran on, and a second line that moved `model_tier` would be a second authority on it.
+   */
+  StepTierDownshifted: 'step.tier_downshifted',
   /**
    * One deterministic gate ran, was skipped, or failed — CAP-13's first tier, recorded per gate.
    *
@@ -154,6 +172,7 @@ export const FOLDED_EVENT_TYPES: readonly string[] = Object.freeze([
   ENGINE_EVENT_TYPES.StepBaselineReset,
   ENGINE_EVENT_TYPES.StepTierPromoted,
   ENGINE_EVENT_TYPES.HandoffRecorded,
+  ENGINE_EVENT_TYPES.BudgetDegraded,
   /**
    * AD-19's ledger entry *and* the effect it records, in one line.
    *
@@ -253,6 +272,7 @@ export const emptyRunState = (options: RebuildOptions): RunState => {
     created_at: at,
     updated_at: at,
     handoff: null,
+    degradation: null,
   };
 };
 
@@ -296,6 +316,7 @@ export const rebuildFromLog = (
   let state: FeatureState = 'drafting';
   let mode: RunMode = options.plan.mode;
   let handoff: Handoff | null = null;
+  let degradation: Degradation | null = null;
   let createdAt: string | null = null;
   let updatedAt: string | null = null;
   let lastSeq = 0;
@@ -547,6 +568,20 @@ export const rebuildFromLog = (
         break;
       }
 
+      case ENGINE_EVENT_TYPES.BudgetDegraded: {
+        /**
+         * `??=`, so the first line stands. A second `budget.degraded` should never be written — the engine
+         * guards on this very field — but a log is data, and a duplicated line must not move the record of
+         * *when* and *why* the run degraded to a later, different answer.
+         */
+        const dimension = payloadString(event, BUDGET_PAYLOAD_KEYS.Dimension);
+        degradation ??= {
+          dimension: isOneOf(CEILING_DIMENSIONS, dimension) ? dimension : null,
+          recorded_at: event.ts,
+        };
+        break;
+      }
+
       default:
         // AD-5 — a reader ignores an unknown type rather than erroring.
         break;
@@ -563,6 +598,7 @@ export const rebuildFromLog = (
     created_at: createdAt ?? base.created_at,
     updated_at: updatedAt ?? base.updated_at,
     handoff,
+    degradation,
   };
 };
 
@@ -618,6 +654,9 @@ export const compareCheckpointToLog = (
   compare('last_event_seq', checkpoint.last_event_seq, rebuilt.last_event_seq);
   compare('mode', checkpoint.mode, rebuilt.mode);
   compare('handoff.code', checkpoint.handoff?.code ?? null, rebuilt.handoff?.code ?? null);
+  // A checkpoint that has forgotten a degradation the log records would put a degraded run back on the
+  // ordinary tier and the ordinary review, which is the un-degrading story 2-9 forbids.
+  compare('degradation', checkpoint.degradation, rebuilt.degradation);
 
   const fromLog = new Map(rebuilt.steps.map((record) => [record.step, record]));
   for (const record of checkpoint.steps) {

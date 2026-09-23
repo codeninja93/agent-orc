@@ -25,9 +25,11 @@ import {
   DEFAULT_BRANCH_PATTERN,
   ENV_VAR_NAME_PATTERN,
   MAX_ENV_VAR_NAME_LENGTH,
+  MAX_RATE_LIMIT_WINDOW_TOKENS,
   MECHANICS_COMMAND_NAMES,
   MODEL_RUNGS,
   PACKAGE_MANAGERS,
+  PLACEHOLDER_RATE_LIMIT_WINDOW_TOKENS,
   RESOURCE_NEEDS,
   REVERSIBILITY_CLASSES,
   RUN_MODES,
@@ -747,6 +749,14 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
           defaultSource: fixed('50'),
           suggest: always('50'),
         },
+        {
+          key: 'rate_limit_window_tokens',
+          prompt: 'Size of the rate-limit window, in tokens',
+          // A placeholder, not a measurement: nothing published sizes a subscription's window in tokens,
+          // so this is what a person accepts when they do not know either (story 2-9).
+          defaultSource: fixed(String(PLACEHOLDER_RATE_LIMIT_WINDOW_TOKENS)),
+          suggest: always(String(PLACEHOLDER_RATE_LIMIT_WINDOW_TOKENS)),
+        },
       ],
     },
     parse: (raw) => {
@@ -764,6 +774,12 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
         MAX_RATE_LIMIT_BUDGET_PERCENT,
       );
       if (typeof percent === 'string') return refuse(percent);
+      const windowTokens = parseCeiling(
+        field(raw, 'rate_limit_window_tokens'),
+        'The rate-limit window size',
+        MAX_RATE_LIMIT_WINDOW_TOKENS,
+      );
+      if (typeof windowTokens === 'string') return refuse(windowTokens);
       return {
         ok: true,
         value: {
@@ -771,6 +787,7 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
             steps,
             wall_clock_minutes: minutes,
             rate_limit_budget_percent: percent,
+            rate_limit_window_tokens: windowTokens,
           },
         },
       };

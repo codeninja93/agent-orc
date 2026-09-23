@@ -366,6 +366,7 @@ describe('the hand-off document reads as a colleague’s note', () => {
     const withBranch = renderHandoffDocument(
       aBrief({
         escape: {
+          trigger: 'take-over',
           branch: `${TAKEOVER_BRANCH_PREFIX}${RUN}`,
           commit: BASELINE,
           preserved: true,
@@ -393,6 +394,7 @@ describe('the hand-off document reads as a colleague’s note', () => {
       aBrief({
         reason: `The deploy step failed because the token ${secret} was rejected.`,
         escape: {
+          trigger: 'take-over',
           branch: `${TAKEOVER_BRANCH_PREFIX}${RUN}`,
           commit: BASELINE,
           preserved: true,

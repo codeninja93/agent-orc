@@ -409,13 +409,15 @@ stateDiagram-v2
     running --> blocked: irreversible gate reached
     blocked --> running: approval, or default-on-timeout taken
     running --> degraded: eighty percent of a ceiling
-    degraded --> running: scope narrowed, tier downshifted
+    degraded --> degraded: step completed, scope narrowed, tier downshifted
     running --> interrupted: engine killed, crash, or laptop closed
     interrupted --> running: resume by session id, else baseline reset and re-run
     running --> verifying: implementation steps complete
     verifying --> running: gate failed, tier promoted
     verifying --> committed: gates passed, committer opens a pull request
+    degraded --> committed: gates passed while degraded, committer opens a pull request
     degraded --> hibernated: ceiling reached
+    running --> hibernated: a ceiling reached with no eighty percent step in between
     running --> killed: user steering command
     running --> handed_off: escape hatch, or repeated failure
     blocked --> handed_off: escape hatch

@@ -93,8 +93,25 @@ export const execFileWorktreeGit: WorktreeGit = (worktree, args) => {
 export const TAKEOVER_COMMITTER_NAME = 'orch';
 export const TAKEOVER_COMMITTER_EMAIL = 'orch@localhost';
 
+/**
+ * Why the escape hatch was invoked: a person taking the work over (CAP-23), or a run reaching one of
+ * AD-24's ceilings.
+ *
+ * The git sequence is identical for both, and that is the point — story 2-9 hibernates *through* this
+ * function rather than beside it, so AD-32's crash-safety is one implementation and not two that could
+ * drift. What differs is what the outcome is evidence of. A take-over is a person's decision and a
+ * ceiling is the budget's, and a branch, a commit message and a document that could not say which would
+ * make a hibernated run indistinguishable from one somebody abandoned — which is exactly the difference a
+ * person reading the branch later needs, because only one of them is worth restarting as it stands.
+ */
+export const ESCAPE_TRIGGERS = ['take-over', 'ceiling'] as const;
+
+export type EscapeTrigger = (typeof ESCAPE_TRIGGERS)[number];
+
 /** What the escape hatch did with the partial work. */
 export interface EscapeHatchOutcome {
+  /** What invoked it, carried back so every reader of the outcome can tell a ceiling from a take-over. */
+  readonly trigger: EscapeTrigger;
   readonly branch: string;
   /** The commit the work landed on, or `null` when there was nothing uncommitted to commit. */
   readonly commit: string | null;
@@ -139,13 +156,17 @@ export const escapeHatch = (request: {
   readonly feature: string;
   readonly worktree: string;
   readonly git?: WorktreeGit;
+  /** Defaults to a take-over, which is what every caller before story 2-9 was. */
+  readonly trigger?: EscapeTrigger;
 }): EscapeHatchOutcome => {
   const git = request.git ?? execFileWorktreeGit;
+  const trigger = request.trigger ?? 'take-over';
   const branch = takeoverBranchFor(request.run);
 
   const status = git(request.worktree, ['status', '--porcelain']);
   if (status.status !== 0) {
     return {
+      trigger,
       branch,
       commit: null,
       preserved: false,
@@ -178,6 +199,7 @@ export const escapeHatch = (request: {
       : git(request.worktree, ['checkout', '-b', branch]);
   if (switched.status !== 0) {
     return {
+      trigger,
       branch,
       commit: null,
       preserved: false,
@@ -205,6 +227,7 @@ export const escapeHatch = (request: {
     const head = git(request.worktree, ['rev-parse', 'HEAD']);
     const commit = head.status === 0 ? head.stdout.trim() : null;
     return {
+      trigger,
       branch,
       commit,
       preserved: false,
@@ -236,11 +259,19 @@ export const escapeHatch = (request: {
           'commit',
           '--no-verify',
           '-m',
-          `orch: partial work from run ${request.run} (${request.feature})`,
+          /**
+           * The commit says which trigger made it, because the commit is the one part of this that outlives
+           * the run directory: `git log` on the take-over branch is where a person meets it months later,
+           * and "hibernated at a run ceiling" and "taken over" call for different next moves.
+           */
+          trigger === 'ceiling'
+            ? `orch: partial work from run ${request.run} (${request.feature}), hibernated at a run ceiling`
+            : `orch: partial work from run ${request.run} (${request.feature})`,
         ])
       : staged;
   if (committed.status !== 0) {
     return {
+      trigger,
       branch,
       commit: null,
       preserved: false,
@@ -263,6 +294,7 @@ export const escapeHatch = (request: {
 
   const head = git(request.worktree, ['rev-parse', 'HEAD']);
   return {
+    trigger,
     branch,
     commit: head.status === 0 ? head.stdout.trim() : null,
     preserved: true,
@@ -432,8 +464,17 @@ export const renderHandoffDocument = (
       'above are what was being built against.',
   );
 
+  /**
+   * The headline says which kind of stop this was, because a person decides differently about each.
+   *
+   * A run that hibernated at an AD-24 ceiling was *not* failing — it ran out of the allowance it was given —
+   * so the same document opening "handed off" would read as a verdict on the work that nobody made. Keyed on
+   * the state the run is entering rather than on the escape outcome, because a hibernation whose git sequence
+   * failed is still a hibernation.
+   */
+  const hibernated = brief.state === 'hibernated';
   const lines: string[] = [
-    `# ${brief.feature} — handed off`,
+    `# ${brief.feature} — ${hibernated ? 'hibernated at a run ceiling' : 'handed off'}`,
     '',
     clean(brief.reason, policy),
     '',
@@ -472,7 +513,8 @@ export const renderHandoffDocument = (
         }`,
     '',
     `In the system's own vocabulary this was \`${brief.code}\`, and the run is now \`${brief.state}\`. ` +
-      'Neither will change on its own: no later pass picks a handed-off run back up.',
+      `Neither will change on its own: no later pass picks a ${hibernated ? 'hibernated' : 'handed-off'} ` +
+      'run back up.',
     '',
     '## Where the work is',
     '',

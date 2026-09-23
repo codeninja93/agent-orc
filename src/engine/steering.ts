@@ -374,7 +374,15 @@ export const decideSteering = (
       return {
         kind: 'apply',
         effect: effect('approved', {
-          toState: 'running',
+          /**
+           * A degraded run returns to `degraded`, not `running` (AD-24, story 2-9).
+           *
+           * Degradation is a standing condition: a run that crossed eighty percent of a ceiling and then
+           * blocked at a gate has not got its budget back by being approved. Answering `running` here was
+           * the one arrow in the engine that took a degraded run back to an undegraded state, and it would
+           * have shown a person the state flapping on the one surface that is meant to be an honest signal.
+           */
+          toState: state.degradation === null ? 'running' : 'degraded',
           step: blocked?.step ?? null,
           // The approval settles the condition the step blocked on, so its error is spent and the step
           // becomes resumable-or-re-runnable. Leaving the error standing would make the next pass

@@ -33,9 +33,9 @@ export const RUN_STATE_FILE_NAME = 'state.json';
 /**
  * The feature state lifecycle, exactly as the spine's state diagram records it in the checkpoint.
  *
- * `degraded` and `hibernated` are declared here because the lifecycle has them, but nothing enters
- * them until AD-24's ceilings arrive in story 2-9: a state the enum omitted would be a contract
- * change then, and a state the reconciler never writes is not.
+ * `degraded` and `hibernated` were declared here before anything entered them, so story 2-9's ceilings
+ * arrived as behaviour rather than as a contract change. `src/engine/ceilings.ts` is what enters them:
+ * `degraded` at eighty percent of any ceiling, `hibernated` on reaching one.
  */
 export const FEATURE_STATES = [
   'drafting',
@@ -230,6 +230,44 @@ export const HandoffSchema = z.object({
 export type Handoff = z.infer<typeof HandoffSchema>;
 
 /**
+ * AD-24's three ceilings, by name — step count, wall clock, consumed rate-limit budget — and no fourth.
+ *
+ * There is no currency member and there never may be: AD-24 says "no currency dimension" and R10 says cost
+ * is subscription usage. The list is the vocabulary a `budget.degraded` line names its trigger in, so a
+ * dimension a later build adds is one this build folds as `null` rather than refuses (AD-5).
+ */
+export const CEILING_DIMENSIONS = ['steps', 'wall_clock', 'rate_limit_budget'] as const;
+
+export type CeilingDimension = (typeof CEILING_DIMENSIONS)[number];
+
+/**
+ * AD-24 — that the run degraded, when, and on which ceiling first. Folded from the first `budget.degraded`.
+ *
+ * **Why this is a field and not a `FeatureState`.** `degraded` *is* a feature state, and the run enters it.
+ * But story 2-9 makes degradation a standing condition — once a run crosses eighty percent of any ceiling it
+ * stays degraded for the rest of its life, so the person reading `budget.degraded` gets one honest signal
+ * rather than a flapping one — and the feature state is one slot that `blocked` and `interrupted` overwrite
+ * on their way through. A degraded run that is interrupted and resumed must come back *degraded*, not
+ * `running`, and the only way the loop can know that from the checkpoint alone (AD-7) is a fact the state
+ * slot cannot erase. This is that fact; the state slot says where the run is right now.
+ *
+ * Nothing clears it. There is no event that un-degrades a run, deliberately, and the fold keeps the *first*
+ * line's values so a later ceiling crossing eighty percent changes nothing here either.
+ */
+export const DegradationSchema = z.object({
+  dimension: z
+    .enum(CEILING_DIMENSIONS)
+    .nullable()
+    .describe(
+      'The ceiling that crossed eighty percent first. Null when the line named a dimension this build ' +
+        'does not know: the run is still degraded, which is the fact that matters (AD-5).',
+    ),
+  recorded_at: TimestampSchema.describe('When the first budget.degraded line was recorded.'),
+});
+
+export type Degradation = z.infer<typeof DegradationSchema>;
+
+/**
  * `runs/<run-id>/state.json`.
  *
  * `last_event_seq` is the hinge of AD-4: it names the log position this checkpoint was folded from,
@@ -257,6 +295,14 @@ export const RunStateSchema = versioned({
   created_at: TimestampSchema,
   updated_at: TimestampSchema,
   handoff: HandoffSchema.nullable(),
+  /**
+   * AD-24 — the standing degradation, or `null` for a run that has never crossed eighty percent.
+   *
+   * Defaulted to `null` on the way in rather than required, so a `state.json` written before story 2-9 still
+   * parses as the checkpoint it is; the log then decides, as it always does (AD-4) — a run whose log carries
+   * `budget.degraded` disagrees with such a checkpoint and the checkpoint is rebuilt.
+   */
+  degradation: DegradationSchema.nullable().default(null),
 }).refine(
   (state) => new Set(state.steps.map((step) => step.step)).size === state.steps.length,
   {

@@ -35,6 +35,9 @@ import { dirname, join } from 'node:path';
 import {
   ANALYSIS_CONTRACT_ID,
   BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
+  BUDGET_DEGRADED_EVENT_TYPE,
+  BUDGET_EXHAUSTED_EVENT_TYPE,
+  BUDGET_PAYLOAD_KEYS,
   BRANCH_PROTECTION_PAYLOAD_KEYS,
   COMMITTING_CONTRACT_ID,
   COMMIT_COMPOSED_EVENT_TYPE,
@@ -70,10 +73,12 @@ import {
   renderSchemaRefusal,
 } from '../contracts/index.js';
 import type {
+  Ceilings,
   Command,
   CommandIntent,
   CommandSource,
   BranchProtectionReport,
+  ErrorCode,
   DeflectionSource,
   EventEnvelope,
   FeatureState,
@@ -205,6 +210,18 @@ import {
 import type { ComposedCommit } from './committer.js';
 
 import { ModelRungUnrecognised, rungForAttempt } from './promotion.js';
+import {
+  DECLARED_FALLBACK_CEILINGS,
+  budgetFrom,
+  ceilingVerdict,
+  describeReading,
+  downshiftFor,
+  measureConsumption,
+  readCeilings,
+  runCeilingsFrom,
+  skipsModelReview,
+} from './ceilings.js';
+import type { CeilingReading, CeilingVerdict, DownshiftDecision } from './ceilings.js';
 import { defaultUlidMinter } from './ulid.js';
 import type { UlidMinter } from './ulid.js';
 
@@ -384,14 +401,27 @@ export const criterionEditedPayload = (argument: string): Record<string, unknown
 const SAFE_STEP_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 /**
- * A declared wall-clock allowance carried on the step input so the contract is satisfied.
+ * The AD-35 code a ceiling hibernation is recorded under.
  *
- * AD-24's ceilings — step count, wall clock and rate-limit budget — are story 2-9's to *enforce*, and
- * this story's Never list excludes them. The value is therefore declared and passed through, and
- * nothing here degrades, hibernates or refuses on it. Naming it rather than inlining a number is what
- * keeps that honest: when 2-9 arrives it replaces this constant, it does not discover a magic literal.
+ * `budget.exhausted` was declared `abandon-and-hand-off` in the table from story 1-1 with nothing to route
+ * to it; this is the code the hand-off record and the document carry, so a hibernated run explains itself
+ * in the same vocabulary as every other stop and no reader has to learn a second one.
  */
-export const DECLARED_WALL_CLOCK_MS = 60 * 60 * 1000;
+export const CEILING_HANDOFF_CODE: ErrorCode = 'budget.exhausted';
+
+/**
+ * The action kinds that spend: each hands the executor a step, which is what a ceiling bounds.
+ *
+ * AD-24 has a run hibernate "rather than dying mid-write or continuing", and continuing is *these*. A run
+ * whose next action is to record an orphan, advance to `committed`, wait for a person or hand off is not
+ * continuing to spend, so the ceilings are not asked about it — which is what lets a run that finished its
+ * last step exactly at a ceiling commit rather than hibernate with nothing left to do.
+ */
+export const SPENDING_ACTION_KINDS: readonly ReconcileActionKind[] = [
+  'run-step',
+  'resume-step',
+  'reset-and-rerun',
+];
 
 /**
  * How often the loop looks at `runs/<run-id>/commands/` while a step is in flight.
@@ -757,6 +787,31 @@ export type ReconcileAction =
       readonly step: string | null;
       readonly code: string;
       readonly reason: string;
+    }
+  /**
+   * AD-24 — eighty percent of a ceiling: record `budget.degraded` and enter `degraded`, once.
+   *
+   * An action of its own rather than a prefix to the step it displaced, for AD-7's one-action rule: the
+   * step runs on the next pass, and runs degraded — downshifted, and with its review narrowed.
+   */
+  | {
+      readonly kind: 'degrade';
+      readonly reading: CeilingReading;
+      readonly readings: readonly CeilingReading[];
+      readonly reason: string;
+    }
+  /**
+   * AD-24 — a ceiling reached: the escape hatch, the hand-off document, `budget.exhausted`, `hibernated`.
+   *
+   * `step` is the step the run would have spent on next, carried for the report only; the hibernation
+   * itself is run-level, because it is the run's allowance that ran out and not a step that failed.
+   */
+  | {
+      readonly kind: 'hibernate';
+      readonly step: string | null;
+      readonly reading: CeilingReading;
+      readonly readings: readonly CeilingReading[];
+      readonly reason: string;
     };
 
 export type ReconcileActionKind = ReconcileAction['kind'];
@@ -1010,6 +1065,31 @@ export class UnreadableGateConfiguration extends Error {
       { cause },
     );
     this.name = 'UnreadableGateConfiguration';
+    this.run = run;
+  }
+}
+
+/**
+ * The run's profile exists and cannot be read, so which ceilings it declares is unknown.
+ *
+ * Refused rather than answered with {@link DECLARED_FALLBACK_CEILINGS}, for the distinction story 2-6 drew
+ * for the gates one class up: *absent* and *unreadable* are different answers. A profile that cannot be read
+ * may declare ceilings far tighter than the fallback, and spending against the fallback would spend what a
+ * person said not to. `config.invalid` → `escalate-to-human`: no retry reads an unreadable file.
+ */
+export class UnreadableCeilingConfiguration extends Error {
+  readonly code = 'config.invalid';
+  readonly run: string;
+
+  constructor(run: string, cause: unknown) {
+    super(
+      `Run ${run} has a configuration snapshot whose profile cannot be read: ` +
+        `${cause instanceof Error ? cause.message : String(cause)}. Which ceilings it declares is ` +
+        'therefore unknown, and AD-24 bounds every run by its declared ceilings — so no step is started ' +
+        'against an allowance nobody can read, and the run waits for a person instead.',
+      { cause },
+    );
+    this.name = 'UnreadableCeilingConfiguration';
     this.run = run;
   }
 }
@@ -2334,6 +2414,8 @@ export class Reconciler {
       readonly code: string;
       readonly reason: string;
       readonly escape: EscapeHatchOutcome | null;
+      /** The terminal state the run is entering; `handed_off` unless a ceiling is hibernating it. */
+      readonly state?: 'handed_off' | 'hibernated';
     },
   ): string {
     const document = writeHandoffDocument(
@@ -2341,9 +2423,9 @@ export class Reconciler {
       {
         run: state.run,
         feature: state.feature,
-        // The state the run is *entering*: the document is only ever written on the way to handing off,
-        // and telling a person the run is still `running` would be the one thing it must not do.
-        state: 'handed_off',
+        // The state the run is *entering*: the document is only ever written on the way to a terminal
+        // state, and telling a person the run is still `running` would be the one thing it must not do.
+        state: options.state ?? 'handed_off',
         request: plan.request,
         acceptanceCriteria: plan.acceptance_criteria,
         code: options.code,
@@ -2709,7 +2791,16 @@ export class Reconciler {
     // so no action is ever chosen from a state the durable truth does not support.
     if (loaded.checkpointRebuilt) state = this.writeCheckpoint(paths, state);
 
-    const action = decideAction(state, plan);
+    /**
+     * AD-24 — the ceilings are asked *after* the ordinary decision, and only ever narrow it.
+     *
+     * `decideAction` is untouched by the budget except for the state a degraded run works in, so every
+     * routing — the AD-35 table, the attempt bound, the ladder — is the one an undegraded run gets. The
+     * ceilings then answer one question about the action it chose: may this run spend? That keeps the
+     * two concerns separable in the code the way they are in the spine, and it is what matrix row 7 needs:
+     * a degraded run's failing gate is disposed by exactly the routing an undegraded run's would be.
+     */
+    const action = this.governedByCeilings(loaded, state, decideAction(state, plan));
     const from = state.state;
 
     if (isInertAction(action.kind)) {
@@ -2722,6 +2813,57 @@ export class Reconciler {
     const step = await this.perform(paths, plan, state, action);
     const settled = this.checkpointFromLog(paths, plan);
     return this.report(run, settled, action, from, step, loaded);
+  }
+
+  /**
+   * AD-24 — whether the ceilings let this action spend, and what the run does instead when they do not.
+   *
+   * Asked only of a spending action, or of a run whose log already carries `budget.exhausted` — the one
+   * case where the next pass must finish a hibernation a crash interrupted (matrix row 11) whatever the
+   * ordinary decision would now be. Everything else passes through untouched, so a run that is merely
+   * waiting on a person does not read its configuration on every pass.
+   */
+  private governedByCeilings(
+    loaded: LoadedState,
+    state: RunState,
+    action: ReconcileAction,
+  ): ReconcileAction {
+    const exhausted = loaded.events.some((event) => event.type === BUDGET_EXHAUSTED_EVENT_TYPE);
+    if (!exhausted && !SPENDING_ACTION_KINDS.includes(action.kind)) return action;
+    let readings: readonly CeilingReading[];
+    try {
+      readings = this.ceilingReadings(state, loaded.events);
+    } catch (thrown: unknown) {
+      if (!(thrown instanceof UnreadableCeilingConfiguration)) throw thrown;
+      return { kind: 'escalate-to-human', step: spendingStepOf(action), reason: thrown.message };
+    }
+    return decideCeilingAction(action, state, ceilingVerdict(readings), exhausted);
+  }
+
+  /** The run's three ceilings, read against what it has consumed so far. */
+  private ceilingReadings(
+    state: RunState,
+    events: readonly EventEnvelope[],
+  ): readonly CeilingReading[] {
+    return readCeilings(
+      measureConsumption({ state, events, now: this.now() }),
+      runCeilingsFrom(this.declaredCeilings(state.run)),
+    );
+  }
+
+  /**
+   * The ceilings the run's AD-9 snapshot declares, the fallback when it holds no profile, or a refusal.
+   *
+   * Read from the snapshot rather than `.orch/`, like every configuration read here: a ceiling raised
+   * mid-run in the repository must not raise the ceiling of a run already under way (AD-9, AD-34).
+   */
+  private declaredCeilings(run: string): Ceilings {
+    try {
+      return readStepConfiguration(run, { orchHome: this.orchHome }).profile.profile.ceilings;
+    } catch (thrown: unknown) {
+      if (thrown instanceof ProfileNotFound) return DECLARED_FALLBACK_CEILINGS;
+      throw new UnreadableCeilingConfiguration(run, thrown);
+    }
   }
 
   /**
@@ -2915,6 +3057,35 @@ export class Reconciler {
         return action.step;
       }
 
+      case 'degrade': {
+        /**
+         * Two lines, in this order, and the order is the crash story.
+         *
+         * `budget.degraded` first, because it is the fact the fold keeps for good: once it is durable the
+         * run is degraded whatever happens next, and a crash before the state change is finished by the
+         * next pass without a second `budget.degraded` — `decideAction` already hands a degraded run's next
+         * step `degraded` as its working state, so `driveStep` makes the transition on its own. The other
+         * order could leave a run in `degraded` with no line saying why, which is a state nothing can
+         * explain and nothing would ever re-emit the reason for.
+         */
+        this.emit(recorder, {
+          step: null,
+          type: BUDGET_DEGRADED_EVENT_TYPE,
+          payload: this.budgetPayload(plan, state, action.reading, action.readings, action.reason),
+        });
+        this.emit(recorder, {
+          step: null,
+          type: ENGINE_EVENT_TYPES.FeatureStateChanged,
+          payload: { from: state.state, to: 'degraded', reason: action.reason },
+        });
+        return null;
+      }
+
+      case 'hibernate': {
+        this.hibernate(paths, plan, state, action);
+        return action.step;
+      }
+
       case 'idle':
       case 'await-confirmation':
       case 'await-approval':
@@ -2980,13 +3151,28 @@ export class Reconciler {
      * escaping the pass as an uncaught throw and taking every other feature's pass with it — the same
      * treatment the baseline reset below already gets.
      */
+    /**
+     * AD-24 — a degraded run's attempt downshifts instead of climbing, and declines a promotion it was due.
+     *
+     * The ordinary rule is asked first *without* the promotion, and the downshift is taken from its answer:
+     * the rung this step would otherwise run on, one step toward the floor. The promotion the routing
+     * granted is not spent — spending it and then running lower would record a climb that never happened,
+     * and the step's one promotion would be gone for nothing. It is named on the downshift line instead, so
+     * the log says what budget pressure overrode.
+     */
+    const degraded = state.degradation !== null;
     let tier: ModelRung;
+    let downshift: DownshiftDecision | null = null;
     try {
       tier = rungForAttempt({
-        promoteTo: options.promoteTo,
+        promoteTo: degraded ? null : options.promoteTo,
         recorded: existing?.model_tier ?? null,
         declared: this.declaredStartingRung(state.run, options.step.phase) ?? plan.starting_model_tier,
       });
+      if (degraded) {
+        downshift = downshiftFor(tier);
+        tier = downshift.to;
+      }
     } catch (thrown: unknown) {
       if (!(thrown instanceof ModelRungUnrecognised)) throw thrown;
       this.emit(recorder, {
@@ -2996,7 +3182,7 @@ export class Reconciler {
       });
       return;
     }
-    if (options.promoteTo !== null) {
+    if (options.promoteTo !== null && !degraded) {
       this.emit(recorder, {
         step: options.step.step,
         type: ENGINE_EVENT_TYPES.StepTierPromoted,
@@ -3004,6 +3190,21 @@ export class Reconciler {
           from: existing?.model_tier ?? plan.starting_model_tier,
           to: options.promoteTo,
           ladder: MODEL_RUNGS.join('>'),
+        },
+      });
+    }
+    if (downshift !== null && (downshift.moved || options.promoteTo !== null)) {
+      this.emit(recorder, {
+        step: options.step.step,
+        type: ENGINE_EVENT_TYPES.StepTierDownshifted,
+        payload: {
+          from: downshift.from,
+          to: downshift.to,
+          // The trigger, spelled as the event that caused it, so no reader can mistake this for a climb.
+          trigger: BUDGET_DEGRADED_EVENT_TYPE,
+          ladder: MODEL_RUNGS.join('>'),
+          declined_promotion: options.promoteTo,
+          reason: downshift.reason,
         },
       });
     }
@@ -3076,6 +3277,40 @@ export class Reconciler {
       attempt,
     );
     if (gates === null) return;
+
+    /**
+     * AD-24's "narrowing scope", and nothing wider: a degraded run's verification step stops after its
+     * deterministic gates.
+     *
+     * Here, after the gates have run and passed, and not one line earlier — the first tier is exactly what
+     * narrowing must not touch. A failing gate has already been recorded and disposed above by the path an
+     * undegraded run takes, so all this ever cuts is the model turn spent judging a result the gates have
+     * already accepted. The step completes with no model output, because no model was asked; the line below
+     * is the positive statement of why, beside the absence of a spawn.
+     */
+    if (skipsModelReview({ degraded, phase: options.step.phase, gates })) {
+      this.emit(recorder, {
+        step: options.step.step,
+        type: ENGINE_EVENT_TYPES.ReviewSkipped,
+        payload: {
+          reason:
+            'the run is degraded, so its scope is narrowed: the deterministic gates ran and passed, and ' +
+            'the model-based review was not spawned (AD-24)',
+          narrowed_by: BUDGET_DEGRADED_EVENT_TYPE,
+          failed_gates: [],
+          passed_gates: gates.filter((gate) => gate.outcome === 'passed').map((gate) => gate.command),
+        },
+        baselineRef,
+      });
+      this.recordTermination(
+        state,
+        options.step,
+        baselineRef,
+        { step: options.step.step, disposition: 'completed', sessionId: null, output: null, error: null, usage: null },
+        { transitionTo: options.transitionTo, plan },
+      );
+      return;
+    }
 
     /**
      * The input is written **after** the gates ran, because it carries what they returned.
@@ -3291,6 +3526,107 @@ export class Reconciler {
       },
     });
     this.boundary('stopper-unwired');
+  }
+
+  /**
+   * The payload of a `budget.degraded` or `budget.exhausted` line: which ceiling, by how much, and the budget.
+   *
+   * The three `BudgetSchema` fields go in under their own names because `src/tui/projection.ts` already
+   * folds exactly those off these two types; the fraction is unclamped, so an overshoot reads as one.
+   */
+  private budgetPayload(
+    plan: FeaturePlan,
+    state: RunState,
+    reading: CeilingReading,
+    readings: readonly CeilingReading[],
+    reason: string,
+  ): Record<string, unknown> {
+    const budget = budgetFrom(stepsRemainingIn(plan, state), readings);
+    const rate = readings.find((entry) => entry.dimension === 'rate_limit_budget');
+    return {
+      [BUDGET_PAYLOAD_KEYS.Dimension]: reading.dimension,
+      [BUDGET_PAYLOAD_KEYS.Fraction]: reading.fraction,
+      [BUDGET_PAYLOAD_KEYS.Consumed]: reading.consumed,
+      [BUDGET_PAYLOAD_KEYS.Ceiling]: reading.ceiling,
+      [BUDGET_PAYLOAD_KEYS.Reason]: reason,
+      ...budget,
+      // Unclamped in the log, unlike in a step input: `formatBudgetShare` reports a share past 1 as outside
+      // the scale rather than clamping it, and a clamped figure here would give it nothing to report (R12).
+      rate_limit_budget_consumed:
+        rate !== undefined && Number.isFinite(rate.fraction)
+          ? rate.fraction
+          : budget.rate_limit_budget_consumed,
+    };
+  }
+
+  /**
+   * AD-24 — hibernate: the work onto a branch, the note written, `budget.exhausted`, then `hibernated`.
+   *
+   * **Through {@link escapeHatch}, never beside it.** CAP-23's take-over already puts a run's work on an
+   * ordinary branch and writes the four-question document, and it is already idempotent against a crash
+   * mid-write (AD-32). A second branch-and-document path for the ceiling case would be a second thing to
+   * keep crash-safe, and the first thing to drift would be the one sentence that must never be wrong —
+   * where the work is. What is new here is only the trigger and what the record says about it.
+   *
+   * **Every step is safe to repeat, and the repeat writes nothing twice.** The order is the take-over's:
+   * the work is preserved before any line claims it is, the document before the lines that describe it,
+   * and the state change last, because it is what makes the run terminal and nothing looks at a terminal
+   * run again. A crash anywhere before it leaves a non-terminal run whose log carries — or is about to carry
+   * — `budget.exhausted`, and the next pass comes back here: the hatch adopts its own branch, the document
+   * is rewritten whole, and each line is appended only if the log does not already hold it (matrix row 11).
+   */
+  private hibernate(
+    paths: RunPaths,
+    plan: FeaturePlan,
+    state: RunState,
+    action: Extract<ReconcileAction, { kind: 'hibernate' }>,
+  ): void {
+    const recorder = this.recorderFor(state.run, state.feature);
+    const escape = escapeHatch({
+      run: state.run,
+      feature: state.feature,
+      worktree: plan.worktree,
+      git: this.worktreeGit,
+      trigger: 'ceiling',
+    });
+    this.boundary(`escape-hatch:${escape.preserved ? 'committed' : 'branch-only'}`);
+
+    // The hatch's own `detail` is appended for the reason the take-over path appends it: it is the one
+    // sentence about where the work is that is true whether or not git cooperated.
+    const reason = `${action.reason} ${escape.detail}`;
+    this.writeHandoff(paths, plan, state, {
+      code: CEILING_HANDOFF_CODE,
+      reason,
+      escape,
+      state: 'hibernated',
+    });
+
+    const logged = readEventLog(paths.eventLog);
+    if (
+      !logged.some(
+        (event) =>
+          event.type === ENGINE_EVENT_TYPES.HandoffRecorded &&
+          event.payload['code'] === CEILING_HANDOFF_CODE,
+      )
+    ) {
+      this.emit(recorder, {
+        step: null,
+        type: ENGINE_EVENT_TYPES.HandoffRecorded,
+        payload: { code: CEILING_HANDOFF_CODE, reason },
+      });
+    }
+    if (!logged.some((event) => event.type === BUDGET_EXHAUSTED_EVENT_TYPE)) {
+      this.emit(recorder, {
+        step: null,
+        type: BUDGET_EXHAUSTED_EVENT_TYPE,
+        payload: this.budgetPayload(plan, state, action.reading, action.readings, action.reason),
+      });
+    }
+    this.emit(recorder, {
+      step: null,
+      type: ENGINE_EVENT_TYPES.FeatureStateChanged,
+      payload: { from: state.state, to: 'hibernated', reason: action.reason },
+    });
   }
 
   /** CAP-23 — stop and explain, as its own recorded facts, so every caller hands off identically. */
@@ -3977,7 +4313,6 @@ export class Reconciler {
        */
     }
 
-    const completed = state.steps.filter((record) => record.disposition === 'completed').length;
     const value: StepInput = {
       schema_version: CURRENT_SCHEMA_VERSION,
       contract_id: step.contract_id,
@@ -4002,11 +4337,16 @@ export class Reconciler {
           description: `the output of the ${gate.command} gate, which ran "${gate.declared}"`,
         })),
       gates: recorded,
-      budget: {
-        steps_remaining: Math.max(plan.steps.length - completed, 0),
-        wall_clock_ms_remaining: DECLARED_WALL_CLOCK_MS,
-        rate_limit_budget_consumed: 0,
-      },
+      /**
+       * AD-24's three ceilings, measured for real rather than passed through as constants.
+       *
+       * Read from the same log and snapshot the ceiling decision reads, so the step is told the allowance
+       * the loop is actually holding it to. `steps_remaining` is the plan-derived count it always was.
+       */
+      budget: budgetFrom(
+        stepsRemainingIn(plan, state),
+        this.ceilingReadings(state, readEventLog(paths.eventLog)),
+      ),
       created_at: formatTimestamp(this.now()),
     };
 
@@ -4395,7 +4735,7 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
       };
     }
 
-    const target = targetStateFor(plan, pending.step);
+    const target = targetStateFor(state, plan, pending.step);
     const sessionId = pending.session_id;
     switch (routing.action) {
       case 'resume':
@@ -4474,7 +4814,7 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
   return {
     kind: 'run-step',
     step: next,
-    transitionTo: featureStateWhileRunning(next.phase),
+    transitionTo: workingStateFor(state, next.phase),
     reason:
       `Step "${next.step}" is the next declared ${next.phase} step with no completed record, so the ` +
       'reconciler claims it.',
@@ -4498,8 +4838,94 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
 const featureStateWhileRunning = (phase: StepPhase): FeatureState =>
   phase === 'verification' ? 'verifying' : 'running';
 
+/**
+ * The state a run works in while a step of this phase runs: `degraded`, once it has degraded, for every
+ * phase.
+ *
+ * This is the whole of "degradation does not un-degrade" on the lifecycle side (story 2-9). Without it the
+ * next step a degraded run took would transition it `degraded → running` — or `→ verifying` — on the
+ * strength of the phase alone, and the person who read `budget.degraded` would watch the state flap back
+ * as if the ceiling had gone away. The ceiling has not gone away; what the run is working *in* is the
+ * narrowed, downshifted mode, and that is what the state says until the run reaches a terminal one.
+ * `blocked` and `interrupted` still pass through, because they are different facts, and a step started
+ * after either brings the run back here rather than to `running`.
+ */
+const workingStateFor = (state: RunState, phase: StepPhase): FeatureState =>
+  state.degradation === null ? featureStateWhileRunning(phase) : 'degraded';
+
 /** The feature state a step's phase puts the run in while that step runs. */
-const targetStateFor = (plan: FeaturePlan, step: string): FeatureState => {
+const targetStateFor = (state: RunState, plan: FeaturePlan, step: string): FeatureState => {
   const entry = plan.steps.find((candidate) => candidate.step === step);
-  return entry === undefined ? 'running' : featureStateWhileRunning(entry.phase);
+  return entry === undefined
+    ? workingStateFor(state, 'implementation')
+    : workingStateFor(state, entry.phase);
+};
+
+/** Declared steps with no completed record: the plan-derived count the step input has always carried. */
+const stepsRemainingIn = (plan: FeaturePlan, state: RunState): number =>
+  Math.max(plan.steps.length - state.steps.filter((record) => record.disposition === 'completed').length, 0);
+
+/** The step a spending action would hand the executor, or `null` for any other action. */
+const spendingStepOf = (action: ReconcileAction): string | null => {
+  switch (action.kind) {
+    case 'run-step':
+      return action.step.step;
+    case 'resume-step':
+    case 'reset-and-rerun':
+      return action.step;
+    default:
+      return null;
+  }
+};
+
+/**
+ * AD-24 — what the ceilings make of the action `decideAction` chose. A pure function, like that one.
+ *
+ * Three answers, in this order:
+ *
+ * 1. **Hibernate** when a ceiling is reached, or when the log already carries `budget.exhausted` — the
+ *    second is the crash case, where the hibernation began and the terminal state never landed, and the
+ *    next pass must finish it rather than notice the clock went backwards and carry on spending.
+ * 2. **Degrade** at eighty percent of any ceiling, but **only for a run that has not already degraded.**
+ *    That guard is the whole of "a second ceiling crossing eighty percent does not re-emit": the standing
+ *    degradation is folded from the first `budget.degraded`, and a run already carrying one goes on to the
+ *    step it chose, which it takes degraded.
+ * 3. Otherwise the action stands, unchanged.
+ */
+export const decideCeilingAction = (
+  action: ReconcileAction,
+  state: RunState,
+  verdict: CeilingVerdict,
+  exhaustedRecorded: boolean,
+): ReconcileAction => {
+  if (verdict.kind === 'hibernate' || exhaustedRecorded) {
+    const reading =
+      verdict.kind === 'within'
+        ? [...verdict.readings].sort((left, right) => right.fraction - left.fraction)[0]
+        : verdict.reading;
+    if (reading !== undefined) {
+      return {
+        kind: 'hibernate',
+        step: spendingStepOf(action),
+        reading,
+        readings: verdict.readings,
+        reason:
+          `The run reached a ceiling: ${describeReading(reading)}. AD-24 has a run hibernate at its ` +
+          'ceiling rather than continue, so the work is put on a take-over branch and a hand-off note is ' +
+          'written instead of starting another step.',
+      };
+    }
+  }
+  if (verdict.kind === 'degrade' && state.degradation === null) {
+    return {
+      kind: 'degrade',
+      reading: verdict.reading,
+      readings: verdict.readings,
+      reason:
+        `The run crossed eighty percent of a ceiling: ${describeReading(verdict.reading)}. AD-24 degrades ` +
+        'it from here on — the model tier downshifts toward the floor, and a verification step runs its ' +
+        'deterministic gates without the model-based review.',
+    };
+  }
+  return action;
 };

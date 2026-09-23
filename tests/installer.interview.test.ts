@@ -13,6 +13,11 @@ import { join } from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import {
+  PLACEHOLDER_RATE_LIMIT_WINDOW_TOKENS,
+  PROFILE_SCHEMA_VERSION,
+  ProfileSchema,
+} from '../src/contracts/index.js';
 import { INTERVIEW, detectDefaults, parseToml, runInit } from '../src/installer/index.js';
 import type { QuestionId } from '../src/installer/index.js';
 import { makeRepository, readTree, scriptedIo } from './helpers/installer-fixture.js';
@@ -220,6 +225,41 @@ describe('detected defaults are offered, and every one of them can be overridden
     });
     expect(profile['branch_pattern']).toBe('agent/<slug>');
     expect(profile['ceilings']).toMatchObject({ steps: 12 });
+  });
+
+  it('writes the rate-limit window size into the ceilings, the placeholder when nobody states one', async () => {
+    const accepted = repository();
+    await runInit({ repository: accepted, io: scriptedIo({}) });
+    const defaulted = parseToml(readFileSync(join(accepted, '.orch', 'profile.toml'), 'utf8'));
+    expect(defaulted['ceilings']).toMatchObject({ rate_limit_window_tokens: PLACEHOLDER_RATE_LIMIT_WINDOW_TOKENS });
+
+    const stated = repository();
+    await runInit({ repository: stated, io: scriptedIo({ 'ceilings.rate_limit_window_tokens': '250000' }) });
+    const written = parseToml(readFileSync(join(stated, '.orch', 'profile.toml'), 'utf8'));
+    expect(written['ceilings']).toMatchObject({ rate_limit_window_tokens: 250_000 });
+  });
+
+  it('refuses a window of zero tokens and asks again', async () => {
+    const repo = repository();
+    const io = scriptedIo({ 'ceilings.rate_limit_window_tokens': ['0', '300000'] });
+    await runInit({ repository: repo, io });
+    expect(io.said.some((line) => line.includes('The rate-limit window size must be between 1'))).toBe(true);
+    const profile = parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8'));
+    expect(profile['ceilings']).toMatchObject({ rate_limit_window_tokens: 300_000 });
+  });
+
+  it('reads a profile written before the window field existed, at the same schema version, as the placeholder', async () => {
+    const repo = repository();
+    await runInit({ repository: repo, io: scriptedIo({ 'ceilings.rate_limit_window_tokens': '250000' }) });
+    // The profile a story 2-1 installer wrote: the same file with the fourth ceiling taken back out.
+    const profile = ProfileSchema.parse({
+      ...parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8')),
+      ceilings: { steps: 60, wall_clock_minutes: 120, rate_limit_budget_percent: 50 },
+    });
+    expect(profile.schema_version).toBe(PROFILE_SCHEMA_VERSION);
+    expect(PROFILE_SCHEMA_VERSION).toBe(2);
+    expect(profile.ceilings.rate_limit_window_tokens).toBe(PLACEHOLDER_RATE_LIMIT_WINDOW_TOKENS);
+    expect(profile.ceilings).toMatchObject({ steps: 60, wall_clock_minutes: 120, rate_limit_budget_percent: 50 });
   });
 
   it('refuses an answer it cannot use and asks again rather than writing a guess', async () => {

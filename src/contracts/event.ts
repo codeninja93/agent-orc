@@ -117,6 +117,38 @@ export const GATE_SKIPPED_EVENT_TYPE = 'gate.skipped';
 export const REVIEW_SKIPPED_EVENT_TYPE = 'verification.review_skipped';
 
 /**
+ * AD-24's two ceiling lines, spelled once for the writer and every reader.
+ *
+ * Both were in {@link EVENT_TYPES} as bare literals from story 1-1 with no emitter, and `src/tui/` spells
+ * them a third time. A constant here is what lets the engine's writer and the fold's reader be the same
+ * string by construction rather than by two people typing it identically.
+ */
+export const BUDGET_DEGRADED_EVENT_TYPE = 'budget.degraded';
+export const BUDGET_EXHAUSTED_EVENT_TYPE = 'budget.exhausted';
+
+/**
+ * The payload keys a `budget.degraded` or `budget.exhausted` line carries beside the three
+ * `BudgetSchema` fields.
+ *
+ * The three budget fields travel under their `BudgetSchema` names — `steps_remaining`,
+ * `wall_clock_ms_remaining`, `rate_limit_budget_consumed` — because `src/tui/projection.ts` already folds
+ * those names off exactly these two types, so a second spelling here would be a field no surface reads.
+ * What is added is *which* ceiling tripped and by how much, which the budget alone cannot say. Every value
+ * is a short enum member or a number, so AD-21's entropy sweep has nothing to rewrite (AD-5 additive).
+ */
+export const BUDGET_PAYLOAD_KEYS = {
+  /** Which of AD-24's three ceilings this line is about. */
+  Dimension: 'dimension',
+  /** Consumed over ceiling on that dimension, unclamped: an overshoot is reported as one (R12). */
+  Fraction: 'fraction',
+  /** What was consumed on that dimension, in its own unit: steps, milliseconds or tokens. */
+  Consumed: 'consumed',
+  /** The ceiling that dimension is measured against, in the same unit. */
+  Ceiling: 'ceiling',
+  Reason: 'reason',
+} as const;
+
+/**
  * The branch-protection assertion taken at run start, and what it concluded (ADR-001, story 2-7).
  *
  * One type carrying an outcome rather than three, which is the opposite of what the gate lines do, and the
@@ -217,8 +249,8 @@ export const EVENT_TYPES = [
   'write.executed',
   'permission.denied',
   'redaction.failed',
-  'budget.degraded',
-  'budget.exhausted',
+  BUDGET_DEGRADED_EVENT_TYPE,
+  BUDGET_EXHAUSTED_EVENT_TYPE,
   'question.asked',
   'question.resolved',
   'question.default_taken',

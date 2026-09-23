@@ -120,8 +120,11 @@ const grouped = (count: number): string => {
  * subscription usage, never currency" — and AD-24 gives a run three ceilings "and no currency dimension".
  * Model usage is prepaid by subscription and costs nothing at the margin, so a figure with a currency mark
  * on it would be a fiction about the thing a person is deciding with. The CLI's own `total_cost_usd` is
- * recorded in the log because story 2-9's ceilings and story 3-3's measurement are specified to read it,
- * and it is rendered here and in no other segment: nowhere at all.
+ * recorded in the log for story 3-3's measurement, and it is rendered here and in no other segment:
+ * nowhere at all. **Story 2-9's ceilings do not read it** — a draft of this comment once said they
+ * would, before that story was built; the ceilings track the rate-limit dimension in tokens, against a
+ * profile-declared window, which is R10 and AD-24 held to exactly — a dollar figure never enters the
+ * decision.
  *
  * The counts are stated in the order a person reads them — what went in, what came out, then what the cache
  * did — which is not `STEP_USAGE_FIELDS`' order and deliberately so: that list is every field once,

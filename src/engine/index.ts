@@ -28,6 +28,10 @@
  * - `commands` — AD-19's durable intent files: the only path a steering command reaches the loop by;
  * - `steering` — what a consumed intent does, and why applying one twice does it once;
  * - `handoff` — CAP-23's escape hatch and the document written when the system gives up;
+ * - `ceilings` — AD-24's three run ceilings as a pure decision: eighty percent degrades, a ceiling reached
+ *   hibernates, and degradation's two effects — a downshift toward the floor, and a verification step that
+ *   stops after its deterministic gates. The reconciler acts on the answer; hibernation goes through
+ *   `handoff`'s escape hatch rather than a second branch-and-document path;
  * - `questions` — AD-25's compare-and-set: one accepted transition from `asked`, decided by an
  *   exclusively created file so the first creator wins by construction rather than by careful ordering;
  * - `question-window` — CAP-4's window, and the timeout default taken as a resolver competing in that
@@ -82,6 +86,7 @@ export * from './lock.js';
 export * from './checkpoint.js';
 export * from './rebuild.js';
 export * from './promotion.js';
+export * from './ceilings.js';
 export * from './dispositions.js';
 export * from './territory.js';
 export * from './baseline.js';
