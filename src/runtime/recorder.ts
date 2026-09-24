@@ -30,8 +30,10 @@ import {
 import { hostname } from 'node:os';
 
 import {
+  EVENT_ENVELOPE_IDENTITY_SHAPES,
   EVENT_ENVELOPE_STREAM_FIELDS,
   EVENT_ENVELOPE_VERBATIM_FIELDS,
+  EVENT_PAYLOAD_VERBATIM_FIELDS,
   EventEnvelopeSchema,
   dispositionFor,
   formatTimestamp,
@@ -521,8 +523,17 @@ export class Recorder {
       };
     }
 
+    /**
+     * Story 3-3 — the payload-scoped counterpart to the restore just above. `preservePassthrough` only
+     * ever reaches the envelope's own top-level keys; a commit SHA nested under a payload key (`pull_
+     * request.merge_fidelity`'s `head_ref_oid`/`merge_commit`) needs its own restore, over
+     * `EVENT_PAYLOAD_VERBATIM_FIELDS`, or it is silently destroyed by the entropy sweep with nothing here
+     * to rescue it.
+     */
+    const preservedWithPayload = this.preservePassthroughPayload(candidate, preserved);
+
     // The envelope is re-validated after redaction: the pass may not turn a valid line invalid.
-    const reparsed = EventEnvelopeSchema.safeParse(preserved);
+    const reparsed = EventEnvelopeSchema.safeParse(preservedWithPayload);
     if (!reparsed.success) {
       return {
         event: this.appendRedactionFailure(seq, candidate, {
@@ -580,6 +591,35 @@ export class Recorder {
       restored[field] = original;
     }
     return restored as EventEnvelope;
+  }
+
+  /**
+   * Story 3-3 — restore {@link EVENT_PAYLOAD_VERBATIM_FIELDS} inside `payload`, the payload-scoped
+   * counterpart to {@link preservePassthrough}.
+   *
+   * Same discipline, one field narrower: a candidate value is restored only when it is a string, proven
+   * free of every pattern class, and shaped exactly like a commit SHA —
+   * {@link EVENT_ENVELOPE_IDENTITY_SHAPES}'s own `baseline_ref` regex, reused verbatim rather than
+   * declaring a second copy of it, since a commit SHA is a commit SHA regardless of which field carries
+   * it. Never verbatim-or-dropped: unlike the two AD-5 stream fields, a payload field that fails the proof
+   * simply keeps whatever the pass produced — there is no "drop the whole artifact" case for a payload
+   * key, the same fail-safe direction the envelope's own identity fields already take.
+   */
+  private preservePassthroughPayload(
+    candidate: EventEnvelope,
+    redacted: EventEnvelope,
+  ): EventEnvelope {
+    const shape = EVENT_ENVELOPE_IDENTITY_SHAPES['baseline_ref'];
+    const candidatePayload = candidate.payload;
+    const restoredPayload: Record<string, unknown> = { ...redacted.payload };
+    for (const field of EVENT_PAYLOAD_VERBATIM_FIELDS) {
+      const original = candidatePayload[field];
+      if (typeof original !== 'string') continue;
+      if (!this.redactor.provesPatternFree(original)) continue;
+      if (!shape?.test(original)) continue;
+      restoredPayload[field] = original;
+    }
+    return { ...redacted, payload: restoredPayload };
   }
 
   /**

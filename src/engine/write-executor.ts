@@ -342,6 +342,178 @@ const detailOf = (result: WriteCallResult): string =>
       ? result.stdout.trim()
       : `exited with status ${String(result.status)}`;
 
+/** The two outcomes the merge-fidelity comparison can settle on — story 3-3, matrix rows 11-13, 19. */
+export type MergeFidelityOutcome = 'unchanged' | 'corrected';
+
+/**
+ * What the merge-fidelity comparison found, or why it could not be made. `outcome` and `code` are
+ * mutually exclusive, exactly like `SHADOW_COMPARED_PAYLOAD_KEYS`' own absent-on-success shape: a read
+ * failure is reported as itself, never guessed as `'unchanged'`.
+ */
+export interface MergeFidelity {
+  readonly outcome: MergeFidelityOutcome | null;
+  /** Present only when `outcome` is `null`. A short, stable code, never a raw `git` error string. */
+  readonly code: string | null;
+  /** One line, short and punctuated: what was found, or why it could not be. */
+  readonly detail: string;
+  /**
+   * This run's own worktree `HEAD`, once read — the value the `pull_request.merge_fidelity` payload's
+   * `head_ref_oid` field carries. `null` only when even that first read failed.
+   */
+  readonly proposedHead: string | null;
+}
+
+/** `mergeCommit` has fewer than two parents, so it is not a real merge commit this comparison can trust. */
+export const MERGE_FIDELITY_NOT_A_MERGE_COMMIT = 'pull_request.merge_fidelity_not_a_merge_commit';
+
+/** This run's own worktree `HEAD` could not be read. */
+export const MERGE_FIDELITY_HEAD_UNREADABLE = 'pull_request.merge_fidelity_head_unreadable';
+
+/** `git merge-base <mergeCommit>^1 <proposedHead>` failed. */
+export const MERGE_FIDELITY_MERGE_BASE_UNREADABLE = 'pull_request.merge_fidelity_merge_base_unreadable';
+
+/** `git diff --name-only <mergeBase> <proposedHead>` (this run's own touched paths) failed. */
+export const MERGE_FIDELITY_TOUCHED_PATHS_UNREADABLE =
+  'pull_request.merge_fidelity_touched_paths_unreadable';
+
+/** The final, path-scoped `git diff --name-only <proposedHead> <mergeCommit> -- <touchedPaths...>` failed. */
+export const MERGE_FIDELITY_COMPARISON_UNREADABLE = 'pull_request.merge_fidelity_comparison_unreadable';
+
+/**
+ * Whether the files *this run's own feature branch actually touched* landed in the merge commit exactly
+ * as this run's worktree last held them — the trust record's one new durable fact (story 3-3, matrix rows
+ * 11-13, 19). Redesigned in this story's own review pass (see the spec's Spec Change Log) after an earlier
+ * whole-tree design proved wrong two ways: comparing two trees rooted at different base states flags
+ * unrelated `main` drift as a false correction on every fleet-concurrent feature, and reading the head
+ * fresh from `gh pr view` after the merge is confirmed can already reflect a correction that happened
+ * before this check ever ran, hiding a real correction as a false `'unchanged'`.
+ *
+ * **Scoped to this run's own already-local worktree state, never a live remote read.** `proposedHead` is
+ * `plan.worktree`'s own `HEAD` — the commit this run itself produced and pushed, untouched by anything
+ * else between this run's own push and merge-detection — never a `gh pr view` field, which by
+ * merge-detection time may already name a *later* commit someone else pushed to the same branch.
+ *
+ * **Scoped to only the paths this run's own commits touched, never the whole tree.** `mergeBase` is found
+ * via the merge commit's first parent (`mergeCommit^1`, `main`'s tip immediately before this merge), never
+ * via `merge-base(mergeCommit, proposedHead)` directly — `proposedHead` is already an ancestor of
+ * `mergeCommit`, so that call would trivially answer `proposedHead` itself and say nothing about the fork
+ * point. `touchedPaths` is `git diff --name-only mergeBase proposedHead`: exactly the files this run's own
+ * commits changed. The final comparison, `git diff --name-only proposedHead mergeCommit -- touchedPaths`,
+ * is restricted to exactly those paths, so unrelated `main` drift outside them never reports as a
+ * correction (matrix row 19) — the same lesson `compareShadowRun` applies by pinning both sides of its own
+ * comparison to one base, generalised here to a path restriction because this comparison's two sides are
+ * never rooted at the same base to begin with.
+ *
+ * **Assumes `mergeCommit` is a real two-parent merge commit** (this project's own merges are); one with
+ * fewer than two parents — a fast-forward or a squash landed by hand outside this system — is a read
+ * failure (`code`), never guessed at, because `mergeCommit^1` would otherwise silently resolve to that
+ * single parent and compute a meaningless "fork point" rather than failing loudly.
+ *
+ * **Fetches nothing itself.** `performGitNote`'s own prior `git fetch REMOTE mergeCommit`, in the same
+ * call sequence immediately before this runs, already brings `mergeCommit` and its ancestry (including its
+ * first parent) into the local object database; `proposedHead` is always already local by construction.
+ *
+ * Never `git diff --quiet`: its exit status `1` means "a real difference was found," not "the command
+ * failed," and treating the two alike is exactly the "guessed past a failure" mistake this function must
+ * never make. `--name-only` always exits `0` on success whether or not it found a difference, so a
+ * non-zero exit here is unambiguously a read failure.
+ */
+export const mergeFidelityOf = (git: GitCall, worktree: string, mergeCommit: string): MergeFidelity => {
+  const head = git(['rev-parse', 'HEAD'], worktree);
+  if (head.status !== 0) {
+    return {
+      outcome: null,
+      code: MERGE_FIDELITY_HEAD_UNREADABLE,
+      detail: `could not read this run's own worktree HEAD: ${detailOf(head)}`,
+      proposedHead: null,
+    };
+  }
+  const proposedHead = head.stdout.trim();
+
+  // Verified before `mergeCommit^1` is trusted as "the fork point on main": a one-parent commit's `^1`
+  // resolves fine, to that single parent, so a missing second parent would otherwise pass through
+  // silently rather than failing loudly as the story's own Boundaries require.
+  const secondParent = git(['rev-parse', '--verify', `${mergeCommit}^2`], worktree);
+  if (secondParent.status !== 0) {
+    return {
+      outcome: null,
+      code: MERGE_FIDELITY_NOT_A_MERGE_COMMIT,
+      detail:
+        `${mergeCommit.slice(0, 12)} has fewer than two parents, so it is not a real merge commit this ` +
+        `comparison can trust: ${detailOf(secondParent)}`,
+      proposedHead,
+    };
+  }
+
+  const base = git(['merge-base', `${mergeCommit}^1`, proposedHead], worktree);
+  if (base.status !== 0) {
+    return {
+      outcome: null,
+      code: MERGE_FIDELITY_MERGE_BASE_UNREADABLE,
+      detail:
+        `git merge-base ${mergeCommit.slice(0, 12)}^1 ${proposedHead.slice(0, 12)} failed: ` +
+        detailOf(base),
+      proposedHead,
+    };
+  }
+  const mergeBase = base.stdout.trim();
+
+  const touched = git(['diff', '--name-only', mergeBase, proposedHead], worktree);
+  if (touched.status !== 0) {
+    return {
+      outcome: null,
+      code: MERGE_FIDELITY_TOUCHED_PATHS_UNREADABLE,
+      detail:
+        `git diff --name-only ${mergeBase.slice(0, 12)} ${proposedHead.slice(0, 12)} (this run's own ` +
+        `touched paths) failed: ${detailOf(touched)}`,
+      proposedHead,
+    };
+  }
+  const touchedPaths = touched.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '');
+
+  if (touchedPaths.length === 0) {
+    // A no-op diff, trivially unchanged: this run touched nothing relative to its own fork point, so
+    // there is nothing it could have been corrected on.
+    return {
+      outcome: 'unchanged',
+      code: null,
+      detail:
+        `${proposedHead.slice(0, 12)} touched no paths relative to its fork point ` +
+        `${mergeBase.slice(0, 12)}, so there is nothing to have been corrected`,
+      proposedHead,
+    };
+  }
+
+  const comparison = git(
+    ['diff', '--name-only', proposedHead, mergeCommit, '--', ...touchedPaths],
+    worktree,
+  );
+  if (comparison.status !== 0) {
+    return {
+      outcome: null,
+      code: MERGE_FIDELITY_COMPARISON_UNREADABLE,
+      detail:
+        `git diff --name-only ${proposedHead.slice(0, 12)} ${mergeCommit.slice(0, 12)} over this run's ` +
+        `own touched paths failed: ${detailOf(comparison)}`,
+      proposedHead,
+    };
+  }
+  const matches = comparison.stdout.trim() === '';
+  return {
+    outcome: matches ? 'unchanged' : 'corrected',
+    code: null,
+    detail: matches
+      ? `${mergeCommit.slice(0, 12)} carries this run's own touched paths unchanged from ` +
+        proposedHead.slice(0, 12)
+      : `${mergeCommit.slice(0, 12)} differs from ${proposedHead.slice(0, 12)} on at least one path ` +
+        'this run’s own commits touched',
+    proposedHead,
+  };
+};
+
 const recordAttempted = (intent: WriteIntent, context: WriteExecutionContext): void => {
   context.emit(WRITE_ATTEMPTED_EVENT_TYPE, {
     [WRITE_ATTEMPTED_PAYLOAD_KEYS.IntentId]: intent.intent_id,

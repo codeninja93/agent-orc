@@ -10,7 +10,15 @@
  * engine never opens `events.jsonl` itself — both structural, both invisible until a later story
  * breaks them.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -18,6 +26,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
   CommittingOutputSchema,
+  PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
+  PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS,
   RUN_STATE_FILE_NAME,
   StepInputSchema,
   StepOutputSchema,
@@ -1737,6 +1747,209 @@ describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
     );
     expect(attempted).toHaveLength(1);
     expect(executed).toHaveLength(1);
+  });
+
+  /**
+   * Story 3-3 — the trust record's one new durable fact, emitted at exactly this call site, once,
+   * alongside the transition to `committed`. Fixture SHAs are real (non-repeated-character) hex, not
+   * `'a'.repeat(40)`-style zero-entropy stand-ins, so these tests exercise the same AD-21 redaction path a
+   * real run's payload goes through — a repeated-character fixture has zero Shannon entropy and would
+   * never trip the pass, silently hiding the exact defect row 21 exists to catch.
+   */
+  describe('pull_request.merge_fidelity — matrix rows 12, 19, 20', () => {
+    const buildMergeFidelityRun = (
+      label: string,
+      mergeFidelityGit: GitCall,
+    ): {
+      readonly reconciler: Reconciler;
+      readonly run: string;
+      readonly merge: ReturnType<typeof controllableMergeChecker>;
+    } => {
+      const orchHome = makeHome(label);
+      toRemove.push(orchHome);
+      const plan = makePlan({ feature: label, steps: STANDARD_PLAN_STEPS });
+      const writes: RecordedWrite[] = [];
+      const merge = controllableMergeChecker();
+      const reconciler = Reconciler.open({
+        orchHome,
+        plans: planProvider(plan),
+        baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+        executor: createScriptedExecutor(committingCapableScript()),
+        writeExecutor: recordingWriteExecutor(writes),
+        mergeChecker: merge.checker,
+        mergeFidelityGit,
+      });
+      toClose.push(reconciler);
+      const accepted = reconciler.acceptFeature(plan);
+      reconciler.confirm(accepted.run);
+      return { reconciler, run: accepted.run, merge };
+    };
+
+    /** A fake `git` covering `mergeFidelityOf`'s exact call sequence, canned per test. */
+    const fakeMergeFidelityGit = (options: {
+      readonly proposedHead: string;
+      readonly mergeCommit: string;
+      readonly mergeBase: string;
+      readonly touchedPaths: readonly string[];
+      readonly comparisonStdout: string;
+    }): GitCall => {
+      const { proposedHead, mergeCommit, mergeBase, touchedPaths, comparisonStdout } = options;
+      return (args) => {
+        if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
+          return { status: 0, stdout: `${proposedHead}\n`, stderr: '' };
+        }
+        if (args[0] === 'rev-parse' && args[1] === '--verify') {
+          return { status: 0, stdout: `${mergeCommit}\n`, stderr: '' };
+        }
+        if (args[0] === 'merge-base') return { status: 0, stdout: `${mergeBase}\n`, stderr: '' };
+        if (args[0] === 'diff' && args[2] === mergeBase) {
+          return { status: 0, stdout: touchedPaths.length === 0 ? '' : `${touchedPaths.join('\n')}\n`, stderr: '' };
+        }
+        if (args[0] === 'diff' && args[2] === proposedHead) {
+          return { status: 0, stdout: comparisonStdout, stderr: '' };
+        }
+        throw new Error(`unexpected git call in mergeFidelityOf fixture: ${args.join(' ')}`);
+      };
+    };
+
+    it('records outcome: corrected when the merge commit differs on this run’s own touched path (row 12)', async () => {
+      const proposedHead = 'c1de83cbc3a7312c08d943dbecc23783912b82cd';
+      const mergeCommit = '2c40b18d69d0996f02eade0028dbcd0ee646ced5';
+      const mergeBase = 'a9af53ccce93aa8c1025571c7500f36788fabdf9';
+      const { reconciler, run, merge } = buildMergeFidelityRun(
+        'merge-fidelity-corrected',
+        fakeMergeFidelityGit({
+          proposedHead,
+          mergeCommit,
+          mergeBase,
+          touchedPaths: ['src/a.ts'],
+          comparisonStdout: 'src/a.ts\n',
+        }),
+      );
+      await driveToAwaitingMerge(reconciler);
+      merge.state.answer = { state: 'MERGED', mergeCommit };
+
+      await reconciler.pass();
+
+      expect(reconciler.load(run).state.state).toBe('committed');
+      const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+      const fidelity = events.filter((event) => event.type === PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE);
+      expect(fidelity).toHaveLength(1);
+      // The real, non-repeated-character SHAs survive the AD-21 pass verbatim (row 21, exercised here too).
+      const payload = fidelity[0]?.payload ?? {};
+      expect(payload).toMatchObject({
+        [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Outcome]: 'corrected',
+        [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.HeadRefOid]: proposedHead,
+        [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.MergeCommit]: mergeCommit,
+      });
+      expect(Object.keys(payload)).toHaveLength(4);
+      expect(typeof payload[PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Detail]).toBe('string');
+    });
+
+    it('records outcome: unchanged when only unrelated main drift differs, never a false correction (row 19)', async () => {
+      // The touched-paths diff (mergeBase..proposedHead) says this run only ever touched `src/a.ts`. The
+      // final comparison is restricted to exactly that path and finds it unchanged — so this reports
+      // `unchanged` regardless of whatever else `main` picked up on other paths between fork and merge; a
+      // whole-tree comparison would have had no way to tell that drift apart from a real correction.
+      const proposedHead = 'e78c0692580b39a09582a11611be0e8139cdce93';
+      const mergeCommit = 'e9d50f06faec4c587fb25e73cfc435ee6078c6bc';
+      const mergeBase = '33c8fd427ee0179acf4234c7eaf7383fcad9d853';
+      const { reconciler, run, merge } = buildMergeFidelityRun(
+        'merge-fidelity-unchanged-main-drift',
+        fakeMergeFidelityGit({
+          proposedHead,
+          mergeCommit,
+          mergeBase,
+          touchedPaths: ['src/a.ts'],
+          comparisonStdout: '',
+        }),
+      );
+      await driveToAwaitingMerge(reconciler);
+      merge.state.answer = { state: 'MERGED', mergeCommit };
+
+      await reconciler.pass();
+
+      expect(reconciler.load(run).state.state).toBe('committed');
+      const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+      const fidelity = events.filter((event) => event.type === PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE);
+      expect(fidelity).toHaveLength(1);
+      const payload = fidelity[0]?.payload ?? {};
+      expect(payload).toMatchObject({
+        [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Outcome]: 'unchanged',
+        [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.HeadRefOid]: proposedHead,
+        [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.MergeCommit]: mergeCommit,
+      });
+      expect(Object.keys(payload)).toHaveLength(4);
+      expect(typeof payload[PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Detail]).toBe('string');
+    });
+
+    it('records code, never a guessed outcome, when the comparison itself cannot be made (row 13)', async () => {
+      const mergeCommit = '1aa05d03b5192ef1e76faa214c9a5c5009aac4c4';
+      const { reconciler, run, merge } = buildMergeFidelityRun('merge-fidelity-unreadable', () => ({
+        status: 1,
+        stdout: '',
+        stderr: 'boom',
+      }));
+      await driveToAwaitingMerge(reconciler);
+      merge.state.answer = { state: 'MERGED', mergeCommit };
+
+      await reconciler.pass();
+
+      expect(reconciler.load(run).state.state).toBe('committed');
+      const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+      const fidelity = events.filter((event) => event.type === PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE);
+      expect(fidelity).toHaveLength(1);
+      expect(fidelity[0]?.payload[PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Outcome]).toBeUndefined();
+      expect(fidelity[0]?.payload[PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Code]).toBe(
+        'pull_request.merge_fidelity_head_unreadable',
+      );
+    });
+
+    it('never emits a second line when the run’s log already carries one (row 20)', async () => {
+      const mergeCommit = '5ea6748cb81c7e053093927c9815d5e559fcaabb';
+      const mergeFidelityGit: GitCall = () => {
+        throw new Error('mergeFidelityOf must not be called once the line is already recorded');
+      };
+      const { reconciler, run, merge } = buildMergeFidelityRun(
+        'merge-fidelity-idempotent',
+        mergeFidelityGit,
+      );
+      await driveToAwaitingMerge(reconciler);
+
+      // Simulate the established crash-injection seam: a prior pass already recorded the line and crashed
+      // before the following `committed`-transition emit landed, so the run is still `awaiting_merge`.
+      const paths = runPaths(run, reconciler.orchHome);
+      const before = readEventLog(paths.eventLog);
+      const maxSeq = before.reduce((max, event) => Math.max(max, event.seq), 0);
+      const priorLine = {
+        ts: '2026-09-24T10:00:00.000Z',
+        seq: maxSeq + 1,
+        feature: before[0]?.feature ?? 'merge-fidelity-idempotent',
+        run,
+        step: null,
+        emitter: 'engine.reconciler',
+        type: PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
+        payload: {
+          [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Outcome]: 'unchanged',
+          [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.HeadRefOid]: 'a-prior-pass-already-recorded-this',
+          [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.MergeCommit]: mergeCommit,
+          [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Detail]: 'recorded by a prior, interrupted pass',
+        },
+      };
+      appendFileSync(paths.eventLog, `${JSON.stringify(priorLine)}\n`, 'utf8');
+      expect(reconciler.load(run).state.state).toBe('awaiting_merge');
+
+      merge.state.answer = { state: 'MERGED', mergeCommit };
+      await reconciler.pass();
+
+      expect(reconciler.load(run).state.state).toBe('committed');
+      const events = readEventLog(paths.eventLog);
+      const fidelity = events.filter((event) => event.type === PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE);
+      expect(fidelity).toHaveLength(1);
+      expect(fidelity[0]?.payload[PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.HeadRefOid]).toBe(
+        'a-prior-pass-already-recorded-this',
+      );
+    });
   });
 
   /**

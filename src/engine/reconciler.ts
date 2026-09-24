@@ -64,6 +64,8 @@ import {
   DECLARATION_PAYLOAD_KEYS,
   PLANNING_CONTRACT_ID,
   MODEL_RUNGS,
+  PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
+  PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS,
   REPAIRED_PAYLOAD_KEY,
   REVIEW_SKIPPED_PAYLOAD_KEYS,
   SPEC_CRITERION_EDITED_EVENT_TYPE,
@@ -220,8 +222,9 @@ import {
   commitRunRecordFrom,
   composeCommit,
 } from './committer.js';
-import { writeIntentSettled } from './write-executor.js';
+import { mergeFidelityOf, realGitCall, writeIntentSettled } from './write-executor.js';
 import type {
+  GitCall,
   MergeCheckPort,
   WriteExecutionContext,
   WriteExecutorPort,
@@ -1274,6 +1277,13 @@ export interface ReconcilerOptions {
    * named, visible gap rather than a guess.
    */
   readonly mergeChecker?: MergeCheckPort | null;
+  /**
+   * Story 3-3 — how the reconciler reads the two trees `mergeFidelityOf` compares, once a merge is
+   * confirmed. Defaults to real `git` (`src/engine/write-executor.ts`'s own port and its own default),
+   * so a production assembly needs no wiring; a suite substitutes a double that never touches a real
+   * repository, the same seam every other git-shelling port on this interface already gets.
+   */
+  readonly mergeFidelityGit?: GitCall;
 }
 
 /**
@@ -1349,6 +1359,7 @@ export class Reconciler {
   private readonly branchProtection: BranchProtectionAssertion | null;
   private readonly writeExecutor: WriteExecutorPort | null;
   private readonly mergeChecker: MergeCheckPort | null;
+  private readonly mergeFidelityGit: GitCall;
   /** Open recorders, keyed by run id. An I/O handle, not run state: nothing is read back from it. */
   private readonly recorders = new Map<string, Recorder>();
   private closed = false;
@@ -1397,6 +1408,7 @@ export class Reconciler {
     this.branchProtection = options.branchProtection ?? null;
     this.writeExecutor = options.writeExecutor ?? null;
     this.mergeChecker = options.mergeChecker ?? null;
+    this.mergeFidelityGit = options.mergeFidelityGit ?? realGitCall;
   }
 
   /**
@@ -3334,6 +3346,38 @@ export class Reconciler {
           outcome = null;
         }
         if (outcome === null || outcome.status === 'failed') return null;
+
+        /**
+         * Story 3-3 — the trust record's one new durable fact, captured exactly once, right here: the same
+         * call site that already confirms the merge and is about to transition the run to `committed`. A
+         * comparison failure is recorded as `code`, never guessed as `unchanged`, and never blocks the
+         * commit — this is a measurement taken alongside the transition, not a gate on it.
+         *
+         * **Guarded against a re-entered pass.** This `check-merge` action runs again every pass until the
+         * run leaves `awaiting_merge`, and a crash between this emit and the `committed`-transition emit
+         * just below would otherwise leave the next pass computing and emitting a second line for the same
+         * merge. Checking the run's own log first — the same "check before acting" discipline
+         * `write-executor.ts`'s own `notePushedToRemote` already uses — makes the whole action idempotent
+         * rather than adding a new pattern.
+         */
+        const alreadyRecorded = readEventLog(paths.eventLog).some(
+          (event) => event.type === PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
+        );
+        if (!alreadyRecorded) {
+          const fidelity = mergeFidelityOf(this.mergeFidelityGit, plan.worktree, check.mergeCommit);
+          this.emit(recorder, {
+            step: null,
+            type: PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
+            payload: {
+              [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.HeadRefOid]: fidelity.proposedHead,
+              [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.MergeCommit]: check.mergeCommit,
+              ...(fidelity.outcome === null
+                ? { [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Code]: fidelity.code }
+                : { [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Outcome]: fidelity.outcome }),
+              [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Detail]: fidelity.detail,
+            },
+          });
+        }
 
         this.emit(recorder, {
           step: null,

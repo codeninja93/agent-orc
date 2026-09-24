@@ -18,6 +18,7 @@ import {
   NoteMergeCommitUnknown,
   WriteKindNotImplemented,
   checkPullRequestMerged,
+  mergeFidelityOf,
   performWriteIntent,
   writeIntentSettled,
 } from '../src/engine/index.js';
@@ -437,6 +438,112 @@ describe('checkPullRequestMerged — the bounded, cheap per-pass read', () => {
       state: 'OPEN',
       mergeCommit: null,
     });
+  });
+});
+
+describe('mergeFidelityOf — story 3-3, matrix rows 11-13, 19', () => {
+  const proposedHead = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+  const mergeCommit = 'f9e8d7c6b5a4938271605f4e3d2c1b0a99887766';
+  const mergeBase = '00112233445566778899aabbccddeeff0011223';
+
+  /**
+   * A fake `git` covering every call `mergeFidelityOf` makes, in order: `rev-parse HEAD`, `rev-parse
+   * --verify <mergeCommit>^2` (the two-parent check), `merge-base <mergeCommit>^1 <proposedHead>`,
+   * `diff --name-only <mergeBase> <proposedHead>` (this run's own touched paths), and the final
+   * path-scoped `diff --name-only <proposedHead> <mergeCommit> -- <touchedPaths...>`.
+   */
+  const fakeGit = (overrides: {
+    readonly head?: WriteCallResult;
+    readonly secondParent?: WriteCallResult;
+    readonly mergeBaseResult?: WriteCallResult;
+    readonly touchedPaths?: WriteCallResult;
+    readonly comparison?: WriteCallResult;
+  }): { readonly git: GitCall; readonly calls: (readonly string[])[] } =>
+    recordingGit((args) => {
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD') return overrides.head ?? ok(`${proposedHead}\n`);
+      if (args[0] === 'rev-parse' && args[1] === '--verify') {
+        return overrides.secondParent ?? ok(`${mergeCommit}\n`);
+      }
+      if (args[0] === 'merge-base') return overrides.mergeBaseResult ?? ok(`${mergeBase}\n`);
+      if (args[0] === 'diff' && args[2] === mergeBase) return overrides.touchedPaths ?? ok('src/a.ts\n');
+      if (args[0] === 'diff' && args[2] === proposedHead) return overrides.comparison ?? ok('');
+      throw new Error(`unexpected git call: ${args.join(' ')}`);
+    });
+
+  it('reports unchanged when the touched-paths comparison is empty (row 11)', () => {
+    const { git } = fakeGit({});
+    expect(mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit)).toStrictEqual({
+      outcome: 'unchanged',
+      code: null,
+      detail: `${mergeCommit.slice(0, 12)} carries this run's own touched paths unchanged from ${proposedHead.slice(0, 12)}`,
+      proposedHead,
+    });
+  });
+
+  it('reports unchanged, with no diff call at all, when this run touched no paths', () => {
+    const { calls, git } = fakeGit({ touchedPaths: ok('') });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBe('unchanged');
+    expect(result.code).toBeNull();
+    // The final comparison is never even attempted for an empty touched-paths list.
+    expect(calls.filter((args) => args[0] === 'diff')).toHaveLength(1);
+  });
+
+  it('reports corrected when the merge commit differs on a path this run touched (row 12)', () => {
+    const { git } = fakeGit({ comparison: ok('src/a.ts\n') });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBe('corrected');
+    expect(result.code).toBeNull();
+    expect(result.proposedHead).toBe(proposedHead);
+  });
+
+  it('never reports a false correction from unrelated main drift outside the run’s own touched paths (row 19)', () => {
+    // main advanced with a change to `src/unrelated.ts`, which this run never touched — the final
+    // comparison is restricted to `src/a.ts` alone (the run's own touched path) and reports it unchanged,
+    // regardless of what else differs between proposedHead and mergeCommit on unrelated paths.
+    const { calls, git } = fakeGit({ touchedPaths: ok('src/a.ts\n'), comparison: ok('') });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBe('unchanged');
+    const finalDiff = calls.find((args) => args[0] === 'diff' && args[2] === proposedHead);
+    expect(finalDiff).toStrictEqual(['diff', '--name-only', proposedHead, mergeCommit, '--', 'src/a.ts']);
+  });
+
+  it('records a code, never a guessed outcome, when this run’s own worktree HEAD cannot be read (row 13)', () => {
+    const { git } = fakeGit({ head: failed() });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBeNull();
+    expect(result.code).toBe('pull_request.merge_fidelity_head_unreadable');
+    expect(result.proposedHead).toBeNull();
+  });
+
+  it('records a code, never a guessed outcome, when mergeCommit has fewer than two parents (row 13)', () => {
+    const { git } = fakeGit({ secondParent: failed() });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBeNull();
+    expect(result.code).toBe('pull_request.merge_fidelity_not_a_merge_commit');
+    // The worktree HEAD was already read before this check, so it is still reported.
+    expect(result.proposedHead).toBe(proposedHead);
+  });
+
+  it('records a code, never a guessed outcome, when the fork point cannot be found (row 13)', () => {
+    const { git } = fakeGit({ mergeBaseResult: failed() });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBeNull();
+    expect(result.code).toBe('pull_request.merge_fidelity_merge_base_unreadable');
+  });
+
+  it('records a code, never a guessed outcome, when this run’s own touched paths cannot be read (row 13)', () => {
+    const { git } = fakeGit({ touchedPaths: failed() });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBeNull();
+    expect(result.code).toBe('pull_request.merge_fidelity_touched_paths_unreadable');
+  });
+
+  it('records a code, never a guessed outcome, when the final path-scoped comparison fails (row 13)', () => {
+    const { git } = fakeGit({ comparison: failed() });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBeNull();
+    expect(result.code).toBe('pull_request.merge_fidelity_comparison_unreadable');
   });
 });
 

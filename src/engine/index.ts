@@ -64,6 +64,11 @@
  *   classification a completed shadow run's resulting tree is graded by, against the real merge commit it
  *   was shadowing. No rolling window and no gate verdict here — that is story 3-3's, computed from this
  *   module's one raw, per-run result;
+ * - `rework-rate`, `interruption-count`, `feature-usage` — story 3-3's per-feature stage-3 gate signals,
+ *   each a pure fold over `events: readonly EventEnvelope[]` in `deflection-rate`'s own idiom;
+ * - `trust-record`, `shadow-gate` — story 3-3's two cross-run folds, in `src/tui/fleet.ts`'s `foldFleet`
+ *   style: every run under `runsDir`, read with `listRunIds`/`readEventLog` rather than the projected
+ *   `ShellView` a renderer wants, because both need the raw lines a projection does not carry;
  * The run-start branch-protection assertion is deliberately **not** here. `src/container/lifecycle.ts`
  * already owned it, and a second implementation in this package disagreed with it about the one thing
  * that matters — whether "we could not check" and "it is not protected" have the same consequence. The
@@ -117,4 +122,9 @@ export * from './deflection.js';
 export * from './question-merge.js';
 export * from './deflection-rate.js';
 export * from './interviewer.js';
+export * from './rework-rate.js';
+export * from './interruption-count.js';
+export * from './feature-usage.js';
+export * from './trust-record.js';
+export * from './shadow-gate.js';
 export * from './reconciler.js';

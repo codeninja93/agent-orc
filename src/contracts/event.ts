@@ -378,6 +378,36 @@ export const SHADOW_COMPARED_PAYLOAD_KEYS = {
 } as const;
 
 /**
+ * Story 3-3 — the trust record's one new durable fact: a merged pull request's head-branch tree versus
+ * its merge commit's tree, captured once at merge-detection time by
+ * `src/engine/write-executor.ts`'s `mergeFidelityOf` and emitted by the reconciler at the same
+ * `awaiting_merge` → `committed` call site that already confirms the merge.
+ *
+ * Dedicated structured fields rather than a `Detail` free-text line, matching `shadow.compared`'s own
+ * `RealMergeCommit` precedent for why a raw commit SHA in a *named* field is fine even though
+ * `WRITE_EXECUTED_PAYLOAD_KEYS.Detail`'s own comment forbids one in free text: a replay needs the two
+ * oids to reconstruct what was compared, not merely a sentence about it.
+ */
+export const PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE = 'pull_request.merge_fidelity';
+
+/** The payload keys a `pull_request.merge_fidelity` line carries. */
+export const PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS = {
+  /** `'unchanged'` or `'corrected'`. Absent when the comparison itself could not be made (`Code` instead). */
+  Outcome: 'outcome',
+  /** The head branch's own final commit, as `gh pr view` reports it even after the branch is merged. */
+  HeadRefOid: 'head_ref_oid',
+  MergeCommit: 'merge_commit',
+  /**
+   * Present only when a tree could not be read (`git rev-parse <ref>^{tree}` failed on either ref) —
+   * exactly like `SHADOW_COMPARED_PAYLOAD_KEYS.Code`'s own absent-on-success shape. Never guessed as
+   * `unchanged`; absent on a successful comparison.
+   */
+  Code: 'code',
+  /** One line, short and punctuated: what the comparison found, or why it could not be made. */
+  Detail: 'detail',
+} as const;
+
+/**
  * The declared event vocabulary. Dot-namespaced and past-tense. The vocabulary is open by
  * design: a reader meeting a type absent from this list accepts the envelope and ignores the
  * event, so later stories add types without a breaking change.
@@ -448,6 +478,8 @@ export const EVENT_TYPES = [
   COMMIT_COMPOSED_EVENT_TYPE,
   /** Story 3-2 (AD-27) — a shadow run's own tree-comparison result, or that producing one failed. */
   SHADOW_COMPARED_EVENT_TYPE,
+  /** Story 3-3 — a confirmed merge's head-branch tree compared against its merge commit's tree. */
+  PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
 ] as const;
 
 export type DeclaredEventType = (typeof EVENT_TYPES)[number];
@@ -530,6 +562,25 @@ export const EVENT_ENVELOPE_VERBATIM_FIELDS = [
 ] as const;
 
 export type EventEnvelopeVerbatimField = (typeof EVENT_ENVELOPE_VERBATIM_FIELDS)[number];
+
+/**
+ * Story 3-3's own review round — the payload-scoped counterpart to {@link EVENT_ENVELOPE_VERBATIM_FIELDS}.
+ *
+ * `EVENT_ENVELOPE_VERBATIM_FIELDS` only ever restores a *top-level envelope* key by name; it has no
+ * mechanism reaching into `payload`, so a commit SHA nested under a payload key — `pull_request.
+ * merge_fidelity`'s own `head_ref_oid`/`merge_commit` — was silently destroyed by the AD-21 entropy pass
+ * with no rescue at all (a real 40-character hex SHA scores ~3.58 bits/char, above the pass's default
+ * 3.5-bit/24-length threshold). This is a second, narrower allow-list rather than a widening of the first,
+ * because the two live at different depths in the envelope and `src/runtime/recorder.ts`'s
+ * `preservePassthrough` walks the envelope's own top-level keys only.
+ *
+ * By field *name*, not by event type: both keys are unique to `pull_request.merge_fidelity` today, so no
+ * per-event-type scoping is needed, and a later event type reusing either name gets the same rescue for
+ * the same reason (a commit SHA is a commit SHA regardless of which line carries it).
+ */
+export const EVENT_PAYLOAD_VERBATIM_FIELDS = ['head_ref_oid', 'merge_commit'] as const;
+
+export type EventPayloadVerbatimField = (typeof EVENT_PAYLOAD_VERBATIM_FIELDS)[number];
 
 /**
  * The two AD-5 stream-origin fields, which are verbatim-or-dropped: the pass may not rewrite them,
