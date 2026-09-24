@@ -273,6 +273,20 @@ export const StepInputSchema = versioned({
   /** Pointers into the evidence plane the step may read on demand (AD-23). */
   evidence: z.array(EvidencePointerSchema),
   /**
+   * Story 4-3 — a person's steering note or scope-narrowing free text, delivered once, or `null` when
+   * none was pending when this step's input was built.
+   *
+   * Carries only the text, never `RunState.pending_note`'s own `kind` discriminator: a step reads a note
+   * as a note, regardless of whether a person typed it as free-form colour or as a narrower scope — the
+   * discriminator is for the durable log's own readers (a person, or a future story), not the agent's
+   * input. `null` rather than `.optional()` for the same AD-2 subset reason every other nullable field
+   * here is: every property stays required and the shape stays closed.
+   *
+   * Never `acceptance_criteria`: a scope-narrowing note is delivered as text the agent reads and
+   * interprets, and it never reopens the criteria a run was confirmed with (CAP-2).
+   */
+  steering_note: z.string().nullable(),
+  /**
    * What the deterministic gates did before this step was spawned, or an empty list.
    *
    * Empty for every phase but `verification`, and for a verification step whose run declares no gate

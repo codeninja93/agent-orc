@@ -521,6 +521,52 @@ export const PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS = {
 } as const;
 
 /**
+ * Story 4-3 — a durable note landed against a run: a person's steering colour (`kind: 'note'`), or a
+ * person-initiated scope reduction (`kind: 'narrow'`, CAP-16's own person-initiated half). One event
+ * type for both, discriminated by `kind`, because the two are the same shape of thing delivered the same
+ * way — a scope-narrowing instruction is a note whose *content* asks for less, not a structurally
+ * different delivery (see this story's own Design Notes on why `narrow` is not folded into story 2-9's
+ * `Degradation` machinery instead).
+ *
+ * Folded into `RunState.pending_note` (`src/contracts/state.ts`), set here and cleared by the next
+ * `step.started` line for the run — the same "set by one event, cleared by a later one" shape story 4-1's
+ * `pending_gate` already established. A second `note.injected` before the first is consumed **replaces**
+ * it: the fold is a plain assignment, never an append, so only one note is ever pending at a time.
+ */
+export const NOTE_INJECTED_EVENT_TYPE = 'note.injected';
+
+/** The payload keys a `note.injected` line carries: the free text, and which of the two it is. */
+export const NOTE_INJECTED_PAYLOAD_KEYS = {
+  Text: 'text',
+  Kind: 'kind',
+} as const;
+
+/**
+ * Story 4-3 — a run was forked into a wholly new, independent run, seeded from this run's own current
+ * worktree state. Emitted on the *source* run's own log — never the forked run's — so a person reading
+ * the source run's timeline sees that it was forked and where to; the source run's own `FeatureState` and
+ * step disposition are untouched, which is why this is not folded into anything (`fork` is not an
+ * `IntentEffect`: see `src/engine/steering.ts`'s own docblock for why that shape only ever mutates the
+ * *same* run).
+ *
+ * `IntentId` is carried in addition to the one key this story's own Tasks list names (`forked_run`), for
+ * a reason that key alone cannot cover: AD-19's delivery is at-least-once, and forking a run is not an
+ * idempotent side effect the way `escapeHatch`/`writeHandoff` are — a naive redelivery would mint and
+ * create a *second* new run. Carrying the intent id lets the engine recognise "this exact fork already
+ * happened" from the log alone, before ever creating another one, the same way `WRITE_GATE_APPROVED_
+ * PAYLOAD_KEYS.IntentId` lets a redelivered approval catch up rather than re-approve.
+ */
+export const RUN_FORKED_EVENT_TYPE = 'run.forked';
+
+/** The payload keys a `run.forked` line carries. */
+export const RUN_FORKED_PAYLOAD_KEYS = {
+  /** The new, independent run's own id. */
+  ForkedRun: 'forked_run',
+  /** The `fork` intent's id, so a redelivery is recognised without creating a second run. */
+  IntentId: 'intent_id',
+} as const;
+
+/**
  * The declared event vocabulary. Dot-namespaced and past-tense. The vocabulary is open by
  * design: a reader meeting a type absent from this list accepts the envelope and ignores the
  * event, so later stories add types without a breaking change.
@@ -601,6 +647,10 @@ export const EVENT_TYPES = [
   WRITE_GATE_OPENED_EVENT_TYPE,
   WRITE_GATE_APPROVED_EVENT_TYPE,
   WRITE_GATE_REJECTED_EVENT_TYPE,
+  /** Story 4-3 — a durable note or person-initiated narrowing landed against a run. */
+  NOTE_INJECTED_EVENT_TYPE,
+  /** Story 4-3 — a run was forked into a wholly new, independent run. */
+  RUN_FORKED_EVENT_TYPE,
 ] as const;
 
 export type DeclaredEventType = (typeof EVENT_TYPES)[number];
@@ -698,10 +748,33 @@ export type EventEnvelopeVerbatimField = (typeof EVENT_ENVELOPE_VERBATIM_FIELDS)
  * By field *name*, not by event type: both keys are unique to `pull_request.merge_fidelity` today, so no
  * per-event-type scoping is needed, and a later event type reusing either name gets the same rescue for
  * the same reason (a commit SHA is a commit SHA regardless of which line carries it).
+ *
+ * Story 4-3 adds `forked_run`: `run.forked` carries the new run's own id — an unbroken ULID — in its
+ * payload rather than in an envelope field, because `EVENT_ENVELOPE_VERBATIM_FIELDS`'s own `run` field
+ * already means *this* line's own run (the source, per every other event type), and `run.forked` is the
+ * one line whose payload has to name a *second*, different run. Without this it would be silently
+ * destroyed the same way `head_ref_oid`/`merge_commit` were before this list existed.
+ *
+ * **Story 4-3, round-1 review — a map from field to the *one* shape it is allowed, never a flat list
+ * checked against every declared shape.** The first draft of this addition was a plain array, and
+ * `src/runtime/recorder.ts`'s `preservePassthroughPayload` checked each entry against *every* shape in
+ * {@link EVENT_ENVELOPE_IDENTITY_SHAPES} — which would have let a ULID-shaped value survive redaction
+ * under `head_ref_oid`/`merge_commit`, fields that should only ever hold a commit SHA. Still caught by
+ * `provesPatternFree` if the value were a real secret, but a genuine loss of the field-specific precision
+ * {@link hasEventIdentityShape} already established at the envelope level — extended here to the
+ * payload-scoped fields by the same convention, rather than invented separately: each value names the
+ * *one* `EVENT_ENVELOPE_IDENTITY_SHAPES` key that field's value must match, and `hasEventIdentityShape`
+ * is the one function either level actually tests a value against a shape with.
  */
-export const EVENT_PAYLOAD_VERBATIM_FIELDS = ['head_ref_oid', 'merge_commit'] as const;
+export const EVENT_PAYLOAD_VERBATIM_FIELDS: Readonly<
+  Record<string, keyof typeof EVENT_ENVELOPE_IDENTITY_SHAPES>
+> = Object.freeze({
+  head_ref_oid: 'baseline_ref',
+  merge_commit: 'baseline_ref',
+  forked_run: 'run',
+});
 
-export type EventPayloadVerbatimField = (typeof EVENT_PAYLOAD_VERBATIM_FIELDS)[number];
+export type EventPayloadVerbatimField = keyof typeof EVENT_PAYLOAD_VERBATIM_FIELDS;
 
 /**
  * The two AD-5 stream-origin fields, which are verbatim-or-dropped: the pass may not rewrite them,

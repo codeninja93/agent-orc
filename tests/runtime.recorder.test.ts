@@ -51,6 +51,7 @@ import {
   runPaths,
 } from '../src/runtime/index.js';
 import type { EventSubmission } from '../src/runtime/index.js';
+import { mintRunId } from '../src/engine/index.js';
 
 const RUN_ID = '01JBQZ8Q0000000000000000AA';
 const FEATURE = 'runtime-recorder';
@@ -602,6 +603,69 @@ describe('Story 3-3 — the payload-scoped identity fields, row 21', () => {
     expect(outcome.event.payload['head_ref_oid']).toBe('[redacted]');
     expect(outcome.event.payload['merge_commit']).toBe(SHA);
     expect(readFileSync(logPathFor(), 'utf8')).not.toContain(credentialShapedLikeASha);
+  });
+});
+
+describe('Story 4-3, round-1 review — each payload-scoped field is restored by its own shape, never "any declared shape passes for any field" (row 14)', () => {
+  /**
+   * A freshly minted, real ULID — not a hand-written string with long repeated runs (`RUN_ID` above has
+   * sixteen `0`s in a row and would not reliably trip the entropy heuristic in the first place, which
+   * would make a test built on it pass whether or not the restore mechanism does anything at all, the
+   * same zero-entropy trap `SHA`'s own docblock above already calls out for a repeated-character SHA).
+   */
+  const ULID = mintRunId();
+  const SHA = 'ddd9bed4d286ac1f8a0f4f7bfef9530046605787';
+
+  it('restores a real ULID under forked_run, which the entropy rule would otherwise replace', () => {
+    const recorder = recorderFor();
+    const event = recorder.record(
+      submission({ type: 'run.forked', payload: { forked_run: ULID, intent_id: 'cmd-fork-01' } }),
+    );
+    expect(event.payload['forked_run']).toBe(ULID);
+    const [first] = readEventLog(logPathFor());
+    expect(first?.payload['forked_run']).toBe(ULID);
+  });
+
+  it('rejects a ULID-shaped value under head_ref_oid/merge_commit — that field needs a commit SHA, never any declared shape', () => {
+    // The finding this test guards: a first-draft "any shape passes for any field" union would have let
+    // this survive, weakening story 3-3's own field-specific guarantee.
+    const recorder = recorderFor();
+    const event = recorder.record(
+      submission({
+        type: 'pull_request.merge_fidelity',
+        payload: { outcome: 'unchanged', head_ref_oid: ULID, merge_commit: ULID },
+      }),
+    );
+    expect(event.payload['head_ref_oid']).toBe('[redacted]');
+    expect(event.payload['merge_commit']).toBe('[redacted]');
+  });
+
+  it('rejects a commit-SHA-shaped value under forked_run — that field needs a ULID, never any declared shape', () => {
+    // The symmetric direction: `forked_run` is declared against the `run` shape specifically, so a
+    // value shaped like a commit SHA is not restored either, even though it is a real declared shape —
+    // just not the one *this* field is pinned to.
+    const recorder = recorderFor();
+    const event = recorder.record(
+      submission({ type: 'run.forked', payload: { forked_run: SHA, intent_id: 'cmd-fork-02' } }),
+    );
+    expect(event.payload['forked_run']).toBe('[redacted]');
+  });
+
+  it('survives all three — a real SHA pair and a real ULID — each in its own correct field, in one line', () => {
+    const OTHER_SHA = 'f4e8b6a2c9d1735068e0a1c4b8d6f2937e5a9c07';
+    const recorder = recorderFor();
+    const fidelity = recorder.record(
+      submission({
+        type: 'pull_request.merge_fidelity',
+        payload: { outcome: 'unchanged', head_ref_oid: SHA, merge_commit: OTHER_SHA },
+      }),
+    );
+    const forked = recorder.record(
+      submission({ type: 'run.forked', payload: { forked_run: ULID, intent_id: 'cmd-fork-03' } }),
+    );
+    expect(fidelity.payload['head_ref_oid']).toBe(SHA);
+    expect(fidelity.payload['merge_commit']).toBe(OTHER_SHA);
+    expect(forked.payload['forked_run']).toBe(ULID);
   });
 });
 

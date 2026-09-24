@@ -117,6 +117,7 @@ const aState = (overrides: Partial<RunState> = {}): RunState => ({
   handoff: null,
   degradation: null,
   pending_gate: null,
+  pending_note: null,
   ...overrides,
 });
 
@@ -185,37 +186,40 @@ describe('every member of the Command enum has a declared handling', () => {
       expect(handling, command).toBeDefined();
       if (handling.kind === 'awaiting') expect(handling.owner, command).toMatch(/story/);
     }
-    // The eight this build honours: story 1-3's five, plus the three question commands story 1-8
-    // un-parked once the AD-25 compare-and-set existed to receive them. A ninth appearing here without
-    // a test is what the list is for.
+    // Story 4-3 un-parks the last four `awaiting` commands (`narrow`, `pause`, `inject_note`, `fork`),
+    // so the list grows from eight to twelve. A thirteenth appearing here without a test is what the
+    // list is for.
     expect([...HONOURED_COMMANDS].sort()).toStrictEqual([
       'answer',
       'approve',
       'confirm_spec',
       'disengage',
       'edit_criterion',
+      'fork',
+      'inject_note',
       'kill',
+      'narrow',
+      'pause',
       'reject',
       'take_over',
     ]);
   });
 
-  it('leaves a command another story owns on disk rather than swallowing it', () => {
-    const decision = decideSteering(anIntent('narrow'), aState(), noneApplied);
-    expect(decision.kind).toBe('awaiting');
-    if (decision.kind !== 'awaiting') return;
-    // No story's accepted scope names `narrow` yet; story 4-3 owns the steering controls it sits among, and
-    // has to be able to see the intent that asked for it.
-    expect(decision.owner).toContain('4-3');
+  /**
+   * Story 4-3 closes the last four commands this build ever parked: `narrow`, `pause`, `inject_note` and
+   * `fork` were the whole of `COMMAND_HANDLING`'s `awaiting` bucket, and none of them is any longer.
+   *
+   * There is therefore no real `Command` enum member left to drive `decideSteering`'s `awaiting` branch
+   * with — the exact question this story's own instructions asked to be checked, and this is the answer.
+   * The branch itself is untouched (a later story may park a new command the same way), so this asserts
+   * the fact about *today's* table rather than exercising code nothing currently reaches.
+   */
+  it('parks no command on a later story any longer', () => {
+    for (const command of COMMANDS) {
+      expect(COMMAND_HANDLING[command].kind, command).not.toBe('awaiting');
+    }
   });
 
-  /**
-   * The owners, by name — because `/story/` alone pins none of them.
-   *
-   * `COMMAND_HANDLING.fork` named "story 1-9" as its awaiting owner, which was done and implemented no
-   * forking; the correction to story 4-3 was held by nothing, so reverting it left the whole suite green.
-   * The generic assertion above matches either string. These do not.
-   */
   it('lists every disposition in the enum’s declaration order, as it says it does', () => {
     // `Object.keys(COMMAND_HANDLING)` is the object literal's key order, which is the same order today
     // and a claim about the wrong thing: AD-3 makes the enum the single declaration both renderers are
@@ -226,25 +230,15 @@ describe('every member of the Command enum has a declared handling', () => {
     expect(HONOURED_COMMANDS.every((command) => COMMANDS.includes(command))).toBe(true);
   });
 
-  it.each([
-    ['narrow', /^story 4-3\b.*not yet named in any story/],
-    ['pause', /^story 4-3\b/],
-    ['inject_note', /^story 4-3\b/],
-    ['fork', /4-3/],
-  ] as const)('names %s’s owner as the story that actually owns it', (command, owner) => {
-    const handling = COMMAND_HANDLING[command];
-    expect(handling.kind).toBe('awaiting');
-    if (handling.kind !== 'awaiting') return;
-    expect(handling.owner).toMatch(owner);
-  });
-
   /**
    * The durable form of the same rule: **no parked command may name a story that is already finished.**
    *
-   * Pinning each owner by name catches a revert; this catches the *drift* — a command still waiting on a
-   * story that has since shipped, which is what "story 1-9" became the day 1-9 was marked done. When 2-9,
-   * 2-10 or 4-3 lands, this fails and the entry has to be revisited rather than going on telling a person
-   * that a finished story will get to their keystroke.
+   * This caught the *drift* a reverted `awaiting` entry would not — a command still waiting on a story
+   * that has since shipped, which is what "story 1-9" became the day 1-9 was marked done, and what
+   * `narrow`/`pause`/`inject_note`/`fork` would have become the day story 4-3 shipped without this test
+   * ever failing. Story 4-3 is this story, and the "parks no command" test above already asserts the
+   * loop below now finds nothing at all — kept anyway, so a *future* story that parks a new command the
+   * same way still gets this guard for free rather than needing it reinvented.
    */
   it('never parks a command on a story that is already done', () => {
     const storiesDir = new URL('../docs/specs/spec-agent-orchestrator/stories/', import.meta.url);
@@ -271,10 +265,10 @@ describe('every member of the Command enum has a declared handling', () => {
       if (status !== null) checked += 1;
       expect(status, `${command} waits on story ${story}, which is ${String(status)}`).not.toBe('done');
     }
-    // Every owner today names a story with no file yet, which is itself the honest state — so this
-    // asserts only that the lookup works, using a story that does have one.
+    // No command is awaiting any longer (the test above), so the loop above finds nothing to check —
+    // this asserts only that `statusOf` itself still works, using a story that does have a file.
     expect(statusOf('1-9')).toBe('done');
-    expect(checked).toBeGreaterThanOrEqual(0);
+    expect(checked).toBe(0);
   });
 
   it('routes the three question commands through the AD-25 transition rather than parking them', () => {
@@ -755,6 +749,132 @@ describe('stopping the work', () => {
   });
 });
 
+describe('pausing (story 4-3, I/O matrix row 1)', () => {
+  it('mirrors a kill’s own effect exactly, except for the disposition it targets', () => {
+    const state = aState({ steps: [aStep({ session_id: 'sess-implement' })] });
+    const kill = decideSteering(anIntent('kill'), state, noneApplied);
+    const pause = decideSteering(anIntent('pause'), state, noneApplied);
+    expect(kill.kind).toBe('apply');
+    expect(pause.kind).toBe('apply');
+    if (kill.kind !== 'apply' || pause.kind !== 'apply') return;
+    // Same step targeted, same shape — only the state each side records differs.
+    expect(pause.effect.step).toBe(kill.effect.step);
+    expect(pause.effect.toState).toBe('interrupted');
+    expect(pause.effect.stepDisposition).toBe('interrupted');
+    expect(kill.effect.toState).toBe('killed');
+    expect(kill.effect.stepDisposition).toBe('killed');
+  });
+
+  it('never relabels a finished step, exactly as kill never does', () => {
+    const state = aState({
+      steps: [aStep({ disposition: 'completed', terminated_at: '2026-09-20T10:01:00.000Z' })],
+    });
+    const decision = decideSteering(anIntent('pause'), state, noneApplied);
+    expect(decision.kind).toBe('apply');
+    if (decision.kind !== 'apply') return;
+    expect(decision.effect.toState).toBe('interrupted');
+    expect(decision.effect.step).toBeNull();
+    expect(decision.effect.stepDisposition).toBeNull();
+  });
+
+  it('carries no target-state guard, exactly as the other stop gestures do not (I/O matrix row 10 is the terminal one)', () => {
+    for (const state of ['drafting', 'confirmed', 'running', 'blocked', 'verifying', 'interrupted'] as const) {
+      expect(decideSteering(anIntent('pause'), aState({ state }), noneApplied).kind).toBe('apply');
+    }
+  });
+});
+
+describe('injecting a note and person-initiated narrow (story 4-3, I/O matrix rows 3, 5, 6)', () => {
+  it('carries the note text and kind: "note" for inject_note (row 3)', () => {
+    const decision = decideSteering(anIntent('inject_note', null, 'watch the refund path'), aState(), noneApplied);
+    expect(decision.kind).toBe('apply');
+    if (decision.kind !== 'apply') return;
+    expect(decision.effect.injectedNote).toStrictEqual({ text: 'watch the refund path', kind: 'note' });
+    // A note changes nothing about the run's own lifecycle or its steps.
+    expect(decision.effect.toState).toBeNull();
+    expect(decision.effect.step).toBeNull();
+    expect(decision.effect.stepDisposition).toBeNull();
+  });
+
+  it('carries the note text and kind: "narrow" for a person-initiated narrow (row 6)', () => {
+    const decision = decideSteering(anIntent('narrow', null, 'just the refund path'), aState(), noneApplied);
+    expect(decision.kind).toBe('apply');
+    if (decision.kind !== 'apply') return;
+    expect(decision.effect.injectedNote).toStrictEqual({ text: 'just the refund path', kind: 'narrow' });
+    expect(decision.effect.toState).toBeNull();
+  });
+
+  it('never touches acceptance_criteria — narrow’s free text is not a new criterion', () => {
+    // The effect shape has no field that could carry one: `injectedNote` is the only thing `narrow`
+    // produces, and it is delivered as `StepInput.steering_note`, never as an amended criterion.
+    const decision = decideSteering(anIntent('narrow', null, 'just the refund path'), aState(), noneApplied);
+    expect(decision.kind).toBe('apply');
+    if (decision.kind !== 'apply') return;
+    expect(Object.keys(decision.effect)).not.toContain('acceptanceCriteria');
+  });
+
+  it.each(['inject_note', 'narrow'] as const)(
+    'refuses %s carrying no text, the same defence reject’s own guard already is',
+    (command) => {
+      const blank = anUnvalidatedIntent(command, '   ');
+      expect(CommandIntentSchema.safeParse(blank).success, command).toBe(false);
+      const decision = decideSteering(blank, aState(), noneApplied);
+      expect(decision.kind, command).toBe('refuse');
+      if (decision.kind !== 'refuse') return;
+      expect(decision.reason).toBe('missing-answer');
+    },
+  );
+
+  it('replaces rather than queues: a second inject_note decision carries only the second text (row 5)', () => {
+    // `decideSteering` itself is pure and per-intent; the "replace, never queue" property is the fold's
+    // own (`RunState.pending_note` is a plain assignment in `rebuild.ts`) — asserted at the decision level
+    // here only as far as it goes: each `inject_note` intent decides its *own* text independently, so two
+    // in a row produce two independent effects rather than one that remembers the first.
+    const first = decideSteering(anIntent('inject_note', null, 'first note'), aState(), noneApplied);
+    const second = decideSteering(anIntent('inject_note', null, 'second note'), aState(), noneApplied);
+    expect(first.kind).toBe('apply');
+    expect(second.kind).toBe('apply');
+    if (first.kind !== 'apply' || second.kind !== 'apply') return;
+    expect(first.effect.injectedNote?.text).toBe('first note');
+    expect(second.effect.injectedNote?.text).toBe('second note');
+  });
+});
+
+describe('forking (story 4-3, I/O matrix rows 7-11)', () => {
+  /**
+   * `fork` is decided here only to the extent every other command's exactly-once and terminal-run guards
+   * already are: the actual new run is created by `Reconciler.forkFeature`, called from `consumeIntents`
+   * beside — never inside — this switch (see `case 'fork'`'s own docblock in `src/engine/steering.ts`).
+   * So the effect this decides is a deliberate, same-run no-op; the reconciler-level mechanism is exercised
+   * through a real pass in `tests/engine.reconciler.test.ts`.
+   */
+  it('decides a same-run no-op effect, never describing the new run it causes', () => {
+    const decision = decideSteering(anIntent('fork'), aState(), noneApplied);
+    expect(decision.kind).toBe('apply');
+    if (decision.kind !== 'apply') return;
+    expect(decision.effect.toState).toBeNull();
+    expect(decision.effect.step).toBeNull();
+    expect(decision.effect.stepDisposition).toBeNull();
+    expect(decision.effect.escapeHatch).toBe(false);
+    expect(decision.effect.handoff).toBeNull();
+  });
+
+  it('is refused on a terminal run, the same terminal-run refusal every other command gets (row 10)', () => {
+    for (const state of ['committed', 'killed', 'handed_off', 'hibernated'] as const) {
+      const decision = decideSteering(anIntent('fork'), aState({ state }), noneApplied);
+      expect(decision.kind, state).toBe('refuse');
+      if (decision.kind !== 'refuse') continue;
+      expect(decision.reason, state).toBe('terminal-run');
+    }
+  });
+
+  it('recognises a redelivered fork by id rather than deciding a fresh one (row 11)', () => {
+    const intent = anIntent('fork');
+    const decision = decideSteering(intent, aState(), { applied: new Map([[intent.intent_id, 'fork']]) });
+    expect(decision.kind).toBe('already-applied');
+  });
+});
+
 describe('taking the work over', () => {
   it('asks for the escape hatch, the hand-off and the halt, in one effect', () => {
     const decision = decideSteering(
@@ -1040,34 +1160,15 @@ describe('the loop applies what the decision decided', () => {
       (event) => event.type === COMMAND_EVENT_TYPES.Applied,
     );
 
-  it('leaves an awaiting intent pending, records nothing for it, and reports it as awaiting', async () => {
-    /**
-     * Nothing in the suite asserted `awaiting` at the pass level, so *retiring* such an intent — which
-     * swallows a user's answer or edit before its owner ever sees it — left the whole suite green.
-     */
-    const { reconciler } = openReconciler();
-    const accepted = reconciler.acceptFeature(makePlan());
-    const intentId = writeOne(accepted.run, 'narrow', 'just the refund path');
-
-    const result = await reconciler.pass();
-    const outcome = result.steering.find((entry) => entry.run === accepted.run);
-
-    // Reported, so it is visible rather than invisible...
-    expect(outcome?.awaiting.map((entry) => entry.intentId)).toStrictEqual([intentId]);
-    expect(outcome?.awaiting[0]?.command).toBe('narrow');
-    expect(outcome?.awaiting[0]?.reason).toContain('story 2-9');
-    expect(outcome?.applied).toStrictEqual([]);
-    // ...and still on disk, unconsumed and unrecorded, for the unit that owns it.
-    expect(readIntentFiles(runPaths(accepted.run, home)).pending.map((p) => p.intent.intent_id)).toStrictEqual([
-      intentId,
-    ]);
-    expect(appliedEvents(accepted.run).some((event) => event.payload['intent_id'] === intentId)).toBe(
-      false,
-    );
-    // A second pass does not change its mind about it.
-    await reconciler.pass();
-    expect(readIntentFiles(runPaths(accepted.run, home)).pending).toHaveLength(1);
-  });
+  /**
+   * Story 4-3 closed the last four `awaiting` commands (`narrow`, `pause`, `inject_note`, `fork` — see
+   * "parks no command on a later story any longer", above), so there is no real `Command` enum member
+   * left to drive `consumeIntents`'s own `awaiting` branch with. `narrow` was this test's own concrete
+   * example before this story; nothing in this build's committed `Command` enum reaches that branch any
+   * longer, and this codebase has no established pattern for mocking `COMMAND_HANDLING` to synthesise
+   * one (no other suite in this repository does that). The branch itself is untouched — a future story
+   * parking a new command the same way would need a test here again, at that command's name.
+   */
 
   it('records an acknowledged command once, with its principal, and changes no run state', async () => {
     /**
@@ -1097,18 +1198,20 @@ describe('the loop applies what the decision decided', () => {
     expect(readIntentFiles(runPaths(accepted.run, home)).pending).toStrictEqual([]);
   });
 
-  it('throws rather than handing a caller the old state for a command nothing applied', () => {
-    /**
-     * `steer` returned the *old* state and no error for an `awaiting` decision, so
-     * `reconciler.steer(run, 'pause')` read exactly like a pause that had happened. A caller holding a
-     * control in their hand is owed the reason it did nothing, and "story 2-9 owns this" is a reason.
-     */
+  /**
+   * `steer` used to return the *old* state and no error for an `awaiting` decision, so
+   * `reconciler.steer(run, 'pause')` read exactly like a pause that had happened — before story 4-3 gave
+   * `pause` a real effect. There is no real `Command` member left that reaches `steer`'s `awaiting`
+   * branch any longer (see the block comment above), so what is left to assert is the positive fact this
+   * story adds instead: `pause` now actually applies, changing the run state `steer` hands back.
+   */
+  it('applies a pause through steer rather than leaving it parked', () => {
     const { reconciler } = openReconciler();
     const accepted = reconciler.acceptFeature(makePlan());
 
-    expect(() => reconciler.steer(accepted.run, 'pause')).toThrowError(SteeringRefused);
-    // The file is *not* quarantined: its owner still has to see it, which is the whole point of awaiting.
-    expect(readIntentFiles(runPaths(accepted.run, home)).pending).toHaveLength(1);
+    const paused = reconciler.steer(accepted.run, 'pause');
+    expect(paused.state).toBe('interrupted');
+    expect(readIntentFiles(runPaths(accepted.run, home)).pending).toStrictEqual([]);
   });
 
   it('applies a pending intent when a caller drives advance directly', async () => {

@@ -88,6 +88,18 @@ export interface IntentEffect {
    * way it already reads `handoff` to know a hand-off document belongs beside one.
    */
   readonly gateResolution: { readonly intentId: string; readonly outcome: 'approved' | 'rejected' } | null;
+  /**
+   * Story 4-3 — a note or scope-narrowing free text this effect delivers, or `null` when it delivers
+   * none.
+   *
+   * `inject_note` and person-initiated `narrow` are the same shape of thing tagged differently (see this
+   * story's own Design Notes on why `narrow` is not a second mechanism): both produce this field, with
+   * `kind: 'note'` or `kind: 'narrow'`. A field of its own for the same reason `gateResolution` is one:
+   * `toState`/`stepDisposition` mean something else already, and injecting a note changes neither —
+   * `applyIntent` reads this field to know a `note.injected` line belongs beside the `command.applied`
+   * line it is about to write.
+   */
+  readonly injectedNote: { readonly text: string; readonly kind: 'note' | 'narrow' } | null;
 }
 
 /**
@@ -196,6 +208,7 @@ const effect = (summary: string, parts: Partial<Omit<IntentEffect, 'summary'>>):
   escapeHatch: parts.escapeHatch ?? false,
   handoff: parts.handoff ?? null,
   gateResolution: parts.gateResolution ?? null,
+  injectedNote: parts.injectedNote ?? null,
 });
 
 /**
@@ -220,6 +233,59 @@ const stopEffect = (state: RunState, summary: string): IntentEffect => {
     step: target?.step ?? null,
     stepDisposition: target === null ? null : 'killed',
   });
+};
+
+/**
+ * A pause's effect: the in-flight step, if any, and the run's non-terminal halt.
+ *
+ * Mirrors {@link stopEffect} exactly, on purpose — `pause` reuses `kill`'s own live-stop signal
+ * unchanged (`STOP_COMMANDS` now includes it, `src/runtime/steering-view.ts`), and the Always list draws
+ * out the one place the two gestures differ: what gets *recorded*. A step stopped by `pause` records
+ * `interrupted`, AD-8's own resumable disposition, never `killed` — a paused run resumes exactly the way
+ * any other `interrupted` run already does, by session id, with no new resume mechanism of its own.
+ */
+const pauseEffect = (state: RunState, summary: string): IntentEffect => {
+  const target = inFlightStep(state);
+  return effect(summary, {
+    toState: 'interrupted',
+    step: target?.step ?? null,
+    stepDisposition: target === null ? null : 'interrupted',
+  });
+};
+
+/**
+ * `inject_note` and person-initiated `narrow`'s shared effect: the free text, tagged by which gesture it
+ * was.
+ *
+ * Both commands reach here rather than a second mechanism, per this story's own reasoning: a
+ * scope-narrowing instruction is a note whose *content* asks for less, not a structurally different
+ * delivery. Neither ever touches `toState`/`stepDisposition` — a note changes nothing about the run's
+ * lifecycle or its steps, only what the run's *next* step input carries (`injectedNote`, read by
+ * `applyIntent` and `Reconciler.stepInput`). The argument is guaranteed non-blank by
+ * `ARGUMENT_REQUIRED_COMMANDS` at the contract door (`src/contracts/command.ts`); the blank check below
+ * is defence in depth, the same shape `reject`'s own guard above already is, for an intent built by hand
+ * around that door (see `anUnvalidatedIntent` in `tests/engine.steering.test.ts`).
+ */
+const noteEffect = (command: 'inject_note' | 'narrow', argument: string | null): SteeringDecision => {
+  const text = (argument ?? '').trim();
+  if (text === '') {
+    return {
+      kind: 'refuse',
+      reason: 'missing-answer',
+      detail:
+        `"${command}" carries no text, so there is nothing to inject — a note is only ever the person's ` +
+        'own words, and an empty one would deliver silence into the run’s next step input.',
+    };
+  }
+  const kind: 'note' | 'narrow' = command === 'narrow' ? 'narrow' : 'note';
+  return {
+    kind: 'apply',
+    effect: effect('note-injected', { injectedNote: { text, kind } }),
+    reason:
+      kind === 'narrow'
+        ? `a person narrowed the run's scope (CAP-16, CAP-15): ${text}`
+        : `a person injected a note for whichever step this run starts next (CAP-15): ${text}`,
+  };
 };
 
 /**
@@ -639,16 +705,63 @@ export const decideSteering = (
       };
     }
 
+    /**
+     * Story 4-3 — `pause` reuses `stopEffect`'s own template exactly, targeting `interrupted` rather
+     * than `killed` (see {@link pauseEffect}'s own docblock). Unlike `kill`/`disengage`/`take_over`, it
+     * carries no target-state guard for the identical reason those three do not: every non-terminal
+     * state is a legitimate target for a halt a person can always ask for, and the terminal guard above
+     * already refuses the one state that is not.
+     */
+    case 'pause':
+      return {
+        kind: 'apply',
+        effect: pauseEffect(state, 'paused'),
+        reason:
+          'a person paused the run (CAP-15) — resumable exactly as any other AD-8-interrupted run, by ' +
+          'session id, with no new resume mechanism of its own',
+      };
+
+    case 'inject_note':
+      return noteEffect('inject_note', intent.argument);
+
+    case 'narrow':
+      return noteEffect('narrow', intent.argument);
+
+    /**
+     * Story 4-3 — `fork` is not decided here in the sense every other case above is: an `IntentEffect`
+     * only ever mutates the *same* run (see `IntentEffect`'s own docblock), and forking creates a wholly
+     * new one while leaving this run's own state untouched — a shape this function has no field for and
+     * never will.
+     *
+     * What this case *does* decide is real, and it is exactly what every other exactly-once-by-id guard
+     * above already decided for every other command: whether this `intent_id` is a fresh gesture, a
+     * redelivery, or an intent for a run that has gone terminal since. Reusing those guards here — rather
+     * than duplicating the id-reuse and terminal-run checks a second time in the reconciler-level fork
+     * mechanism itself — is what keeps this module the single place that answers "has this exact intent
+     * already happened," for `fork` exactly as for every other command (AD-19).
+     *
+     * The `IntentEffect` this returns is an explicit no-op: nothing about *this* run's `toState` or steps
+     * moves. `Reconciler`'s own per-intent loop (`consumeIntents`, beside — never inside — this switch)
+     * is what notices the command is `fork`, actually calls `forkFeature`, and emits `run.forked` on this
+     * run's own log *before* the `command.applied` line this decision's `apply` produces — so the ledger
+     * entry that retires the intent file still carries the exactly-once guarantee AD-19 requires, and a
+     * redelivered `fork` intent finds its id already applied and creates nothing a second time.
+     */
+    case 'fork':
+      return {
+        kind: 'apply',
+        effect: effect('forked', {}),
+        reason:
+          'a person forked the run (CAP-15) — a new, independent run is created, seeded from this run’s ' +
+          'own current worktree state; this run’s own state is untouched',
+      };
+
     // Every remaining member is `question`, `acknowledge` or `awaiting` and returned above. Enumerated
     // rather than defaulted so adding a command with an effect is a compile error here.
     case 'answer':
     case 'edit_criterion':
     case 'reject':
     case 'continue':
-    case 'narrow':
-    case 'pause':
-    case 'inject_note':
-    case 'fork':
     case 'just_do_it':
       return {
         kind: 'refuse',

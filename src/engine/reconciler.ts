@@ -72,10 +72,14 @@ import {
   DECLARATION_PAYLOAD_KEYS,
   PLANNING_CONTRACT_ID,
   MODEL_RUNGS,
+  NOTE_INJECTED_EVENT_TYPE,
+  NOTE_INJECTED_PAYLOAD_KEYS,
   PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
   PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS,
   REPAIRED_PAYLOAD_KEY,
   REVIEW_SKIPPED_PAYLOAD_KEYS,
+  RUN_FORKED_EVENT_TYPE,
+  RUN_FORKED_PAYLOAD_KEYS,
   SPEC_CRITERION_EDITED_EVENT_TYPE,
   SPEC_RECORDED_EVENT_TYPE,
   SpecCriterionEditedPayloadSchema,
@@ -562,10 +566,52 @@ export interface StopObservation {
   readonly observedAt: string;
 }
 
-/** Adapt story 1-4's spawner to {@link StepStopper}, structurally so no type crosses the boundary. */
+/**
+ * Adapt story 1-4's spawner to {@link StepStopper}, structurally so no type crosses the boundary.
+ *
+ * Story 4-3 — `target.command` was already carried on `StepStopper`'s own target and discarded here
+ * unread; a real, in-flight `pause` reached the spawner exactly as a `kill` did, so `spawner.ts`'s own
+ * outcome-handling durably recorded the step `killed` — before `decideSteering`'s `pauseEffect` ever ran,
+ * and by then too late for it to correct (a step no longer `disposition: null` is not "in flight").
+ * `resumable: target.command === 'pause'` is the one bit that closes it: the spawner's own `kill` takes
+ * it from here (`src/engine/spawner.ts`'s `StepStopOptions`), and reports `interrupted` rather than
+ * `killed` for exactly this one command, through the exact SIGTERM-then-`stop(false)` path the wall-clock
+ * timeout already uses.
+ */
 export const stepStopperFrom = (spawner: {
-  readonly kill: (step: string, run?: string) => boolean;
-}): StepStopper => (target): boolean => spawner.kill(target.step, target.run);
+  readonly kill: (step: string, run?: string, options?: { readonly resumable?: boolean }) => boolean;
+}): StepStopper => (target): boolean =>
+  spawner.kill(target.step, target.run, { resumable: target.command === 'pause' });
+
+/**
+ * The port {@link Reconciler.forkFeature} creates the forked run's own worktree through.
+ *
+ * See {@link ReconcilerOptions.forkWorktree}'s own docblock for why this is a structural port rather
+ * than an import of `createWorktree` (`src/pool/worktree.ts`). The request carries exactly the two
+ * fields a fork needs from `WorktreeCreateRequest`: the run id the new worktree is named for, and the ref
+ * its branch starts at — pinned to the source run's own current worktree `HEAD` rather than the
+ * repository's, so the fork continues from whatever `implement`/`test` work has landed there so far.
+ */
+export type ForkWorktreePort = (request: {
+  readonly run: string;
+  readonly ref: string;
+}) => { readonly path: string };
+
+/**
+ * The forked run's own feature slug: the source's, with a short suffix from the new run's own id.
+ *
+ * `branchFor` (`src/engine/committer.ts`) derives a branch name from the feature slug alone, never the
+ * run id (confirmed by story 3-2's own investigation into the identical hazard for shadow-mode branch
+ * collisions) — so two runs sharing one feature slug reaching `commit` would compute the identical branch
+ * name. The suffix is the new run's own id's **last** six characters, lowercased for the kebab-case
+ * convention — never the *first* six: a ULID's leading ten characters are its millisecond timestamp
+ * (AD-29), identical for any two runs minted in the same millisecond, which forking twice in quick
+ * succession is exactly the case most likely to do. The trailing characters fall inside the id's 80 bits
+ * of per-millisecond randomness (monotonically incremented when two mints share a millisecond), which is
+ * what actually disambiguates them — with no change to `branchFor` itself.
+ */
+export const forkedFeatureSlug = (feature: string, forkedRun: string): string =>
+  `${feature}-fork-${forkedRun.slice(-6).toLowerCase()}`;
 
 /** What one intent's consumption did. */
 export const INTENT_OUTCOMES = [
@@ -1448,6 +1494,21 @@ export interface ReconcilerOptions {
    * repository, the same seam every other git-shelling port on this interface already gets.
    */
   readonly mergeFidelityGit?: GitCall;
+  /**
+   * CAP-15 — how `forkFeature` creates the forked run's own worktree, pinned to the source run's own
+   * current worktree `HEAD`. A function rather than importing `createWorktree`
+   * (`src/pool/worktree.ts`) directly, for the same dependency-direction reason `writeExecutor`/
+   * `branchProtection`/`mergeChecker` are all ports: `src/engine/` may import only `src/contracts/`,
+   * `src/runtime/` and node builtins (`tests/engine.reconciler.test.ts`'s own guard), and worktree
+   * creation belongs to `src/pool/`. A real adapter is a thin wrapper over `createWorktree`, passing
+   * this request's `run` and `ref` straight through — no new worktree capability, exactly as
+   * `WorktreeCreateRequest.ref` already accepting an arbitrary starting ref promised.
+   *
+   * `null` is a genuine gap, stated plainly rather than guessed past — `forkFeature` refuses loudly when
+   * asked to act with none wired, exactly as `writeExecutor: null` leaves a write composed but never
+   * performed rather than pretending nothing was asked.
+   */
+  readonly forkWorktree?: ForkWorktreePort | null;
 }
 
 /**
@@ -1524,6 +1585,7 @@ export class Reconciler {
   private readonly writeExecutor: WriteExecutorPort | null;
   private readonly mergeChecker: MergeCheckPort | null;
   private readonly mergeFidelityGit: GitCall;
+  private readonly forkWorktree: ForkWorktreePort | null;
   /** Open recorders, keyed by run id. An I/O handle, not run state: nothing is read back from it. */
   private readonly recorders = new Map<string, Recorder>();
   private closed = false;
@@ -1573,6 +1635,7 @@ export class Reconciler {
     this.writeExecutor = options.writeExecutor ?? null;
     this.mergeChecker = options.mergeChecker ?? null;
     this.mergeFidelityGit = options.mergeFidelityGit ?? realGitCall;
+    this.forkWorktree = options.forkWorktree ?? null;
   }
 
   /**
@@ -1623,8 +1686,21 @@ export class Reconciler {
    * (CAP-2), which is why the initial state is `drafting` rather than `running`.
    */
   acceptFeature(plan: FeaturePlan): AcceptedFeature {
+    return this.acceptRun(this.minter.mint(), plan);
+  }
+
+  /**
+   * `acceptFeature`'s own body, taking the run id as a parameter rather than minting one.
+   *
+   * `acceptFeature` still mints here and nowhere else for its own callers (AD-29's promise is
+   * unchanged), but {@link forkFeature} has its own reason to see the id *before* this runs: the forked
+   * run's worktree has to be created — at the id `ForkWorktreePort` names it by — before the plan handed
+   * in here can even be built, because the plan's own `worktree` field has to name where that worktree
+   * landed. Splitting the id out is exactly that seam and nothing else; every line below is
+   * `acceptFeature`'s own, unchanged.
+   */
+  private acceptRun(run: string, plan: FeaturePlan): AcceptedFeature {
     this.assertOpen();
-    const run = this.minter.mint();
     const paths = runPaths(run, this.orchHome);
     mkdirSync(paths.runDir, { recursive: true });
 
@@ -1724,6 +1800,58 @@ export class Reconciler {
     }
 
     return { run, state: this.checkpointFromLog(paths, plan) };
+  }
+
+  /**
+   * CAP-15 — fork a run into a wholly new, independent run, seeded from its own current worktree state.
+   *
+   * Mirrors {@link acceptRun}'s own shape exactly — a fresh ULID, `run.created` on the *new* run's own
+   * log, a fresh plan starting at `drafting` — never a copy of the source run's own step history: nothing
+   * in this codebase's architecture supports seeding one run's checkpoint from another's, and inventing
+   * that is out of this story's own scope (see its Never list). What *is* inherited is the worktree's
+   * file contents: {@link ForkWorktreePort} is asked to create the new run's own worktree with its `ref`
+   * pinned to the source run's own current worktree `HEAD` — whatever `implement`/`test` work has landed
+   * there so far — rather than the repository's own unrelated `HEAD`. The forked run's feature slug
+   * carries a short suffix derived from its own new run id ({@link forkedFeatureSlug}), so `branchFor`
+   * (`src/engine/committer.ts`, read here, never changed) naturally produces a distinct branch with no
+   * change to `branchFor` itself.
+   *
+   * **Never called for the source run's own sake.** This method creates the new run and returns it;
+   * it does not touch the source run's own state, emit anything on the source run's own log, or mark any
+   * intent applied — that is `consumeIntents`'s own job, in the `fork`-specific check beside (never
+   * inside) `decideSteering`'s per-command switch, which is the only caller of this method in this build.
+   */
+  forkFeature(sourceRun: string): AcceptedFeature {
+    this.assertOpen();
+    if (this.forkWorktree === null) {
+      throw new Error(
+        `Cannot fork run ${sourceRun}: this engine has no fork-worktree port wired ` +
+          '(ReconcilerOptions.forkWorktree), so there is nowhere to create the forked run’s own ' +
+          'worktree. Wire one — a thin adapter over `src/pool/worktree.ts`’s `createWorktree` — before ' +
+          'forking a run, rather than guessing where it should live.',
+      );
+    }
+    const source = this.load(sourceRun);
+    const head = this.worktreeGit(source.plan.worktree, ['rev-parse', 'HEAD']);
+    if (head.status !== 0) {
+      throw new Error(
+        `Cannot fork run ${sourceRun}: could not read the current HEAD of its worktree ` +
+          `(${source.plan.worktree}): ${head.stderr.trim()}`,
+      );
+    }
+    const newRun = this.minter.mint();
+    const worktree = this.forkWorktree({ run: newRun, ref: head.stdout.trim() });
+    const plan: FeaturePlan = {
+      feature: forkedFeatureSlug(source.plan.feature, newRun),
+      mode: source.plan.mode,
+      territory: [...source.plan.territory],
+      steps: source.plan.steps,
+      request: source.plan.request,
+      acceptance_criteria: [...source.plan.acceptance_criteria],
+      starting_model_tier: source.plan.starting_model_tier,
+      worktree: worktree.path,
+    };
+    return this.acceptRun(newRun, plan);
   }
 
   /**
@@ -1875,6 +2003,37 @@ export class Reconciler {
    */
   takeOver(run: string, options: SteerOptions = {}): RunState {
     return this.steer(run, 'take_over', options);
+  }
+
+  /**
+   * CAP-15 — pause the run: the same live-stop signal `kill` uses, but the step in flight (if any)
+   * records `interrupted`, never `killed`. A paused run resumes exactly as any other AD-8-interrupted
+   * run, by session id — no method of its own for that; the next ordinary pass does it.
+   */
+  pause(run: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'pause', options);
+  }
+
+  /**
+   * CAP-15 — inject a note, delivered once, into whichever step's input this run builds next.
+   *
+   * Never into the process already running (a `claude` subprocess reads its input file once, at start),
+   * and never a second time: a second `inject_note` before the first is consumed replaces it rather than
+   * queuing (`RunState.pending_note`, `src/contracts/state.ts`).
+   */
+  injectNote(run: string, text: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'inject_note', { ...options, argument: text });
+  }
+
+  /**
+   * CAP-16 — narrow the run's scope with free text, delivered through the exact same mechanism
+   * {@link injectNote} uses, tagged `kind: 'narrow'` rather than `kind: 'note'` in the durable log.
+   *
+   * Never touches `StepInput.acceptance_criteria`: the text is delivered as a note the agent reads and
+   * interprets, so a run's confirmed criteria (CAP-2) are never reopened by it.
+   */
+  narrow(run: string, text: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'narrow', { ...options, argument: text });
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -2096,6 +2255,7 @@ export class Reconciler {
               escapeHatch: false,
               handoff: null,
               gateResolution: null,
+              injectedNote: null,
             },
             resolved.reason,
           );
@@ -2110,6 +2270,42 @@ export class Reconciler {
         case 'apply': {
           const effect = decision.kind === 'apply' ? decision.effect : null;
           try {
+            /**
+             * Story 4-3 — `fork`'s real effect, beside (never inside) `decideSteering`'s own switch.
+             *
+             * `decideSteering`'s `case 'fork'` already decided this intent is a fresh, non-terminal-run
+             * gesture (its own exactly-once and terminal-run guards, reused rather than duplicated a
+             * second time here) and handed back a same-run no-op `IntentEffect` — because forking creates
+             * a *different* run, a shape that field can never describe. This is the actual side effect:
+             * a new run, and a `run.forked` line recording it, both landing before the `command.applied`
+             * line just below retires the file.
+             *
+             * **Guarded against redelivery by more than the id map below.** AD-19 is at-least-once, and
+             * unlike `escapeHatch`/`writeHandoff`, minting a new run is not naturally idempotent — calling
+             * `forkFeature` twice creates two runs. A crash between `run.forked` landing and this same
+             * intent's own `command.applied` landing would otherwise redeliver the intent past the
+             * `applied` map (which is only set *after* this succeeds) and fork a second time. So the
+             * check is the log itself: a `run.forked` already naming this exact `intent_id` means the
+             * fork already happened, and only the still-missing `command.applied` line is caught up.
+             */
+            if (decision.kind === 'apply' && intent.command === 'fork') {
+              const alreadyForked = loaded.events.some(
+                (event) =>
+                  event.type === RUN_FORKED_EVENT_TYPE &&
+                  event.payload[RUN_FORKED_PAYLOAD_KEYS.IntentId] === intent.intent_id,
+              );
+              if (!alreadyForked) {
+                const forked = this.forkFeature(state.run);
+                this.emit(this.recorderFor(state.run, state.feature), {
+                  step: null,
+                  type: RUN_FORKED_EVENT_TYPE,
+                  payload: {
+                    [RUN_FORKED_PAYLOAD_KEYS.ForkedRun]: forked.run,
+                    [RUN_FORKED_PAYLOAD_KEYS.IntentId]: intent.intent_id,
+                  },
+                });
+              }
+            }
             this.applyIntent(paths, plan, state, pending, effect, decision.reason);
           } catch (thrown: unknown) {
             /**
@@ -2306,6 +2502,27 @@ export class Reconciler {
                 // one with `missing-answer`, and `ARGUMENT_REQUIRED_COMMANDS` refuses one at the door.
                 [WRITE_GATE_REJECTED_PAYLOAD_KEYS.Reason]: pending.intent.argument ?? '',
               },
+      });
+    }
+
+    /**
+     * Story 4-3 — an injected note or scope-narrowing reaches the log as its own line, not only as
+     * `command.applied`'s own summary.
+     *
+     * `RunState.pending_note` is folded from this line alone (`rebuild.ts`), so it goes before
+     * `command.applied` for the reason every other side effect here does: a crash between the two
+     * redelivers the intent, `decideSteering` recomputes the identical `injectedNote` from the same
+     * intent, and this line is simply written again — which the fold absorbs as a plain overwrite, never
+     * a queue, exactly as a second genuinely new note would be (I/O matrix row 5).
+     */
+    if (corrected !== null && corrected.injectedNote !== null) {
+      this.emit(recorder, {
+        step: null,
+        type: NOTE_INJECTED_EVENT_TYPE,
+        payload: {
+          [NOTE_INJECTED_PAYLOAD_KEYS.Text]: corrected.injectedNote.text,
+          [NOTE_INJECTED_PAYLOAD_KEYS.Kind]: corrected.injectedNote.kind,
+        },
       });
     }
 
@@ -5366,7 +5583,23 @@ export class Reconciler {
          * re-run would hand the step the *previous* attempt's exit statuses and evidence pointers,
          * which is a step judging one run of the gates while the log records another.
          */
-        JSON.stringify(parsed.data.gates) === JSON.stringify(recorded)
+        JSON.stringify(parsed.data.gates) === JSON.stringify(recorded) &&
+        /**
+         * Story 4-3, round-1 review (row 13) — a pending note always forces a fresh rebuild, bypassing
+         * this cache.
+         *
+         * An ordinary AD-8 resume calls this method with the *same* `baseline_ref` and (for any
+         * non-verification phase) the same empty `gates` as the attempt it is resuming, so it satisfies
+         * every clause above on essentially every resume — precisely the "pause, inject a note, resume"
+         * sequence this story's own CAP-15 wording is about. Left unguarded, the cache-hit branch above
+         * returns the on-disk file *verbatim* without ever reaching `steering_note` below, so an injected
+         * note would be silently dropped (no fresh step ever starts to deliver it) or misdelivered later,
+         * into an unrelated step. This is a narrow, deliberate exception to CAP-6's "a re-run reads the
+         * same bytes" rule, not a violation of it: the note is new content this run is intentionally
+         * introducing, exactly as `inject_note`'s own existence already implies "this step's next input
+         * may legitimately differ from its last."
+         */
+        state.pending_note === null
       ) {
         return { value: parsed.data, relativePath };
       }
@@ -5408,6 +5641,16 @@ export class Reconciler {
           path: gate.evidence,
           description: `the output of the ${gate.command} gate, which ran "${gate.declared}"`,
         })),
+      /**
+       * Story 4-3 — whatever note was pending the moment this step's input was built, or `null`.
+       *
+       * Read here and nowhere else: this is "whichever step's input is built next" — the one moment the
+       * design settled on for delivering a note into a running agent's next input, because a `claude`
+       * subprocess reads its input file once at start and nothing re-polls it mid-flight. `pendingNote`
+       * is cleared by the `step.started` line this same call site writes just before calling this method
+       * (see `rebuild.ts`'s own fold), so the clearing and the delivery are two sides of one moment.
+       */
+      steering_note: state.pending_note?.text ?? null,
       gates: recorded,
       /**
        * AD-24's three ceilings, measured for real rather than passed through as constants.

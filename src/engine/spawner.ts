@@ -500,13 +500,27 @@ export interface StepSpawnerOptions {
   readonly killGraceMs?: number;
 }
 
+/**
+ * Story 4-3 — what an executor-initiated stop is asked to record once the child actually stops.
+ *
+ * `resumable: true` is `pause`'s own request: the step's termination should read `interrupted` (AD-8's
+ * resumable disposition), never `killed`. Omitted or `false` is every other stop (`kill`/`disengage`/
+ * `take_over`), which still means `killed` — the default this type's absence already meant before this
+ * story, so an existing caller passing nothing is unchanged.
+ */
+export interface StepStopOptions {
+  readonly resumable?: boolean;
+}
+
 /** The executor, plus the two things a caller and a suite legitimately need to see. */
 export interface StepSpawner extends StepExecutor {
   /** The plan the most recent attempt executed. Read by the suite; never by the loop. */
   readonly lastPlan: () => SpawnPlan | null;
   /**
    * Stop a running step. The resulting termination is `killed`, which AD-8 never resumes or re-runs —
-   * this is the executor-initiated stop a steering command reaches the executor as.
+   * this is the executor-initiated stop a steering command reaches the executor as. Story 4-3's
+   * `options.resumable` is the one exception: the same SIGTERM/grace/SIGKILL sequence, but the resulting
+   * termination reads `interrupted` instead, the exact path the wall-clock timeout already uses.
    *
    * `run` narrows the stop to one run's attempt. One spawner serves every run and reconciliation is
    * concurrent across features, so a step name alone does not identify a child: two runs of the same
@@ -514,7 +528,7 @@ export interface StepSpawner extends StepExecutor {
    * whichever was found first. Omitting `run` stops every live attempt at that step, which is what a
    * shutdown wants and what a steering command must not rely on.
    */
-  readonly kill: (step: string, run?: string) => boolean;
+  readonly kill: (step: string, run?: string, options?: StepStopOptions) => boolean;
   /** Stop every running step. For a caller shutting down. */
   readonly killAll: () => void;
   /** The plan one identified attempt executed, for a caller holding more than one in flight. */
@@ -844,8 +858,11 @@ interface LiveAttempt {
   readonly run: string;
   readonly step: string;
   readonly attempt: number;
-  /** Stop the child: the executor-initiated stop that becomes a `killed` disposition. */
-  readonly stop: () => void;
+  /**
+   * Stop the child. The resulting termination is `killed` unless {@link StepStopOptions.resumable} asks
+   * for `interrupted` instead (story 4-3).
+   */
+  readonly stop: (options?: StepStopOptions) => void;
 }
 
 /** Session ids kept bounded, oldest evicted first, so a long-lived engine does not grow forever. */
@@ -1376,8 +1393,16 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
         run: request.run,
         step: request.step,
         attempt: request.attempt,
-        stop: () => {
-          stop(true);
+        /**
+         * Story 4-3 — `resumable: true` (a `pause`) calls `stop(false)`, the exact path the wall-clock
+         * timeout below already uses: `killedByExecutor` stays `false`, so `terminationFor` never takes
+         * the unconditional `'killed'` branch, and the signalled child falls through to the
+         * `outcome.signal !== null` case, which reads `'interrupted'` — AD-8's own resumable disposition.
+         * Anything else (omitted, or `resumable: false` — `kill`/`disengage`/`take_over`) calls `stop(true)`
+         * exactly as before this story.
+         */
+        stop: (stopOptions): void => {
+          stop(stopOptions?.resumable !== true);
         },
       });
 
@@ -1827,12 +1852,12 @@ export const createStepSpawner = (options: StepSpawnerOptions): StepSpawner => {
     lastPlan: (): SpawnPlan | null => lastPlan,
     planOf: (run: string, step: string, attempt: number): SpawnPlan | null =>
       plans.get(attemptKey(run, step, attempt)) ?? null,
-    kill: (step: string, run?: string): boolean => {
+    kill: (step: string, run?: string, options?: StepStopOptions): boolean => {
       let stopped = false;
       for (const running of live.values()) {
         if (running.step !== step) continue;
         if (run !== undefined && running.run !== run) continue;
-        running.stop();
+        running.stop(options);
         stopped = true;
       }
       return stopped;

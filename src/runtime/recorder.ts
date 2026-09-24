@@ -30,7 +30,6 @@ import {
 import { hostname } from 'node:os';
 
 import {
-  EVENT_ENVELOPE_IDENTITY_SHAPES,
   EVENT_ENVELOPE_STREAM_FIELDS,
   EVENT_ENVELOPE_VERBATIM_FIELDS,
   EVENT_PAYLOAD_VERBATIM_FIELDS,
@@ -598,10 +597,19 @@ export class Recorder {
    * counterpart to {@link preservePassthrough}.
    *
    * Same discipline, one field narrower: a candidate value is restored only when it is a string, proven
-   * free of every pattern class, and shaped exactly like a commit SHA —
-   * {@link EVENT_ENVELOPE_IDENTITY_SHAPES}'s own `baseline_ref` regex, reused verbatim rather than
-   * declaring a second copy of it, since a commit SHA is a commit SHA regardless of which field carries
-   * it. Never verbatim-or-dropped: unlike the two AD-5 stream fields, a payload field that fails the proof
+   * free of every pattern class, and shaped exactly like the *one* identity shape that field is declared
+   * to hold — a commit SHA for `head_ref_oid`/`merge_commit`, a ULID for story 4-3's own `forked_run`
+   * (`run.forked` carries a *second*, different run's id in its payload, because the envelope's own `run`
+   * field already means this line's own run). `hasEventIdentityShape` is the exact function
+   * {@link preservePassthrough} already tests an envelope field's shape with — reused here rather than a
+   * second copy, so a payload field and an envelope field are proven safe the same way.
+   *
+   * **Never "any declared shape passes for any field."** An earlier draft checked each candidate against
+   * every shape in `EVENT_ENVELOPE_IDENTITY_SHAPES`, which would have let a ULID-shaped value survive
+   * redaction under `head_ref_oid`/`merge_commit` — fields that should only ever hold a commit SHA. Still
+   * caught by `provesPatternFree` if it were a real secret, but a real loss of field-specific precision;
+   * `EVENT_PAYLOAD_VERBATIM_FIELDS`'s own map is what pins each field to the one shape it may be restored
+   * as. Never verbatim-or-dropped: unlike the two AD-5 stream fields, a payload field that fails the proof
    * simply keeps whatever the pass produced — there is no "drop the whole artifact" case for a payload
    * key, the same fail-safe direction the envelope's own identity fields already take.
    */
@@ -609,14 +617,13 @@ export class Recorder {
     candidate: EventEnvelope,
     redacted: EventEnvelope,
   ): EventEnvelope {
-    const shape = EVENT_ENVELOPE_IDENTITY_SHAPES['baseline_ref'];
     const candidatePayload = candidate.payload;
     const restoredPayload: Record<string, unknown> = { ...redacted.payload };
-    for (const field of EVENT_PAYLOAD_VERBATIM_FIELDS) {
+    for (const [field, shape] of Object.entries(EVENT_PAYLOAD_VERBATIM_FIELDS)) {
       const original = candidatePayload[field];
       if (typeof original !== 'string') continue;
       if (!this.redactor.provesPatternFree(original)) continue;
-      if (!shape?.test(original)) continue;
+      if (!hasEventIdentityShape(shape, original)) continue;
       restoredPayload[field] = original;
     }
     return { ...redacted, payload: restoredPayload };

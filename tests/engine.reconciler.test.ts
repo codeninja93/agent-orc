@@ -29,8 +29,12 @@ import {
   CommittingOutputSchema,
   VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE,
   VERIFICATION_JUDGEMENTS_RECORDED_PAYLOAD_KEYS,
+  NOTE_INJECTED_EVENT_TYPE,
+  NOTE_INJECTED_PAYLOAD_KEYS,
   PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
   PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS,
+  RUN_FORKED_EVENT_TYPE,
+  RUN_FORKED_PAYLOAD_KEYS,
   RUN_STATE_FILE_NAME,
   StepInputSchema,
   StepOutputSchema,
@@ -44,6 +48,7 @@ import {
   makeError,
 } from '../src/contracts/index.js';
 import type {
+  Command,
   EventEnvelope,
   ModelRung,
   OrchError,
@@ -54,6 +59,7 @@ import type {
 import { Recorder, RunFetchRecord, readEventLog, runPaths, runsDir } from '../src/runtime/index.js';
 import {
   BaselineResetError,
+  COMMAND_EVENT_TYPES,
   COMPOSED_COMMIT_RELATIVE_PATH,
   ENGINE_EMITTER,
   ENGINE_EVENT_TYPES,
@@ -64,23 +70,31 @@ import {
   ResumeRefused,
   SteeringRefused,
   StepSpawnFailed,
+  branchFor,
   createRecordingResetter,
   createScriptedExecutor,
   createUlidMinter,
+  forkedFeatureSlug,
   gitBaselineResetter,
   isUlid,
   measureConsumption,
+  mintIntentId,
+  mintRunId,
+  newCommandIntent,
   performWriteIntent,
+  readIntentFiles,
   rebuildFromLog,
   routeRefusedResume,
   routeTermination,
   takeConfigSnapshot,
   terminated,
+  writeCommandIntent,
 } from '../src/engine/index.js';
 import type {
   BaselineResetter,
   DeterministicGateRunner,
   FeaturePlan,
+  ForkWorktreePort,
   GateOutcomeRecord,
   GateRunRequest,
   GhCall,
@@ -88,6 +102,7 @@ import type {
   MergeCheck,
   MergeCheckPort,
   ScriptedExecutorOptions,
+  WorktreeGit,
   WriteExecutorPort,
 } from '../src/engine/index.js';
 
@@ -3288,4 +3303,399 @@ describe('story 4-2 — the adversarial spawn-gating check and hand-off routing'
       expect(record?.error?.code).not.toBe('step.adversarial_break_found');
     },
   );
+});
+
+// -------------------------------------------------------------------------------------------------
+// Story 4-3 — pause, inject a note, person-initiated narrow, and fork
+// -------------------------------------------------------------------------------------------------
+
+/** Write an intent as a renderer would, for the commands story 4-3 adds no method wrapper for. */
+const writeForkIntent = (
+  run: string,
+  feature: string,
+  command: Command,
+  options: { readonly intentId?: string; readonly argument?: string | null } = {},
+): string => {
+  const intentId = options.intentId ?? mintIntentId(mintRunId());
+  writeCommandIntent(
+    runPaths(run, home),
+    newCommandIntent({
+      intentId,
+      command,
+      run,
+      feature,
+      principal: { kind: 'user', id: 'deep' },
+      source: 'tui',
+      argument: options.argument ?? null,
+    }),
+  );
+  return intentId;
+};
+
+describe('story 4-3 — injecting a note and person-initiated narrow (I/O matrix rows 3-6)', () => {
+  it('records note.injected and sets pending_note between steps, changing nothing else yet (row 3)', () => {
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+    const before = reconciler.load(accepted.run).state;
+
+    const after = reconciler.injectNote(accepted.run, 'watch the refund path');
+
+    expect(after.pending_note).toStrictEqual({ text: 'watch the refund path', kind: 'note' });
+    // Nothing else moved: no step started, the feature state stands.
+    expect(after.state).toBe(before.state);
+    expect(after.steps).toStrictEqual([]);
+
+    const injected = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === NOTE_INJECTED_EVENT_TYPE,
+    );
+    expect(injected).toHaveLength(1);
+    expect(injected[0]?.payload[NOTE_INJECTED_PAYLOAD_KEYS.Text]).toBe('watch the refund path');
+    expect(injected[0]?.payload[NOTE_INJECTED_PAYLOAD_KEYS.Kind]).toBe('note');
+  });
+
+  it('delivers the note into the next step’s own input, then clears pending_note (row 4)', async () => {
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+    reconciler.injectNote(accepted.run, 'watch the refund path');
+
+    await reconciler.pass(); // starts and completes `implement`, the first declared step
+
+    const inputPath = join(runPaths(accepted.run, home).runDir, 'steps', 'implement', 'input.json');
+    const input = StepInputSchema.parse(JSON.parse(readFileSync(inputPath, 'utf8')));
+    expect(input.steering_note).toBe('watch the refund path');
+    expect(reconciler.load(accepted.run).state.pending_note).toBeNull();
+  });
+
+  /**
+   * Story 4-3, round-1 review (row 13) — the case row 4's own test does not cover: a note injected while
+   * the *next* input this run writes is a **resume** of the step already in flight, not a fresh start.
+   *
+   * `stepInput()`'s pre-existing cache-reuse branch (CAP-6, unrelated to this story) returns the on-disk
+   * `input.json` verbatim whenever `baseline_ref`/`contract_id`/`gates` match — which an ordinary AD-8
+   * resume always does, since none of the three changes between an interruption and its resume. Before
+   * the fix, this test's own resumed request would have carried `steering_note: null`: the exact
+   * "pause, inject a note, resume" sequence this story's own CAP-15 wording is about, silently dropped.
+   */
+  it('delivers the note into a resumed step’s own input, bypassing the cache, and clears pending_note (row 13)', async () => {
+    const { reconciler, executor } = openReconciler({
+      script: {
+        sessionIdFor: () => 'sess-implement',
+        // The first attempt is interrupted — not by a steering command, just an ordinary AD-8
+        // interruption — leaving a resumable step and a real `steps/implement/input.json` on disk.
+        onStart: () => terminated('implement', 'interrupted', { sessionId: 'sess-implement' }),
+        onResume: () => terminated('implement', 'completed', { sessionId: 'sess-implement' }),
+      },
+    });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+    await reconciler.pass(); // `implement` starts and is interrupted; its input.json now exists on disk
+    expect(reconciler.load(accepted.run).state.steps[0]?.disposition).toBe('interrupted');
+
+    reconciler.injectNote(accepted.run, 'watch the refund path');
+    expect(reconciler.load(accepted.run).state.pending_note).not.toBeNull();
+
+    const result = await reconciler.pass(); // resumes `implement`, never a fresh start
+    expect(result.actions.map((action) => action.kind)).toStrictEqual(['resume-step']);
+
+    // The resume request itself carries the note — read directly off what the executor was actually
+    // handed, not only off the file the cache-bypass rewrote, so a regression in *either* half is caught.
+    expect(executor.resumed).toHaveLength(1);
+    expect(executor.resumed[0]?.input.steering_note).toBe('watch the refund path');
+
+    const inputPath = join(runPaths(accepted.run, home).runDir, 'steps', 'implement', 'input.json');
+    const input = StepInputSchema.parse(JSON.parse(readFileSync(inputPath, 'utf8')));
+    expect(input.steering_note).toBe('watch the refund path');
+
+    expect(reconciler.load(accepted.run).state.pending_note).toBeNull();
+    expect(reconciler.load(accepted.run).state.steps[0]?.disposition).toBe('completed');
+  });
+
+  it('replaces rather than queues a second note before the first is consumed (row 5)', async () => {
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+
+    reconciler.injectNote(accepted.run, 'first note');
+    const after = reconciler.injectNote(accepted.run, 'second note');
+    expect(after.pending_note).toStrictEqual({ text: 'second note', kind: 'note' });
+
+    await reconciler.pass();
+    const inputPath = join(runPaths(accepted.run, home).runDir, 'steps', 'implement', 'input.json');
+    const input = StepInputSchema.parse(JSON.parse(readFileSync(inputPath, 'utf8')));
+    // Only the second stands: never a queue, never the first note delivered alongside it.
+    expect(input.steering_note).toBe('second note');
+
+    // Both notes are durably recorded — the log is never lossy, even though only one is ever pending.
+    const injected = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === NOTE_INJECTED_EVENT_TYPE,
+    );
+    expect(injected.map((event) => event.payload[NOTE_INJECTED_PAYLOAD_KEYS.Text])).toStrictEqual([
+      'first note',
+      'second note',
+    ]);
+  });
+
+  it('delivers a person-initiated narrow through the exact same mechanism, tagged "narrow" (row 6)', async () => {
+    const { reconciler, plan } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+
+    const after = reconciler.narrow(accepted.run, 'just the refund path');
+    expect(after.pending_note).toStrictEqual({ text: 'just the refund path', kind: 'narrow' });
+
+    const injected = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === NOTE_INJECTED_EVENT_TYPE,
+    );
+    expect(injected[0]?.payload[NOTE_INJECTED_PAYLOAD_KEYS.Kind]).toBe('narrow');
+
+    await reconciler.pass();
+    const inputPath = join(runPaths(accepted.run, home).runDir, 'steps', 'implement', 'input.json');
+    const input = StepInputSchema.parse(JSON.parse(readFileSync(inputPath, 'utf8')));
+    expect(input.steering_note).toBe('just the refund path');
+    // Never a new criterion (CAP-2's "Never" rule): the plan's own declared criteria stand, untouched.
+    expect(input.acceptance_criteria).toStrictEqual([...plan.acceptance_criteria]);
+  });
+});
+
+describe('story 4-3 — terminal-run refusal, for all four (I/O matrix row 10)', () => {
+  it.each(['pause', 'inject_note', 'narrow', 'fork'] as const)(
+    'refuses %s on a run that has already reached a terminal state, the run standing unchanged',
+    async (command) => {
+      const { reconciler } = openReconciler({ script: alwaysCompletes });
+      const accepted = reconciler.acceptFeature(makePlan());
+      reconciler.confirm(accepted.run);
+      await reconciler.runUntilSettled();
+      expect(reconciler.load(accepted.run).state.state).toBe('committed');
+
+      const needsArgument = command === 'inject_note' || command === 'narrow';
+      expect(() =>
+        reconciler.steer(accepted.run, command, needsArgument ? { argument: 'text' } : {}),
+      ).toThrowError(SteeringRefused);
+      expect(reconciler.load(accepted.run).state.state).toBe('committed');
+    },
+  );
+});
+
+describe('story 4-3 — forking a run (I/O matrix rows 7-9, 11)', () => {
+  /** A commit SHA the source run's own worktree stands at, per the fake `worktreeGit` below. */
+  const SOURCE_HEAD = 'a'.repeat(40);
+
+  /** `rev-parse HEAD` in the source worktree, and nothing else — this fixture asks for nothing more. */
+  const fakeWorktreeGit: WorktreeGit = (_worktree, args) =>
+    args[0] === 'rev-parse' && args[1] === 'HEAD'
+      ? { status: 0, stdout: `${SOURCE_HEAD}\n`, stderr: '' }
+      : { status: 1, stdout: '', stderr: `unsupported git args in this fixture: ${args.join(' ')}` };
+
+  /** A `ForkWorktreePort` double that records every request and answers with a distinct fake path. */
+  const trackedForkWorktree = (): {
+    readonly port: ForkWorktreePort;
+    readonly calls: { readonly run: string; readonly ref: string }[];
+  } => {
+    const calls: { readonly run: string; readonly ref: string }[] = [];
+    return {
+      calls,
+      port: (request): { readonly path: string } => {
+        calls.push(request);
+        return { path: `/fake/fork-worktree/${request.run}` };
+      },
+    };
+  };
+
+  const openForkable = (
+    forkWorktree: ForkWorktreePort | null,
+  ): { readonly reconciler: Reconciler; readonly plan: FeaturePlan } => {
+    const plan = makePlan({ feature: 'fork-source' });
+    const reconciler = Reconciler.open({
+      orchHome: home,
+      executor: createScriptedExecutor(alwaysCompletes),
+      plans: planProvider(plan),
+      baseline: createRecordingResetter(BASELINE),
+      worktreeGit: fakeWorktreeGit,
+      ...(forkWorktree === null ? {} : { forkWorktree }),
+    });
+    toClose.push(reconciler);
+    return { reconciler, plan };
+  };
+
+  it('creates a new, independent run seeded from the source worktree’s HEAD, and touches the source not at all (row 7)', async () => {
+    const { port: forkWorktree, calls } = trackedForkWorktree();
+    const { reconciler, plan } = openForkable(forkWorktree);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+    const sourceBefore = reconciler.load(accepted.run).state;
+
+    const intentId = writeForkIntent(accepted.run, plan.feature, 'fork');
+    const result = await reconciler.pass();
+
+    // The worktree port saw exactly the source run's own current HEAD, never the repository's own.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.ref).toBe(SOURCE_HEAD);
+
+    // `run.forked` on the *source* run's own log, naming the new run.
+    const forkedLine = readEventLog(runPaths(accepted.run, home).eventLog).find(
+      (event) => event.type === RUN_FORKED_EVENT_TYPE,
+    );
+    expect(forkedLine).toBeDefined();
+    const forkedRun = forkedLine?.payload[RUN_FORKED_PAYLOAD_KEYS.ForkedRun];
+    expect(typeof forkedRun).toBe('string');
+    expect(forkedLine?.payload[RUN_FORKED_PAYLOAD_KEYS.IntentId]).toBe(intentId);
+    expect(calls[0]?.run).toBe(forkedRun);
+
+    // The source run's own state is byte-for-byte the same as before the fork, but for the log position
+    // the `run.forked`/`command.applied` lines themselves advance.
+    const sourceAfter = reconciler.load(accepted.run).state;
+    expect(sourceAfter.state).toBe(sourceBefore.state);
+    expect(sourceAfter.steps).toStrictEqual(sourceBefore.steps);
+    expect(sourceAfter.feature).toBe(sourceBefore.feature);
+
+    // The forked run exists, is its own run, and starts fresh at `drafting` — never a copy of the
+    // source's own step history (nothing had run on the source yet either, but the new run's log proves
+    // it independently: only `run.created` and the declaration lines, never a `step.*` line).
+    const forkedRunId = String(forkedRun);
+    const forkedLog = readEventLog(runPaths(forkedRunId, home).eventLog);
+    expect(forkedLog.some((event) => event.type === ENGINE_EVENT_TYPES.RunCreated)).toBe(true);
+    expect(forkedLog.some((event) => event.type.startsWith('step.'))).toBe(false);
+    const forkedCheckpoint = JSON.parse(
+      readFileSync(join(runPaths(forkedRunId, home).runDir, RUN_STATE_FILE_NAME), 'utf8'),
+    ) as { readonly state: string; readonly feature: string };
+    expect(forkedCheckpoint.state).toBe('drafting');
+    // Disambiguated: the source's own slug, with a suffix derived from the new run's own id.
+    expect(forkedCheckpoint.feature).toBe(forkedFeatureSlug(plan.feature, forkedRunId));
+    expect(forkedCheckpoint.feature).not.toBe(plan.feature);
+
+    expect(result.actions.map((action) => action.kind)).not.toContain('run-step');
+  });
+
+  it('creates two independent runs for two forks of the same source, each disambiguated from the other (row 8)', async () => {
+    const { port: forkWorktree } = trackedForkWorktree();
+    const { reconciler, plan } = openForkable(forkWorktree);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    writeForkIntent(accepted.run, plan.feature, 'fork');
+    await reconciler.pass();
+    writeForkIntent(accepted.run, plan.feature, 'fork');
+    await reconciler.pass();
+
+    const forkedLines = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === RUN_FORKED_EVENT_TYPE,
+    );
+    expect(forkedLines).toHaveLength(2);
+    const forkedRuns = forkedLines.map((event) => String(event.payload[RUN_FORKED_PAYLOAD_KEYS.ForkedRun]));
+    expect(new Set(forkedRuns).size).toBe(2);
+
+    const slugs = forkedRuns.map((run) => forkedFeatureSlug(plan.feature, run));
+    expect(new Set(slugs).size).toBe(2);
+    expect(slugs).not.toContain(plan.feature);
+  });
+
+  it('never creates a second run for a fork intent redelivered after it already applied (row 11)', async () => {
+    const { port: forkWorktree, calls } = trackedForkWorktree();
+    const { reconciler, plan } = openForkable(forkWorktree);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    const intentId = writeForkIntent(accepted.run, plan.feature, 'fork');
+    await reconciler.pass();
+    expect(calls).toHaveLength(1);
+
+    // The exact same intent id, redelivered — AD-19's at-least-once, the ordinary case: a renderer whose
+    // write may or may not have landed rewrites the file under the same id.
+    writeForkIntent(accepted.run, plan.feature, 'fork', { intentId });
+    await reconciler.pass();
+
+    // No second worktree, no second `run.forked` — the id is already in `appliedIntents`.
+    expect(calls).toHaveLength(1);
+    const forkedLines = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === RUN_FORKED_EVENT_TYPE,
+    );
+    expect(forkedLines).toHaveLength(1);
+  });
+
+  /**
+   * The subtler half of row 11: a crash landing `run.forked` durably but not this same intent's own
+   * `command.applied` — the file is still pending, and nothing in `appliedIntents` (folded from
+   * `command.applied` lines alone) yet knows the id. Without the log-scan guard in `consumeIntents`
+   * (`src/engine/reconciler.ts`, beside `decideSteering`'s own switch), the next pass would fork a
+   * *second* time before ever reaching the still-missing ledger line.
+   */
+  it('catches up the missing ledger line rather than forking again, when only run.forked landed', async () => {
+    const { port: forkWorktree, calls } = trackedForkWorktree();
+    const first = openForkable(forkWorktree);
+    const accepted = first.reconciler.acceptFeature(first.plan);
+    first.reconciler.confirm(accepted.run);
+    // AD-30's single-writer claim is per process, held for the reconciler's own lifetime — closed before
+    // a standalone `Recorder` appends to the same log, exactly as the crash-injection fixtures elsewhere
+    // in this suite do (see "a disengage written while a *resumed* step is running").
+    first.reconciler.close();
+
+    const intentId = mintIntentId(mintRunId());
+    // Simulate the crash window: `run.forked` is durable, `command.applied` for this id is not.
+    const recorder = Recorder.open({ runId: accepted.run, feature: first.plan.feature, orchHome: home });
+    try {
+      recorder.record({
+        feature: first.plan.feature,
+        run: accepted.run,
+        step: null,
+        emitter: ENGINE_EMITTER,
+        type: RUN_FORKED_EVENT_TYPE,
+        payload: {
+          [RUN_FORKED_PAYLOAD_KEYS.ForkedRun]: 'already-forked-run-id',
+          [RUN_FORKED_PAYLOAD_KEYS.IntentId]: intentId,
+        },
+      });
+    } finally {
+      recorder.close();
+    }
+    writeForkIntent(accepted.run, first.plan.feature, 'fork', { intentId });
+
+    const { reconciler } = openForkable(forkWorktree);
+    await reconciler.pass();
+
+    // Nothing was forked again: the port was never called.
+    expect(calls).toStrictEqual([]);
+    const forkedLines = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === RUN_FORKED_EVENT_TYPE,
+    );
+    expect(forkedLines).toHaveLength(1);
+    // The still-missing ledger line is caught up, so the intent is retired rather than met forever.
+    const applied = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === COMMAND_EVENT_TYPES.Applied && event.payload['intent_id'] === intentId,
+    );
+    expect(applied).toHaveLength(1);
+    expect(readIntentFiles(runPaths(accepted.run, home)).pending).toStrictEqual([]);
+  });
+
+  it('refuses loudly rather than guessing where to put a worktree, with no port wired', async () => {
+    const { reconciler, plan } = openForkable(null);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    writeForkIntent(accepted.run, plan.feature, 'fork');
+    const result = await reconciler.pass();
+
+    const refused = result.steering.flatMap((entry) => entry.refused);
+    expect(refused).toHaveLength(1);
+    expect(refused[0]?.reason).toBe('effect-failed');
+    expect(refused[0]?.detail).toContain('no fork-worktree port wired');
+  });
+
+  it('never collides with the source run’s own eventual branch name (row 9)', () => {
+    // A pure-function check of the guarantee the disambiguated slug exists for: `branchFor` (read here,
+    // never changed) derives a branch name from the feature slug alone, so two slugs that differ produce
+    // two branches that differ, with no change to `branchFor` itself.
+    const forkedRun = '01K5NQ9ZJ7V3M2P9XQWRTC4BDF';
+    const sourceSlug = 'fork-source';
+    const forkedSlug = forkedFeatureSlug(sourceSlug, forkedRun);
+    expect(forkedSlug).not.toBe(sourceSlug);
+    expect(branchFor(null, forkedSlug)).not.toBe(branchFor(null, sourceSlug));
+
+    // Two forks of the same source produce two more slugs, all four pairwise distinct.
+    const secondForkedRun = '01K5NQ9ZJ7V3M2P9XQWRTC4BDG';
+    const secondForkedSlug = forkedFeatureSlug(sourceSlug, secondForkedRun);
+    const branches = [sourceSlug, forkedSlug, secondForkedSlug].map((slug) => branchFor(null, slug));
+    expect(new Set(branches).size).toBe(3);
+  });
 });

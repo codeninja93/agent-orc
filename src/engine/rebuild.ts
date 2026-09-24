@@ -27,6 +27,9 @@ import {
   GATE_PASSED_EVENT_TYPE,
   GATE_SKIPPED_EVENT_TYPE,
   MODEL_RUNGS,
+  NOTE_INJECTED_EVENT_TYPE,
+  NOTE_INJECTED_PAYLOAD_KEYS,
+  NOTE_KINDS,
   OrchErrorSchema,
   REVERSIBILITY_CLASSES,
   REVIEW_SKIPPED_EVENT_TYPE,
@@ -52,6 +55,7 @@ import type {
   PendingGate,
   PendingGateBatchEntry,
   PendingGateResolution,
+  PendingNote,
   RunMode,
   RunState,
   StepDisposition,
@@ -151,6 +155,12 @@ export const ENGINE_EVENT_TYPES = {
   WriteGateApproved: WRITE_GATE_APPROVED_EVENT_TYPE,
   /** A person rejected the pending gate (CAP-23), so the run hands off. Clears `pendingGate`. */
   WriteGateRejected: WRITE_GATE_REJECTED_EVENT_TYPE,
+  /**
+   * Story 4-3 — a durable note or person-initiated narrowing landed against the run. Folded into
+   * `pendingNote`; the next `step.started` for this run clears it, mirroring `pendingGate`'s own
+   * set-by-one-event, cleared-by-a-later-one shape.
+   */
+  NoteInjected: NOTE_INJECTED_EVENT_TYPE,
 } as const;
 
 export type EngineEventType = (typeof ENGINE_EVENT_TYPES)[keyof typeof ENGINE_EVENT_TYPES];
@@ -199,6 +209,8 @@ export const FOLDED_EVENT_TYPES: readonly string[] = Object.freeze([
   ENGINE_EVENT_TYPES.WriteGateOpened,
   ENGINE_EVENT_TYPES.WriteGateApproved,
   ENGINE_EVENT_TYPES.WriteGateRejected,
+  /** Story 4-3 — the standing note, set by `note.injected` and cleared by the run's next `step.started`. */
+  ENGINE_EVENT_TYPES.NoteInjected,
   /**
    * AD-19's ledger entry *and* the effect it records, in one line.
    *
@@ -350,6 +362,7 @@ export const emptyRunState = (options: RebuildOptions): RunState => {
     handoff: null,
     degradation: null,
     pending_gate: null,
+    pending_note: null,
   };
 };
 
@@ -395,6 +408,8 @@ export const rebuildFromLog = (
   let handoff: Handoff | null = null;
   let degradation: Degradation | null = null;
   let pendingGate: PendingGate | null = null;
+  /** Story 4-3 — the standing note, set by `note.injected` and cleared by the run's next `step.started`. */
+  let pendingNote: PendingNote | null = null;
   let createdAt: string | null = null;
   let updatedAt: string | null = null;
   let lastSeq = 0;
@@ -439,6 +454,14 @@ export const rebuildFromLog = (
       }
 
       case ENGINE_EVENT_TYPES.StepStarted: {
+        /**
+         * Story 4-3 — this is "whichever step's input is built next" (the one moment `stepInput`
+         * delivers a pending note into), so any `step.started` line for this run clears it, unconditionally
+         * — the note was either delivered into *this* step's own input, or there was none pending at all.
+         * Cleared even if the line names no readable step below, because the fact this clears is about the
+         * run having started a step, not about which one.
+         */
+        pendingNote = null;
         const id = event.step;
         if (id === null) break;
         const existing = steps.get(id);
@@ -520,6 +543,16 @@ export const rebuildFromLog = (
       }
 
       case ENGINE_EVENT_TYPES.StepResumeAttempted: {
+        /**
+         * Story 4-3, round-1 review — a resume is "the next input this run writes" exactly as much as a
+         * fresh start is (row 13): `stepInput()` is called on the resume path too, and a note pending when
+         * the resume began was delivered into *this* attempt's own input (or there was none pending at
+         * all). Clearing only on `step.started` left a note injected while a step was `interrupted`
+         * uncleared for ever, since a resume never emits that type. Unconditional, the same as the
+         * `step.started` case's own clear: the fact this clears is about the run having resumed a step,
+         * not about which one or whether the bound-counting line below even applies.
+         */
+        pendingNote = null;
         const record = stepOf(event);
         if (record === null) break;
         /**
@@ -705,6 +738,21 @@ export const rebuildFromLog = (
         break;
       }
 
+      case ENGINE_EVENT_TYPES.NoteInjected: {
+        /**
+         * A second `note.injected` before the first is consumed **replaces** it — this is a plain
+         * assignment, never an append, which is the whole of "only one pending note at a time" (I/O
+         * matrix row 5). A line naming a `kind` this build cannot place is ignored rather than folded as
+         * a guess, the same defence {@link loggedRung} gives an unplaceable rung.
+         */
+        const text = payloadString(event, NOTE_INJECTED_PAYLOAD_KEYS.Text);
+        const kind = payloadString(event, NOTE_INJECTED_PAYLOAD_KEYS.Kind);
+        if (text !== null && isOneOf(NOTE_KINDS, kind)) {
+          pendingNote = { text, kind };
+        }
+        break;
+      }
+
       /**
        * Story 4-1, round-1 review's most serious fix — `resolution` is what these two lines change, never
        * the whole record going to `null` directly. Clearing straight to `null` here raced the *separate*
@@ -764,6 +812,7 @@ export const rebuildFromLog = (
     handoff,
     degradation,
     pending_gate: pendingGate,
+    pending_note: pendingNote,
   };
 };
 
@@ -825,6 +874,9 @@ export const compareCheckpointToLog = (
   // A checkpoint that has forgotten a pending gate the log still holds open would let `approve`/`reject`
   // fall through to the ordinary step-failure branches for a run where no step failed (story 4-1).
   compare('pending_gate', checkpoint.pending_gate, rebuilt.pending_gate);
+  // A checkpoint that has forgotten a pending note would build the run's next step input with no
+  // `steering_note`, silently dropping a person's own words (story 4-3).
+  compare('pending_note', checkpoint.pending_note, rebuilt.pending_note);
 
   const fromLog = new Map(rebuilt.steps.map((record) => [record.step, record]));
   for (const record of checkpoint.steps) {

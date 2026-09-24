@@ -345,6 +345,35 @@ export const PendingGateSchema = z.object({
 export type PendingGate = z.infer<typeof PendingGateSchema>;
 
 /**
+ * Story 4-3 — which of two things a durable note is: a person's steering colour, or a person-initiated
+ * scope reduction (CAP-16's own person-initiated half, folded into this story rather than built as a
+ * second mechanism — see the story's own Design Notes).
+ */
+export const NOTE_KINDS = ['note', 'narrow'] as const;
+
+export type NoteKind = (typeof NOTE_KINDS)[number];
+
+/**
+ * Story 4-3 — a durable note waiting to be delivered to whichever step's input this run builds next.
+ *
+ * **Parallel to {@link PendingGateSchema}, the same "set by one event, cleared by a later one" shape.**
+ * `note.injected` sets it; the next `step.started` line for this run clears it, once that step's own
+ * `StepInput.steering_note` has been populated from it (`src/engine/reconciler.ts`'s `stepInput`). A
+ * second `note.injected` before the first is consumed replaces this record outright — the fold is a
+ * plain assignment, never an append, so exactly one note is ever pending (I/O matrix row 5).
+ *
+ * **Never `StepInput.acceptance_criteria`.** `kind: 'narrow'` carries the same free text
+ * `inject_note` does; it is delivered as a note the agent reads and interprets, and it never reopens the
+ * confirmed criteria CAP-2 protects.
+ */
+export const PendingNoteSchema = z.object({
+  text: z.string(),
+  kind: z.enum(NOTE_KINDS),
+});
+
+export type PendingNote = z.infer<typeof PendingNoteSchema>;
+
+/**
  * `runs/<run-id>/state.json`.
  *
  * `last_event_seq` is the hinge of AD-4: it names the log position this checkpoint was folded from,
@@ -389,6 +418,16 @@ export const RunStateSchema = versioned({
    * a checkpoint and the checkpoint is rebuilt.
    */
   pending_gate: PendingGateSchema.nullable().default(null),
+  /**
+   * Story 4-3 — the standing note waiting for the run's next step input, or `null` for a run with none
+   * pending.
+   *
+   * Defaulted to `null` on the way in, exactly as `degradation`/`pending_gate` are and for the same
+   * reason: a `state.json` written before this story still parses as the checkpoint it is, and the log
+   * then decides, as it always does (AD-4) — a run whose log carries `note.injected` disagrees with such
+   * a checkpoint and the checkpoint is rebuilt.
+   */
+  pending_note: PendingNoteSchema.nullable().default(null),
 }).refine(
   (state) => new Set(state.steps.map((step) => step.step)).size === state.steps.length,
   {
