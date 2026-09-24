@@ -43,6 +43,7 @@ import {
   gitBaselineResetter,
   isUlid,
   measureConsumption,
+  performWriteIntent,
   rebuildFromLog,
   routeRefusedResume,
   routeTermination,
@@ -51,6 +52,8 @@ import {
 import type {
   BaselineResetter,
   FeaturePlan,
+  GhCall,
+  GitCall,
   MergeCheck,
   MergeCheckPort,
   ScriptedExecutorOptions,
@@ -1843,6 +1846,144 @@ describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
     // git_push is not attempted a second time: `writeIntentSettled` found its `write.executed` line.
     expect(flaky.writes.map((write) => write.kind)).toStrictEqual(['pull_request']);
     expect(reconciler.load(accepted.run).state.state).toBe('awaiting_merge');
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Story 3-2 (AD-27) — a shadow run never enters `awaiting_merge` (matrix row 10).
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * A write executor that emits the shadow shape — `write.attempted` then `write.suppressed`, never
+ * `write.executed` — for every intent it is handed. The suppression logic itself
+ * (`performWriteIntent`/`performGitNoteShadow` under `mode: 'shadow'`) is `src/engine/write-executor.ts`'s
+ * own subject, proven in `tests/engine.write-executor.test.ts`; what this file's own test needs is only
+ * that the reconciler routes a run whose intents settle this way straight to `committed`.
+ */
+const recordingShadowWriteExecutor = (writes: RecordedWrite[]): WriteExecutorPort => {
+  const port: WriteExecutorPort = (intent, context) => {
+    writes.push({ kind: intent.kind, mergeCommit: context.mergeCommit });
+    context.emit('write.attempted', {
+      intent_id: intent.intent_id,
+      kind: intent.kind,
+      target: intent.target,
+    });
+    context.emit('write.suppressed', {
+      intent_id: intent.intent_id,
+      kind: intent.kind,
+      target: intent.target,
+      destructive: false,
+      detail: 'suppressed by the test double',
+    });
+    return Promise.resolve({
+      status: 'suppressed' as const,
+      destructive: false,
+      detail: 'suppressed by the test double',
+    });
+  };
+  return port;
+};
+
+describe('AD-27, story 3-2 — a shadow run never enters awaiting_merge (matrix row 10)', () => {
+  it('reaches committed directly once push, pull-request and note all settle as write.suppressed', async () => {
+    const orchHome = makeHome('shadow-committed');
+    toRemove.push(orchHome);
+    const plan = makePlan({ feature: 'shadow-committed', mode: 'shadow', steps: STANDARD_PLAN_STEPS });
+    const writes: RecordedWrite[] = [];
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(plan),
+      baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+      executor: createScriptedExecutor(committingCapableScript()),
+      writeExecutor: recordingShadowWriteExecutor(writes),
+      // Deliberately no `mergeChecker`: a shadow run must never need one, since it never enters
+      // `awaiting_merge` to begin with — wiring one here would leave a bug that reached for it unnoticed.
+    });
+    toClose.push(reconciler);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    const seenStates: string[] = [];
+    for (let index = 0; index < 10 && reconciler.load(accepted.run).state.state !== 'committed'; index += 1) {
+      await reconciler.pass();
+      seenStates.push(reconciler.load(accepted.run).state.state);
+    }
+
+    expect(reconciler.load(accepted.run).state.state).toBe('committed');
+    expect(seenStates).not.toContain('awaiting_merge');
+    // All three composed intents settle in this one pass, unlike a live run's push/pull-request-then-note
+    // split — there is no merge to wait on, so nothing is held back.
+    expect(writes.map((write) => write.kind)).toStrictEqual(['git_push', 'pull_request', 'git_note']);
+    expect(writes.every((write) => write.mergeCommit === null)).toBe(true);
+
+    const events = readEventLog(runPaths(accepted.run, reconciler.orchHome).eventLog);
+    expect(events.some((event) => event.type === 'write.executed')).toBe(false);
+    expect(
+      events.filter((event) => event.type === 'write.suppressed').map((event) => event.payload['kind']),
+    ).toStrictEqual(['git_push', 'pull_request', 'git_note']);
+  });
+});
+
+/**
+ * The reconciler's `mode: plan.mode` wiring, exercised against the *real* `performWriteIntent` — every
+ * other shadow test above drives a hand-rolled stub that never reads `context.mode` at all, so none of
+ * them can prove the reconciler actually threads it through correctly. This wraps the real function with
+ * fake `git`/`gh` calls, the same pattern `tests/engine.write-executor.test.ts` drives it with directly,
+ * so the only thing injected is the process boundary — the mode-branching logic under test is 3-2's own.
+ */
+describe('AD-27, story 3-2 — the real performWriteIntent, through a Reconciler, under mode: shadow', () => {
+  it('never issues a real mutating git/gh call for a shadow run', async () => {
+    const orchHome = makeHome('shadow-real-executor');
+    toRemove.push(orchHome);
+    const plan = makePlan({ feature: 'shadow-real-executor', mode: 'shadow', steps: STANDARD_PLAN_STEPS });
+
+    const calls: string[] = [];
+    const git: GitCall = (args) => {
+      calls.push(`git ${args.join(' ')}`);
+      if (args[0] === 'rev-parse') return { status: 0, stdout: `${'a'.repeat(40)}\n`, stderr: '' };
+      if (args[0] === 'ls-remote') return { status: 0, stdout: '', stderr: '' }; // nothing found yet
+      if (args[0] === 'fetch') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'notes' && args[2] === 'show') {
+        return { status: 1, stdout: '', stderr: 'error: no note found for object.' };
+      }
+      throw new Error(`a shadow run must never reach this real git call: ${args.join(' ')}`);
+    };
+    const gh: GhCall = (args) => {
+      calls.push(`gh ${args.join(' ')}`);
+      if (args[0] === 'pr' && args[1] === 'list') return Promise.resolve({ status: 0, stdout: '[]', stderr: '' });
+      throw new Error(`a shadow run must never reach this real gh call: ${args.join(' ')}`);
+    };
+    // The real performer, with only its process boundary faked — exactly `tests/engine.write-executor.test.ts`'s
+    // own pattern (`contextFor({ git, gh, mode: 'shadow' })`), reached this time through a real `Reconciler`.
+    const writeExecutor: WriteExecutorPort = (intent, context) =>
+      performWriteIntent(intent, { ...context, git, gh });
+
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(plan),
+      baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+      executor: createScriptedExecutor(committingCapableScript()),
+      writeExecutor,
+    });
+    toClose.push(reconciler);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    for (let index = 0; index < 10 && reconciler.load(accepted.run).state.state !== 'committed'; index += 1) {
+      await reconciler.pass();
+    }
+
+    expect(reconciler.load(accepted.run).state.state).toBe('committed');
+    // The real performer did run real probes (this is not vacuous)...
+    expect(calls.length).toBeGreaterThan(0);
+    // ...but never once the mutating half of any of the three kinds.
+    expect(calls.some((call) => call.startsWith('git push'))).toBe(false);
+    expect(calls.some((call) => call.includes('notes') && call.includes(' add'))).toBe(false);
+    expect(calls.some((call) => call.startsWith('gh pr create'))).toBe(false);
+
+    const events = readEventLog(runPaths(accepted.run, reconciler.orchHome).eventLog);
+    expect(events.some((event) => event.type === 'write.executed')).toBe(false);
+    expect(events.filter((event) => event.type === 'write.suppressed')).toHaveLength(3);
   });
 });
 

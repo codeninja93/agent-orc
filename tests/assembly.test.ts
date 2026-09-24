@@ -9,15 +9,17 @@
  * fallback to "unverified" — proven against a real, disposable *local* git repository, never against
  * this repository's own `origin` and never against a real GitHub API.
  */
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  ShadowStartRefUnresolvable,
   ghDefaultBranchProtectionProbe,
   parseConfirmedFeatureSpec,
+  resolveShadowStartRef,
   seededUlidMinter,
 } from '../src/assembly/index.js';
 import { Reconciler, createScriptedExecutor, mintRunId, terminated } from '../src/engine/index.js';
@@ -223,5 +225,101 @@ describe('the worktree id and the accepted run id are the same value', () => {
       summary.retained.some((resource) => resource.kind === 'worktree' && resource.id === worktreeId),
     ).toBe(true);
     expect(existsSync(worktree.path)).toBe(true);
+  });
+});
+
+/**
+ * Story 3-2 (AD-27), matrix row 9 — a shadow run's worktree starts at the named merge commit's *parent*,
+ * never current `HEAD` and never the merge commit itself. `resolveShadowStartRef` is the one new thing a
+ * shadow run needs at the worktree layer; `createWorktree`'s existing `ref` option does the rest, proven
+ * here against a real scratch repository and a real worktree, never a fake.
+ */
+describe('resolveShadowStartRef — a shadow run’s worktree starts at the real merge commit’s parent', () => {
+  const repos: string[] = [];
+  const homes: string[] = [];
+  afterEach(() => {
+    for (const repo of repos.splice(0)) rmSync(repo, { recursive: true, force: true });
+    for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
+  });
+
+  const scratchRepo = (): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'orch-shadow-ref-repo-'));
+    repos.push(dir);
+    fixtureGit(dir, ['init', '--initial-branch', 'main']);
+    return dir;
+  };
+
+  const scratchOrchHome = (): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'orch-shadow-ref-home-'));
+    homes.push(dir);
+    return dir;
+  };
+
+  const commit = (repo: string, fileName: string, content: string, message: string): string => {
+    writeFileSync(join(repo, fileName), content, 'utf8');
+    fixtureGit(repo, ['add', '-A']);
+    fixtureGit(repo, ['commit', '-m', message]);
+    return fixtureGit(repo, ['rev-parse', 'HEAD']);
+  };
+
+  it('resolves to the named merge commit’s parent, not the merge commit and not HEAD', () => {
+    const repo = scratchRepo();
+    const parent = commit(repo, 'base.txt', 'base\n', 'the commit before the feature');
+    const mergeCommit = commit(repo, 'feature.txt', 'the feature\n', 'the real feature, merged');
+    // A commit after the merge, so "resolves to HEAD" and "resolves to the parent" are distinguishable.
+    commit(repo, 'after.txt', 'later work\n', 'work that landed after the feature');
+
+    expect(resolveShadowStartRef(repo, mergeCommit)).toBe(parent);
+  });
+
+  it('creates the worktree at that resolved parent, via createWorktree’s existing ref option', () => {
+    const repo = scratchRepo();
+    const orchHome = scratchOrchHome();
+    const parent = commit(repo, 'base.txt', 'base\n', 'the commit before the feature');
+    const mergeCommit = commit(repo, 'feature.txt', 'the feature\n', 'the real feature, merged');
+    commit(repo, 'after.txt', 'later work\n', 'work that landed after the feature');
+
+    const ref = resolveShadowStartRef(repo, mergeCommit);
+    const worktree = createWorktree({ run: mintRunId(), repository: repo, orchHome, ref });
+
+    expect(fixtureGit(worktree.path, ['rev-parse', 'HEAD'])).toBe(parent);
+    expect(existsSync(join(worktree.path, 'after.txt'))).toBe(false);
+    expect(existsSync(join(worktree.path, 'feature.txt'))).toBe(false);
+    expect(existsSync(join(worktree.path, 'base.txt'))).toBe(true);
+  });
+
+  it('throws ShadowStartRefUnresolvable for a merge commit that does not exist', () => {
+    const repo = scratchRepo();
+    commit(repo, 'base.txt', 'base\n', 'initial');
+
+    expect(() =>
+      resolveShadowStartRef(repo, '0000000000000000000000000000000000000000'),
+    ).toThrow(ShadowStartRefUnresolvable);
+  });
+
+  /**
+   * `<sha>^` (first-parent) is well-defined for a commit with any number of parents, but is only actually
+   * exercised elsewhere in this file against single-parent history — a true two-parent merge commit
+   * (`git merge --no-ff`) is the shape a real, already-merged pull request produces, and the one this
+   * story's own primary use case shadows.
+   */
+  it('resolves to the first parent — the branch merged into — for a true two-parent merge commit', () => {
+    const repo = scratchRepo();
+    const mainBeforeMerge = commit(repo, 'base.txt', 'base\n', 'main, before the feature merges');
+
+    fixtureGit(repo, ['checkout', '-b', 'feature/two-parent']);
+    const featureTip = commit(repo, 'feature.txt', 'the feature\n', 'the feature branch’s own commit');
+
+    fixtureGit(repo, ['checkout', 'main']);
+    fixtureGit(repo, ['merge', '--no-ff', '-m', 'merge the feature', 'feature/two-parent']);
+    const mergeCommit = fixtureGit(repo, ['rev-parse', 'HEAD']);
+
+    const parents = fixtureGit(repo, ['log', '-1', '--pretty=%P', mergeCommit]).split(/\s+/);
+    expect(parents).toHaveLength(2);
+    expect(parents[0]).toBe(mainBeforeMerge);
+    expect(parents[1]).toBe(featureTip);
+
+    // The first parent — the branch merged *into* — never the branch merged *from*.
+    expect(resolveShadowStartRef(repo, mergeCommit)).toBe(mainBeforeMerge);
   });
 });

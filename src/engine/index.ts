@@ -60,6 +60,10 @@
  * - `deflection-rate` — Q4's reported rate, folded from `question.asked`/`question.deflected` lines;
  * - `interviewer` — spec echo and question compression as the logic a live turn calls into. The live
  *   conversation itself is not here; it is the one component architecture.md requires to be a model;
+ * - `shadow` — story 3-2 (AD-27): `compareShadowRun`, the tree diff and `accepted`/`material_change`
+ *   classification a completed shadow run's resulting tree is graded by, against the real merge commit it
+ *   was shadowing. No rolling window and no gate verdict here — that is story 3-3's, computed from this
+ *   module's one raw, per-run result;
  * The run-start branch-protection assertion is deliberately **not** here. `src/container/lifecycle.ts`
  * already owned it, and a second implementation in this package disagreed with it about the one thing
  * that matters — whether "we could not check" and "it is not protected" have the same consequence. The
@@ -108,6 +112,7 @@ export * from './agents.js';
 export * from './config-snapshot.js';
 export * from './committer.js';
 export * from './write-executor.js';
+export * from './shadow.js';
 export * from './deflection.js';
 export * from './question-merge.js';
 export * from './deflection-rate.js';

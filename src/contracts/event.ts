@@ -291,6 +291,18 @@ export const WRITE_ATTEMPTED_EVENT_TYPE = 'write.attempted';
 export const WRITE_EXECUTED_EVENT_TYPE = 'write.executed';
 export const WRITE_FAILED_EVENT_TYPE = 'write.failed';
 
+/**
+ * Story 3-2 (AD-27) — what a shadow run's write executor records in place of `write.executed`.
+ *
+ * `write.attempted` and the read-only probe happen exactly as they do for a live run (AD-15's durability
+ * half still holds); this is the "executes" half suppressed, said explicitly rather than left as an
+ * absence. It carries the same `intent_id`/`kind`/`target` identity every write line does, plus whether
+ * the probe found the target already carrying something different from what this run would have produced
+ * — the zero-tolerance case the stage-3 autonomy gate hard-fails on (story 3-3) — and a detail line stating
+ * what the probe found and what would have happened.
+ */
+export const WRITE_SUPPRESSED_EVENT_TYPE = 'write.suppressed';
+
 /** The payload keys every `write.attempted` line carries — the intent, named, before the call. */
 export const WRITE_ATTEMPTED_PAYLOAD_KEYS = {
   /** The AD-15 idempotency key with the run id: `{step}.{kind}`, never minted. */
@@ -324,6 +336,47 @@ export const WRITE_FAILED_PAYLOAD_KEYS = {
   Reason: 'reason',
 } as const;
 
+/** The payload keys a `write.suppressed` line carries — story 3-2, AD-27. */
+export const WRITE_SUPPRESSED_PAYLOAD_KEYS = {
+  IntentId: 'intent_id',
+  Kind: 'kind',
+  Target: 'target',
+  /**
+   * True when the probe found the target already carrying something different from what this run would
+   * have produced — reusing 2-11's own probe verdict (`git ls-remote`/`gh pr list`/`git notes show`)
+   * rather than a second classification axis. False when the target does not yet exist, or exists and
+   * already matches.
+   */
+  Destructive: 'destructive',
+  /** One line, short and punctuated: what the probe found, and what would have happened. */
+  Detail: 'detail',
+} as const;
+
+/**
+ * Story 3-2 (AD-27) — the one raw, per-run result a shadow run produces: its resulting worktree tree
+ * compared against the real merge commit it was shadowing (`src/engine/shadow.ts`'s `compareShadowRun`).
+ * Emitted once, whether the comparison succeeded or failed — a failure to produce it is durably recorded
+ * here too, rather than only ever existing as an in-memory return value nobody else can see, matching the
+ * `write.*` trio's own discipline of never leaving a fact silently un-logged.
+ */
+export const SHADOW_COMPARED_EVENT_TYPE = 'shadow.compared';
+
+/** The payload keys a `shadow.compared` line carries. */
+export const SHADOW_COMPARED_PAYLOAD_KEYS = {
+  /** `'accepted'` or `'material_change'` (`ShadowComparisonOutcome`); absent when the comparison failed. */
+  Outcome: 'outcome',
+  ShadowTreeRef: 'shadow_tree_ref',
+  /** The real, already-merged feature's merge commit this run was shadowing. */
+  RealMergeCommit: 'real_merge_commit',
+  /**
+   * Present only when the comparison itself could not be produced (a `git` read failure) — the run may
+   * still have reached `committed`; only the grading of it is missing. Absent on a successful comparison.
+   */
+  Code: 'code',
+  /** One line, short and punctuated. Never the raw diff: AD-23 makes a diff evidence, not control plane. */
+  Detail: 'detail',
+} as const;
+
 /**
  * The declared event vocabulary. Dot-namespaced and past-tense. The vocabulary is open by
  * design: a reader meeting a type absent from this list accepts the envelope and ignores the
@@ -336,6 +389,8 @@ export const EVENT_TYPES = [
   WRITE_ATTEMPTED_EVENT_TYPE,
   WRITE_EXECUTED_EVENT_TYPE,
   WRITE_FAILED_EVENT_TYPE,
+  /** Story 3-2 (AD-27) — a shadow run's write executor records this in place of `write.executed`. */
+  WRITE_SUPPRESSED_EVENT_TYPE,
   'permission.denied',
   'redaction.failed',
   BUDGET_DEGRADED_EVENT_TYPE,
@@ -391,6 +446,8 @@ export const EVENT_TYPES = [
   BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
   /** The branch, the three write intents and the note a completed committing step composed (AD-22). */
   COMMIT_COMPOSED_EVENT_TYPE,
+  /** Story 3-2 (AD-27) — a shadow run's own tree-comparison result, or that producing one failed. */
+  SHADOW_COMPARED_EVENT_TYPE,
 ] as const;
 
 export type DeclaredEventType = (typeof EVENT_TYPES)[number];

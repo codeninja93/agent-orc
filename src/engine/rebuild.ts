@@ -226,6 +226,15 @@ export interface FeaturePlan {
   readonly starting_model_tier: ModelRung;
   /** The worktree a step's baseline ref is taken in and reset against (AD-26). */
   readonly worktree: string;
+  /**
+   * Story 3-2 (AD-27) — the real, already-merged feature's merge commit this run shadows, or `null`/absent
+   * for a live run. Read by the write executor's `pull_request` performer under `mode: 'shadow'` to tell
+   * the one pull request a shadow run *expects* to find (the historical one it is reproducing, never
+   * destructive) apart from any other, genuinely unexpected one (destructive) — see
+   * `src/engine/write-executor.ts`'s own docblock. Optional so no existing caller or fixture that builds a
+   * `FeaturePlan` needs to change.
+   */
+  readonly shadowRealMergeCommit?: string | null;
 }
 
 const isOneOf = <T extends string>(members: readonly T[], value: unknown): value is T =>

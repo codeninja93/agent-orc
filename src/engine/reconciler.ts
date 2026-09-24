@@ -3219,6 +3219,15 @@ export class Reconciler {
          * the run in `awaiting_merge` rather than `committed`. `settlePreMergeWrites` returning `'none'`
          * (no executor, or nothing composed) is the one case that still commits directly, unchanged from
          * every build before this story.
+         *
+         * **Story 3-2 (AD-27) — a shadow run never enters `awaiting_merge`.** Under shadow, the push and
+         * pull-request intents settle as `write.suppressed` rather than `write.executed` — there is no real
+         * pull request ever opened, so there is nothing to wait on. `settlePreMergeWrites` already settles
+         * a shadow run's `git_note` intent in the same pass (see its own docblock), so once it reports
+         * `'awaiting-merge'` for a shadow run, every one of the three composed intents is already settled
+         * and the run proceeds straight to `committed` — the one branch this story adds to this method's
+         * own step-driving logic, downstream of the write executor's own suppression exactly the way the
+         * existing `awaiting_merge` transition is already downstream of a live run's real push/PR landing.
          */
         let to: FeatureState = action.to;
         let reason = action.reason;
@@ -3226,11 +3235,20 @@ export class Reconciler {
           const settlement = await this.settlePreMergeWrites(paths, plan, recorder);
           if (settlement === 'unsettled') return null;
           if (settlement === 'awaiting-merge') {
-            to = 'awaiting_merge';
-            reason =
-              'The composed commit’s push and pull-request intents have landed. AD-22 binds the ' +
-              'durable note to the merge commit, which does not exist until a person merges the pull ' +
-              'request, so the run waits here rather than claiming a terminal state early (AD-32).';
+            if (plan.mode === 'shadow') {
+              reason =
+                'Under mode: shadow, the composed commit’s push, pull-request and note intents all ' +
+                'settled as write.suppressed — no real pull request was ever opened, so there is nothing ' +
+                'to wait on, and the run reaches its terminal state directly rather than parking in ' +
+                'awaiting_merge for a merge that will never happen (AD-27).';
+              // `to` stays `'committed'`, `action.to`'s own value — no override needed.
+            } else {
+              to = 'awaiting_merge';
+              reason =
+                'The composed commit’s push and pull-request intents have landed. AD-22 binds the ' +
+                'durable note to the merge commit, which does not exist until a person merges the pull ' +
+                'request, so the run waits here rather than claiming a terminal state early (AD-32).';
+            }
           }
         }
         this.emit(recorder, {
@@ -4626,6 +4644,14 @@ export class Reconciler {
   ): WriteExecutionContext {
     return {
       run: recorder.paths.runId,
+      // AD-27 — threaded through unchanged: every non-write-surface component behaves identically under
+      // `mode: 'shadow'` and `mode: 'live'`, and this is the one place the write executor itself learns
+      // which it is.
+      mode: plan.mode,
+      // The real merge commit this run is shadowing, or `null` for a live run — how `performPullRequest`
+      // tells the one pull request a shadow run expects to find (never destructive) apart from any other
+      // (destructive). See `WriteExecutionContext.shadowRealMergeCommit`'s own docblock.
+      shadowRealMergeCommit: plan.shadowRealMergeCommit ?? null,
       // The run's own worktree (AD-26): a worktree shares its repository's remotes, so pushing from here
       // reaches the same `origin` the committer named the branch and the pull request against.
       repository: plan.worktree,
@@ -4640,17 +4666,28 @@ export class Reconciler {
 
   /**
    * Story 2-11 — perform a completed committing step's `git_push` and `pull_request` intents, durably,
-   * before letting the run wait for a merge. `git_note` is deliberately never performed here: AD-22 binds
-   * the note to the merge commit, which does not exist yet at this point in the run (see
-   * `src/engine/write-executor.ts`'s own docblock), so it is held back for the `check-merge` action below.
+   * before letting the run wait for a merge. `git_note` is deliberately never performed here **for a live
+   * run**: AD-22 binds the note to the merge commit, which does not exist yet at this point in the run
+   * (see `src/engine/write-executor.ts`'s own docblock), so it is held back for the `check-merge` action
+   * below.
+   *
+   * **Story 3-2 (AD-27) — a shadow run's `git_note` is settled right here, alongside the other two.** A
+   * shadow run never opens a real pull request, so no real merge commit will ever exist for `check-merge`
+   * to wait on — holding the note back for it would park a shadow run in `awaiting_merge` forever, waiting
+   * for a merge that can never happen (this story's own Boundaries call this out explicitly). All three
+   * composed intents are therefore settled in this one pass under shadow, each recording `write.suppressed`
+   * (`src/engine/write-executor.ts`'s `performGitNoteShadow` probes the worktree's own `HEAD` in place of a
+   * merge commit that will never exist), and the caller below routes a shadow run straight to `committed`.
    *
    * - `'none'` — no executor is wired, or nothing was composed for this run (no committing step in the
    *   plan, or one that composed no prose). The caller commits exactly as every build before this story
    *   did: composed and logged, performed by nobody — the same "no production assembly point" gap already
    *   carried as a high-severity deferred entry since story 2-4, not a new hole this story opens.
-   * - `'awaiting-merge'` — both pre-merge intents are `executed`, either because this pass's call landed
-   *   or because the reconciliation check found it already had (AD-15: never a second push, never a
-   *   second pull request). The caller transitions to `awaiting_merge` rather than `committed`.
+   * - `'awaiting-merge'` — every intent this call is responsible for is settled (`executed` for a live
+   *   run's push and pull request, `suppressed` for all three of a shadow run's), either because this
+   *   pass's call landed or because the reconciliation check found it already had (AD-15: never a second
+   *   push, never a second pull request). The caller transitions to `awaiting_merge` for a live run, or
+   *   straight to `committed` for a shadow one (AD-27) — see the `advance-state` case.
    * - `'unsettled'` — a real write failed and neither kind refused by name. Nothing is emitted here: the
    *   executor already recorded its own `write.attempted`/`write.failed` lines, so the caller leaves the
    *   run where it is and the next pass tries again from the top, which costs at most one wasted
@@ -4669,9 +4706,10 @@ export class Reconciler {
     const context = this.writeExecutionContextFor(plan, recorder, composed, null);
 
     for (const intent of composed.intents) {
-      // `git_note` is the third composed intent and is never performed from here (see this method's own
-      // docblock); everything else is `git_push` and `pull_request`, in that order.
-      if (intent.kind === 'git_note') continue;
+      // `git_note` is the third composed intent. For a live run it is never performed from here (see this
+      // method's own docblock) — only `git_push` and `pull_request`, in that order. For a shadow run there
+      // is no merge to wait for, so it is settled here too (AD-27).
+      if (intent.kind === 'git_note' && plan.mode !== 'shadow') continue;
       if (writeIntentSettled(events, intent.intent_id)) continue;
       let outcome: WriteIntentResult;
       try {
