@@ -73,7 +73,12 @@ export const COMMAND_HANDLING: CommandMap<CommandHandling> = {
       'story 4-3, "Steerable observability — pause, inject, kill, fork", which names pause among its ' +
       'controls; story 2-9’s hibernation is terminal, not the non-terminal halt pause needs',
   },
-  inject_note: { kind: 'awaiting', owner: 'story 2-10, which owns a running agent’s next input' },
+  inject_note: {
+    kind: 'awaiting',
+    owner:
+      'story 4-3, "Steerable observability — pause, inject, kill, fork", which names inject among its ' +
+      'controls; nothing this build has shipped yet injects a note into a running agent’s next input',
+  },
   kill: { kind: 'effect' },
   fork: { kind: 'awaiting', owner: 'story 4-3, which owns forking a run from its current point' },
   take_over: { kind: 'effect' },

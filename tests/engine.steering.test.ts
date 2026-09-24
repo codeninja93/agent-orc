@@ -227,7 +227,7 @@ describe('every member of the Command enum has a declared handling', () => {
   it.each([
     ['narrow', /^story 4-3\b.*not yet named in any story/],
     ['pause', /^story 4-3\b/],
-    ['inject_note', /2-10/],
+    ['inject_note', /^story 4-3\b/],
     ['fork', /4-3/],
   ] as const)('names %s’s owner as the story that actually owns it', (command, owner) => {
     const handling = COMMAND_HANDLING[command];
