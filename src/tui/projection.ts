@@ -614,6 +614,8 @@ const nextGateFor = (facts: {
         : `your approval at the gate step "${facts.current.step}" is blocked at`;
     case 'verifying':
       return 'the verification gates';
+    case 'awaiting_merge':
+      return 'the pull request being merged; the AD-22 note lands once it is';
     case 'interrupted':
       return 'a resume, or a re-run from the step baseline';
     case 'degraded':

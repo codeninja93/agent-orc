@@ -12,7 +12,8 @@
   "bin": {
     "orch": "dist/bin/init.js",
     "orch-runner": "dist/bin/runner.js",
-    "orch-jira-server": "dist/bin/jira-server.js"
+    "orch-jira-server": "dist/bin/jira-server.js",
+    "orch-run": "dist/bin/orch-run.js"
   },
   "exports": {
     ".": {
@@ -30,6 +31,10 @@
     "./tool-servers/jira": {
       "types": "./dist/tool-servers/jira/index.d.ts",
       "import": "./dist/tool-servers/jira/index.js"
+    },
+    "./assembly": {
+      "types": "./dist/assembly/index.d.ts",
+      "import": "./dist/assembly/index.js"
     }
   },
   "types": "./dist/contracts/index.d.ts",

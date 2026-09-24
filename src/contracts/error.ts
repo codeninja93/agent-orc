@@ -70,6 +70,22 @@ export const ERROR_DISPOSITIONS = {
   'write.branch_protection_violation': 'escalate-to-human',
   'write.conflict': 'escalate-to-human',
   'write.outcome_unknown': 'escalate-to-human',
+  /**
+   * Story 2-11 — the `git push` half of a committing step's declared intents failed: network, auth,
+   * or a non-fast-forward rejection. The reconciliation check that runs before every attempt (AD-15)
+   * means a retry never repeats a push that already landed, so retrying is safe rather than merely
+   * hopeful.
+   */
+  'write.push_failed': 'retry-with-backoff',
+  /** Story 2-11 — `gh pr create` failed. Reconciled the same way before a retry, for the same reason. */
+  'write.pull_request_failed': 'retry-with-backoff',
+  /**
+   * Story 2-11 — the enumerated write surface was asked to perform `git_tag` or `domain_mutation`,
+   * neither of which has a real performer yet (nothing in this codebase composes one). Not retryable
+   * and not a human's to approve away: the gap is closed by shipping a performer, which is a code
+   * change, not an action this run can take.
+   */
+  'write.kind_unimplemented': 'abandon-and-hand-off',
 
   // Git and the step baseline (AD-22, AD-26)
   'git.worktree_unavailable': 'retry-with-backoff',

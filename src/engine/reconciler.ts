@@ -29,7 +29,16 @@
  * id are envelope fields on the verbatim allow-list. Payloads carry only short, punctuated,
  * low-entropy values. Getting this wrong is silent: the run works and the log becomes unreadable.
  */
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import {
@@ -211,6 +220,13 @@ import {
   commitRunRecordFrom,
   composeCommit,
 } from './committer.js';
+import { writeIntentSettled } from './write-executor.js';
+import type {
+  MergeCheckPort,
+  WriteExecutionContext,
+  WriteExecutorPort,
+  WriteIntentResult,
+} from './write-executor.js';
 import type { ComposedCommit } from './committer.js';
 
 import { ModelRungUnrecognised, rungForAttempt } from './promotion.js';
@@ -737,6 +753,31 @@ export class UnrecordedAction extends Error {
   }
 }
 
+/**
+ * Story 2-11 — `commit/composed.json` exists but could not be read back.
+ *
+ * Never folded into "nothing was composed": the only writer is `recordComposedCommit`, writing
+ * atomically, so a file that exists and will not parse is disk damage, not the absence of a
+ * composition. Treating it as absence would have a run whose pull request was already declared quietly
+ * skip ever pushing or opening it — the exact silent loss AD-15 exists to prevent. Thrown rather than
+ * returned so it propagates out as a per-run refusal a person sees, the same as any other durable state
+ * this loop cannot make sense of.
+ */
+export class ComposedCommitUnreadable extends Error {
+  readonly code = 'internal.invariant_violated';
+  readonly path: string;
+
+  constructor(path: string, cause: unknown) {
+    super(
+      `The composed commit at "${path}" exists but could not be read: ${renderCause(cause) ?? 'unknown error'}. ` +
+        'It is the record of a branch and pull request already declared for this run, so this is reported ' +
+        'rather than treated as nothing having been composed.',
+    );
+    this.name = 'ComposedCommitUnreadable';
+    this.path = path;
+  }
+}
+
 /** What the loop decided to do about one feature in one pass. */
 export type ReconcileAction =
   /** Nothing to do: the feature is terminal, or a step was stopped by a steering command. */
@@ -785,6 +826,12 @@ export type ReconcileAction =
     }
   /** A lifecycle transition with no step attached, e.g. every step done so the run is committed. */
   | { readonly kind: 'advance-state'; readonly to: FeatureState; readonly reason: string }
+  /**
+   * AD-22, AD-15 — the run is `awaiting_merge`: one bounded `gh pr view` check, per pass, for whether the
+   * pull request has merged. Never a poll loop of its own — a pass is already the loop's own cadence, and
+   * this is the one action that cadence takes while a person's merge is the only thing left to happen.
+   */
+  | { readonly kind: 'check-merge'; readonly reason: string }
   /** AD-35 — a condition no retrying resolves but a person can. */
   | { readonly kind: 'escalate-to-human'; readonly step: string | null; readonly reason: string }
   /** CAP-23 — stop and explain rather than thrash. */
@@ -1198,6 +1245,35 @@ export interface ReconcilerOptions {
    * because protected main is the one control that survives total agent failure.
    */
   readonly branchProtection?: BranchProtectionAssertion | null;
+  /**
+   * Story 2-11 — how the engine performs a committing step's composed write intents (AD-15).
+   *
+   * A function rather than a configuration object, for the same reason `branchProtection` is one: the
+   * performer belongs to `src/engine/write-executor.ts`, which holds the `git`/`gh` shell-outs and the
+   * per-kind reconciliation checks, and this is the seam a composition root wires it through.
+   *
+   * `null` is not "nothing to do" — it is "no executor is assembled", and the consequence is stated
+   * plainly rather than softened: a committed transition still composes and logs the three intents
+   * (story 2-7's job, unchanged), but performs none of them, exactly as every build before this story
+   * behaved. That is the same "no production assembly point" gap already carried as a high-severity
+   * deferred entry since story 2-4, not a new fail-open hole opened here — and it is why the roughly
+   * fifty existing `Reconciler.open` call sites that supply no executor keep reaching `committed` with
+   * no git or `gh` call ever attempted. `src/assembly/index.ts` is the composition root that wires the
+   * real one — outside `src/engine/` because it also needs `src/pool/` and `src/container/`, which the
+   * dependency-direction guard this package's own suite holds does not let `src/engine/` import.
+   */
+  readonly writeExecutor?: WriteExecutorPort | null;
+  /**
+   * Story 2-11 — the one bounded read `awaiting_merge` takes per pass: has the pull request merged?
+   *
+   * A second port beside `writeExecutor` rather than folded into it, because checking is not writing —
+   * `gh pr view` never mutates anything — and the two have different failure postures: a write that
+   * cannot be performed fails the intent, while a check that cannot be read is reported as "still open"
+   * rather than as a reason to escalate (`src/engine/write-executor.ts`'s `checkPullRequestMerged`).
+   * `null` leaves a run in `awaiting_merge` exactly as `writeExecutor: null` leaves one uncommitted: a
+   * named, visible gap rather than a guess.
+   */
+  readonly mergeChecker?: MergeCheckPort | null;
 }
 
 /**
@@ -1271,6 +1347,8 @@ export class Reconciler {
   private readonly worktreeGit: WorktreeGit;
   private readonly principal: Principal;
   private readonly branchProtection: BranchProtectionAssertion | null;
+  private readonly writeExecutor: WriteExecutorPort | null;
+  private readonly mergeChecker: MergeCheckPort | null;
   /** Open recorders, keyed by run id. An I/O handle, not run state: nothing is read back from it. */
   private readonly recorders = new Map<string, Recorder>();
   private closed = false;
@@ -1317,6 +1395,8 @@ export class Reconciler {
     this.worktreeGit = options.worktreeGit ?? execFileWorktreeGit;
     this.principal = options.principal ?? { kind: 'user', id: 'local' };
     this.branchProtection = options.branchProtection ?? null;
+    this.writeExecutor = options.writeExecutor ?? null;
+    this.mergeChecker = options.mergeChecker ?? null;
   }
 
   /**
@@ -3129,10 +3209,124 @@ export class Reconciler {
       }
 
       case 'advance-state': {
+        /**
+         * Story 2-11 — every declared step completing is no longer automatically `committed`.
+         *
+         * `decideAction` still decides `to: 'committed'` here exactly as story 2-7 left it — it is a pure
+         * function of the checkpoint and the plan, and whether a real executor is assembled is neither.
+         * This is where that gap is closed: a composed commit with an executor wired pushes and opens the
+         * pull request before anything is emitted, and — the reason AD-22's note cannot exist yet — lands
+         * the run in `awaiting_merge` rather than `committed`. `settlePreMergeWrites` returning `'none'`
+         * (no executor, or nothing composed) is the one case that still commits directly, unchanged from
+         * every build before this story.
+         */
+        let to: FeatureState = action.to;
+        let reason = action.reason;
+        if (action.to === 'committed') {
+          const settlement = await this.settlePreMergeWrites(paths, plan, recorder);
+          if (settlement === 'unsettled') return null;
+          if (settlement === 'awaiting-merge') {
+            to = 'awaiting_merge';
+            reason =
+              'The composed commit’s push and pull-request intents have landed. AD-22 binds the ' +
+              'durable note to the merge commit, which does not exist until a person merges the pull ' +
+              'request, so the run waits here rather than claiming a terminal state early (AD-32).';
+          }
+        }
         this.emit(recorder, {
           step: null,
           type: ENGINE_EVENT_TYPES.FeatureStateChanged,
-          payload: { from: state.state, to: action.to, reason: action.reason },
+          payload: { from: state.state, to, reason },
+        });
+        return null;
+      }
+
+      case 'check-merge': {
+        // `readComposedCommit` throws `ComposedCommitUnreadable` for a damaged artifact rather than
+        // returning `null` for it — deliberately left uncaught here, so it propagates out of this pass
+        // as a per-run refusal rather than being read as "nothing was ever composed" (that would silently
+        // abandon a run whose branch and pull request were already declared).
+        const composed = this.readComposedCommit(paths);
+        const noteIntent = composed?.intents.find((intent) => intent.kind === 'git_note') ?? null;
+        // Nothing to check against: no composition survives here in practice (only `awaiting_merge`
+        // reaches this case, and only `settlePreMergeWrites` puts a run there, which requires one).
+        // Steering (kill, disengage, take-over) still reaches the run exactly as any non-terminal one.
+        if (composed === null || noteIntent === null) return null;
+
+        if (this.mergeChecker === null || this.writeExecutor === null) {
+          // Named and visible, the same convention every other missing-port gap in this file already
+          // follows (`gates`, `branchProtection`, the pre-merge half of `writeExecutor`) — never a silent
+          // skip. A run parked here needs a person: the assembly that put it into `awaiting_merge` cannot
+          // get it out on its own.
+          this.emit(recorder, {
+            step: null,
+            type: ENGINE_EVENT_TYPES.FeatureStateChanged,
+            payload: {
+              from: state.state,
+              to: 'blocked',
+              reason:
+                this.mergeChecker === null
+                  ? 'No merge checker is assembled, so this run cannot learn whether its pull request ' +
+                    'has merged. A person needs to finish assembling the engine, or steer this run past ' +
+                    '`awaiting_merge` by hand.'
+                  : 'No write executor is assembled, so this run can check whether its pull request has ' +
+                    'merged but cannot write the AD-22 note once it has. A person needs to finish ' +
+                    'assembling the engine.',
+            },
+          });
+          return null;
+        }
+
+        const check = await this.mergeChecker({ repository: plan.worktree, branch: composed.branch });
+
+        if (check.state === 'CLOSED') {
+          // CAP-23's escape hatch, said in the vocabulary a person acts on: a closed-without-merging pull
+          // request is a fact about the run, not a condition to poll forever waiting for it to change.
+          this.emit(recorder, {
+            step: null,
+            type: ENGINE_EVENT_TYPES.FeatureStateChanged,
+            payload: {
+              from: state.state,
+              to: 'blocked',
+              reason:
+                `The pull request from "${composed.branch}" was closed without merging, so the run ` +
+                'stops waiting and hands the decision to a person rather than checking forever.',
+            },
+          });
+          return null;
+        }
+
+        if (check.state !== 'MERGED' || check.mergeCommit === null) return null; // still open
+
+        const context = this.writeExecutionContextFor(plan, recorder, composed, check.mergeCommit);
+        let outcome: WriteIntentResult | null;
+        try {
+          outcome = await this.writeExecutor(noteIntent, context);
+        } catch {
+          /**
+           * A thrown refusal is not a termination this loop may let escape uncaught.
+           *
+           * `performWriteIntent` throws rather than returning a `WriteIntentResult` for a condition that
+           * says the call should never have been made (`NoteMergeCommitUnknown`, `WriteKindNotImplemented`)
+           * — neither is reachable here in practice, since this method only ever hands it a `git_note`
+           * intent with a real merge commit already attached. If either ever did fire, the treatment is
+           * identical to a returned `{status:'failed'}`: the run stays `awaiting_merge` and the next pass
+           * tries again, rather than this uncaught throw crashing the whole reconcile loop.
+           */
+          outcome = null;
+        }
+        if (outcome === null || outcome.status === 'failed') return null;
+
+        this.emit(recorder, {
+          step: null,
+          type: ENGINE_EVENT_TYPES.FeatureStateChanged,
+          payload: {
+            from: state.state,
+            to: 'committed',
+            reason:
+              `The pull request from "${composed.branch}" merged at ${check.mergeCommit}, the AD-22 note ` +
+              'is durable on that commit, and the run reaches its terminal state.',
+          },
         });
         return null;
       }
@@ -4349,7 +4543,23 @@ export class Reconciler {
      */
     const artifact = join(paths.runDir, COMPOSED_COMMIT_RELATIVE_PATH);
     mkdirSync(dirname(artifact), { recursive: true });
-    writeFileSync(artifact, `${JSON.stringify(composed, null, 2)}\n`, 'utf8');
+    /**
+     * Atomic: a temporary file beside the target, fsynced, then renamed — the same shape
+     * `src/engine/checkpoint.ts`'s `writeCheckpoint` already uses. A direct `writeFileSync` to the final
+     * path leaves a reader that races a crash mid-write with a torn, unparseable file; a rename is a
+     * single filesystem operation a reader either sees whole or not at all.
+     */
+    const temp = `${artifact}.${String(process.pid)}.tmp`;
+    writeFileSync(temp, `${JSON.stringify(composed, null, 2)}\n`, 'utf8');
+    const fd = openSync(temp, 'r');
+    try {
+      fsyncSync(fd);
+    } catch {
+      // Unsynced contents are a durability weakness, not a torn file: the rename below is still atomic.
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temp, artifact);
 
     this.emit(recorder, {
       step: step.step,
@@ -4362,6 +4572,120 @@ export class Reconciler {
         [COMMIT_COMPOSED_PAYLOAD_KEYS.Artifact]: COMPOSED_COMMIT_RELATIVE_PATH,
       },
     });
+  }
+
+  /**
+   * Read back what {@link recordComposedCommit} wrote, or `null` when there is nothing to execute.
+   *
+   * From disk and not from the log: the log carries only a pointer (AD-23, for the reason
+   * {@link recordComposedCommit} states about the note's run id), and this is the one reader of the
+   * artifact the pointer names. `null` covers two cases alike, deliberately: no committing step in the
+   * plan, and a committing step that produced no prose or whose composition refused (`commit.composed`
+   * carries a `refusal_code` and no artifact) — both mean "nothing for the write executor to do", and
+   * both {@link settlePreMergeWrites} and the `check-merge` action treat the absence as settled.
+   *
+   * **A file that exists but cannot be read is a third case, and it is never folded into `null`.** The
+   * only writer is `recordComposedCommit`, a few lines above, writing atomically — so a corrupt file
+   * means the disk itself damaged it, not that nothing was ever composed. Reading that as `null` would
+   * have a run whose pull request was already declared quietly skip ever pushing or opening it, which is
+   * the exact silent loss AD-15 exists to prevent; {@link ComposedCommitUnreadable} is thrown instead, so
+   * the caller reports a refusal a person sees rather than a run that silently proceeds as if nothing had
+   * ever been composed.
+   */
+  private readComposedCommit(paths: RunPaths): ComposedCommit | null {
+    const artifact = join(paths.runDir, COMPOSED_COMMIT_RELATIVE_PATH);
+    if (!existsSync(artifact)) return null;
+    let raw: string;
+    try {
+      raw = readFileSync(artifact, 'utf8');
+    } catch (thrown: unknown) {
+      throw new ComposedCommitUnreadable(artifact, thrown);
+    }
+    // Not re-validated against a Zod schema beyond the `JSON.parse` below: the only writer is
+    // `recordComposedCommit`, in this same process — there is no path by which an external or a
+    // model-authored value reaches this file, only a torn or truncated one from a damaged disk.
+    try {
+      return JSON.parse(raw) as ComposedCommit;
+    } catch (thrown: unknown) {
+      throw new ComposedCommitUnreadable(artifact, thrown);
+    }
+  }
+
+  /**
+   * The context every write-executor call for this run's composed commit shares.
+   *
+   * `mergeCommit` is the one field that changes between the two phases: `null` for `git_push` and
+   * `pull_request`, which never read it, and the real oid once `check-merge` has confirmed one, for
+   * `git_note`, which refuses to run without it (`src/engine/write-executor.ts`'s `NoteMergeCommitUnknown`).
+   */
+  private writeExecutionContextFor(
+    plan: FeaturePlan,
+    recorder: Recorder,
+    composed: ComposedCommit,
+    mergeCommit: string | null,
+  ): WriteExecutionContext {
+    return {
+      run: recorder.paths.runId,
+      // The run's own worktree (AD-26): a worktree shares its repository's remotes, so pushing from here
+      // reaches the same `origin` the committer named the branch and the pull request against.
+      repository: plan.worktree,
+      pullRequest: composed.pull_request,
+      note: composed.note,
+      mergeCommit,
+      emit: (type: string, payload: Record<string, unknown>): void => {
+        this.emit(recorder, { step: null, type, payload });
+      },
+    };
+  }
+
+  /**
+   * Story 2-11 — perform a completed committing step's `git_push` and `pull_request` intents, durably,
+   * before letting the run wait for a merge. `git_note` is deliberately never performed here: AD-22 binds
+   * the note to the merge commit, which does not exist yet at this point in the run (see
+   * `src/engine/write-executor.ts`'s own docblock), so it is held back for the `check-merge` action below.
+   *
+   * - `'none'` — no executor is wired, or nothing was composed for this run (no committing step in the
+   *   plan, or one that composed no prose). The caller commits exactly as every build before this story
+   *   did: composed and logged, performed by nobody — the same "no production assembly point" gap already
+   *   carried as a high-severity deferred entry since story 2-4, not a new hole this story opens.
+   * - `'awaiting-merge'` — both pre-merge intents are `executed`, either because this pass's call landed
+   *   or because the reconciliation check found it already had (AD-15: never a second push, never a
+   *   second pull request). The caller transitions to `awaiting_merge` rather than `committed`.
+   * - `'unsettled'` — a real write failed and neither kind refused by name. Nothing is emitted here: the
+   *   executor already recorded its own `write.attempted`/`write.failed` lines, so the caller leaves the
+   *   run where it is and the next pass tries again from the top, which costs at most one wasted
+   *   "already present" lookup on the intent that already succeeded, never a duplicate write.
+   */
+  private async settlePreMergeWrites(
+    paths: RunPaths,
+    plan: FeaturePlan,
+    recorder: Recorder,
+  ): Promise<'none' | 'awaiting-merge' | 'unsettled'> {
+    if (this.writeExecutor === null) return 'none';
+    const composed = this.readComposedCommit(paths);
+    if (composed === null) return 'none';
+
+    const events = readEventLog(paths.eventLog);
+    const context = this.writeExecutionContextFor(plan, recorder, composed, null);
+
+    for (const intent of composed.intents) {
+      // `git_note` is the third composed intent and is never performed from here (see this method's own
+      // docblock); everything else is `git_push` and `pull_request`, in that order.
+      if (intent.kind === 'git_note') continue;
+      if (writeIntentSettled(events, intent.intent_id)) continue;
+      let outcome: WriteIntentResult;
+      try {
+        outcome = await this.writeExecutor(intent, context);
+      } catch {
+        // A thrown refusal (`WriteKindNotImplemented` for a kind `composeCommit` never actually
+        // produces) gets the same treatment a returned `{status:'failed'}` already gets: the run stays
+        // where it is and the next pass tries again, rather than this throw escaping uncaught and
+        // crashing the whole reconcile loop over one run's composed commit.
+        return 'unsettled';
+      }
+      if (outcome.status === 'failed') return 'unsettled';
+    }
+    return 'awaiting-merge';
   }
 
   /**
@@ -4825,6 +5149,25 @@ export const decideAction = (state: RunState, plan: FeaturePlan): ReconcileActio
     return {
       kind: 'await-approval',
       reason: 'The feature blocked at a gate and waits for a person, not for another pass (CAP-12).',
+    };
+  }
+
+  /**
+   * Story 2-11 — `awaiting_merge` sits between the push/pull-request intents landing and the AD-22 note.
+   *
+   * No step is in flight and none is pending here — the committing step is the last one the plan declares
+   * and it is already `completed` — so nothing below this would ever fire for this state anyway. Named
+   * explicitly rather than left to fall through, the same reasoning `drafting` and `blocked` are: the
+   * person reading this switch should not have to prove to themselves that the fall-through path happens
+   * to do the right thing.
+   */
+  if (state.state === 'awaiting_merge') {
+    return {
+      kind: 'check-merge',
+      reason:
+        'The run is waiting for a person to merge the pull request. AD-24 excludes this wait from the ' +
+        'wall-clock ceiling (PERSON_WAITING_STATES), and each pass makes one bounded check rather than ' +
+        'polling without bound.',
     };
   }
 

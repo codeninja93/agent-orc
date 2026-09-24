@@ -177,8 +177,12 @@ const tokensIn = (usage: StepUsage | null): number | null => {
  * blocked overnight, accrue its whole allowance unchecked, and hibernate on the first pass after the person
  * approved it, having done no work in that time. AD-24's wall clock bounds how long a run *works*.
  * `interrupted` is not here: a crashed engine or a closed laptop is the run's own time lost, not a person's.
+ *
+ * Story 2-11 adds `awaiting_merge`: the run's push and pull request have landed and the only thing left is
+ * a person merging it, exactly the same shape as `blocked` waiting on an approval — the run is not doing
+ * anything, so its wait costs nothing against the ceiling that bounds how long a run *works*.
  */
-export const PERSON_WAITING_STATES: readonly FeatureState[] = ['drafting', 'blocked'];
+export const PERSON_WAITING_STATES: readonly FeatureState[] = ['drafting', 'blocked', 'awaiting_merge'];
 
 const stringField = (event: EventEnvelope, key: string): string | null => {
   const value = event.payload[key];

@@ -17,18 +17,21 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
+  CommittingOutputSchema,
   RUN_STATE_FILE_NAME,
   StepInputSchema,
+  StepOutputSchema,
   dispositionFor,
   makeError,
 } from '../src/contracts/index.js';
-import type { ModelRung, OrchError, StepDisposition } from '../src/contracts/index.js';
+import type { EventEnvelope, ModelRung, OrchError, StepDisposition } from '../src/contracts/index.js';
 import { Recorder, RunFetchRecord, readEventLog, runPaths, runsDir } from '../src/runtime/index.js';
 import {
   BaselineResetError,
   ENGINE_EMITTER,
   ENGINE_EVENT_TYPES,
   SPEC_RECORDED_EVENT_TYPE,
+  STANDARD_PLAN_STEPS,
   TERRITORY_DECLARED_EVENT_TYPE,
   Reconciler,
   ResumeRefused,
@@ -39,6 +42,8 @@ import {
   createUlidMinter,
   gitBaselineResetter,
   isUlid,
+  measureConsumption,
+  rebuildFromLog,
   routeRefusedResume,
   routeTermination,
   terminated,
@@ -46,7 +51,10 @@ import {
 import type {
   BaselineResetter,
   FeaturePlan,
+  MergeCheck,
+  MergeCheckPort,
   ScriptedExecutorOptions,
+  WriteExecutorPort,
 } from '../src/engine/index.js';
 
 import { makeGitWorktree, makeHome, makePlan, planProvider } from './helpers/engine-fixture.js';
@@ -1519,5 +1527,368 @@ describe('a rung the build cannot place blocks the feature rather than crashing 
     await reconciler.pass();
 
     expect(reconciler.load(accepted.run).state.steps[0]?.model_tier).toBe('claude-haiku-4-5');
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Story 2-11 — `awaiting_merge` and the bounded per-pass merge check (matrix rows 1, 4, 5, 7)
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * A committing step's output, exactly as `tests/engine.committer.test.ts` composes one: prose only, no
+ * step disposition of its own — the engine supplies the record, per story 2-7.
+ */
+const committingOutput = (step: string): Record<string, unknown> => ({
+  contract_id: 'step.committing',
+  step,
+  status: 'completed',
+  summary: 'Composed the pull-request prose.',
+  provenance: ['commit: src/engine/committer.ts'],
+  decisions: [],
+  artifacts: [],
+  questions: [],
+  write_intents: [],
+  error: null,
+  pull_request_title: 'Write surface: awaiting_merge and the bounded check',
+  pull_request_body: 'The write executor lands the push and pull request; the engine waits for the merge.',
+});
+
+/** Every phase completes on its first attempt; the committing phase also composes real prose. */
+const committingCapableScript = (): ScriptedExecutorOptions => ({
+  onStart: (request) => {
+    if (request.phase !== 'committing') return terminated(request.step, 'completed', {});
+    const raw = committingOutput(request.step);
+    return terminated(request.step, 'completed', {
+      output: StepOutputSchema.parse(raw),
+      contractOutput: CommittingOutputSchema.parse(raw),
+    });
+  },
+});
+
+/** One entry per write-executor call this fixture's double received, in order. */
+interface RecordedWrite {
+  readonly kind: string;
+  readonly mergeCommit: string | null;
+}
+
+/**
+ * A write executor that never touches `git`/`gh`: it records the call and durably emits the same
+ * `write.attempted`/`write.executed` pair the real one does, through the context it is handed — which is
+ * what the reconciler's own durability ordering and event-log assertions below are about, not whether a
+ * particular shell command ran.
+ */
+const recordingWriteExecutor = (writes: RecordedWrite[]): WriteExecutorPort => {
+  const port: WriteExecutorPort = (intent, context) => {
+    writes.push({ kind: intent.kind, mergeCommit: context.mergeCommit });
+    context.emit('write.attempted', {
+      intent_id: intent.intent_id,
+      kind: intent.kind,
+      target: intent.target,
+    });
+    context.emit('write.executed', {
+      intent_id: intent.intent_id,
+      kind: intent.kind,
+      target: intent.target,
+      already_present: false,
+      detail: 'recorded by the test double',
+    });
+    return Promise.resolve({
+      status: 'executed' as const,
+      alreadyPresent: false,
+      detail: 'recorded by the test double',
+    });
+  };
+  return port;
+};
+
+/**
+ * A write executor whose per-kind failure is a mutable set, so a test can make one kind fail and then
+ * clear it, exactly as a real `git`/`gh` call recovers between reconcile passes.
+ */
+const flakyWriteExecutor = (): {
+  readonly checker: WriteExecutorPort;
+  readonly writes: RecordedWrite[];
+  readonly failing: Set<string>;
+} => {
+  const writes: RecordedWrite[] = [];
+  const failing = new Set<string>();
+  const checker: WriteExecutorPort = (intent, context) => {
+    writes.push({ kind: intent.kind, mergeCommit: context.mergeCommit });
+    context.emit('write.attempted', { intent_id: intent.intent_id, kind: intent.kind, target: intent.target });
+    if (failing.has(intent.kind)) {
+      context.emit('write.failed', {
+        intent_id: intent.intent_id,
+        kind: intent.kind,
+        target: intent.target,
+        code: 'write.push_failed',
+        reason: 'the test double is failing this kind for now',
+      });
+      return Promise.resolve({
+        status: 'failed' as const,
+        error: makeError('write.push_failed', 'the test double is failing this kind for now'),
+      });
+    }
+    context.emit('write.executed', {
+      intent_id: intent.intent_id,
+      kind: intent.kind,
+      target: intent.target,
+      already_present: false,
+      detail: 'recorded by the test double',
+    });
+    return Promise.resolve({
+      status: 'executed' as const,
+      alreadyPresent: false,
+      detail: 'recorded by the test double',
+    });
+  };
+  return { checker, writes, failing };
+};
+
+/** A merge checker whose answer is a mutable field, so one test can change it mid-run. */
+const controllableMergeChecker = (): { readonly checker: MergeCheckPort; readonly state: { calls: number; answer: MergeCheck } } => {
+  const state = { calls: 0, answer: { state: 'OPEN', mergeCommit: null } as MergeCheck };
+  const checker: MergeCheckPort = () => {
+    state.calls += 1;
+    return Promise.resolve(state.answer);
+  };
+  return { checker, state };
+};
+
+describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
+  const buildRun = (): {
+    readonly reconciler: Reconciler;
+    readonly run: string;
+    readonly writes: RecordedWrite[];
+    readonly merge: ReturnType<typeof controllableMergeChecker>;
+  } => {
+    const orchHome = makeHome('awaiting-merge');
+    toRemove.push(orchHome);
+    const plan = makePlan({ feature: 'awaiting-merge-wiring', steps: STANDARD_PLAN_STEPS });
+    const writes: RecordedWrite[] = [];
+    const merge = controllableMergeChecker();
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(plan),
+      baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+      executor: createScriptedExecutor(committingCapableScript()),
+      writeExecutor: recordingWriteExecutor(writes),
+      mergeChecker: merge.checker,
+    });
+    toClose.push(reconciler);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+    return { reconciler, run: accepted.run, writes, merge };
+  };
+
+  /**
+   * Analyse, plan, implement, test, verify, commit — one pass each, `STANDARD_PLAN_STEPS`'s own order —
+   * then the pass that executes the pre-merge intents and transitions to `awaiting_merge`. Seven passes,
+   * exactly: `tests/engine.committer.test.ts` already drives the same six steps to a completed `commit`
+   * step in six, and this story adds exactly one more action (the `advance-state` that now settles the
+   * write surface before it can claim `committed`).
+   */
+  const driveToAwaitingMerge = async (reconciler: Reconciler): Promise<void> => {
+    for (let index = 0; index < 7; index += 1) await reconciler.pass();
+  };
+
+  it('lands git_push and pull_request and enters awaiting_merge, not committed (matrix row 1)', async () => {
+    const { reconciler, run, writes } = buildRun();
+    await driveToAwaitingMerge(reconciler);
+
+    expect(reconciler.load(run).state.state).toBe('awaiting_merge');
+    expect(writes.map((write) => write.kind)).toStrictEqual(['git_push', 'pull_request']);
+    // Neither pre-merge intent ever sees a merge commit: it does not exist yet.
+    expect(writes.every((write) => write.mergeCommit === null)).toBe(true);
+  });
+
+  it('makes one bounded check and writes no note while the pull request is still open (matrix row 4)', async () => {
+    const { reconciler, run, writes, merge } = buildRun();
+    await driveToAwaitingMerge(reconciler);
+    writes.length = 0; // isolate the merge-check pass under test from the setup above
+
+    await reconciler.pass();
+
+    expect(merge.state.calls).toBe(1);
+    expect(reconciler.load(run).state.state).toBe('awaiting_merge');
+    expect(writes).toStrictEqual([]);
+  });
+
+  it('writes the note on the real merge commit and reaches committed once merged (matrix row 5)', async () => {
+    const { reconciler, run, writes, merge } = buildRun();
+    await driveToAwaitingMerge(reconciler);
+    const mergeCommit = 'f'.repeat(40);
+    merge.state.answer = { state: 'MERGED', mergeCommit };
+    writes.length = 0;
+
+    await reconciler.pass();
+
+    expect(reconciler.load(run).state.state).toBe('committed');
+    expect(writes).toStrictEqual([{ kind: 'git_note', mergeCommit }]);
+
+    const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+    const attempted = events.filter(
+      (event) => event.type === 'write.attempted' && event.payload['kind'] === 'git_note',
+    );
+    const executed = events.filter(
+      (event) => event.type === 'write.executed' && event.payload['kind'] === 'git_note',
+    );
+    expect(attempted).toHaveLength(1);
+    expect(executed).toHaveLength(1);
+  });
+
+  /**
+   * The exactly-once claim, demonstrated at the reach this suite can reach without two real engine
+   * processes racing one lock. `write.attempted`/`write.executed` are the row's real guarantee (AD-15,
+   * proven above); what this test adds is that once `committed` is reached — a terminal state — no
+   * further pass performs another write at all: `decideAction`'s very first test is
+   * `isTerminalFeatureState`, so a second and third pass never even reach the write executor. AD-29's
+   * single-writer claim on the run's own log is what would serialise two truly concurrent passes; that
+   * mechanism is `src/runtime/recorder.ts`'s own subject and is exercised by its own suite, not repeated
+   * here.
+   */
+  it('performs no further write once committed, across repeated later passes (matrix row 7)', async () => {
+    const { reconciler, run, writes, merge } = buildRun();
+    await driveToAwaitingMerge(reconciler);
+    merge.state.answer = { state: 'MERGED', mergeCommit: 'f'.repeat(40) };
+    await reconciler.pass();
+    expect(reconciler.load(run).state.state).toBe('committed');
+    writes.length = 0;
+
+    await reconciler.pass();
+    await reconciler.pass();
+
+    expect(writes).toStrictEqual([]);
+  });
+
+  it('surfaces a closed-without-merging pull request to a person rather than checking forever', async () => {
+    const { reconciler, run, merge } = buildRun();
+    await driveToAwaitingMerge(reconciler);
+    merge.state.answer = { state: 'CLOSED', mergeCommit: null };
+
+    await reconciler.pass();
+
+    expect(reconciler.load(run).state.state).toBe('blocked');
+  });
+
+  /**
+   * `settlePreMergeWrites`'s `'unsettled'` return, exercised through a real reconciler pass rather than
+   * asserted about the private method directly: a failed write neither commits nor enters
+   * `awaiting_merge`, and the run stays exactly where the failure found it.
+   */
+  it('does not enter awaiting_merge when a pre-merge write fails, and retries from the top once it clears', async () => {
+    const orchHome = makeHome('awaiting-merge-unsettled');
+    toRemove.push(orchHome);
+    const plan = makePlan({ feature: 'awaiting-merge-unsettled', steps: STANDARD_PLAN_STEPS });
+    const flaky = flakyWriteExecutor();
+    flaky.failing.add('git_push');
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(plan),
+      baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+      executor: createScriptedExecutor(committingCapableScript()),
+      writeExecutor: flaky.checker,
+    });
+    toClose.push(reconciler);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    for (let index = 0; index < 6; index += 1) await reconciler.pass(); // analyse .. commit
+    await reconciler.pass(); // the settlement pass: git_push fails, so this is 'unsettled'
+
+    expect(reconciler.load(accepted.run).state.state).not.toBe('awaiting_merge');
+    expect(reconciler.load(accepted.run).state.state).not.toBe('committed');
+    expect(flaky.writes.map((write) => write.kind)).toStrictEqual(['git_push']);
+
+    // The failure clears; the next pass retries from the top and this time settles all the way through.
+    flaky.failing.delete('git_push');
+    flaky.writes.length = 0;
+    await reconciler.pass();
+
+    expect(reconciler.load(accepted.run).state.state).toBe('awaiting_merge');
+    expect(flaky.writes.map((write) => write.kind)).toStrictEqual(['git_push', 'pull_request']);
+  });
+
+  /**
+   * The partial-settlement case: `git_push` already `executed`, `pull_request` not yet. A retry must
+   * resume from `writeIntentSettled`'s reading of the log, never re-attempt the whole set from scratch —
+   * proven by asserting `git_push` is not called a second time on the pass that finally succeeds.
+   */
+  it('resumes a partially settled write via the log rather than re-attempting from scratch', async () => {
+    const orchHome = makeHome('awaiting-merge-partial');
+    toRemove.push(orchHome);
+    const plan = makePlan({ feature: 'awaiting-merge-partial', steps: STANDARD_PLAN_STEPS });
+    const flaky = flakyWriteExecutor();
+    flaky.failing.add('pull_request');
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(plan),
+      baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+      executor: createScriptedExecutor(committingCapableScript()),
+      writeExecutor: flaky.checker,
+    });
+    toClose.push(reconciler);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    for (let index = 0; index < 6; index += 1) await reconciler.pass();
+    await reconciler.pass(); // git_push succeeds; pull_request fails -> 'unsettled'
+
+    expect(flaky.writes.map((write) => write.kind)).toStrictEqual(['git_push', 'pull_request']);
+    expect(reconciler.load(accepted.run).state.state).not.toBe('awaiting_merge');
+
+    flaky.failing.delete('pull_request');
+    flaky.writes.length = 0;
+    await reconciler.pass();
+
+    // git_push is not attempted a second time: `writeIntentSettled` found its `write.executed` line.
+    expect(flaky.writes.map((write) => write.kind)).toStrictEqual(['pull_request']);
+    expect(reconciler.load(accepted.run).state.state).toBe('awaiting_merge');
+  });
+});
+
+/**
+ * AD-24 — `awaiting_merge` joins `PERSON_WAITING_STATES` (matrix row 8), demonstrated the same way the
+ * wall clock is proven for `drafting`/`blocked` elsewhere: `measureConsumption` folds a synthetic log and
+ * the reading excludes the waiting window rather than counting it.
+ */
+describe('AD-24 — awaiting_merge is excluded from the wall-clock ceiling (matrix row 8)', () => {
+  it('subtracts the time spent waiting for a merge from the measured wall clock', () => {
+    const run = '01JBQ8Z1X2Y3W4V5U6T7S8R9Q0';
+    const feature = 'awaiting-merge-ceiling';
+    const plan = makePlan({ feature });
+
+    const envelope = (
+      seq: number,
+      ts: string,
+      type: string,
+      payload: Record<string, unknown> = {},
+    ): EventEnvelope => ({ ts, seq, feature, run, step: null, emitter: ENGINE_EMITTER, type, payload });
+
+    const events: EventEnvelope[] = [
+      envelope(1, '2026-09-24T00:00:00.000Z', ENGINE_EVENT_TYPES.RunCreated, { mode: 'live' }),
+      envelope(2, '2026-09-24T00:05:00.000Z', ENGINE_EVENT_TYPES.FeatureStateChanged, {
+        from: 'confirmed',
+        to: 'running',
+        reason: 'the reconciler claims the first step',
+      }),
+      // Five minutes of *working* time elapses (00:05 to 00:10) before the run waits for a merge. The
+      // five minutes before that is `drafting`, itself a `PERSON_WAITING_STATES` member, so it is
+      // excluded on its own account — the assertion below isolates the one window that is neither.
+      envelope(3, '2026-09-24T00:10:00.000Z', ENGINE_EVENT_TYPES.FeatureStateChanged, {
+        from: 'running',
+        to: 'awaiting_merge',
+        reason: 'the push and pull-request intents have landed',
+      }),
+    ];
+    const state = rebuildFromLog(events, { run, plan });
+    expect(state.state).toBe('awaiting_merge');
+
+    // A person sits on the merge for a further 24 hours the ceiling must never see.
+    const now = new Date('2026-09-25T00:10:00.000Z');
+    const consumption = measureConsumption({ state, events, now });
+
+    // Elapsed since creation is 24h10m; `drafting` (00:00–00:05) and `awaiting_merge` (00:10 onward) are
+    // both excluded, leaving only the five `running` minutes in between — never the 24 hours of waiting.
+    expect(consumption.wallClockMs).toBe(5 * 60 * 1000);
   });
 });

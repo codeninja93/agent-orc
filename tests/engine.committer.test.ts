@@ -484,15 +484,36 @@ describe('the engine performs no push, pull request or note write (matrix 20)', 
     expect(files).toContain('engine/committer.ts');
   });
 
-  it('finds none anywhere under src/', () => {
+  /**
+   * The one file this story's own docblock named in advance: "the executor is story 2-11's".
+   *
+   * `engine/write-executor.ts` is that executor, landed by story 2-11 — it is the enumerated AD-15 write
+   * surface's one performer, and its whole job is exactly what every other file under `src/` is held to
+   * never doing. Named by exact path rather than by a pattern, so a second file quietly growing the same
+   * capability is still caught.
+   */
+  const EXECUTOR_FILE = 'engine/write-executor.ts';
+
+  it('finds none anywhere under src/ but the one file that is the executor', () => {
     const offenders = new Map<string, readonly PerformedWrite[]>();
     for (const file of files) {
+      if (file === EXECUTOR_FILE) continue;
       const performed = performedWritesIn(file, readFileSync(new URL(file, sourceRoot), 'utf8'));
       if (performed.length > 0) offenders.set(file, performed);
     }
     expect(
       [...offenders.entries()].map(([file, writes]) => `${file}: ${JSON.stringify(writes)}`),
     ).toStrictEqual([]);
+  });
+
+  it('confirms the one exemption is real and not just declared', () => {
+    // If write-executor.ts stopped performing any of the three writes, this guard's exemption would be
+    // dead weight — worth knowing, since a dead exemption is a door left open for the next file.
+    const performed = performedWritesIn(
+      EXECUTOR_FILE,
+      readFileSync(new URL(EXECUTOR_FILE, sourceRoot), 'utf8'),
+    );
+    expect(performed.length).toBeGreaterThan(0);
   });
 
   /**

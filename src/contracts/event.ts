@@ -277,6 +277,54 @@ export const COMMIT_COMPOSED_PAYLOAD_KEYS = {
 } as const;
 
 /**
+ * Story 2-11 — AD-15's durable-before-write pair, plus the outcome a failed call leaves behind.
+ *
+ * `write.attempted` is durable before the underlying `git`/`gh` call, per AD-15's fixed ordering.
+ * `write.executed` follows a call that landed (or a reconciliation check that found it already had).
+ * `write.failed` is the third outcome: the call did not land, so `write.executed` is never written for
+ * that attempt, and the *absence* of one is what tells a later pass — or a person reading the log — that
+ * this intent still needs the reconciliation check run again before anything is retried. It is spelled
+ * out here, once, so `src/engine/write-executor.ts` (the one file allowed to perform a write) and every
+ * reader use the same three strings.
+ */
+export const WRITE_ATTEMPTED_EVENT_TYPE = 'write.attempted';
+export const WRITE_EXECUTED_EVENT_TYPE = 'write.executed';
+export const WRITE_FAILED_EVENT_TYPE = 'write.failed';
+
+/** The payload keys every `write.attempted` line carries — the intent, named, before the call. */
+export const WRITE_ATTEMPTED_PAYLOAD_KEYS = {
+  /** The AD-15 idempotency key with the run id: `{step}.{kind}`, never minted. */
+  IntentId: 'intent_id',
+  Kind: 'kind',
+  Target: 'target',
+} as const;
+
+/**
+ * The payload keys a `write.executed` line carries: the intent, and enough of the outcome to
+ * reconstruct what happened without re-deriving it (a re-run's reconciliation check answers the same
+ * question again from the target, never from this line — it exists for a person and a replay, not as
+ * an authority the executor reads back).
+ */
+export const WRITE_EXECUTED_PAYLOAD_KEYS = {
+  IntentId: 'intent_id',
+  Kind: 'kind',
+  Target: 'target',
+  /** True when the check found the write already reflected on the target and the call was never made. */
+  AlreadyPresent: 'already_present',
+  /** One line, short and punctuated, stating what happened. Never a raw commit SHA or URL body. */
+  Detail: 'detail',
+} as const;
+
+/** The payload keys a `write.failed` line carries: the intent, and the AD-35 error it failed with. */
+export const WRITE_FAILED_PAYLOAD_KEYS = {
+  IntentId: 'intent_id',
+  Kind: 'kind',
+  Target: 'target',
+  Code: 'code',
+  Reason: 'reason',
+} as const;
+
+/**
  * The declared event vocabulary. Dot-namespaced and past-tense. The vocabulary is open by
  * design: a reader meeting a type absent from this list accepts the envelope and ignores the
  * event, so later stories add types without a breaking change.
@@ -285,8 +333,9 @@ export const EVENT_TYPES = [
   'step.started',
   'agent.tool_used',
   'fetch.recorded',
-  'write.attempted',
-  'write.executed',
+  WRITE_ATTEMPTED_EVENT_TYPE,
+  WRITE_EXECUTED_EVENT_TYPE,
+  WRITE_FAILED_EVENT_TYPE,
   'permission.denied',
   'redaction.failed',
   BUDGET_DEGRADED_EVENT_TYPE,

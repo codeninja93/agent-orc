@@ -45,6 +45,15 @@ export const FEATURE_STATES = [
   'degraded',
   'interrupted',
   'verifying',
+  /**
+   * Story 2-11 — between the write-executor's `git_push`/`pull_request` intents landing and the AD-22
+   * note being written. Non-terminal: AD-32 reclaims a run's resources on reaching a terminal state, and
+   * the note's own commit (the merge commit) does not exist until a human merges the pull request, so
+   * `committed` cannot mean "pushed and opened" without the worktree being reclaimed out from under it.
+   * `PERSON_WAITING_STATES` in `src/engine/ceilings.ts` excludes this wait from the wall-clock ceiling,
+   * the same way `drafting`/`blocked` already are: this is the run waiting on a person, not spending.
+   */
+  'awaiting_merge',
   'committed',
   'hibernated',
   'killed',

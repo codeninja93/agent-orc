@@ -107,6 +107,7 @@ export * from './roster.js';
 export * from './agents.js';
 export * from './config-snapshot.js';
 export * from './committer.js';
+export * from './write-executor.js';
 export * from './deflection.js';
 export * from './question-merge.js';
 export * from './deflection-rate.js';

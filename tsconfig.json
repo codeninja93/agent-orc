@@ -33,7 +33,8 @@
     "paths": {
       "agent-orcastrator/installer": ["./src/installer/index.ts"],
       "agent-orcastrator/runner": ["./src/runner/index.ts"],
-      "agent-orcastrator/tool-servers/jira": ["./src/tool-servers/jira/index.ts"]
+      "agent-orcastrator/tool-servers/jira": ["./src/tool-servers/jira/index.ts"],
+      "agent-orcastrator/assembly": ["./src/assembly/index.ts"]
     }
   },
   "include": [
