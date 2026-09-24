@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "run": "01JDEMO000000000000000000",
+  "feature": "story-2-11-write-surface-demo",
+  "branch": "demo/story-2-11-write-surface",
+  "steps": [
+    {
+      "step": "demo",
+      "phase": "implementation",
+      "disposition": "completed"
+    }
+  ],
+  "acceptance_criteria": [
+    "A real push, pull request and AD-22 note are demonstrated against this repository."
+  ],
+  "usage": {
+    "input_tokens": null,
+    "output_tokens": null,
+    "cache_read_input_tokens": null,
+    "cache_creation_input_tokens": null
+  },
+  "decisions": []
+}
