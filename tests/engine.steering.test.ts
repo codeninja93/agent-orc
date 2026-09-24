@@ -19,11 +19,12 @@ import {
   commandRequiresArgument,
   makeError,
 } from '../src/contracts/index.js';
-import type { Command, CommandIntent, RunState, StepRecord } from '../src/contracts/index.js';
+import type { Command, CommandIntent, PendingGate, RunState, StepRecord } from '../src/contracts/index.js';
 import { readEventLog, runPaths } from '../src/runtime/index.js';
 import {
   COMMAND_EVENT_TYPES,
   COMMAND_HANDLING,
+  GATE_REJECTED_HANDOFF_CODE,
   HONOURED_COMMANDS,
   commandAvailabilities,
   QUESTION_COMMANDS,
@@ -115,6 +116,7 @@ const aState = (overrides: Partial<RunState> = {}): RunState => ({
   updated_at: '2026-09-20T10:00:00.000Z',
   handoff: null,
   degradation: null,
+  pending_gate: null,
   ...overrides,
 });
 
@@ -555,6 +557,163 @@ describe('approving the gate a step blocked at', () => {
     // Nothing is rewritten: only the run state moves.
     expect(decision.effect.step).toBeNull();
     expect(decision.effect.stepDisposition).toBeNull();
+  });
+});
+
+/** A pending AD-12 gate, as `RunState.pending_gate` carries one. */
+const aGate = (overrides: Partial<PendingGate> = {}): PendingGate => ({
+  step: 'commit',
+  intent_id: 'commit.git_push',
+  kind: 'git_push',
+  reversibility: 'irreversible',
+  batch: [
+    { intent_id: 'commit.git_push', kind: 'git_push' },
+    { intent_id: 'commit.pull_request', kind: 'pull_request' },
+  ],
+  resolution: 'pending',
+  ...overrides,
+});
+
+describe('story 4-1 — a pending AD-12 gate is resolved, never mistaken for a step failure', () => {
+  it('approving a gated run emits a gateResolution and touches no step (matrix row 2)', () => {
+    const state = aState({ state: 'blocked', pending_gate: aGate() });
+    const decision = decideSteering(anIntent('approve'), state, noneApplied);
+    expect(decision.kind).toBe('apply');
+    if (decision.kind !== 'apply') return;
+    expect(decision.effect.toState).toBe('running');
+    expect(decision.effect.step).toBeNull();
+    expect(decision.effect.stepDisposition).toBeNull();
+    expect(decision.effect.clearsStepError).toBe(false);
+    expect(decision.effect.gateResolution).toStrictEqual({
+      intentId: 'commit.git_push',
+      outcome: 'approved',
+    });
+  });
+
+  it('returns a degraded run to degraded, not running, once its gate is approved (AD-24)', () => {
+    const state = aState({
+      state: 'blocked',
+      pending_gate: aGate(),
+      degradation: { dimension: 'steps', recorded_at: '2026-09-20T10:00:00.000Z' },
+    });
+    const decision = decideSteering(anIntent('approve'), state, noneApplied);
+    expect(decision.kind).toBe('apply');
+    if (decision.kind !== 'apply') return;
+    expect(decision.effect.toState).toBe('degraded');
+  });
+
+  it('rejecting a gated run emits a gateResolution and hands the run off with the reason (matrix row 4)', () => {
+    const state = aState({ state: 'blocked', pending_gate: aGate() });
+    const decision = decideSteering(
+      anIntent('reject', null, 'this push touches a path nobody reviewed'),
+      state,
+      noneApplied,
+    );
+    expect(decision.kind).toBe('apply');
+    if (decision.kind !== 'apply') return;
+    expect(decision.effect.toState).toBe('handed_off');
+    expect(decision.effect.step).toBeNull();
+    expect(decision.effect.stepDisposition).toBeNull();
+    expect(decision.effect.gateResolution).toStrictEqual({
+      intentId: 'commit.git_push',
+      outcome: 'rejected',
+    });
+    expect(decision.effect.handoff?.code).toBe(GATE_REJECTED_HANDOFF_CODE);
+    expect(decision.effect.handoff?.reason).toContain('this push touches a path nobody reviewed');
+  });
+
+  it('refuses a blank reject at a gate rather than recording an empty decision', () => {
+    const state = aState({ state: 'blocked', pending_gate: aGate() });
+    const blank = anUnvalidatedIntent('reject', '   ');
+    const decision = decideSteering(blank, state, noneApplied);
+    expect(decision.kind).toBe('refuse');
+    if (decision.kind !== 'refuse') return;
+    expect(decision.reason).toBe('missing-answer');
+  });
+
+  it('leaves approve/reject byte-for-byte unchanged when no gate is pending (matrix row 5)', () => {
+    // No gate, an ordinary running state: approve still refuses `wrong-target-state`, exactly as before
+    // this story, because `pending_gate` is `null` here.
+    const approveDecision = decideSteering(anIntent('approve'), aState({ state: 'running' }), noneApplied);
+    expect(approveDecision.kind).toBe('refuse');
+    if (approveDecision.kind === 'refuse') expect(approveDecision.reason).toBe('wrong-target-state');
+
+    // No gate, no open question: reject still falls through to its pre-existing question handling.
+    const rejectDecision = decideSteering(
+      anIntent('reject', null, 'use the first option'),
+      aState(),
+      noneApplied,
+    );
+    expect(rejectDecision.kind).toBe('resolve-question');
+  });
+
+  describe('round-1 review — resolution decides everything, never pending_gate !== null alone', () => {
+    it('refuses a later approve once the gate was already rejected, rather than silently resuming (matrix row 11)', () => {
+      const state = aState({ state: 'blocked', pending_gate: aGate({ resolution: 'rejected' }) });
+      const decision = decideSteering(anIntent('approve'), state, noneApplied);
+      expect(decision.kind).toBe('refuse');
+      if (decision.kind !== 'refuse') return;
+      expect(decision.reason).toBe('wrong-target-state');
+      expect(decision.detail).toContain('already rejected');
+    });
+
+    it('re-emits only the state transition for a redelivered approve, never a second gateResolution (matrix row 12)', () => {
+      const state = aState({ state: 'blocked', pending_gate: aGate({ resolution: 'approved' }) });
+      const decision = decideSteering(anIntent('approve'), state, noneApplied);
+      expect(decision.kind).toBe('apply');
+      if (decision.kind !== 'apply') return;
+      expect(decision.effect.toState).toBe('running');
+      expect(decision.effect.gateResolution).toBeNull();
+    });
+
+    it('refuses to reject a gate that was already approved', () => {
+      const state = aState({ state: 'blocked', pending_gate: aGate({ resolution: 'approved' }) });
+      const decision = decideSteering(anIntent('reject', null, 'too late now'), state, noneApplied);
+      expect(decision.kind).toBe('refuse');
+      if (decision.kind !== 'refuse') return;
+      expect(decision.reason).toBe('wrong-target-state');
+      expect(decision.detail).toContain('already approved');
+    });
+
+    it('re-emits only the hand-off transition for a redelivered reject, never a second gateResolution', () => {
+      const state = aState({ state: 'blocked', pending_gate: aGate({ resolution: 'rejected' }) });
+      const decision = decideSteering(
+        anIntent('reject', null, 'this push touches a path nobody reviewed'),
+        state,
+        noneApplied,
+      );
+      expect(decision.kind).toBe('apply');
+      if (decision.kind !== 'apply') return;
+      expect(decision.effect.toState).toBe('handed_off');
+      expect(decision.effect.gateResolution).toBeNull();
+      expect(decision.effect.handoff?.code).toBe(GATE_REJECTED_HANDOFF_CODE);
+    });
+
+    it('refuses a reject naming both a pending gate and an open question, resolving neither (matrix row 10)', () => {
+      const state = aState({ state: 'blocked', pending_gate: aGate() });
+      const decision = decideSteering(anIntent('reject', null, 'which one is this about?'), state, {
+        applied: new Map(),
+        activeQuestionId: 'q-01',
+      });
+      expect(decision.kind).toBe('refuse');
+      if (decision.kind !== 'refuse') return;
+      expect(decision.reason).toBe('ambiguous-target');
+      expect(decision.detail).toContain('commit.git_push');
+      expect(decision.detail).toContain('q-01');
+    });
+
+    it('does not treat an approved or rejected gate as ambiguous, even with an open question', () => {
+      // The ambiguity only exists while the gate itself is undecided (`resolution: 'pending'`): once it
+      // has an answer, a further reject can only be a redelivery or a (refused) attempt to reverse it.
+      const approved = aState({ state: 'blocked', pending_gate: aGate({ resolution: 'approved' }) });
+      const decision = decideSteering(anIntent('reject', null, 'too late'), approved, {
+        applied: new Map(),
+        activeQuestionId: 'q-01',
+      });
+      expect(decision.kind).toBe('refuse');
+      if (decision.kind !== 'refuse') return;
+      expect(decision.reason).toBe('wrong-target-state');
+    });
   });
 });
 

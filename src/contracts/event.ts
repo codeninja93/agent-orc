@@ -353,6 +353,77 @@ export const WRITE_SUPPRESSED_PAYLOAD_KEYS = {
 } as const;
 
 /**
+ * Story 4-1 — AD-12's reversibility gate, said durably rather than only decided in memory.
+ *
+ * **`write.gate_opened` is what `settlePreMergeWrites` emits in place of calling the write executor**,
+ * for the first not-yet-settled intent of a composed commit whose `reversibility` is one of the
+ * project's `gated_reversibility_classes` (`PermissionsSchema`, `src/contracts/installer.ts`). One line
+ * per gate, never one per intent settled after it opens: `settlePreMergeWrites` checks the run's own
+ * `pending_gate` record (never a per-intent `write.gate_approved` lookup — round-1 review's fix, see
+ * {@link WRITE_GATE_APPROVED_EVENT_TYPE}'s own docblock) before ever opening a second one.
+ *
+ * **`batch` discloses the whole remaining batch, not only the intent whose class triggered the check —
+ * added in round-1 review.** `settlePreMergeWrites`'s settlement loop has no gate check inside it: once
+ * this one gate clears, every intent still unsettled at open time runs in the same pass. The first
+ * version's payload named only the triggering intent, understating what one approval actually authorises;
+ * `batch` lists every one of them (kind and target each), so a person approving sees the real blast
+ * radius.
+ *
+ * **`write.gate_approved`/`write.gate_rejected` are the only two ways a gate closes, and neither clears it
+ * — round-1 review's most serious finding.** Each is recorded by `applyIntent` alongside the
+ * `command.applied` line that retires the `approve`/`reject` intent — before it, for the reason
+ * `handoff.recorded` is: a crash between the two redelivers the intent rather than losing the resolution.
+ * The first version folded either line straight to `pending_gate: null`, which raced the *separate*
+ * `feature.state_changed` line the same effect also emits: a crash landing the resolution durably but not
+ * the state change left the fold reporting no gate at all while the run was still `blocked` — for a
+ * rejection, a later `Command.Approve` would then find nothing to refuse against and silently reverse it.
+ * Fixed: these two lines set `resolution: 'approved'`/`'rejected'` on the *existing* `pending_gate` record
+ * (`src/contracts/state.ts`'s `PendingGateSchema`); only the `feature.state_changed` line that follows,
+ * once it actually lands, clears the record to `null`. Approval carries only the `intent_id`; nothing else
+ * about the write changed. Rejection carries the person's own reason text, which
+ * `ARGUMENT_REQUIRED_COMMANDS` already guarantees `Command.Reject` never reaches here without
+ * (`src/contracts/command.ts`).
+ */
+export const WRITE_GATE_OPENED_EVENT_TYPE = 'write.gate_opened';
+export const WRITE_GATE_APPROVED_EVENT_TYPE = 'write.gate_approved';
+export const WRITE_GATE_REJECTED_EVENT_TYPE = 'write.gate_rejected';
+
+/** One entry of a `write.gate_opened` line's `batch` array: enough to disclose the write, never a payload. */
+export const WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS = {
+  IntentId: 'intent_id',
+  Kind: 'kind',
+  Target: 'target',
+} as const;
+
+/** The payload keys a `write.gate_opened` line carries: the intent, its class, and the step it came from. */
+export const WRITE_GATE_OPENED_PAYLOAD_KEYS = {
+  /** The AD-15 idempotency key of the intent whose `reversibility` triggered the gate. */
+  IntentId: 'intent_id',
+  Kind: 'kind',
+  Target: 'target',
+  /** The class that gated it — always one of the project's own `gated_reversibility_classes`. */
+  Reversibility: 'reversibility',
+  /** The committing step this write's intent belongs to. Never a step that failed: none did. */
+  Step: 'step',
+  /**
+   * Every intent still unsettled when this gate opened, `IntentId`'s own included — the whole remaining
+   * batch one approval or rejection covers, each shaped by {@link WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS}.
+   */
+  Batch: 'batch',
+} as const;
+
+/** The payload keys a `write.gate_approved` line carries: the intent, and nothing else. */
+export const WRITE_GATE_APPROVED_PAYLOAD_KEYS = {
+  IntentId: 'intent_id',
+} as const;
+
+/** The payload keys a `write.gate_rejected` line carries: the intent, and the person's own reason text. */
+export const WRITE_GATE_REJECTED_PAYLOAD_KEYS = {
+  IntentId: 'intent_id',
+  Reason: 'reason',
+} as const;
+
+/**
  * Story 3-2 (AD-27) — the one raw, per-run result a shadow run produces: its resulting worktree tree
  * compared against the real merge commit it was shadowing (`src/engine/shadow.ts`'s `compareShadowRun`).
  * Emitted once, whether the comparison succeeded or failed — a failure to produce it is durably recorded
@@ -480,6 +551,10 @@ export const EVENT_TYPES = [
   SHADOW_COMPARED_EVENT_TYPE,
   /** Story 3-3 — a confirmed merge's head-branch tree compared against its merge commit's tree. */
   PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
+  /** Story 4-1 — AD-12's reversibility gate opened, and the two ways it closes. */
+  WRITE_GATE_OPENED_EVENT_TYPE,
+  WRITE_GATE_APPROVED_EVENT_TYPE,
+  WRITE_GATE_REJECTED_EVENT_TYPE,
 ] as const;
 
 export type DeclaredEventType = (typeof EVENT_TYPES)[number];

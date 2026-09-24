@@ -27,6 +27,7 @@ import {
   AgentDeclarationSchema,
   CURRENT_SCHEMA_VERSION,
   PROFILE_SCHEMA_VERSION,
+  GATED_REVERSIBILITY_CLASSES,
   KnowledgeSectionSchema,
   MANIFEST_FILE_NAME,
   ManifestSchema,
@@ -65,9 +66,6 @@ export const GITIGNORE_LINES: readonly string[] = ['.orch/**/*.tmp'];
 
 /** Written above the lines on a first append, and never matched against, so it never duplicates. */
 export const GITIGNORE_HEADER = '# agent-orchestrator runtime paths (AD-9); .orch/ itself is committed.';
-
-/** The reversibility classes that stop for a person. CAP-12: an irreversible action is gated. */
-export const GATED_REVERSIBILITY_CLASSES = ['irreversible'] as const;
 
 export type WriteDisposition = 'created' | 'updated' | 'unchanged';
 

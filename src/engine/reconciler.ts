@@ -52,6 +52,7 @@ import {
   COMMIT_COMPOSED_EVENT_TYPE,
   COMMIT_COMPOSED_PAYLOAD_KEYS,
   DETERMINISTIC_GATE_NAMES,
+  GATED_REVERSIBILITY_CLASSES,
   NOTE_REF,
   composedProseIn,
   totalUsage,
@@ -74,6 +75,13 @@ import {
   SpecRecordedPayloadSchema,
   StepInputSchema,
   USAGE_PAYLOAD_KEY,
+  WRITE_GATE_APPROVED_EVENT_TYPE,
+  WRITE_GATE_APPROVED_PAYLOAD_KEYS,
+  WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS,
+  WRITE_GATE_OPENED_EVENT_TYPE,
+  WRITE_GATE_OPENED_PAYLOAD_KEYS,
+  WRITE_GATE_REJECTED_EVENT_TYPE,
+  WRITE_GATE_REJECTED_PAYLOAD_KEYS,
   compareEventOrder,
   featureStateFingerprint,
   findStepRecord,
@@ -100,6 +108,7 @@ import type {
   OrchError,
   Principal,
   QuestionDraft,
+  ReversibilityClass,
   StepPhase,
   QuestionState,
   RunState,
@@ -213,7 +222,7 @@ import type { TerritoryCandidate, TerritoryDeferral } from './territory.js';
 import { EngineLock } from './lock.js';
 import { resolveAgentGrant } from './agents.js';
 import { readStepConfiguration } from './config-snapshot.js';
-import { ProfileNotFound } from './profile.js';
+import { ProfileNotFound, loadPermissions } from './profile.js';
 import { decisionsInLog } from './decision.js';
 import {
   BranchPatternRefused,
@@ -1131,6 +1140,35 @@ export class UnreadableGateConfiguration extends Error {
 }
 
 /**
+ * Story 4-1's Never list — a composed commit whose intents disagree about `reversibility`.
+ *
+ * `settlePreMergeWrites` reads only the first not-yet-settled intent's class and treats one gate decision
+ * as covering the whole remaining batch, which is only sound while `COMMIT_WRITE_REVERSIBILITY`
+ * (`src/engine/committer.ts`) really does class every intent of a composed commit alike — true of every
+ * write kind this build implements, and asserted here rather than silently trusted, so a future write kind
+ * that broke the assumption would fail loudly instead of quietly under-gating a higher-class intent riding
+ * in the same batch as an approved lower-class one. Deliberately left uncaught by its one call site, the
+ * same treatment `ComposedCommitUnreadable` already gets: there is no recovery to route an assumption this
+ * method's own logic depends on being false to.
+ */
+export class MixedReversibilityBatch extends Error {
+  readonly code = 'internal.invariant_violated';
+  readonly run: string;
+
+  constructor(run: string, classified: readonly string[]) {
+    super(
+      `Refusing to settle the composed commit for run ${run}: its intents do not share one reversibility ` +
+        `class (${classified.join(', ')}), but COMMIT_WRITE_REVERSIBILITY classes a whole composed commit ` +
+        'uniformly and settlePreMergeWrites reads only the first unsettled intent\'s class for the whole ' +
+        'remaining batch. Treating one gate decision as covering intents of a class nobody checked would ' +
+        'silently under-gate whichever of them is more irreversible than the one actually approved.',
+    );
+    this.name = 'MixedReversibilityBatch';
+    this.run = run;
+  }
+}
+
+/**
  * The run's profile exists and cannot be read, so which ceilings it declares is unknown.
  *
  * Refused rather than answered with {@link DECLARED_FALLBACK_CEILINGS}, for the distinction story 2-6 drew
@@ -1853,7 +1891,15 @@ export class Reconciler {
 
     for (const pending of read.pending) {
       const intent = pending.intent;
-      const decision = decideSteering(intent, state, { applied });
+      /**
+       * Story 4-1, row 10 — read fresh for each intent, exactly as `state` is refreshed after each one
+       * applies: an earlier intent in this same pass (an `answer`, say) can settle the very question a
+       * later `reject` in the same batch would otherwise have found still open.
+       */
+      const decision = decideSteering(intent, state, {
+        applied,
+        activeQuestionId: activeQuestion(paths)?.questionId ?? null,
+      });
       const outcome = (kind: IntentOutcomeKind, reason: string): IntentOutcome => ({
         intentId: intent.intent_id,
         command: intent.command,
@@ -1923,6 +1969,7 @@ export class Reconciler {
               clearsStepError: false,
               escapeHatch: false,
               handoff: null,
+              gateResolution: null,
             },
             resolved.reason,
           );
@@ -2104,6 +2151,35 @@ export class Reconciler {
         step: effect === null ? pending.intent.step : effect.step,
         type: ENGINE_EVENT_TYPES.HandoffRecorded,
         payload: { code: corrected.handoff.code, reason: corrected.handoff.reason },
+      });
+    }
+
+    /**
+     * Story 4-1 — an approved or rejected AD-12 gate reaches the log as its own line, not only as
+     * `command.applied`'s `effect` summary.
+     *
+     * Before `command.applied`, for the reason every other side effect here is: `RunState.pendingGate` is
+     * folded from this line alone, so a crash between this emit and `command.applied` leaves the intent
+     * unretired — the file is still in `commands/`, `decideSteering` sees `pendingGate` already cleared on
+     * the next pass, and applies the run-level transition through its own ordinary-approval branch instead
+     * (`state.state` is still `blocked`, no step is, so `blockedStepOf` still finds none). The opposite
+     * order is the one that cannot be recovered from: `command.applied` landing without this line would
+     * retire the intent with the gate still open in the checkpoint, and nothing would ever revisit it.
+     */
+    if (corrected !== null && corrected.gateResolution !== null) {
+      const { intentId, outcome } = corrected.gateResolution;
+      this.emit(recorder, {
+        step: null,
+        type: outcome === 'approved' ? WRITE_GATE_APPROVED_EVENT_TYPE : WRITE_GATE_REJECTED_EVENT_TYPE,
+        payload:
+          outcome === 'approved'
+            ? { [WRITE_GATE_APPROVED_PAYLOAD_KEYS.IntentId]: intentId }
+            : {
+                [WRITE_GATE_REJECTED_PAYLOAD_KEYS.IntentId]: intentId,
+                // Guaranteed non-blank: `decideSteering`'s own gate-reject branch already refuses a blank
+                // one with `missing-answer`, and `ARGUMENT_REQUIRED_COMMANDS` refuses one at the door.
+                [WRITE_GATE_REJECTED_PAYLOAD_KEYS.Reason]: pending.intent.argument ?? '',
+              },
       });
     }
 
@@ -3244,8 +3320,59 @@ export class Reconciler {
         let to: FeatureState = action.to;
         let reason = action.reason;
         if (action.to === 'committed') {
-          const settlement = await this.settlePreMergeWrites(paths, plan, recorder);
+          const settlement = await this.settlePreMergeWrites(paths, plan, state, recorder);
           if (settlement === 'unsettled') return null;
+          if (settlement === 'gated') {
+            /**
+             * Story 4-1 — CAP-12's success criterion made visible: "irreversible ones block,
+             * demonstrably". `settlePreMergeWrites` has already made `write.gate_opened` durable (or found
+             * one already open, on a re-entered pass — see that method's own docblock) and returned before
+             * calling the write executor at all, so the only thing left here is the same visible signal
+             * every other block in this file gives — a `feature.state_changed` line naming why.
+             *
+             * **Read back by re-folding the log, not by re-parsing the raw event.** `RunState.pending_gate`
+             * already carries everything this reason needs — `intent_id`, `reversibility` and the whole
+             * remaining `batch` — so the fold is the one reader of it, and the two can never say different
+             * things about the same gate the way a hand-rolled second parse of the payload could.
+             *
+             * **The disclosure names every intent in the batch, not only the one that triggered the
+             * check** — round-1 review's fix: one approval settles the whole remaining batch
+             * (`settlePreMergeWrites`'s own settlement loop has no gate check inside it), so a person
+             * reading this reason has to see everything their one decision actually authorises. `target` is
+             * read from the composed commit, since `pending_gate.batch` itself persists only `intent_id`
+             * and `kind` (`PendingGateBatchEntrySchema`'s own docblock says why).
+             */
+            const refreshed = rebuildFromLog(readEventLog(paths.eventLog), {
+              run: paths.runId,
+              plan,
+              now: this.now,
+            });
+            const gate = refreshed.pending_gate;
+            const composed = this.readComposedCommit(paths);
+            const describeBatchEntry = (entry: { readonly intent_id: string; readonly kind: string }): string => {
+              const intent = composed?.intents.find((candidate) => candidate.intent_id === entry.intent_id);
+              return intent === undefined ? entry.kind : `${entry.kind} (${intent.target})`;
+            };
+            this.emit(recorder, {
+              step: null,
+              type: ENGINE_EVENT_TYPES.FeatureStateChanged,
+              payload: {
+                from: state.state,
+                to: 'blocked',
+                reason:
+                  gate === null
+                    ? 'A composed commit\'s write is gated by this project\'s permissions (AD-12), so the ' +
+                      'run stops here rather than performing it unattended. Approve or reject to continue ' +
+                      '(CAP-12).'
+                    : `The write "${gate.intent_id}" is classed "${gate.reversibility}", which this ` +
+                      'project\'s permissions gate behind a person (AD-12). Approving settles the whole ' +
+                      `remaining batch: ${gate.batch.map(describeBatchEntry).join(', ')}. The run stops ` +
+                      'here rather than performing any of it unattended — approve or reject to continue ' +
+                      '(CAP-12).',
+              },
+            });
+            return null;
+          }
           if (settlement === 'awaiting-merge') {
             if (plan.mode === 'shadow') {
               reason =
@@ -4736,25 +4863,102 @@ export class Reconciler {
    *   executor already recorded its own `write.attempted`/`write.failed` lines, so the caller leaves the
    *   run where it is and the next pass tries again from the top, which costs at most one wasted
    *   "already present" lookup on the intent that already succeeded, never a duplicate write.
+   * - `'gated'` — story 4-1. Either a fresh gate just opened (the first not-yet-settled intent's
+   *   `reversibility` is one of this project's `gated_reversibility_classes`, and `write.gate_opened` is
+   *   now durable), or an existing `pending_gate` record was found and is not yet `'approved'` — either
+   *   way the write executor is never called this pass and the caller transitions the run to `blocked`
+   *   rather than to `awaiting_merge`.
    */
   private async settlePreMergeWrites(
     paths: RunPaths,
     plan: FeaturePlan,
+    state: RunState,
     recorder: Recorder,
-  ): Promise<'none' | 'awaiting-merge' | 'unsettled'> {
+  ): Promise<'none' | 'awaiting-merge' | 'unsettled' | 'gated'> {
     if (this.writeExecutor === null) return 'none';
     const composed = this.readComposedCommit(paths);
     if (composed === null) return 'none';
 
+    /**
+     * Never — the whole-batch-one-class assumption `COMMIT_WRITE_REVERSIBILITY` makes today, asserted
+     * rather than silently trusted. Every read below treats the first unsettled intent's `reversibility`
+     * as the whole remaining batch's; a future write kind whose composed intents genuinely disagree would
+     * have this method approve a lower-class intent and silently release a higher-class one riding in the
+     * same batch. Thrown, deliberately uncaught here — the same "a corrupt or impossible artifact escapes
+     * this pass as a refusal" treatment {@link ComposedCommitUnreadable} already gets — because there is
+     * no recovery to route to for an assumption this method's own logic depends on being false.
+     */
+    const reversibilities = new Set(composed.intents.map((intent) => intent.reversibility));
+    if (reversibilities.size > 1) {
+      throw new MixedReversibilityBatch(
+        paths.runId,
+        composed.intents.map((intent) => `${intent.intent_id}:${intent.reversibility}`),
+      );
+    }
+
     const events = readEventLog(paths.eventLog);
     const context = this.writeExecutionContextFor(plan, recorder, composed, null);
+    const remaining = composed.intents.filter(
+      (intent) =>
+        !(intent.kind === 'git_note' && plan.mode !== 'shadow') && !writeIntentSettled(events, intent.intent_id),
+    );
 
-    for (const intent of composed.intents) {
-      // `git_note` is the third composed intent. For a live run it is never performed from here (see this
-      // method's own docblock) — only `git_push` and `pull_request`, in that order. For a shadow run there
-      // is no merge to wait for, so it is settled here too (AD-27).
-      if (intent.kind === 'git_note' && plan.mode !== 'shadow') continue;
-      if (writeIntentSettled(events, intent.intent_id)) continue;
+    /**
+     * Story 4-1, round-1 review — the *existing* `pending_gate` record's `resolution` decides everything
+     * here, never a per-intent `write.gate_approved` lookup. The first version matched the approval
+     * against whichever intent happened to be `firstUnsettled` at the moment the gate opened; a crash
+     * after only the first of two remaining intents settled left `firstUnsettled` naming the *next* one
+     * on the next pass, whose id carried no approval line of its own — re-opening a second gate for a
+     * batch a person had already approved once (row 12). Reading the record's own `resolution` instead
+     * means `'approved'` covers the whole remaining batch regardless of which intent is `firstUnsettled`
+     * now, and `'pending'`/`'rejected'` both refuse to proceed without ever re-deriving anything per intent.
+     */
+    const gate = state.pending_gate;
+    if (gate !== null) {
+      if (gate.resolution !== 'approved') {
+        // `'pending'` — still open, undecided; nothing new to emit (`write.gate_opened` fires once per
+        // gate). `'rejected'` — never calls the write executor and never re-opens. Either way the run
+        // stays gated; `decideSteering`'s `approve`/`reject` cases are the only way this record changes.
+        return 'gated';
+      }
+      // `'approved'`: fall through and run the settlement loop for the whole remaining batch.
+    } else if (remaining.length > 0) {
+      const [triggering] = remaining;
+      if (triggering !== undefined) {
+        const gatedClasses = this.declaredGatedReversibilityClasses(paths.runId);
+        if (gatedClasses.includes(triggering.reversibility)) {
+          // The committing step's own id, so `RunState.pending_gate` and a `write.gate_opened` reader can
+          // name which step's write this is — never the step that "failed", because none did. Envelope
+          // `step: null` matches the write-executor trio's own convention (`writeExecutionContextFor`'s
+          // `emit` closure): these are run-level facts about a write, not about a step in flight.
+          const committingStep =
+            events.find((event) => event.type === COMMIT_COMPOSED_EVENT_TYPE)?.step ?? '';
+          this.emit(recorder, {
+            step: null,
+            type: WRITE_GATE_OPENED_EVENT_TYPE,
+            payload: {
+              [WRITE_GATE_OPENED_PAYLOAD_KEYS.IntentId]: triggering.intent_id,
+              [WRITE_GATE_OPENED_PAYLOAD_KEYS.Kind]: triggering.kind,
+              [WRITE_GATE_OPENED_PAYLOAD_KEYS.Target]: triggering.target,
+              [WRITE_GATE_OPENED_PAYLOAD_KEYS.Reversibility]: triggering.reversibility,
+              [WRITE_GATE_OPENED_PAYLOAD_KEYS.Step]: committingStep,
+              /**
+               * Round-1 review — every intent still unsettled at open time, not only the triggering one:
+               * this settlement loop has no gate check inside it, so one approval covers all of them.
+               */
+              [WRITE_GATE_OPENED_PAYLOAD_KEYS.Batch]: remaining.map((intent) => ({
+                [WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS.IntentId]: intent.intent_id,
+                [WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS.Kind]: intent.kind,
+                [WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS.Target]: intent.target,
+              })),
+            },
+          });
+          return 'gated';
+        }
+      }
+    }
+
+    for (const intent of remaining) {
       let outcome: WriteIntentResult;
       try {
         outcome = await this.writeExecutor(intent, context);
@@ -4783,6 +4987,39 @@ export class Reconciler {
       return readStepConfiguration(run, { orchHome: this.orchHome }).profile.profile.branch_pattern;
     } catch (thrown: unknown) {
       if (thrown instanceof ProfileNotFound) return null;
+      throw new UnreadableGateConfiguration(run, thrown);
+    }
+  }
+
+  /**
+   * Story 4-1 — the reversibility classes this run's project gates behind a person.
+   *
+   * Read from the AD-9 run snapshot, the same source and the same absent-versus-unreadable distinction
+   * {@link declaredCommands} and {@link declaredBranchPattern} already draw.
+   *
+   * **Round-1 review — an absent policy fails closed, not open.** The first version answered `null` for
+   * a snapshot with no `permissions.toml` at all (or no profile at all), and `settlePreMergeWrites` read
+   * `null` as "no gate at all" — so a project onboarded before this file existed, or one that lost it,
+   * had every irreversible write proceed completely unattended, with no visible signal anything was
+   * skipped. That directly contradicts CAP-12's unconditional "irreversible ones block, demonstrably".
+   * Fixed: absence — `loadPermissions` returning `null`, or the snapshot itself not existing
+   * (`ProfileNotFound`) — falls back to {@link GATED_REVERSIBILITY_CLASSES}, the installer's own default,
+   * imported from `src/contracts/` rather than duplicated. "No policy on disk" now means "the safe
+   * default applies," never "no gate at all" (matrix row 9).
+   *
+   * **A *present* policy is still honoured exactly as written**, including one that explicitly gates
+   * nothing (matrix row 6) — this fallback is for the file's outright absence only, never for a real
+   * answer this build merely disagrees with. A genuinely unreadable file (present but corrupt, or any
+   * failure other than "not found") still throws {@link UnreadableGateConfiguration}: an unreadable
+   * policy is not silently "no gate" or "the default" either, because neither is what the file actually
+   * says — it says nothing this build could read at all.
+   */
+  private declaredGatedReversibilityClasses(run: string): readonly ReversibilityClass[] {
+    try {
+      const source = readStepConfiguration(run, { orchHome: this.orchHome }).source;
+      return loadPermissions(source)?.gated_reversibility_classes ?? GATED_REVERSIBILITY_CLASSES;
+    } catch (thrown: unknown) {
+      if (thrown instanceof ProfileNotFound) return GATED_REVERSIBILITY_CLASSES;
       throw new UnreadableGateConfiguration(run, thrown);
     }
   }

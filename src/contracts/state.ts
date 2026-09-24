@@ -22,7 +22,7 @@ import { z } from 'zod';
 import { TimestampSchema } from './event.js';
 import { OrchErrorSchema } from './error.js';
 import { versioned } from './schema-version.js';
-import { RUN_MODES, STEP_DISPOSITIONS } from './step.js';
+import { REVERSIBILITY_CLASSES, RUN_MODES, STEP_DISPOSITIONS, WRITE_INTENT_KINDS } from './step.js';
 
 /** The registry id this artifact is registered under (AD-17), spelled once. */
 export const RUN_STATE_CONTRACT_ID = 'run.state';
@@ -277,6 +277,67 @@ export const DegradationSchema = z.object({
 export type Degradation = z.infer<typeof DegradationSchema>;
 
 /**
+ * Story 4-1 — AD-12's reversibility gate, standing until a person answers it.
+ *
+ * **Parallel to {@link HandoffSchema}, never a repurposing of it, and never a step disposition either.**
+ * `settlePreMergeWrites` (`src/engine/reconciler.ts`) checks a composed commit's declared `reversibility`
+ * against the project's `gated_reversibility_classes` *after* the committing step has already completed
+ * — so nothing about any step failed, and folding this into a synthetic `blocked` step disposition would
+ * corrupt AD-8's termination record for a failure that never happened. This is its own fact instead: the
+ * gated write's identity, so `decideSteering`'s `approve`/`reject` cases (`src/engine/steering.ts`) know
+ * there is a gate to resolve without asking `blockedStepOf`'s question — "which step failed" — of a run
+ * where none did.
+ *
+ * **`resolution` is what changes; the record itself is never nulled by a resolving event — round-1
+ * review's most serious finding.** The first version cleared this whole record to `null` directly on
+ * `write.gate_approved`/`write.gate_rejected`, which races the *separate* `feature.state_changed` line the
+ * same effect also emits (to `running`/`degraded` for an approval, `handed_off` for a rejection): a crash
+ * landing the resolving event durably but not the state-change one left `pending_gate` reading `null`
+ * while `state.state` was still `blocked`. For a rejection that is not merely untidy — a later, redelivered
+ * `Command.Approve` would find no gate on record, fall through to the pre-existing step-failure branch
+ * (which finds no blocked step and answers `toState: 'running'` unconditionally), and silently reverse a
+ * person's explicit rejection of an irreversible write. So `write.gate_approved`/`write.gate_rejected` set
+ * `resolution` on *this same* record instead; only the `feature.state_changed` line that follows — once it
+ * actually lands — clears the whole record to `null`. A crash in between therefore leaves a fully truthful
+ * intermediate fold: "this gate was rejected, and the run hasn't finished handing off yet."
+ */
+export const PENDING_GATE_RESOLUTIONS = ['pending', 'approved', 'rejected'] as const;
+
+export type PendingGateResolution = (typeof PENDING_GATE_RESOLUTIONS)[number];
+
+/**
+ * One intent still unsettled when the gate opened — the disclosure round-1 review added.
+ *
+ * `settlePreMergeWrites`'s own settlement loop has no gate check inside it: once the one gate on a
+ * composed commit clears, every remaining intent runs in the same pass. The first version's disclosure
+ * named only the intent whose `reversibility` triggered the check, which understated what a person's one
+ * approval actually authorises. `kind`, not `target`, because this is the *persisted* identity a later
+ * fold reads back to know which writes this gate covers — the richer disclosure (`target` included) lives
+ * on the `write.gate_opened` event payload itself, read once, at the moment a person needs to see it.
+ */
+export const PendingGateBatchEntrySchema = z.object({
+  intent_id: z.string(),
+  kind: z.enum(WRITE_INTENT_KINDS),
+});
+
+export type PendingGateBatchEntry = z.infer<typeof PendingGateBatchEntrySchema>;
+
+export const PendingGateSchema = z.object({
+  /** The committing step this write's intent belongs to. Never a step that "failed": none did. */
+  step: z.string(),
+  /** The AD-15 idempotency key of the intent whose `reversibility` triggered this gate. */
+  intent_id: z.string(),
+  kind: z.enum(WRITE_INTENT_KINDS),
+  /** Always one of the project's own `gated_reversibility_classes` — that is why this gate exists at all. */
+  reversibility: z.enum(REVERSIBILITY_CLASSES),
+  /** Every intent still unsettled when this gate opened, `intent_id` included — the whole remaining batch. */
+  batch: z.array(PendingGateBatchEntrySchema),
+  resolution: z.enum(PENDING_GATE_RESOLUTIONS),
+});
+
+export type PendingGate = z.infer<typeof PendingGateSchema>;
+
+/**
  * `runs/<run-id>/state.json`.
  *
  * `last_event_seq` is the hinge of AD-4: it names the log position this checkpoint was folded from,
@@ -312,6 +373,15 @@ export const RunStateSchema = versioned({
    * `budget.degraded` disagrees with such a checkpoint and the checkpoint is rebuilt.
    */
   degradation: DegradationSchema.nullable().default(null),
+  /**
+   * Story 4-1 — the standing AD-12 gate, or `null` for a run with none open.
+   *
+   * Defaulted to `null` on the way in, exactly as `degradation` is and for the same reason: a
+   * `state.json` written before this story still parses as the checkpoint it is, and the log then
+   * decides, as it always does (AD-4) — a run whose log carries `write.gate_opened` disagrees with such
+   * a checkpoint and the checkpoint is rebuilt.
+   */
+  pending_gate: PendingGateSchema.nullable().default(null),
 }).refine(
   (state) => new Set(state.steps.map((step) => step.step)).size === state.steps.length,
   {

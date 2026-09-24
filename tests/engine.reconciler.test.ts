@@ -31,13 +31,27 @@ import {
   RUN_STATE_FILE_NAME,
   StepInputSchema,
   StepOutputSchema,
+  WRITE_GATE_APPROVED_EVENT_TYPE,
+  WRITE_GATE_APPROVED_PAYLOAD_KEYS,
+  WRITE_GATE_OPENED_EVENT_TYPE,
+  WRITE_GATE_OPENED_PAYLOAD_KEYS,
+  WRITE_GATE_REJECTED_EVENT_TYPE,
+  WRITE_GATE_REJECTED_PAYLOAD_KEYS,
   dispositionFor,
   makeError,
 } from '../src/contracts/index.js';
-import type { EventEnvelope, ModelRung, OrchError, StepDisposition } from '../src/contracts/index.js';
+import type {
+  EventEnvelope,
+  ModelRung,
+  OrchError,
+  QuestionDraft,
+  ReversibilityClass,
+  StepDisposition,
+} from '../src/contracts/index.js';
 import { Recorder, RunFetchRecord, readEventLog, runPaths, runsDir } from '../src/runtime/index.js';
 import {
   BaselineResetError,
+  COMPOSED_COMMIT_RELATIVE_PATH,
   ENGINE_EMITTER,
   ENGINE_EVENT_TYPES,
   SPEC_RECORDED_EVENT_TYPE,
@@ -57,6 +71,7 @@ import {
   rebuildFromLog,
   routeRefusedResume,
   routeTermination,
+  takeConfigSnapshot,
   terminated,
 } from '../src/engine/index.js';
 import type {
@@ -70,6 +85,13 @@ import type {
   WriteExecutorPort,
 } from '../src/engine/index.js';
 
+import {
+  fixturePermissions,
+  fixtureProfile,
+  makeWorkspace,
+  writePermissions,
+  writeProfile,
+} from './helpers/config-fixture.js';
 import { makeGitWorktree, makeHome, makePlan, planProvider } from './helpers/engine-fixture.js';
 
 /**
@@ -1667,6 +1689,36 @@ const controllableMergeChecker = (): { readonly checker: MergeCheckPort; readonl
   return { checker, state };
 };
 
+/**
+ * Story 4-1 — a real config snapshot whose permissions explicitly gate nothing.
+ *
+ * Round-1 review's row-9 fix makes an *absent* snapshot fall back to the installer's own default
+ * (`irreversible` gated), so every fixture below that composes a real commit and never cared about
+ * gating before this story would otherwise now block on it incidentally. This gives such a fixture an
+ * explicit, present, empty `gated_reversibility_classes` — row 6's own policy — so its pre-existing
+ * subject (`awaiting_merge`, a shadow run's suppression, a flaky write retrying) stays undisturbed.
+ */
+const ungatedConfigSnapshot = (runId: string, orchHome: string): void => {
+  const repository = makeWorkspace('ungated-repo');
+  toRemove.push(repository);
+  // Blank mechanics commands, so CAP-13's deterministic gates are declared *none* rather than
+  // dispatched to a real runner none of these fixtures wire — the same reason `buildGatedRun` blanks
+  // them below; a real snapshot's own default commands would otherwise try to run for real.
+  writeProfile(
+    repository,
+    fixtureProfile({
+      mechanics: {
+        package_manager: 'npm',
+        commands: { test: '', typecheck: '', lint: '', build: '', run: '' },
+        source_layout: ['src', 'tests'],
+        resources: 'none',
+      },
+    }),
+  );
+  writePermissions(repository, fixturePermissions({ gated_reversibility_classes: [] }));
+  takeConfigSnapshot({ repository, runId, orchHome });
+};
+
 describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
   const buildRun = (): {
     readonly reconciler: Reconciler;
@@ -1689,6 +1741,9 @@ describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
     });
     toClose.push(reconciler);
     const accepted = reconciler.acceptFeature(plan);
+    // Story 4-1 — an ungated snapshot, so this suite's own subject (`awaiting_merge`) is undisturbed by
+    // the AD-12 gate a run with no snapshot at all would now hit by default (row 9's own fallback).
+    ungatedConfigSnapshot(accepted.run, orchHome);
     reconciler.confirm(accepted.run);
     return { reconciler, run: accepted.run, writes, merge };
   };
@@ -1781,6 +1836,7 @@ describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
       });
       toClose.push(reconciler);
       const accepted = reconciler.acceptFeature(plan);
+      ungatedConfigSnapshot(accepted.run, orchHome);
       reconciler.confirm(accepted.run);
       return { reconciler, run: accepted.run, merge };
     };
@@ -2006,6 +2062,7 @@ describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
     });
     toClose.push(reconciler);
     const accepted = reconciler.acceptFeature(plan);
+    ungatedConfigSnapshot(accepted.run, orchHome);
     reconciler.confirm(accepted.run);
 
     for (let index = 0; index < 6; index += 1) await reconciler.pass(); // analyse .. commit
@@ -2044,6 +2101,7 @@ describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
     });
     toClose.push(reconciler);
     const accepted = reconciler.acceptFeature(plan);
+    ungatedConfigSnapshot(accepted.run, orchHome);
     reconciler.confirm(accepted.run);
 
     for (let index = 0; index < 6; index += 1) await reconciler.pass();
@@ -2059,6 +2117,546 @@ describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
     // git_push is not attempted a second time: `writeIntentSettled` found its `write.executed` line.
     expect(flaky.writes.map((write) => write.kind)).toStrictEqual(['pull_request']);
     expect(reconciler.load(accepted.run).state.state).toBe('awaiting_merge');
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Story 4-1 (AD-12) — the reversibility gate: every row of the story's own I/O matrix.
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * A run whose project declares a real `gated_reversibility_classes` policy, read the way
+ * `settlePreMergeWrites` reads every project's: from the AD-9 config snapshot, never a hardcoded
+ * constant. `takeConfigSnapshot` is called between `acceptFeature` and `confirm`, exactly the order
+ * `tests/engine.gate-economics.test.ts` already establishes for a run that needs one.
+ */
+const buildGatedRun = (options: {
+  readonly label: string;
+  readonly gatedClasses: readonly ReversibilityClass[];
+  readonly mode?: 'live' | 'shadow';
+  /**
+   * Row 9 — omit `permissions.toml` from the snapshot entirely, rather than writing one that
+   * declares `gatedClasses`. `options.gatedClasses` is then unused; the point of the row is what the
+   * *absence* of the file falls back to.
+   */
+  readonly noPermissionsFile?: boolean;
+}): {
+  readonly reconciler: Reconciler;
+  readonly run: string;
+  readonly writes: RecordedWrite[];
+  readonly feature: string;
+} => {
+  const orchHome = makeHome(options.label);
+  toRemove.push(orchHome);
+  const repository = makeWorkspace(`${options.label}-repo`);
+  toRemove.push(repository);
+  // Blank mechanics commands, so CAP-13's deterministic gates are declared *none* rather than
+  // dispatched to a real runner this fixture never wires — the fixture's own concern is AD-12's write
+  // gate, not the gate economics `tests/engine.gate-economics.test.ts` already covers.
+  writeProfile(
+    repository,
+    fixtureProfile({
+      mechanics: {
+        package_manager: 'npm',
+        commands: { test: '', typecheck: '', lint: '', build: '', run: '' },
+        source_layout: ['src', 'tests'],
+        resources: 'none',
+      },
+    }),
+  );
+  if (options.noPermissionsFile !== true) {
+    writePermissions(
+      repository,
+      fixturePermissions({ gated_reversibility_classes: [...options.gatedClasses] }),
+    );
+  }
+  const plan = makePlan({
+    feature: options.label,
+    mode: options.mode ?? 'live',
+    steps: STANDARD_PLAN_STEPS,
+  });
+  const writes: RecordedWrite[] = [];
+  const reconciler = Reconciler.open({
+    orchHome,
+    plans: planProvider(plan),
+    baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+    executor: createScriptedExecutor(committingCapableScript()),
+    writeExecutor:
+      options.mode === 'shadow' ? recordingShadowWriteExecutor(writes) : recordingWriteExecutor(writes),
+  });
+  toClose.push(reconciler);
+  const accepted = reconciler.acceptFeature(plan);
+  takeConfigSnapshot({ repository, runId: accepted.run, orchHome });
+  reconciler.confirm(accepted.run);
+  return { reconciler, run: accepted.run, writes, feature: options.label };
+};
+
+describe('AD-12, CAP-12, story 4-1 — the reversibility gate', () => {
+  it(
+    'emits write.gate_opened for the first unsettled intent, blocks, and never calls the write ' +
+      'executor (matrix row 1)',
+    async () => {
+      const { reconciler, run, writes } = buildGatedRun({
+        label: 'gate-row-1',
+        gatedClasses: ['irreversible'],
+      });
+      for (let index = 0; index < 7; index += 1) await reconciler.pass();
+
+      const state = reconciler.load(run).state;
+      expect(state.state).toBe('blocked');
+      expect(writes).toStrictEqual([]);
+      expect(state.pending_gate).toStrictEqual({
+        step: 'commit',
+        intent_id: 'commit.git_push',
+        kind: 'git_push',
+        reversibility: 'irreversible',
+        // The whole remaining batch, not only the triggering intent — round-1 review's disclosure fix.
+        batch: [
+          { intent_id: 'commit.git_push', kind: 'git_push' },
+          { intent_id: 'commit.pull_request', kind: 'pull_request' },
+        ],
+        resolution: 'pending',
+      });
+
+      const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+      const opened = events.filter((event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE);
+      expect(opened).toHaveLength(1);
+      expect(opened[0]?.payload[WRITE_GATE_OPENED_PAYLOAD_KEYS.IntentId]).toBe('commit.git_push');
+      expect(opened[0]?.payload[WRITE_GATE_OPENED_PAYLOAD_KEYS.Kind]).toBe('git_push');
+      expect(opened[0]?.payload[WRITE_GATE_OPENED_PAYLOAD_KEYS.Reversibility]).toBe('irreversible');
+      expect(opened[0]?.payload[WRITE_GATE_OPENED_PAYLOAD_KEYS.Step]).toBe('commit');
+      expect(opened[0]?.payload[WRITE_GATE_OPENED_PAYLOAD_KEYS.Batch]).toStrictEqual([
+        { intent_id: 'commit.git_push', kind: 'git_push', target: 'feature/gate-row-1' },
+        { intent_id: 'commit.pull_request', kind: 'pull_request', target: 'feature/gate-row-1' },
+      ]);
+    },
+  );
+
+  it('records write.gate_approved and returns to running with no step disposition touched (matrix row 2)', async () => {
+    const { reconciler, run } = buildGatedRun({ label: 'gate-row-2', gatedClasses: ['irreversible'] });
+    for (let index = 0; index < 7; index += 1) await reconciler.pass();
+    const commitStepBefore = reconciler.load(run).state.steps.find((record) => record.step === 'commit');
+
+    const after = reconciler.approve(run);
+
+    expect(after.state).toBe('running');
+    // The record stays on disk with `resolution: 'approved'` until the whole batch it names actually
+    // settles (round-1 review, rows 3/12) — cleared only once every intent in it carries a
+    // `write.executed`/`write.suppressed` line, which approving alone does not yet make happen.
+    expect(after.pending_gate?.resolution).toBe('approved');
+    expect(after.pending_gate?.intent_id).toBe('commit.git_push');
+    // No step's disposition changed — the committing step's own record is untouched.
+    expect(after.steps.find((record) => record.step === 'commit')).toStrictEqual(commitStepBefore);
+
+    const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+    const approved = events.filter((event) => event.type === WRITE_GATE_APPROVED_EVENT_TYPE);
+    expect(approved).toHaveLength(1);
+    expect(approved[0]?.payload[WRITE_GATE_APPROVED_PAYLOAD_KEYS.IntentId]).toBe('commit.git_push');
+  });
+
+  it('calls the write executor on the next pass once approved, and never re-opens the gate (matrix row 3)', async () => {
+    const { reconciler, run, writes } = buildGatedRun({ label: 'gate-row-3', gatedClasses: ['irreversible'] });
+    for (let index = 0; index < 7; index += 1) await reconciler.pass();
+    reconciler.approve(run);
+    expect(writes).toStrictEqual([]); // approving itself performs no write
+
+    await reconciler.pass();
+
+    expect(writes.map((write) => write.kind)).toStrictEqual(['git_push', 'pull_request']);
+    expect(reconciler.load(run).state.state).toBe('awaiting_merge');
+    const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+    expect(events.filter((event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE)).toHaveLength(1);
+  });
+
+  it('records write.gate_rejected with the reason and hands the run off, never retrying (matrix row 4)', async () => {
+    const { reconciler, run, writes } = buildGatedRun({ label: 'gate-row-4', gatedClasses: ['irreversible'] });
+    for (let index = 0; index < 7; index += 1) await reconciler.pass();
+
+    const after = reconciler.reject(run, 'This push touches a path nobody has reviewed yet.');
+
+    expect(after.state).toBe('handed_off');
+    expect(after.pending_gate).toBeNull();
+    expect(after.handoff?.code).toBe('user.gate_rejected');
+    expect(writes).toStrictEqual([]);
+
+    const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+    const rejected = events.filter((event) => event.type === WRITE_GATE_REJECTED_EVENT_TYPE);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.payload[WRITE_GATE_REJECTED_PAYLOAD_KEYS.IntentId]).toBe('commit.git_push');
+    expect(rejected[0]?.payload[WRITE_GATE_REJECTED_PAYLOAD_KEYS.Reason]).toBe(
+      'This push touches a path nobody has reviewed yet.',
+    );
+
+    // A further pass does not retry the rejected write: the run is terminal.
+    await reconciler.pass();
+    expect(writes).toStrictEqual([]);
+  });
+
+  it(
+    'leaves approve/reject byte-for-byte unchanged for an ordinary step-failure block, with no gate ' +
+      'pending (matrix row 5)',
+    () => {
+      // A run that never composed a commit at all has no `pendingGate` and no write to gate — the
+      // ordinary `permission.denied` escalation this suite already drives elsewhere is `approve`'s other,
+      // pre-existing branch, unreached here on purpose: this asserts the *refusal* half of row 5, that an
+      // approval finds nothing to approve when no gate and no step failure exist, exactly as before this
+      // story.
+      const { reconciler, run } = buildGatedRun({ label: 'gate-row-5', gatedClasses: ['irreversible'] });
+      expect(reconciler.load(run).state.pending_gate).toBeNull();
+      expect(() => reconciler.approve(run)).toThrow(SteeringRefused);
+      // `reject` with no gate pending falls through unchanged to its pre-existing question handling,
+      // which finds no open question either and refuses — never the new gate-scoped branch.
+      expect(() => reconciler.reject(run, 'nothing to reject here')).toThrow(SteeringRefused);
+    },
+  );
+
+  it('performs the write immediately when the project’s policy does not gate irreversible writes (matrix row 6)', async () => {
+    const { reconciler, run, writes } = buildGatedRun({ label: 'gate-row-6', gatedClasses: [] });
+    for (let index = 0; index < 7; index += 1) await reconciler.pass();
+
+    expect(reconciler.load(run).state.state).toBe('awaiting_merge');
+    expect(writes.map((write) => write.kind)).toStrictEqual(['git_push', 'pull_request']);
+    const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+    expect(events.some((event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE)).toBe(false);
+  });
+
+  it('reads no reversibility at all once every intent is already settled — a re-entered pass (matrix row 7)', async () => {
+    const { reconciler, run, writes, feature } = buildGatedRun({
+      label: 'gate-row-7',
+      gatedClasses: ['irreversible'],
+    });
+    for (let index = 0; index < 6; index += 1) await reconciler.pass(); // analyse .. commit; not yet settled
+
+    // Simulate the crash-recovery re-entrancy `settlePreMergeWrites`'s own docblock describes: both
+    // pre-merge intents already landed durably, but the `feature.state_changed` to `awaiting_merge` did
+    // not — so the next pass re-enters `settlePreMergeWrites` and must find both already settled.
+    const paths = runPaths(run, reconciler.orchHome);
+    const before = readEventLog(paths.eventLog);
+    const maxSeq = before.reduce((max, event) => Math.max(max, event.seq), 0);
+    const priorLine = (seq: number, intentId: string, kind: string) => ({
+      ts: '2026-09-24T10:00:00.000Z',
+      seq,
+      feature,
+      run,
+      step: null,
+      emitter: 'engine.reconciler',
+      type: 'write.executed',
+      payload: {
+        intent_id: intentId,
+        kind,
+        target: 'feature/gate-row-7',
+        already_present: false,
+        detail: 'pre-settled by a prior, interrupted pass',
+      },
+    });
+    appendFileSync(paths.eventLog, `${JSON.stringify(priorLine(maxSeq + 1, 'commit.git_push', 'git_push'))}\n`, 'utf8');
+    appendFileSync(
+      paths.eventLog,
+      `${JSON.stringify(priorLine(maxSeq + 2, 'commit.pull_request', 'pull_request'))}\n`,
+      'utf8',
+    );
+
+    await reconciler.pass(); // the re-entered settlement pass
+
+    expect(writes).toStrictEqual([]); // the executor is never called for either
+    const events = readEventLog(paths.eventLog);
+    expect(events.some((event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE)).toBe(false);
+    expect(reconciler.load(run).state.state).toBe('awaiting_merge');
+  });
+
+  it('gates a shadow run exactly the same as a live run (matrix row 8)', async () => {
+    const { reconciler, run, writes } = buildGatedRun({
+      label: 'gate-row-8',
+      gatedClasses: ['irreversible'],
+      mode: 'shadow',
+    });
+    for (let index = 0; index < 7; index += 1) await reconciler.pass();
+
+    expect(reconciler.load(run).state.state).toBe('blocked');
+    expect(writes).toStrictEqual([]);
+    const opened = readEventLog(runPaths(run, reconciler.orchHome).eventLog).filter(
+      (event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE,
+    );
+    expect(opened).toHaveLength(1);
+
+    // Once approved, a shadow run settles exactly the way `mode: 'shadow'` already does for an ungated
+    // one (story 3-2): all three intents suppress in the one pass and it reaches `committed` directly.
+    reconciler.approve(run);
+    for (
+      let index = 0;
+      index < 5 && reconciler.load(run).state.state !== 'committed';
+      index += 1
+    ) {
+      await reconciler.pass();
+    }
+    expect(reconciler.load(run).state.state).toBe('committed');
+    expect(writes.map((write) => write.kind)).toStrictEqual(['git_push', 'pull_request', 'git_note']);
+  });
+
+  it('falls back to the installer’s own default when permissions.toml is absent, and still gates (matrix row 9)', async () => {
+    const { reconciler, run, writes } = buildGatedRun({
+      label: 'gate-row-9',
+      gatedClasses: [],
+      noPermissionsFile: true,
+    });
+    for (let index = 0; index < 7; index += 1) await reconciler.pass();
+
+    expect(reconciler.load(run).state.state).toBe('blocked');
+    expect(writes).toStrictEqual([]);
+    const opened = readEventLog(runPaths(run, reconciler.orchHome).eventLog).filter(
+      (event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE,
+    );
+    expect(opened).toHaveLength(1);
+    expect(opened[0]?.payload[WRITE_GATE_OPENED_PAYLOAD_KEYS.Reversibility]).toBe('irreversible');
+  });
+
+  it(
+    'refuses a reject naming both a pending gate and an open question, resolving neither (matrix row 10)',
+    async () => {
+      const { reconciler, run, writes } = buildGatedRun({
+        label: 'gate-row-10',
+        gatedClasses: ['irreversible'],
+      });
+      for (let index = 0; index < 7; index += 1) await reconciler.pass();
+      expect(reconciler.load(run).state.state).toBe('blocked');
+
+      const draft: QuestionDraft = {
+        prompt: 'Does this touch a shared config file?',
+        brief: 'A long-window question left open while the run reached the commit step and gated.',
+        options: [
+          { id: 'yes', label: 'Yes', consequence: 'Narrow the territory.' },
+          { id: 'no', label: 'No', consequence: 'Proceed as declared.' },
+        ],
+        escape: { id: 'decide-later', label: 'Ask me later', consequence: 'Nothing changes yet.' },
+        recommended_option_id: 'no',
+        default_action: 'No is assumed.',
+        default_window_ms: 15 * 60 * 1000,
+      };
+      reconciler.ask(run, draft);
+
+      expect(() => reconciler.reject(run, 'reject the gate, or is this about the question?')).toThrow(
+        SteeringRefused,
+      );
+      // Neither the gate nor the question moved.
+      expect(reconciler.load(run).state.pending_gate?.resolution).toBe('pending');
+      expect(reconciler.load(run).state.state).toBe('blocked');
+      expect(writes).toStrictEqual([]);
+      const rejected = readEventLog(runPaths(run, reconciler.orchHome).eventLog).filter(
+        (event) => event.type === WRITE_GATE_REJECTED_EVENT_TYPE,
+      );
+      expect(rejected).toStrictEqual([]);
+    },
+  );
+
+  it(
+    'refuses a later approve when a rejection landed but the hand-off transition did not — a crash ' +
+      'window (matrix row 11)',
+    async () => {
+      const { reconciler, run, writes, feature } = buildGatedRun({
+        label: 'gate-row-11',
+        gatedClasses: ['irreversible'],
+      });
+      for (let index = 0; index < 7; index += 1) await reconciler.pass();
+      expect(reconciler.load(run).state.state).toBe('blocked');
+
+      // Simulate the crash the story's own review round traced by hand: `write.gate_rejected` lands
+      // durably, but the `command.applied` line carrying the `handed_off` transition does not.
+      const paths = runPaths(run, reconciler.orchHome);
+      const before = readEventLog(paths.eventLog);
+      const maxSeq = before.reduce((max, event) => Math.max(max, event.seq), 0);
+      const priorLine = {
+        ts: '2026-09-24T10:00:00.000Z',
+        seq: maxSeq + 1,
+        feature,
+        run,
+        step: null,
+        emitter: 'engine.reconciler',
+        type: WRITE_GATE_REJECTED_EVENT_TYPE,
+        payload: {
+          [WRITE_GATE_REJECTED_PAYLOAD_KEYS.IntentId]: 'commit.git_push',
+          [WRITE_GATE_REJECTED_PAYLOAD_KEYS.Reason]: 'a prior, interrupted pass already rejected this',
+        },
+      };
+      appendFileSync(paths.eventLog, `${JSON.stringify(priorLine)}\n`, 'utf8');
+
+      const loaded = reconciler.load(run).state;
+      expect(loaded.state).toBe('blocked'); // the transition never landed
+      expect(loaded.pending_gate?.resolution).toBe('rejected'); // but the decision is on record
+
+      expect(() => reconciler.approve(run)).toThrow(SteeringRefused);
+      expect(reconciler.load(run).state.state).toBe('blocked'); // never silently resumed
+      expect(writes).toStrictEqual([]);
+    },
+  );
+
+  it(
+    'runs the remaining intents without a second approval once one of an approved batch already ' +
+      'settled — a crash window (matrix row 12)',
+    async () => {
+      const { reconciler, run, writes, feature } = buildGatedRun({
+        label: 'gate-row-12',
+        gatedClasses: ['irreversible'],
+      });
+      for (let index = 0; index < 7; index += 1) await reconciler.pass();
+      reconciler.approve(run);
+      expect(reconciler.load(run).state.pending_gate?.resolution).toBe('approved');
+
+      // Simulate the crash: the first intent of the approved batch settled durably; the reconciler died
+      // before the write executor was ever asked for the second.
+      const paths = runPaths(run, reconciler.orchHome);
+      const before = readEventLog(paths.eventLog);
+      const maxSeq = before.reduce((max, event) => Math.max(max, event.seq), 0);
+      const priorLine = {
+        ts: '2026-09-24T10:00:00.000Z',
+        seq: maxSeq + 1,
+        feature,
+        run,
+        step: null,
+        emitter: 'engine.reconciler',
+        type: 'write.executed',
+        payload: {
+          intent_id: 'commit.git_push',
+          kind: 'git_push',
+          target: `feature/${feature}`,
+          already_present: false,
+          detail: 'pre-settled by a prior, interrupted pass',
+        },
+      };
+      appendFileSync(paths.eventLog, `${JSON.stringify(priorLine)}\n`, 'utf8');
+
+      await reconciler.pass(); // the re-entered settlement pass
+
+      // git_push is never handed to the executor a second time; only pull_request is.
+      expect(writes.map((write) => write.kind)).toStrictEqual(['pull_request']);
+      expect(reconciler.load(run).state.state).toBe('awaiting_merge');
+      const opened = readEventLog(paths.eventLog).filter(
+        (event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE,
+      );
+      expect(opened).toHaveLength(1); // never a second gate for the same batch
+    },
+  );
+
+  it(
+    'self-heals a crash between write.gate_opened landing and the following blocked transition ' +
+      'landing, without opening a second gate',
+    async () => {
+      const { reconciler, run, writes, feature } = buildGatedRun({
+        label: 'gate-row-crash-open',
+        gatedClasses: ['irreversible'],
+      });
+      for (let index = 0; index < 6; index += 1) await reconciler.pass(); // analyse .. commit only
+
+      // Fabricate exactly the durable half of the gate-opening pass, without the `blocked` transition
+      // that pass would otherwise also emit — the window `settlePreMergeWrites`'s own docblock names.
+      const paths = runPaths(run, reconciler.orchHome);
+      const before = readEventLog(paths.eventLog);
+      const maxSeq = before.reduce((max, event) => Math.max(max, event.seq), 0);
+      const priorLine = {
+        ts: '2026-09-24T10:00:00.000Z',
+        seq: maxSeq + 1,
+        feature,
+        run,
+        step: null,
+        emitter: 'engine.reconciler',
+        type: WRITE_GATE_OPENED_EVENT_TYPE,
+        payload: {
+          [WRITE_GATE_OPENED_PAYLOAD_KEYS.IntentId]: 'commit.git_push',
+          [WRITE_GATE_OPENED_PAYLOAD_KEYS.Kind]: 'git_push',
+          [WRITE_GATE_OPENED_PAYLOAD_KEYS.Target]: `feature/${feature}`,
+          [WRITE_GATE_OPENED_PAYLOAD_KEYS.Reversibility]: 'irreversible',
+          [WRITE_GATE_OPENED_PAYLOAD_KEYS.Step]: 'commit',
+          [WRITE_GATE_OPENED_PAYLOAD_KEYS.Batch]: [
+            { intent_id: 'commit.git_push', kind: 'git_push', target: `feature/${feature}` },
+            { intent_id: 'commit.pull_request', kind: 'pull_request', target: `feature/${feature}` },
+          ],
+        },
+      };
+      appendFileSync(paths.eventLog, `${JSON.stringify(priorLine)}\n`, 'utf8');
+      expect(reconciler.load(run).state.state).not.toBe('blocked'); // the transition truly never landed
+
+      await reconciler.pass(); // the re-entered pass completes the transition, opening nothing new
+
+      expect(reconciler.load(run).state.state).toBe('blocked');
+      expect(writes).toStrictEqual([]);
+      const opened = readEventLog(paths.eventLog).filter(
+        (event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE,
+      );
+      expect(opened).toHaveLength(1); // the fabricated line stands; no second one was ever emitted
+    },
+  );
+
+  it('refuses the run with MixedReversibilityBatch rather than under-gating, when a composed commit’s intents disagree', async () => {
+    const { reconciler, run, writes } = buildGatedRun({
+      label: 'gate-row-mixed',
+      gatedClasses: ['irreversible'],
+    });
+    for (let index = 0; index < 6; index += 1) await reconciler.pass(); // analyse .. commit
+
+    const paths = runPaths(run, reconciler.orchHome);
+    const artifactPath = join(paths.runDir, COMPOSED_COMMIT_RELATIVE_PATH);
+    const composed = JSON.parse(readFileSync(artifactPath, 'utf8')) as {
+      intents: { kind: string; reversibility: string }[];
+    };
+    const pullRequestIntent = composed.intents.find((intent) => intent.kind === 'pull_request');
+    expect(pullRequestIntent).toBeDefined();
+    if (pullRequestIntent !== undefined) pullRequestIntent.reversibility = 'reversible';
+    writeFileSync(artifactPath, `${JSON.stringify(composed, null, 2)}\n`, 'utf8');
+
+    // A per-run refusal (`tests/engine.reconciler.test.ts`'s own "one unreadable run does not stop
+    // every other feature" discipline), not a rejected promise — `MixedReversibilityBatch` is deliberately
+    // left uncaught by `settlePreMergeWrites`'s one call site and caught here, at `pass()`'s own boundary.
+    const result = await reconciler.pass();
+    expect(result.refusals).toHaveLength(1);
+    expect(result.refusals[0]?.run).toBe(run);
+    expect(result.refusals[0]?.code).toBe('internal.invariant_violated');
+    expect(result.refusals[0]?.reason).toContain('MixedReversibilityBatch');
+    expect(writes).toStrictEqual([]);
+  });
+
+  it('refuses the run with UnreadableGateConfiguration for a genuinely corrupt permissions.toml, never treating it as no gate or the default', async () => {
+    const label = 'gate-row-unreadable';
+    const orchHome = makeHome(label);
+    toRemove.push(orchHome);
+    const repository = makeWorkspace(`${label}-repo`);
+    toRemove.push(repository);
+    writeProfile(
+      repository,
+      fixtureProfile({
+        mechanics: {
+          package_manager: 'npm',
+          commands: { test: '', typecheck: '', lint: '', build: '', run: '' },
+          source_layout: ['src', 'tests'],
+          resources: 'none',
+        },
+      }),
+    );
+    // A corrupt `permissions.toml`, present but not this build's TOML subset — never merely absent.
+    mkdirSync(join(repository, '.orch'), { recursive: true });
+    writeFileSync(join(repository, '.orch', 'permissions.toml'), '][not toml', 'utf8');
+
+    const plan = makePlan({ feature: label, steps: STANDARD_PLAN_STEPS });
+    const writes: RecordedWrite[] = [];
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(plan),
+      baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+      executor: createScriptedExecutor(committingCapableScript()),
+      writeExecutor: recordingWriteExecutor(writes),
+    });
+    toClose.push(reconciler);
+    const accepted = reconciler.acceptFeature(plan);
+    takeConfigSnapshot({ repository, runId: accepted.run, orchHome });
+    reconciler.confirm(accepted.run);
+
+    for (let index = 0; index < 6; index += 1) await reconciler.pass(); // analyse .. commit
+    // A per-run refusal, not a rejected promise — the same "one unreadable run does not stop every
+    // other feature" boundary the mixed-batch test above documents.
+    const result = await reconciler.pass();
+    expect(result.refusals).toHaveLength(1);
+    expect(result.refusals[0]?.run).toBe(accepted.run);
+    expect(result.refusals[0]?.code).toBe('config.invalid');
+    expect(result.refusals[0]?.reason).toContain('UnreadableGateConfiguration');
+    expect(writes).toStrictEqual([]);
   });
 });
 
@@ -2114,6 +2712,7 @@ describe('AD-27, story 3-2 — a shadow run never enters awaiting_merge (matrix 
     });
     toClose.push(reconciler);
     const accepted = reconciler.acceptFeature(plan);
+    ungatedConfigSnapshot(accepted.run, orchHome);
     reconciler.confirm(accepted.run);
 
     const seenStates: string[] = [];
@@ -2180,6 +2779,7 @@ describe('AD-27, story 3-2 — the real performWriteIntent, through a Reconciler
     });
     toClose.push(reconciler);
     const accepted = reconciler.acceptFeature(plan);
+    ungatedConfigSnapshot(accepted.run, orchHome);
     reconciler.confirm(accepted.run);
 
     for (let index = 0; index < 10 && reconciler.load(accepted.run).state.state !== 'committed'; index += 1) {

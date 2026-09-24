@@ -35,11 +35,12 @@ import {
   ORCH_DIR_NAME,
   PERMISSIONS_FILE_NAME,
   PROFILE_FILE_NAME,
+  PermissionsSchema,
   ProfileSchema,
   parseToml,
   parseVersionedArtifact,
 } from '../contracts/index.js';
-import type { KnowledgeEntry, Profile, TomlTable } from '../contracts/index.js';
+import type { KnowledgeEntry, Permissions, Profile, TomlTable } from '../contracts/index.js';
 
 import { conventionsSpeakingTo, readConventions } from './conventions.js';
 import type { RepositoryConventions } from './conventions.js';
@@ -157,6 +158,36 @@ export const loadProfile = (source: ConfigurationSource): Profile => {
     throw new ProfileUnreadable(source.profile, error);
   }
   return parseVersionedArtifact(ProfileSchema, table, source.profile);
+};
+
+/**
+ * Story 4-1 — read and parse `permissions.toml`, the first reader this artifact ever gets.
+ *
+ * **`null` for "no file", never a default gate table.** `PermissionsSchema` has carried
+ * `gated_reversibility_classes` since AD-12 (`src/contracts/installer.ts`), and every install this
+ * codebase's own installer has ever produced writes one (`renderPermissions`,
+ * `src/installer/write.ts`) — but `{@link copiesFor}` in `src/engine/config-snapshot.ts` has always
+ * copied it *conditionally*, `if (existsSync(projectScope.permissions))`, because AD-9's Rule only
+ * started naming it a third artifact after the profile and the roster already existed without it. A
+ * repository onboarded before that file existed, or a hand-assembled `.orch/` a test builds without
+ * it, has a snapshot with no `permissions.toml` at all. Answering that with the installer's own
+ * `GATED_REVERSIBILITY_CLASSES` default would be a hardcoded constant duplicated in the engine — the
+ * one thing this story's own Boundaries forbid — so the honest answer is "this project declares no
+ * gate", which is what the caller reads a `null` as.
+ *
+ * Present but unreadable is a different case, exactly as {@link loadProfile} draws it for the profile:
+ * a directory where the file belongs, a permission bit, a hand edit the TOML subset refuses. Each
+ * reaches the caller with an AD-35 code rather than as a raw `fs` or parse error.
+ */
+export const loadPermissions = (source: ConfigurationSource): Permissions | null => {
+  if (!existsSync(source.permissions)) return null;
+  let table: TomlTable;
+  try {
+    table = parseToml(readFileSync(source.permissions, 'utf8'));
+  } catch (error) {
+    throw new ProfileUnreadable(source.permissions, error);
+  }
+  return parseVersionedArtifact(PermissionsSchema, table, source.permissions);
 };
 
 /**

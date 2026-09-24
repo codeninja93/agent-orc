@@ -78,6 +78,16 @@ export interface IntentEffect {
   readonly escapeHatch: boolean;
   /** CAP-23 — the hand-off this effect records, and the document it writes. */
   readonly handoff: { readonly code: string; readonly reason: string } | null;
+  /**
+   * Story 4-1 — the AD-12 write gate this effect resolves, or `null` when it resolves none.
+   *
+   * A field of its own rather than folded into `toState`/`stepDisposition`: those two already mean
+   * something for the ordinary step-failure `approve` (a step disposition and a lifecycle state), and a
+   * gate resolution changes neither — `applyIntent` reads this field to know a `write.gate_approved` or
+   * `write.gate_rejected` line belongs beside the `command.applied` line it is about to write, the same
+   * way it already reads `handoff` to know a hand-off document belongs beside one.
+   */
+  readonly gateResolution: { readonly intentId: string; readonly outcome: 'approved' | 'rejected' } | null;
 }
 
 /**
@@ -140,6 +150,16 @@ export type SteeringDecision =
 export const TAKE_OVER_HANDOFF_CODE = 'user.take_over';
 
 /**
+ * The hand-off code a rejected AD-12 gate records.
+ *
+ * Deliberately not an AD-35 error code, for the same reason {@link TAKE_OVER_HANDOFF_CODE} is not: a
+ * person declining a specific proposed irreversible write is a decision, not a failure, and the AD-35
+ * table exists to route a failure. `handoff.code` is informational and nothing routes on it, so a
+ * non-error marker is the honest value here too.
+ */
+export const GATE_REJECTED_HANDOFF_CODE = 'user.gate_rejected';
+
+/**
  * The step whose failure blocked the run, found by asking the table which record escalates to a human.
  *
  * Not "the last step": a completed step sitting last would be rewritten into an `interrupted` one and
@@ -175,6 +195,7 @@ const effect = (summary: string, parts: Partial<Omit<IntentEffect, 'summary'>>):
   clearsStepError: parts.clearsStepError ?? false,
   escapeHatch: parts.escapeHatch ?? false,
   handoff: parts.handoff ?? null,
+  gateResolution: parts.gateResolution ?? null,
 });
 
 /**
@@ -211,7 +232,16 @@ const stopEffect = (state: RunState, summary: string): IntentEffect => {
 export const decideSteering = (
   intent: CommandIntent,
   state: RunState,
-  context: { readonly applied: ReadonlyMap<string, Command | null> },
+  context: {
+    readonly applied: ReadonlyMap<string, Command | null>;
+    /**
+     * Story 4-1, row 10 — the run's open question id, when one exists, so a `reject` addressed to a
+     * pending gate can refuse rather than guess which of the two it means. `undefined`/`null` both mean
+     * "no open question", so every call site that predates this field keeps its original meaning without
+     * being told to pass one.
+     */
+    readonly activeQuestionId?: string | null;
+  },
 ): SteeringDecision => {
   if (context.applied.has(intent.intent_id)) {
     /**
@@ -262,6 +292,106 @@ export const decideSteering = (
       detail:
         `Run ${state.run} is ${state.state}, which is terminal, so "${intent.command}" is refused ` +
         'and the terminal state stands.',
+    };
+  }
+
+  /**
+   * Story 4-1 — a rejection at a pending AD-12 gate is a real effect, decided here before `reject`'s
+   * ordinary handling as a question command ever runs.
+   *
+   * `COMMAND_HANDLING.reject` is `'question'`: CAP-18's rejection of an *answer*, and until this story
+   * that was the only meaning "reject" had. Reaching a gate under that handling fell through to
+   * `resolveQuestionFromIntent`, found no open question under `questions/`, and refused with
+   * `no-open-question` — naming the gate but declaring no transition for it (see that method's own
+   * docblock). `state.pending_gate` is exactly that gate, and it is a fact this pure function can already
+   * read off the run state, so a rejection reaching a gated run is decided here instead of falling
+   * through to machinery built to answer a different question. A rejection reaching any other run — no
+   * gate pending — still falls through unchanged, to `reject`'s existing question handling below.
+   *
+   * **Round-1 review's `resolution` fix, applied here.** `pendingGate.resolution` — not merely
+   * `pendingGate !== null` — decides what a reject does: `'pending'` is the only resolution this branch
+   * may actually resolve; `'approved'` refuses loudly (a gate already answered the other way cannot also
+   * be rejected — silently letting it through would be the same reversal risk the `resolution` field
+   * exists to close, from the opposite direction); `'rejected'` is a redelivered reject whose resolving
+   * line already landed, so only the still-missing state transition is re-emitted, never a second
+   * `write.gate_rejected`.
+   */
+  if (intent.command === 'reject' && state.pending_gate !== null) {
+    const gate = state.pending_gate;
+
+    /**
+     * Round-1 review, row 10 — `reject` has two independent meanings today, and nothing about the
+     * intent itself says which a person meant. Checked only against `'pending'`: once a gate is
+     * decided, an active question can no longer be confused with it (the two branches below are about
+     * the gate alone, its own answer already given or being caught up).
+     */
+    if (gate.resolution === 'pending' && context.activeQuestionId != null) {
+      return {
+        kind: 'refuse',
+        reason: 'ambiguous-target',
+        detail:
+          `Run ${state.run} has both a pending write gate ("${gate.intent_id}") and an open question ` +
+          `(${context.activeQuestionId}) open at once — "reject" could mean either, and this build never ` +
+          'guesses which. Resolve the question first (with "answer" or its own "reject") if the reason ' +
+          'was meant for it, or send "reject" again once the question is settled if the gated write is ' +
+          'what should be declined.',
+      };
+    }
+
+    if (gate.resolution === 'approved') {
+      return {
+        kind: 'refuse',
+        reason: 'wrong-target-state',
+        detail:
+          `The gated write "${gate.intent_id}" was already approved, so it cannot also be rejected — a ` +
+          'gate is resolved for good, in the one direction a person first answered it (CAP-12).',
+      };
+    }
+
+    const reason = (intent.argument ?? '').trim();
+    if (reason === '') {
+      // Unreachable through a validated `CommandIntent` — `ARGUMENT_REQUIRED_COMMANDS` already refuses a
+      // blank `reject` at the door (`src/contracts/command.ts`) — kept so this function refuses the same
+      // way `handling.kind === 'question'` refuses one below, rather than recording a decision with
+      // nothing in it if that guarantee is ever weakened.
+      return {
+        kind: 'refuse',
+        reason: 'missing-answer',
+        detail:
+          '"reject" carries no reason, so there is nothing to record as the decision. A rejection is one ' +
+          'keystroke plus a reason (CAP-18), and an empty one would record that a gated write was ' +
+          'rejected for no stated reason.',
+      };
+    }
+
+    const handoff = {
+      code: GATE_REJECTED_HANDOFF_CODE,
+      reason:
+        `${intent.principal.kind} "${intent.principal.id}" rejected the gated write ` +
+        `"${gate.intent_id}" (${gate.kind}, ${gate.reversibility}): ${reason} The run hands off ` +
+        'rather than retrying the same write automatically (CAP-23).',
+    };
+
+    if (gate.resolution === 'rejected') {
+      // A redelivered reject (AD-19's at-least-once): `write.gate_rejected` already landed for this
+      // gate, so only the still-missing `handed_off` transition is re-emitted.
+      return {
+        kind: 'apply',
+        effect: effect('gate-rejected', { toState: 'handed_off', handoff }),
+        reason:
+          `catching up the hand-off for the gated write "${gate.intent_id}", already rejected (CAP-23)`,
+      };
+    }
+
+    // gate.resolution === 'pending', and no question conflicts: the ordinary gate-rejection effect.
+    return {
+      kind: 'apply',
+      effect: effect('gate-rejected', {
+        toState: 'handed_off',
+        gateResolution: { intentId: gate.intent_id, outcome: 'rejected' },
+        handoff,
+      }),
+      reason: `a person rejected the gated write "${gate.intent_id}" (CAP-23): ${reason}`,
     };
   }
 
@@ -341,6 +471,61 @@ export const decideSteering = (
     }
 
     case 'approve': {
+      /**
+       * Story 4-1 — a pending AD-12 gate is checked before the step-failure branch below, and the two are
+       * mutually exclusive. `blockedStepOf` finds "the blocked step" by asking whether a step's own
+       * recorded termination disposition escalates to a human; a gate blocks the run *after* the
+       * committing step already completed, so no step failed and `blockedStepOf` would find none. Reading
+       * `state.pendingGate` first means an approval on a gated run is decided on the fact that actually
+       * describes it, rather than falling through to a search built to answer "which step failed".
+       */
+      if (state.pending_gate !== null) {
+        const gate = state.pending_gate;
+        // The same degradation-preserving rule the step-failure branch below already has (AD-24).
+        const toState = state.degradation === null ? 'running' : 'degraded';
+
+        /**
+         * Round-1 review's `resolution` fix. `'rejected'` refuses loudly rather than silently resuming —
+         * this is what closes the crash-window reversal the fix exists for: without it, a redelivered or
+         * late-arriving approve on a gate a person already rejected would fall through to the step-failure
+         * branch below, find no blocked step, and answer `toState: 'running'` unconditionally.
+         */
+        if (gate.resolution === 'rejected') {
+          return {
+            kind: 'refuse',
+            reason: 'wrong-target-state',
+            detail:
+              `The gated write "${gate.intent_id}" was already rejected, so approving it now would ` +
+              'silently reverse that decision — a gate is resolved for good, in the one direction a ' +
+              'person first answered it (CAP-12).',
+          };
+        }
+
+        if (gate.resolution === 'approved') {
+          // A redelivered approve (AD-19's at-least-once): `write.gate_approved` already landed for this
+          // gate, so only the still-missing state transition is re-emitted, never a second one.
+          return {
+            kind: 'apply',
+            effect: effect('gate-approved', { toState }),
+            reason:
+              `catching up the run's return from the gated write "${gate.intent_id}", already approved ` +
+              '(CAP-12)',
+          };
+        }
+
+        // gate.resolution === 'pending': the ordinary gate-approval effect.
+        return {
+          kind: 'apply',
+          effect: effect('gate-approved', {
+            toState,
+            gateResolution: { intentId: gate.intent_id, outcome: 'approved' },
+          }),
+          reason:
+            `a person approved the gated write "${gate.intent_id}" (${gate.kind}, ${gate.reversibility}) ` +
+            '(CAP-12)',
+        };
+      }
+
       /**
        * CAP-2 — an approval is only ever an answer to a gate, and only a `blocked` run has one.
        *

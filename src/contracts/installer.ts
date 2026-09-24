@@ -26,6 +26,7 @@ import { versioned } from './schema-version.js';
 import type { SchemaVersionPolicy } from './schema-version.js';
 import { MODEL_RUNGS } from './state.js';
 import { REVERSIBILITY_CLASSES, RUN_MODES } from './step.js';
+import type { ReversibilityClass } from './step.js';
 import { mcpToolCliNamesFor } from './tool-server.js';
 import type { ToolServerDefinition } from './tool-server.js';
 
@@ -783,6 +784,21 @@ export const ProfileSchema = versioned(
 );
 
 export type Profile = z.infer<typeof ProfileSchema>;
+
+/**
+ * The reversibility classes that stop for a person, absent a person's own answer to question 9's
+ * permissions section. CAP-12: an irreversible action is gated.
+ *
+ * **Declared here, in `src/contracts/`, rather than in `src/installer/` where it originated.** Story
+ * 4-1 gave the engine a second reader of this exact default: an absent `permissions.toml` (a project
+ * onboarded before this file existed, or one that lost it) falls back to it rather than reading as "no
+ * policy, no gate" — and `src/engine/` may import only `src/contracts/`, `src/runtime/` and `node:`
+ * builtins (never `src/installer/`), so the one constant both units read has to live where both may
+ * reach it. `src/installer/write.ts` re-exports it rather than declaring its own, so the installer's
+ * own default and the engine's fallback can never drift into two different answers to "what does an
+ * unconfigured project gate".
+ */
+export const GATED_REVERSIBILITY_CLASSES: readonly ReversibilityClass[] = ['irreversible'];
 
 /**
  * `<target-repo>/.orch/permissions.toml` — granted tools, the reversibility gate table and the
