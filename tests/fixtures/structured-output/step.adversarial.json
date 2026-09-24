@@ -1,0 +1,68 @@
+{
+  "contract_id": "step.adversarial",
+  "step": "adversarial",
+  "status": "completed",
+  "summary": "Three attempts to break the runner's declared-command boundary, all held: no attempt found a way to smuggle an arbitrary shell command through the tool's closed enum.",
+  "provenance": [
+    "adversarial: src/runner/commands.ts",
+    "adversarial: src/runner/index.ts"
+  ],
+  "decisions": [],
+  "artifacts": [],
+  "questions": [],
+  "write_intents": [],
+  "error": null,
+  "gates": [
+    {
+      "command": "typecheck",
+      "declared": "npm run typecheck",
+      "outcome": "passed",
+      "exit_status": 0,
+      "evidence": "evidence/typecheck-1.log"
+    },
+    {
+      "command": "lint",
+      "declared": "npm run lint",
+      "outcome": "passed",
+      "exit_status": 0,
+      "evidence": "evidence/lint-1.log"
+    },
+    {
+      "command": "test",
+      "declared": "",
+      "outcome": "skipped",
+      "exit_status": null,
+      "evidence": ""
+    }
+  ],
+  "attempts": [
+    {
+      "attempted": "Called the declared-command tool with a value containing shell metacharacters (\"typecheck; rm -rf /\") to see whether the enum boundary could be smuggled past.",
+      "observed": "The call was refused before it reached the runner: the tool's input schema is a closed enum of the profile's declared names with additionalProperties false, so the malformed value never validated.",
+      "verdict": "held",
+      "provenance": {
+        "step": "adversarial",
+        "source": "src/runner/commands.ts"
+      }
+    },
+    {
+      "attempted": "Requested a declared name the profile does not define (\"deploy\"), to see whether an undeclared command would run anyway.",
+      "observed": "The enum rejects any name outside the profile's declared set, and no container was started.",
+      "verdict": "held",
+      "provenance": {
+        "step": "adversarial",
+        "source": "src/runner/commands.ts"
+      }
+    },
+    {
+      "attempted": "Ran the declared test command twice in the same attempt number to see whether the container-name collision guard could be bypassed to run a stale container.",
+      "observed": "The second call was refused as already in use, matching the AD-20 rule that a container name is not reused within an attempt.",
+      "verdict": "held",
+      "provenance": {
+        "step": "adversarial",
+        "source": "src/runner/index.ts"
+      }
+    }
+  ],
+  "verdict": "held"
+}

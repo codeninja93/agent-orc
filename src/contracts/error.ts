@@ -38,6 +38,17 @@ export const ERROR_DISPOSITIONS = {
   'step.stream_malformed': 'retry-with-backoff',
   'step.schema_invalid_output': 'escalate-model-tier',
   'step.verification_failed': 'escalate-model-tier',
+  /**
+   * Story 4-2 — the adversarial tester found at least one attempt that broke the implementation.
+   *
+   * Never `escalate-model-tier`: that mapping is `step.verification_failed`'s, for a *technical* gate
+   * failure the ladder's next rung might genuinely do better on. Promoting the adversarial tester's own
+   * model rung does nothing to fix a defect in the *implementation* it found — a step it cannot edit and
+   * this engine has no mechanism to send back to an earlier plan step for a fix (no plan-rewind exists).
+   * A person reviews the finding and decides, the same answer CAP-23 already gives every condition with
+   * no safe automatic recovery.
+   */
+  'step.adversarial_break_found': 'escalate-to-human',
   'step.resume_failed': 'retry-with-backoff',
 
   // Model access (AD-1, Stack model rungs)

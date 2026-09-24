@@ -136,6 +136,48 @@ export const REVIEW_SKIPPED_PAYLOAD_KEYS = {
 } as const;
 
 /**
+ * Story 4-2 — a completed verification step's own per-criterion verdicts, promoted from the artifact
+ * into the durable log.
+ *
+ * `step.verification`'s own docblock draws the line that matters here: a contract sees one artifact and
+ * cannot see the run, so it cannot enforce a rule that spans two steps. Whether every one of `verify`'s
+ * own judgements is `met` is exactly such a rule — the reconciler's spawn-gating check for `adversarial`
+ * needs it on a *later* pass, and AD-4/AD-7 make the log the only place a later pass may read a fact
+ * from. Without this line, a verification step's `judgements` lived only in the terminal output the
+ * spawner already discards for a `completed` step's record beyond `contractOutput`, which does not
+ * survive past the pass that produced it.
+ *
+ * One line per completed step, carrying every judgement at once, rather than one line per judgement the
+ * way `gate.*` does: a gate's per-line split exists so a skip is legible without parsing a payload, and
+ * that reasoning does not carry over to a criterion, which is read back programmatically here rather
+ * than watched live.
+ */
+export const VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE = 'verification.judgements_recorded';
+
+/** The payload keys a `verification.judgements_recorded` line carries. */
+export const VERIFICATION_JUDGEMENTS_RECORDED_PAYLOAD_KEYS = {
+  /** Every judgement the completed output reported: `{ criterion, verdict }` pairs, in the output's order. */
+  Judgements: 'judgements',
+} as const;
+
+/**
+ * Story 4-2 — the `adversarial` step was not spawned because `verify`'s own judgements were not all
+ * `met`.
+ *
+ * The same "declared but not run" shape a skipped deterministic gate already has (`gate.skipped`):
+ * CAP-13's third tier is never spent on an implementation the cheaper tier has already found wanting,
+ * and that has to be a line in the log rather than an absent `agent.spawned` a reader has to interpret.
+ */
+export const ADVERSARIAL_SKIPPED_EVENT_TYPE = 'adversarial.skipped';
+
+/** The payload keys an `adversarial.skipped` line carries. */
+export const ADVERSARIAL_SKIPPED_PAYLOAD_KEYS = {
+  Reason: 'reason',
+  /** The criteria `verify` judged `unmet` or `undetermined`, which is what stopped the spawn. */
+  UnresolvedCriteria: 'unresolved_criteria',
+} as const;
+
+/**
  * AD-24's two ceiling lines, spelled once for the writer and every reader.
  *
  * Both were in {@link EVENT_TYPES} as bare literals from story 1-1 with no emitter, and `src/tui/` spells
@@ -543,6 +585,10 @@ export const EVENT_TYPES = [
   GATE_SKIPPED_EVENT_TYPE,
   /** No model-based review was spawned, and why (CAP-13's economics, said out loud). */
   REVIEW_SKIPPED_EVENT_TYPE,
+  /** Story 4-2 — a completed verification step's own per-criterion verdicts, read back by a later pass. */
+  VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE,
+  /** Story 4-2 — the adversarial step was not spawned because a preceding judgement was not `met`. */
+  ADVERSARIAL_SKIPPED_EVENT_TYPE,
   /** What the run-start branch-protection assertion concluded, including that it could not be made. */
   BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
   /** The branch, the three write intents and the note a completed committing step composed (AD-22). */

@@ -196,6 +196,8 @@ describe('the phase vocabulary, widened safely (matrix 14, 15)', () => {
       'implementation',
       'testing',
       'verification',
+      // Story 4-2: `adversarial` was a declared agent with no phase, so nothing could spawn it.
+      'adversarial',
       // Story 2-7: `committing` was a declared agent with no phase, so nothing could spawn it.
       'committing',
     ]);

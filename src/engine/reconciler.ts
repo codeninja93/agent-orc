@@ -42,6 +42,9 @@ import {
 import { dirname, join } from 'node:path';
 
 import {
+  ADVERSARIAL_CONTRACT_ID,
+  ADVERSARIAL_SKIPPED_EVENT_TYPE,
+  ADVERSARIAL_SKIPPED_PAYLOAD_KEYS,
   ANALYSIS_CONTRACT_ID,
   BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
   BUDGET_DEGRADED_EVENT_TYPE,
@@ -54,7 +57,11 @@ import {
   DETERMINISTIC_GATE_NAMES,
   GATED_REVERSIBILITY_CLASSES,
   NOTE_REF,
+  VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE,
+  VERIFICATION_JUDGEMENTS_RECORDED_PAYLOAD_KEYS,
+  brokenAttemptIn,
   composedProseIn,
+  judgementVerdictsIn,
   totalUsage,
   usageFromPayload,
   IMPLEMENTATION_CONTRACT_ID,
@@ -343,6 +350,12 @@ export const STANDARD_PLAN_STEPS: readonly PlanStep[] = Object.freeze([
   // one that mattered most: `step.verification` is what makes a gate outcome and a per-criterion
   // verdict sayable at all, and under `step.output` every refusal it adds was unreachable.
   { step: 'verify', contract_id: VERIFICATION_CONTRACT_ID, phase: 'verification' },
+  // Story 4-2. CAP-13's other half: `verify` judges the change against fixed criteria, and until this
+  // story nothing in the plan ever tried to break what it judged. It sits between `verify` and `commit`
+  // because it is spawned only once every one of `verify`'s own judgements is `met`
+  // (`adversarialSpawnGates`, below) — the third tier of CAP-13's economics, never spent on a run the
+  // cheaper two have already found wanting.
+  { step: 'adversarial', contract_id: ADVERSARIAL_CONTRACT_ID, phase: 'adversarial' },
   // Story 2-7. `committing` was a declared agent with no phase and no step, so the standard plan ended at
   // the verdict and nothing in it ever reached AD-22's note — the one record that survives the worktree.
   // It is last because the note is written on the merge commit, which is the end of the run.
@@ -1112,6 +1125,119 @@ export interface GateRunRequest {
    */
   readonly attempt: number;
 }
+
+/**
+ * Story 4-2 — the full deterministic-gate report a step's latest attempt left in the log, read back
+ * rather than re-run.
+ *
+ * `gateOutcomesOfLatestAttempt` (`src/engine/ceilings.ts`) already answers a narrower version of this
+ * question — whether each gate passed, failed or was skipped — for the review-skip decision, which
+ * never needed the declared command, the exit status or the evidence pointer back. `adversarialSpawnGates`
+ * does: `step.adversarial`'s input carries the very same `GateOutcomeRecord`s `verify`'s own input did,
+ * copied rather than re-derived, and this is what reconstructs them from the `gate.*` lines the loop
+ * already wrote while running `verify`'s own gates.
+ *
+ * Scoped to the lines after the step's *last* `step.started`, the same reasoning
+ * `gateOutcomesOfLatestAttempt` states: a resume does not re-run the gates, so a resumed step's report is
+ * taken from what its attempt already recorded.
+ */
+const gatesOfLatestAttempt = (
+  events: readonly EventEnvelope[],
+  step: string,
+): readonly GateOutcomeRecord[] => {
+  const ordered = [...events].sort(compareEventOrder);
+  let outcomes: GateOutcomeRecord[] = [];
+  for (const event of ordered) {
+    if (event.step !== step) continue;
+    if (event.type === ENGINE_EVENT_TYPES.StepStarted) {
+      outcomes = [];
+      continue;
+    }
+    const outcome =
+      event.type === ENGINE_EVENT_TYPES.GatePassed
+        ? 'passed'
+        : event.type === ENGINE_EVENT_TYPES.GateFailed
+          ? 'failed'
+          : event.type === ENGINE_EVENT_TYPES.GateSkipped
+            ? 'skipped'
+            : null;
+    if (outcome === null) continue;
+    const payload = event.payload;
+    const gateName = typeof payload['gate'] === 'string' ? payload['gate'] : '';
+    const declared = typeof payload['command'] === 'string' ? payload['command'] : '';
+    const exitStatus = typeof payload['exit_status'] === 'number' ? payload['exit_status'] : null;
+    const evidence = typeof payload['evidence'] === 'string' ? payload['evidence'] : '';
+    const summary = typeof payload['reason'] === 'string' ? payload['reason'] : '';
+    // One outcome survives per gate per attempt; a later line for the same gate replaces an earlier one
+    // rather than appending a second entry for it.
+    outcomes = [
+      ...outcomes.filter((existing) => existing.command !== gateName),
+      { command: gateName, declared, outcome, exitStatus, evidence, containerName: null, summary },
+    ];
+  }
+  return outcomes;
+};
+
+/**
+ * Story 4-2 — a completed verification step's own per-criterion verdicts, read back from the
+ * `verification.judgements_recorded` line its termination wrote, for the step's latest attempt.
+ *
+ * The spawn-gating check for `adversarial` runs on a *later* pass than the one that recorded them (AD-4,
+ * AD-7: the checkpoint is rebuilt from the log, and nothing here holds a fact only in memory), so this
+ * is the read half of {@link Reconciler.recordVerificationJudgements}'s write.
+ */
+const judgementVerdictsOfLatestAttempt = (
+  events: readonly EventEnvelope[],
+  step: string,
+): readonly { readonly criterion: string; readonly verdict: string }[] => {
+  const ordered = [...events].sort(compareEventOrder);
+  let latest: readonly { readonly criterion: string; readonly verdict: string }[] = [];
+  for (const event of ordered) {
+    if (event.step !== step) continue;
+    if (event.type === ENGINE_EVENT_TYPES.StepStarted) {
+      latest = [];
+      continue;
+    }
+    if (event.type !== VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE) continue;
+    const carried = event.payload[VERIFICATION_JUDGEMENTS_RECORDED_PAYLOAD_KEYS.Judgements];
+    latest = Array.isArray(carried)
+      ? carried.filter(
+          (entry): entry is { readonly criterion: string; readonly verdict: string } =>
+            typeof entry === 'object' &&
+            entry !== null &&
+            typeof (entry as Record<string, unknown>)['criterion'] === 'string' &&
+            typeof (entry as Record<string, unknown>)['verdict'] === 'string',
+        )
+      : [];
+  }
+  return latest;
+};
+
+/**
+ * Story 4-2 — a completed adversarial output that found a break is not this step's own failure to fix;
+ * it is the implementation's, and this step cannot edit what it attacked. So the termination routes
+ * through `step.adversarial_break_found` (`escalate-to-human`, AD-35) instead of completing quietly with
+ * nobody told a break was found.
+ *
+ * **Keyed on the field, not the phase** — the same reason {@link Reconciler.recordDeclaredTerritory} is:
+ * asking "is this the adversarial step" would be a second place deciding what that agent is, and
+ * {@link brokenAttemptIn} already answers the only question that matters, from the output alone.
+ */
+const adversarialBreakTermination = (termination: StepTermination): StepTermination => {
+  if (termination.disposition !== 'completed') return termination;
+  if (!brokenAttemptIn(termination.contractOutput)) return termination;
+  return {
+    ...termination,
+    disposition: 'failed',
+    error: makeError(
+      'step.adversarial_break_found',
+      'The adversarial tester found at least one attempt that broke the implementation it attacked. ' +
+        'That is a defect in the implementation, not in this step, and this engine has no mechanism to ' +
+        'send it back to an earlier plan step for a fix — so a person reviews the finding and decides ' +
+        '(CAP-23).',
+    ),
+  };
+};
 
 /**
  * The run's profile exists and cannot be read, so which gates it declares is unknown.
@@ -3769,7 +3895,7 @@ export class Reconciler {
      * is how the economics are asserted in `tests/engine.gate-economics.test.ts`, by absence rather
      * than by a counter that could read zero because nothing incremented it.
      */
-    const gates = this.runGatesBeforeReview(
+    const gatesFromReview = this.runGatesBeforeReview(
       plan,
       state,
       options.step,
@@ -3777,7 +3903,32 @@ export class Reconciler {
       options.transitionTo,
       attempt,
     );
-    if (gates === null) return;
+    if (gatesFromReview === null) return;
+
+    /**
+     * Story 4-2's third tier, one phase after CAP-13's own two.
+     *
+     * `runGatesBeforeReview` already returns `[]` unchanged for any phase but `verification` — it never
+     * runs a gate for `adversarial`, which is exactly right (Design Notes: nothing changes the worktree
+     * between `verify` and `adversarial`, so re-running would cost real time for zero new information).
+     * What `adversarial` still needs is *content* for that field — `verify`'s own report, copied — and
+     * the decision of whether to spawn at all, which is `adversarialSpawnGates`'s job: analogous to
+     * `runGatesBeforeReview`, and a different question, over the *preceding* step's own recorded verdicts
+     * rather than this step's own gates.
+     */
+    let gates = gatesFromReview;
+    if (options.step.phase === 'adversarial') {
+      const prepared = this.adversarialSpawnGates(
+        paths,
+        plan,
+        state,
+        options.step,
+        baselineRef,
+        options.transitionTo,
+      );
+      if (prepared === null) return;
+      gates = prepared;
+    }
 
     /**
      * AD-24's "narrowing scope", and nothing wider: a degraded run's verification step stops after its
@@ -4185,9 +4336,13 @@ export class Reconciler {
     state: RunState,
     step: PlanStep,
     baselineRef: string,
-    termination: StepTermination,
+    rawTermination: StepTermination,
     context: { readonly transitionTo: FeatureState; readonly plan: FeaturePlan },
   ): void {
+    // Story 4-2 — a completed output reporting a broken attempt is re-dispositioned before a single line
+    // is written, so `step.terminated` itself carries the AD-35 code rather than a later reader having to
+    // reach into `contractOutput` to learn what a `completed` disposition here does not say.
+    const termination = adversarialBreakTermination(rawTermination);
     const recorder = this.recorderFor(state.run, state.feature);
     this.emit(recorder, {
       step: step.step,
@@ -4213,6 +4368,7 @@ export class Reconciler {
     if (termination.disposition === 'completed') {
       this.recordDeclaredTerritory(state, step, recorder, termination);
       this.recordComposedCommit(state, context.plan, step, recorder, termination);
+      this.recordVerificationJudgements(step, recorder, termination);
     }
 
     if (termination.disposition === 'interrupted' && context.transitionTo !== 'interrupted') {
@@ -4573,6 +4729,74 @@ export class Reconciler {
   }
 
   /**
+   * Story 4-2's third-tier spawn gate: before spawning `adversarial`, read what the preceding `verify`
+   * step's own output actually judged, and refuse to spend the model turn on an implementation the
+   * cheaper tier has already found wanting.
+   *
+   * **Analogous to {@link runGatesBeforeReview}, and a different question.** That decision reads the
+   * *engine's own* gate outcomes, because a spawn is the thing that costs and a step cannot decline to
+   * be spawned; this one reads the *preceding step's own recorded verdicts*, one tier later, for the
+   * identical reason. Every judgement must be `met` — an `unmet` or `undetermined` skips the spawn
+   * exactly as a failing gate skips verification's own review, and the skip is recorded
+   * (`adversarial.skipped`) rather than silent, the same "declared but not run" shape a skipped
+   * deterministic gate already has. A `verify` step recording no judgements at all — a plan with no
+   * verification step, or a step whose contract output never reached the fold — is not a recorded
+   * `unmet`, so the spawn proceeds: this check refuses what it can prove is wanting, and does not invent
+   * a refusal for what it cannot see (the pre-existing gap named in this story's own Deferred section).
+   *
+   * **The gates travel, never re-run.** Nothing changes the worktree between `verify` and `adversarial`
+   * — neither step writes to it — so the outcomes `verify`'s own input already carried are still true,
+   * and this is what copies them for `step.adversarial`'s own input.
+   *
+   * Returns `null` when the pass is already over — the skip was recorded and the step terminated
+   * `completed` with no model spent — and the gate outcomes to copy into the step input otherwise.
+   */
+  private adversarialSpawnGates(
+    paths: RunPaths,
+    plan: FeaturePlan,
+    state: RunState,
+    step: PlanStep,
+    baselineRef: string,
+    transitionTo: FeatureState,
+  ): readonly GateOutcomeRecord[] | null {
+    const events = readEventLog(paths.eventLog);
+    const verifyStep = plan.steps.find((entry) => entry.phase === 'verification');
+    const judgements =
+      verifyStep === undefined ? [] : judgementVerdictsOfLatestAttempt(events, verifyStep.step);
+    const unresolved = judgements.filter((judgement) => judgement.verdict !== 'met');
+
+    if (unresolved.length > 0) {
+      const recorder = this.recorderFor(state.run, state.feature);
+      this.emit(recorder, {
+        step: step.step,
+        type: ADVERSARIAL_SKIPPED_EVENT_TYPE,
+        payload: {
+          [ADVERSARIAL_SKIPPED_PAYLOAD_KEYS.Reason]:
+            `verify judged ${unresolved
+              .map((judgement) => `"${judgement.criterion}" ${judgement.verdict}`)
+              .join(', ')}, so the adversarial tester is not spawned: CAP-13's third tier is spent only ` +
+            'once every criterion is judged met, never on a run the cheaper tier has already found ' +
+            'wanting.',
+          [ADVERSARIAL_SKIPPED_PAYLOAD_KEYS.UnresolvedCriteria]: unresolved.map(
+            (judgement) => judgement.criterion,
+          ),
+        },
+        baselineRef,
+      });
+      this.recordTermination(
+        state,
+        step,
+        baselineRef,
+        { step: step.step, disposition: 'completed', sessionId: null, output: null, error: null, usage: null },
+        { transitionTo, plan },
+      );
+      return null;
+    }
+
+    return verifyStep === undefined ? [] : gatesOfLatestAttempt(events, verifyStep.step);
+  }
+
+  /**
    * The commands the run's profile declares, from its AD-9 snapshot, or `null` when it has none.
    *
    * Read from the snapshot rather than from `.orch/`, for the reason every other configuration read
@@ -4639,6 +4863,36 @@ export class Reconciler {
     // AD-4: a correction the log does not carry is one the next pass will not see, so a dropped line is
     // the same unrecorded action every other emit treats as one rather than something to carry on past.
     if (!recorded.recorded) throw new UnrecordedAction(TERRITORY_DECLARED_EVENT_TYPE);
+  }
+
+  /**
+   * Story 4-2 — promote a completed step's own per-criterion verdicts from its output into the durable
+   * log, so a later pass can read them back (AD-4, AD-7).
+   *
+   * **Keyed on the field, not the phase** — the same reason {@link recordDeclaredTerritory} is: asking
+   * "is this the verify step" would be a second place deciding what that agent is, and
+   * {@link judgementVerdictsIn} already answers the only question that matters, from the output alone.
+   * `adversarialSpawnGates` is the read half of this write, over `judgementVerdictsOfLatestAttempt`.
+   */
+  private recordVerificationJudgements(
+    step: PlanStep,
+    recorder: Recorder,
+    termination: StepTermination,
+  ): void {
+    const judgements = judgementVerdictsIn(termination.contractOutput);
+    // Not an output that judges criteria. Every other contract reaches here too, and says nothing.
+    if (judgements === null) return;
+
+    this.emit(recorder, {
+      step: step.step,
+      type: VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE,
+      payload: {
+        [VERIFICATION_JUDGEMENTS_RECORDED_PAYLOAD_KEYS.Judgements]: judgements.map((judgement) => ({
+          criterion: judgement.criterion,
+          verdict: judgement.verdict,
+        })),
+      },
+    });
   }
 
   /**

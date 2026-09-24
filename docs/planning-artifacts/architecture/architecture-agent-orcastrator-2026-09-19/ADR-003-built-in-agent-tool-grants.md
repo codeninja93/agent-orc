@@ -40,6 +40,7 @@ the decision ever being taken. This ADR takes it.
 | `implementation` | `Read`, `Write`, `Edit`, `Grep`, `Glob` (**`Bash` removed by ADR-004**) | recoverable | It writes the change in the run worktree. It does not run the gates: ADR-004 makes command execution an MCP tool whose server runs the command inside the container. |
 | `testing` | `Read`, `Write`, `Edit`, `Grep`, `Glob` (**`Bash` removed by ADR-004**) | recoverable | **`Write`/`Edit` is deliberate and is broader than ADR-001's sketch.** That sketch said "testing and the committer get `Bash`", which is incomplete: this agent's job is to *write* the tests as well as run them, and a testing agent that cannot author a test is not one. Running them is ADR-004's command tool, not this grant. |
 | `verification` | `Read`, `Grep`, `Glob` (**`Bash` removed by ADR-004**) | reversible | It reports on the declared gates, which it runs through ADR-004's command tool rather than through a shell of its own. It must not be able to edit what it is judging — that is the whole reason it is a separate agent from `testing`. |
+| `adversarial` | `Read`, `Grep`, `Glob` | reversible | **Added by story 4-2.** It tries to break what `verification` already judged met. It must not be able to edit what it attacks, the same reason `verification` cannot edit what it judges — but its grant is narrower than `verification`'s actual reach, not the same: `verification` also holds ADR-004's command tool to run the declared gates, and `adversarial` deliberately does not, because it never re-runs a gate — the report it carries is copied from `verify`'s own attempt. Review found this row's own earlier wording ("same reach... and for the same reason") papered over exactly that difference; corrected here rather than left to be re-discovered. |
 | `committing` | `Read`, `Grep`, `Glob` | irreversible | **Changed from what story 2-1 shipped.** See below. |
 
 **No built-in agent is granted `Task`**, so no step can spawn an unbounded tree of its own. **None is granted
@@ -53,6 +54,16 @@ permission tool but no way to relocate a tool use into a container. Command exec
 whose server runs the command inside the container. `GRANTABLE_TOOLS` keeps `Bash` because AD-17 lets a
 user-defined agent be granted anything the declared set contains — but granting it yields an uncontained
 host shell, which is why story 2-4's `elevated` reporting names it.
+
+## Added by story 4-2: `adversarial`
+
+CAP-13 names two activities — implementation judged against fixed criteria, and something that actively
+tries to break the result — and until story 4-2 only the first had an agent. `adversarial` is the second,
+a distinct agent per this project's one-job-one-agent convention: it must not be the same instance that
+just confirmed the implementation meets its criteria, and per the same reasoning as `verification`'s own
+row, it must not be able to edit what it attacks. Its grant is therefore `verification`'s row, verbatim,
+and its reversibility is `reversible` for the identical reason: it produces no `WriteIntent` and touches
+nothing outside a read-only grant.
 
 ## The one correction: `committing` loses `Bash`
 
@@ -105,3 +116,5 @@ decision; discovering one in a TOML is not.
 - **ADR-001's open question is closed.** What remains open there is nothing.
 - **Stories 2-3 through 2-7** inherit this table rather than each inventing a row of it. A story that needs a
   grant this table does not give is making an architecture change and should say so.
+- **Story 4-2 adds a seventh row**, `adversarial`, rather than inventing one: it is an amendment to this
+  accepted table, per the rule stated above.

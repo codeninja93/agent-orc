@@ -20,6 +20,7 @@
  * typed and never learns what it holds.
  */
 import {
+  ADVERSARIAL_CONTRACT_ID,
   BRANCH_SLUG_PLACEHOLDERS,
   COMMITTING_CONTRACT_ID,
   DEFAULT_BRANCH_PATTERN,
@@ -179,15 +180,17 @@ const noSuggestion = (): null => null;
  * here becomes an offer at question 10 and nothing else; the implementations are stories 2-3 to 2-7.
  *
  * Each references a *registered* contract id (AD-17), never an inline schema, and since story 2-7 none of
- * the six references `step.output`. `committing` was the last that did, on the reasoning that it needed no
+ * the seven references `step.output`. `committing` was the last that did, on the reasoning that it needed no
  * new shape — which was the same mistake one row over: its output is prose alone, and under the shared
  * envelope nothing stopped it declaring a write intent or restating a step's disposition, both of which
  * AD-22 reserves to the engine. Story 2-4 registered
  * `step.analysis` and `step.planning`, whose shapes carry per-claim provenance and a declared territory;
  * story 2-5 registered `step.implementation`, which describes the files changed and leaves no field through
- * which a path outside the run worktree can be returned; and story 2-6 registered `step.testing` and
+ * which a path outside the run worktree can be returned; story 2-6 registered `step.testing` and
  * `step.verification`, which are the pair that most needed telling apart — one may write files and the
- * other may not, and under one shared id nothing the engine reads could say which was which.
+ * other may not, and under one shared id nothing the engine reads could say which was which; and story 4-2
+ * registered `step.adversarial`, the pair `step.verification` most needed telling apart from once a
+ * reviewer existed at all — one judges the change against fixed criteria, the other tries to break it.
  *
  * A declaration naming `step.output` while its agent's contract pins `contract_id` to its own id is a
  * pairing that can never both hold: every refusal the new contract adds would be dead for a default install,
@@ -256,6 +259,24 @@ export const BUILT_IN_AGENTS: readonly AgentDeclarationInput[] = Object.freeze([
     mcp_domains: [],
     reversibility: 'reversible',
     model: { start_tier: 'claude-haiku-4-5', promotion_policy: 'on-gate-failure' },
+  },
+  {
+    id: 'adversarial',
+    // Story 4-2 — ADR-003's seventh row, verification's own grant verbatim and for the identical
+    // reason: it must not be able to edit what it attacks, which is the whole point of it being a
+    // separate agent from `verification` rather than a third tier bolted onto that one's contract. No
+    // `RunDeclaredCommand` either: it never re-runs a gate, only restates the report `verify`'s own
+    // attempt already carries.
+    purpose:
+      'Try to break the implementation, once verify has judged every acceptance criterion met.',
+    contract: ADVERSARIAL_CONTRACT_ID,
+    tools: ['Read', 'Grep', 'Glob'],
+    mcp_domains: [],
+    reversibility: 'reversible',
+    // A stronger starting rung than verification's: judging a fixed criterion is a narrower task than
+    // devising an attack, and AD-17 makes this a *starting* tier, not an assignment — the ladder still
+    // promotes from here on a schema-invalid output.
+    model: { start_tier: 'claude-sonnet-5', promotion_policy: 'on-gate-failure' },
   },
   {
     id: 'committing',

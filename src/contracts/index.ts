@@ -15,6 +15,7 @@ import { assertNodeFloorOrExit } from './node-floor.js';
 
 assertNodeFloorOrExit();
 
+export * from './adversarial.js';
 export * from './analysis.js';
 export * from './command.js';
 export * from './committing.js';

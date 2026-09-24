@@ -438,6 +438,8 @@ describe('a completed analysis re-declares the territory the next pass serialise
         // went from the change straight to judging it.
         'testing',
         'verification',
+        // Story 4-2: the adversarial step, spawned only once verify's own judgements are all met.
+        'adversarial',
         // Story 2-7: the committing step, which is where AD-22's note is composed.
         'committing',
       ]);

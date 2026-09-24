@@ -10,6 +10,7 @@
  */
 import { z } from 'zod';
 
+import { ADVERSARIAL_CONTRACT_ID, AdversarialOutputSchema } from './adversarial.js';
 import { ANALYSIS_CONTRACT_ID, AnalysisOutputSchema } from './analysis.js';
 import { COMMITTING_CONTRACT_ID, CommittingOutputSchema } from './committing.js';
 import { CommandIntentSchema } from './command.js';
@@ -231,6 +232,22 @@ export const CONTRACTS = {
       'verdict on each acceptance criterion the run was accepted with.',
     model_produced: true,
     schema: VerificationOutputSchema,
+  },
+  /**
+   * Story 4-2's adversarial tester, registered for the reason the pair above are — AD-17 has a roster
+   * entry reference a contract by id, and `step.output` cannot tell it apart from `verification`, which
+   * is exactly the pair that must be told apart: one judges the change against fixed criteria, the
+   * other tries to break what was judged, and neither may be the other wearing a different prompt.
+   */
+  [ADVERSARIAL_CONTRACT_ID]: {
+    id: ADVERSARIAL_CONTRACT_ID,
+    kind: 'step',
+    description:
+      'The adversarial tester\'s output: the gate report copied verbatim from `verify`\'s own input, ' +
+      'and one attempt per element to break the implementation, each carrying its provenance and a ' +
+      'verdict of "held" or "broken".',
+    model_produced: true,
+    schema: AdversarialOutputSchema,
   },
   /**
    * Story 2-7's committing agent, registered for the reason the five above are — AD-17 has a roster entry

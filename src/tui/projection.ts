@@ -585,6 +585,9 @@ const NEXT_UP_BY_PHASE: Readonly<Record<StepPhase, string>> = {
   implementation: 'the tests the change has to survive',
   testing: 'verification, once the tests are written',
   verification: 'the verification gates',
+  // Story 4-2. Spawned only once every one of verify's own judgements is met, so a run in this phase
+  // is already past the point CAP-13's cheaper tier could have stopped it at.
+  adversarial: 'the adversarial tester’s attempts to break the change',
   // Story 2-7. A renderer may not infer a branch name from a feature slug (AD-22), so this line names
   // the pull request and the note and never where they land: the committer is the only unit that knows.
   committing: 'the pull request and the AD-22 note',

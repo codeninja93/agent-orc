@@ -108,6 +108,13 @@ export const STEP_PHASES = [
   // standard plan runs them, which is also the order a person reads a run in.
   'testing',
   'verification',
+  // Story 4-2 — CAP-13's other half. `verify` judges the change against criteria fixed before it was
+  // written; nothing tried to break what it judged until this phase existed. It sits after
+  // `verification` and before `committing` because it is spawned only once every one of `verify`'s own
+  // judgements is `met` (`src/engine/reconciler.ts`'s spawn-gating check), extending the two-tier
+  // economics CAP-13 already states into a third tier that is never spent on a run the cheaper one has
+  // already found wanting.
+  'adversarial',
   // Story 2-7, and the same gap one phase later: `committing` was a declared agent with no phase, so
   // nothing could spawn it — the roster offered it and ADR-003 fixed its grant, while the one word that
   // lets a step be planned for it was missing. It is last because AD-22 has the committer write the note

@@ -126,6 +126,7 @@ describe('a repository with no .orch/ is asked everything, in order', () => {
     expect(outcome.asked).toStrictEqual(EXPECTED_ORDER);
     const tree = readTree(join(repo, '.orch'));
     expect([...tree.keys()].sort()).toStrictEqual([
+      'agents/adversarial.toml',
       'agents/analysis.toml',
       'agents/committing.toml',
       'agents/implementation.toml',
