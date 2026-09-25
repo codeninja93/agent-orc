@@ -29,7 +29,6 @@
  */
 import {
   closeSync,
-  existsSync,
   fsyncSync,
   mkdirSync,
   openSync,
@@ -74,8 +73,11 @@ export interface RunConsolidationPassOptions extends ConsolidateOptions {
  * `runPaths`/`runsDir`/`projectMemoryPath` each default their own `orchHome` parameter to
  * `resolveOrchHome()`, but that default-parameter substitution only fires for `undefined` — an explicit
  * `orchHome: ''` would otherwise resolve to a relative path instead of the intended default.
+ *
+ * Exported (story 5-2) so `src/engine/knowledge-sweep.ts` and `src/engine/knowledge-retrieval.ts` share
+ * this one guard rather than each carrying a byte-for-byte copy of it.
  */
-const orchHomeOf = (options: ConsolidationOptions): string | undefined =>
+export const orchHomeOf = (options: ConsolidationOptions): string | undefined =>
   options.orchHome === undefined || options.orchHome.trim() === '' ? undefined : options.orchHome;
 
 const payloadString = (event: EventEnvelope, key: string): string | null => {
@@ -220,10 +222,24 @@ const consolidationKeyOfProvenance = (provenance: string): string | null =>
  * Each line is parsed in its own try/catch, matching this module's own per-run isolation elsewhere
  * (`consolidate`'s try/catch around `consolidateRun`): one malformed line costs only itself, never every
  * future read of the store.
+ *
+ * The read is attempted directly rather than gated by a separate `existsSync` check: a check-then-act
+ * pair races a deletion landing between the two calls, which would otherwise throw an uncaught `ENOENT`
+ * instead of answering the "no store yet" case the same way a store that was never created does. Only
+ * `ENOENT` is swallowed; any other read failure (a permission fault, a directory where the file belongs)
+ * still propagates, exactly as it did when `existsSync` had already found the path present.
+ *
+ * Exported (story 5-2) so `src/engine/knowledge-sweep.ts` and `src/engine/knowledge-retrieval.ts` share
+ * this one reader instead of each carrying a byte-for-byte copy of it.
  */
-const readConsolidatedStore = (storePath: string): readonly KnowledgeEntry[] => {
-  if (!existsSync(storePath)) return [];
-  const text = readFileSync(storePath, 'utf8');
+export const readConsolidatedStore = (storePath: string): readonly KnowledgeEntry[] => {
+  let text: string;
+  try {
+    text = readFileSync(storePath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
   if (text === '') return [];
   const entries: KnowledgeEntry[] = [];
   for (const line of text.split('\n')) {

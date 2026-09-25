@@ -32,16 +32,18 @@
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
+  existsSync,
   fsyncSync,
   mkdirSync,
   openSync,
+  readFileSync,
   readdirSync,
   renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import {
   CURRENT_SCHEMA_VERSION,
@@ -433,6 +435,46 @@ export const ABANDONED_TEMPORARY_GRACE_MS = 60_000;
  * each other — so it is named identically and documented identically rather than passed between them.
  */
 export const CLOCK_SKEW_TOLERANCE_MS = 1_000;
+
+/** What {@link writeFileIfChanged} did: a new file, a rewritten one, or bytes already exactly these. */
+export type WriteDisposition = 'created' | 'updated' | 'unchanged';
+
+/**
+ * Write one file atomically, or leave it alone because it already holds exactly these bytes.
+ *
+ * Moved here (story 5-2) from `src/installer/write.ts`, where story 2-1 put it when the installer was
+ * its only caller. `src/engine/knowledge-sweep.ts` is the second caller — the sweep rewrites
+ * `profile.toml` with the same skip-if-unchanged idiom the installer already uses for that file — and
+ * the spine's dependency rule lets the engine import `src/runtime/` but never `src/installer/`, which is
+ * the same reason `src/contracts/toml.ts` holds the TOML codec rather than `src/installer/toml.ts`
+ * holding it alone. `src/installer/write.ts` re-exports this, so no existing caller changed.
+ *
+ * Reading before writing is not an optimisation. It is the difference between "the installer is
+ * idempotent" and "the installer rewrites the same bytes and calls that idempotent": only the skip
+ * leaves a re-run's tree indistinguishable from the first run's.
+ */
+export const writeFileIfChanged = (absolute: string, contents: string): WriteDisposition => {
+  const exists = existsSync(absolute);
+  if (exists && readFileSync(absolute, 'utf8') === contents) return 'unchanged';
+
+  const directory = dirname(absolute);
+  // The temporary lives beside its target, because `rename` cannot cross a filesystem boundary and
+  // a temporary elsewhere would fail with EXDEV on exactly the machines that separate them.
+  const temp = `${absolute}.${String(process.pid)}.tmp`;
+  writeFileSync(temp, contents, { encoding: 'utf8', mode: 0o644 });
+  const fd = openSync(temp, 'r');
+  try {
+    fsyncSync(fd);
+  } catch {
+    // Unsynced contents are a durability weakness, not a torn file: the rename is still atomic.
+  }
+  // Closed on both paths without a `finally`, matching this module's own idiom above.
+  closeSync(fd);
+  renameSync(temp, absolute);
+  // Only now is the *name* durable; the file's own fsync makes only its contents so.
+  fsyncDirectory(directory);
+  return exists ? 'updated' : 'created';
+};
 
 /**
  * A single non-atomic write of an intent, used by nothing in production.

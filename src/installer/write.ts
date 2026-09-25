@@ -19,8 +19,8 @@
  * is how a re-run knows not to ask them — so a file in `.orch/agents/` is authority, including one a
  * person wrote by hand. Pruning it would delete the answer and then ask for it again.
  */
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 import {
   AGENTS_DIR_NAME,
@@ -44,7 +44,8 @@ import type {
   Permissions,
   Profile,
 } from '../contracts/index.js';
-import { fsyncDirectory } from '../runtime/commands.js';
+import { writeFileIfChanged } from '../runtime/commands.js';
+import type { WriteDisposition } from '../runtime/commands.js';
 
 import { orchPaths, relativeOrchPath } from './answers.js';
 import { BUILT_IN_AGENTS } from './interview.js';
@@ -53,6 +54,17 @@ import { buildManifest } from './manifest.js';
 import type { WrittenFile } from './manifest.js';
 import { parseToml, serialiseToml } from './toml.js';
 import type { TomlTable } from './toml.js';
+
+/**
+ * Re-exported from where it now lives (story 5-2): `src/runtime/commands.ts`, beside `fsyncDirectory`,
+ * which it was already built from. The engine's knowledge sweep is the second caller of the same
+ * skip-if-unchanged idiom this file used alone, and the spine forbids the engine from importing
+ * `src/installer/` — the same reason `src/installer/toml.ts` re-exports `src/contracts/toml.ts` rather
+ * than keeping its own copy of the codec. Kept here (imported above, re-exported here) so no existing
+ * caller of this module changed.
+ */
+export { writeFileIfChanged };
+export type { WriteDisposition };
 
 /**
  * The runtime paths appended to `.gitignore`, per AD-9.
@@ -67,8 +79,6 @@ export const GITIGNORE_LINES: readonly string[] = ['.orch/**/*.tmp'];
 /** Written above the lines on a first append, and never matched against, so it never duplicates. */
 export const GITIGNORE_HEADER = '# agent-orchestrator runtime paths (AD-9); .orch/ itself is committed.';
 
-export type WriteDisposition = 'created' | 'updated' | 'unchanged';
-
 export interface FileOutcome {
   readonly path: string;
   readonly disposition: WriteDisposition;
@@ -79,36 +89,6 @@ export interface WriteOutcome {
   readonly dispositions: readonly FileOutcome[];
   readonly gitignore: 'appended' | 'unchanged';
 }
-
-/**
- * Write one file atomically, or leave it alone because it already holds exactly these bytes.
- *
- * Reading before writing is not an optimisation. It is the difference between "the installer is
- * idempotent" and "the installer rewrites the same bytes and calls that idempotent": only the skip
- * leaves a re-run's tree indistinguishable from the first run's.
- */
-export const writeFileIfChanged = (absolute: string, contents: string): WriteDisposition => {
-  const exists = existsSync(absolute);
-  if (exists && readFileSync(absolute, 'utf8') === contents) return 'unchanged';
-
-  const directory = dirname(absolute);
-  // The temporary lives beside its target, because `rename` cannot cross a filesystem boundary and
-  // a temporary elsewhere would fail with EXDEV on exactly the machines that separate them.
-  const temp = `${absolute}.${String(process.pid)}.tmp`;
-  writeFileSync(temp, contents, { encoding: 'utf8', mode: 0o644 });
-  const fd = openSync(temp, 'r');
-  try {
-    fsyncSync(fd);
-  } catch {
-    // Unsynced contents are a durability weakness, not a torn file: the rename is still atomic.
-  }
-  // Closed on both paths without a `finally`, matching the idiom in `src/runtime/commands.ts`.
-  closeSync(fd);
-  renameSync(temp, absolute);
-  // Only now is the *name* durable; the file's own fsync makes only its contents so.
-  fsyncDirectory(directory);
-  return exists ? 'updated' : 'created';
-};
 
 /**
  * The knowledge section already on disk, so a re-run does not destroy it.

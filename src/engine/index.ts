@@ -73,6 +73,14 @@
  *   folded, with `trust-record`'s own `areaOf`/`territoryFromEvents`, into `KnowledgeEntry`-shaped facts,
  *   appended idempotently to `ORCH_HOME/projects/<project-id>/memory/consolidated.jsonl` (AD-9). Nothing
  *   calls its one entry point, `runConsolidationPass`, yet — wiring a trigger is a future story's;
+ * - `knowledge-sweep` — story 5-2: `sweepProfileKnowledge` retires an AD-16-contradicted or
+ *   anchor-`'dead'` entry from `profile.toml` by rewriting it (`serialiseToml`/`writeFileIfChanged`, now in
+ *   `src/runtime/commands.ts`); `sweepConsolidatedKnowledge` only *reports* the same check against L3's
+ *   append-only `consolidated.jsonl`, never rewriting it. `anchorResolution` is the one filesystem check
+ *   both share, and it is conservative by construction: `'dead'` only for a `module-name`/`file-path`
+ *   anchor actually checked and absent, `'unchecked'` for `api-symbol`/`test-name`, never a guess;
+ * - `knowledge-retrieval` — story 5-2's other half: `retrieveFacts` reads L3 back, filtered to a caller's
+ *   declared areas and capped at a plain per-feature entry-count budget, most-recent-first;
  * The run-start branch-protection assertion is deliberately **not** here. `src/container/lifecycle.ts`
  * already owned it, and a second implementation in this package disagreed with it about the one thing
  * that matters — whether "we could not check" and "it is not protected" have the same consequence. The
@@ -132,4 +140,6 @@ export * from './feature-usage.js';
 export * from './trust-record.js';
 export * from './shadow-gate.js';
 export * from './consolidation.js';
+export * from './knowledge-sweep.js';
+export * from './knowledge-retrieval.js';
 export * from './reconciler.js';
