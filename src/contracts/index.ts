@@ -17,6 +17,7 @@ assertNodeFloorOrExit();
 
 export * from './adversarial.js';
 export * from './analysis.js';
+export * from './bootstrap.js';
 export * from './command.js';
 export * from './committing.js';
 export * from './error.js';

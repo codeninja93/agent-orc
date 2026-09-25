@@ -12,6 +12,7 @@ import { z } from 'zod';
 
 import { ADVERSARIAL_CONTRACT_ID, AdversarialOutputSchema } from './adversarial.js';
 import { ANALYSIS_CONTRACT_ID, AnalysisOutputSchema } from './analysis.js';
+import { BOOTSTRAP_CONTRACT_ID, BootstrapAnalysisSchema } from './bootstrap.js';
 import { COMMITTING_CONTRACT_ID, CommittingOutputSchema } from './committing.js';
 import { CommandIntentSchema } from './command.js';
 import { NOTE_CONTRACT_ID, GitNoteSchema } from './note.js';
@@ -269,6 +270,31 @@ export const CONTRACTS = {
     schema: CommittingOutputSchema,
   },
   /**
+   * Story 5-5's bootstrap agent, registered for the reason every step contract above is — AD-17 has a
+   * roster entry reference a contract by id, and `step.output` cannot tell it apart from any other.
+   *
+   * **`model_produced: true`, and its AD-31 fixture is a named, deferred gap — not registered here as an
+   * afterthought.** This is a brand-new contract, and AD-31's own fixture has to come from a real
+   * `claude -p --json-schema` invocation against this contract's exported draft-7 schema, which needs
+   * subscription auth this build environment cannot provide. It is not omitted from the registry over
+   * that gap — an unregistered contract is one `getContract` cannot resolve at all, which would make
+   * `BOOTSTRAP_AGENT_DECLARATION`'s own `contract` field a reference to nothing. Instead it is registered
+   * exactly like its six siblings, and {@link PENDING_AD31_FIXTURE_CONTRACT_IDS} names it as owing a
+   * fixture; `tests/contracts.round-trip.test.ts` reads that list to turn its fixture-dependent legs into
+   * a visible, explicit gap for this one id rather than a red suite nobody in this repository could fix,
+   * or a silent exclusion with nothing pointing at it.
+   */
+  [BOOTSTRAP_CONTRACT_ID]: {
+    id: BOOTSTRAP_CONTRACT_ID,
+    kind: 'step',
+    description:
+      'The bootstrap agent\'s output: the three profile judgement fields detection cannot answer ' +
+      '(mechanics.resources, risk.high_blast_radius_paths/conflict_domains, and knowledge), each ' +
+      'attributed to what was read (CAP-20).',
+    model_produced: true,
+    schema: BootstrapAnalysisSchema,
+  },
+  /**
    * AD-22's git note, the in-repository durable record written on the merge commit.
    *
    * An `artifact` and not a `step`: no model produces it. The engine composes it from `events.jsonl` and
@@ -321,6 +347,32 @@ export const STEP_CONTRACT_IDS: readonly ContractId[] = contractIdsOfKind('step'
 export const MODEL_PRODUCED_CONTRACT_IDS: readonly ContractId[] = CONTRACT_IDS.filter(
   (id) => CONTRACTS[id].model_produced,
 );
+
+/**
+ * Model-produced contracts registered without an AD-31 fixture yet, each a **named, dated, recorded**
+ * gap rather than a silent one.
+ *
+ * AD-31 requires a recorded real `claude -p --json-schema` transcript for every contract a model
+ * produces, and that recording needs subscription auth no build of this package can supply for itself —
+ * it is a session a person runs once, by hand, and commits the result of. A contract can therefore be
+ * registered — as AD-17 requires, so a roster entry's `contract` field resolves to something real — before
+ * that session has happened, and this list is where that honest, temporary state is written down.
+ * `tests/contracts.round-trip.test.ts` reads it to turn the fixture-dependent legs of its own suite into a
+ * visible, explicit exclusion for exactly these ids, rather than either fabricating a fixture (which
+ * story 5-5's own Boundary forbids: "a schema this codebase cannot actually validate against a real
+ * model's output is worse than an honestly incomplete round-trip test") or failing the whole suite for a
+ * reason nobody working inside this repository could resolve.
+ *
+ * **Removing an id here is a two-step act, not a one-line edit.** Drop it only in the same change that
+ * commits `tests/fixtures/structured-output/<id>.json`, a real recorded transcript — never on its own,
+ * which would silently re-admit the very gap this list exists to keep visible.
+ *
+ * Story 5-5: `step.bootstrap` is new and needs one. Deep has agreed to run the session that supplies it
+ * (confirmed directly, 2026-09-25).
+ */
+export const PENDING_AD31_FIXTURE_CONTRACT_IDS: readonly ContractId[] = Object.freeze([
+  BOOTSTRAP_CONTRACT_ID,
+]);
 
 /** The draft-07 dialect every export must declare. */
 export const JSON_SCHEMA_DIALECT = 'http://json-schema.org/draft-07/schema#';

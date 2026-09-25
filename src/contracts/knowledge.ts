@@ -161,8 +161,24 @@ export const KnowledgeEntrySchema = z
     /** RFC3339 with milliseconds in UTC, per the Consistency Conventions. */
     recorded_at: TimestampSchema,
     decay_policy: z.enum(DECAY_POLICIES),
-    /** How many features an `n-features` entry survives; zero for every other policy. */
-    decay_features: z.int(),
+    /**
+     * How many features an `n-features` entry survives; zero for every other policy.
+     *
+     * **A refinement, not `z.int()` — amended by story 5-5.** This schema was written for
+     * `ProfileSchema`, an on-disk artifact the AD-2 structured-outputs subset never bound. Story 5-5
+     * embeds it verbatim inside `step.bootstrap`'s `knowledge` field, a *model-produced step* contract,
+     * where it is: `z.int()` exports safe-integer `minimum`/`maximum` keywords into the draft-7 schema,
+     * and `minimum` is outside the subset (`src/contracts/step.ts`'s own `BudgetSchema` gives the
+     * identical reasoning for its own integer fields). The refinement holds both of `z.int()`'s rules —
+     * a whole number *and* within the safe integer range (`Number.isSafeInteger`, not the weaker
+     * `Number.isInteger`, which admits values like `1e21` that cannot round-trip exactly) — at parse
+     * time while exporting nothing but `{"type": "number"}`.
+     */
+    decay_features: z.number().refine((value) => Number.isSafeInteger(value), {
+      message:
+        'decay_features is a whole number of features, never a fraction, and stays within the safe ' +
+        'integer range — the same two properties z.int() enforced before this refinement replaced it',
+    }),
   })
   .refine(
     (entry) => (entry.decay_policy === 'n-features' ? entry.decay_features >= 1 : true),
