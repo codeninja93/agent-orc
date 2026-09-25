@@ -129,6 +129,23 @@ export const projectMemoryPath = (
 ): string =>
   join(projectDir(projectId, orchHome), PROJECT_MEMORY_DIR_NAME, CONSOLIDATED_MEMORY_FILE_NAME);
 
+/**
+ * Story 5-3, AD-9 — `projects/<project-id>/memory/decisions.jsonl`, the durable per-project index the
+ * decision-ledger query (`src/engine/decision-index.ts`) appends `decision.recorded` lines to.
+ *
+ * Spelled here beside `projectMemoryPath` for the same reason that name is: `projects/<project-id>/memory/`
+ * already holds one derived-projection store (story 5-1's `consolidated.jsonl`), and this is the second,
+ * so a second spelling of the directory — one in this file, another wherever a future reader is built —
+ * would be the same two-on-disk-layouts split AD-9 exists to prevent.
+ */
+export const DECISION_INDEX_FILE_NAME = 'decisions.jsonl';
+
+/** `projects/<project-id>/memory/decisions.jsonl` for one project id. */
+export const decisionIndexPath = (
+  projectId: string,
+  orchHome: string = resolveOrchHome(),
+): string => join(projectDir(projectId, orchHome), PROJECT_MEMORY_DIR_NAME, DECISION_INDEX_FILE_NAME);
+
 /** The file names inside a run directory, so no caller spells one itself. */
 export const EVENT_LOG_FILE_NAME = 'events.jsonl';
 export const FETCH_RECORD_FILE_NAME = 'fetch-record.json';

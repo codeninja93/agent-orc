@@ -114,8 +114,14 @@ export const isUsableAnchor = (anchor: QuestionAnchor): boolean =>
  */
 export const formatAnchor = (anchor: QuestionAnchor): string => `${anchor.symbol}:${anchor.aspect}`;
 
-/** True when a text names both parts of the anchor as whole tokens. */
-const namesAnchor = (text: string, anchor: QuestionAnchor): boolean =>
+/**
+ * True when a text names both parts of the anchor as whole tokens.
+ *
+ * Exported (story 5-3) so `decision-index.ts`'s `queryDecisionIndex` compares an indexed decision
+ * against an anchor exactly as `matchDecisionLedger` below does, rather than a second whole-token
+ * matcher being written. A pure addition: this function's behaviour is unchanged.
+ */
+export const namesAnchor = (text: string, anchor: QuestionAnchor): boolean =>
   mentionsSymbol(text, anchor.symbol) && mentionsSymbol(text, anchor.aspect);
 
 /** What one attempt found in one source. The answer is the source's own text, never a paraphrase. */
@@ -334,8 +340,12 @@ const TIMEOUT_RESOLVER = 'timeout_default';
  * Narrowed on purpose. The corrupt-log and unsafe-id errors are the runtime's own, and a Node `fs` error
  * carries an errno code (`ENOENT`, `EACCES`, `EISDIR`); anything else — a `TypeError` from a changed
  * payload shape, say — is a bug in this build, and filing it under "unreadable" would hide it for ever.
+ *
+ * Exported (story 5-3) so `decision-index.ts`'s `buildDecisionIndex` classifies a per-run read failure on
+ * exactly these grounds instead of a second, looser definition of "unreadable" being written beside it. A
+ * pure addition: this function's behaviour is unchanged.
  */
-const isUnreadableLog = (error: unknown): boolean =>
+export const isUnreadableLog = (error: unknown): boolean =>
   error instanceof EventLogCorruptError ||
   error instanceof UnsafePathSegmentError ||
   (error instanceof Error && 'code' in error && typeof error.code === 'string' && /^E[A-Z]+$/.test(error.code));
@@ -357,7 +367,12 @@ interface LedgerCandidate {
  *
  * **Newest is by the decision's own `resolved_at`**, an RFC3339 instant that orders as text, with the
  * fold's reading order breaking ties — so the answer does not depend on the order a caller listed runs in.
- * And **newest means newest, even when it cannot be used** (matrix 20): when the newest decision naming
+ * That tie-break is still the *reading* order of this fold's own `runs` argument when two decisions share
+ * one `resolved_at` to the millisecond — an extremely rare case, and caller-order-dependent in exactly the
+ * way the primary sort is not; `decision-index.ts`'s `queryDecisionIndex` inherits this same limitation
+ * over its own `entries` argument rather than resolving it, since resolving it there would make the index
+ * disagree with the live fold it exists to mirror. And **newest means newest, even when it cannot be
+ * used** (matrix 20): when the newest decision naming
  * the anchor had its answer rewritten by AD-21, or recorded none, there is no match. Falling back to the
  * decision before it would deflect with an answer that decision had already superseded.
  *

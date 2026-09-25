@@ -81,6 +81,13 @@
  *   anchor actually checked and absent, `'unchecked'` for `api-symbol`/`test-name`, never a guess;
  * - `knowledge-retrieval` — story 5-2's other half: `retrieveFacts` reads L3 back, filtered to a caller's
  *   declared areas and capped at a plain per-feature entry-count budget, most-recent-first;
+ * - `decision-index` — story 5-3's queryable index over `decision.recorded` lines: `buildDecisionIndex`
+ *   replays `decisionsInLog` out of a batch of ledger runs and appends idempotently, by question id, to
+ *   `ORCH_HOME/projects/<project-id>/memory/decisions.jsonl`; `queryDecisionIndex` reproduces
+ *   `deflection.ts`'s `matchDecisionLedger` semantics against the indexed entries instead of raw event
+ *   logs. `matchDecisionLedger` itself is untouched but for exporting `namesAnchor` and `isUnreadableLog`
+ *   for this reuse, and nothing calls either new function yet — the same complete-and-unwired precedent
+ *   `consolidation.ts` and `knowledge-sweep.ts`/`knowledge-retrieval.ts` already set;
  * The run-start branch-protection assertion is deliberately **not** here. `src/container/lifecycle.ts`
  * already owned it, and a second implementation in this package disagreed with it about the one thing
  * that matters — whether "we could not check" and "it is not protected" have the same consequence. The
@@ -142,4 +149,5 @@ export * from './shadow-gate.js';
 export * from './consolidation.js';
 export * from './knowledge-sweep.js';
 export * from './knowledge-retrieval.js';
+export * from './decision-index.js';
 export * from './reconciler.js';
