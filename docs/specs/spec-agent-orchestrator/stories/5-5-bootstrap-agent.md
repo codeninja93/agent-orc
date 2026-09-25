@@ -19,9 +19,12 @@ deferred:
       entry.id, and BOOTSTRAP_AGENT_DECLARATION's id 'bootstrap' is never looked up anywhere in the
       engine. Found independently by two review layers plus direct tracing. The fix path already exists
       (createStepSpawner's grantFor option is pluggable) and is now documented on bootstrapPlan/
-      BOOTSTRAP_AGENT_DECLARATION, but proving it end-to-end needs a real subprocess dispatch via
-      fake-claude.ts replaying the same AD-31 fixture this story already tracks as pending
-      (PENDING_AD31_FIXTURE_CONTRACT_IDS) - the two gaps are tied together, not independent.
+      BOOTSTRAP_AGENT_DECLARATION. Update, 2026-09-25: the AD-31 fixture this gap was tied to is now
+      recorded (tests/fixtures/structured-output/step.bootstrap.json, real claude -p transcript, verified
+      three ways) and BOOTSTRAP_CONTRACT_ID is no longer in PENDING_AD31_FIXTURE_CONTRACT_IDS — so the
+      blocker on *this* item is gone, but the item itself remains open: nothing yet exercises a real
+      (non-scripted) spawner, a custom grantFor, and fake-claude.ts replaying that fixture end-to-end.
+      That is new test-writing work, not part of the fixture-capture closure, and stays deferred.
     location: >-
       src/engine/bootstrap.ts (bootstrapPlan, BOOTSTRAP_AGENT_DECLARATION)
     severity: medium
@@ -160,6 +163,19 @@ future work, matching the unwired-but-complete precedent every story since 5-1 h
 
 ## Spec Change Log
 
+### 2026-09-25 — AD-31 fixture recorded, `step.bootstrap` gap closed
+Deep ran a real `claude -p --json-schema` session against `exportContract('step.bootstrap')`, per the
+procedure this story's own review pass and `PENDING_AD31_FIXTURE_CONTRACT_IDS`'s doc comment laid out. The
+returned `structured_output` is committed at `tests/fixtures/structured-output/step.bootstrap.json`,
+verified three ways before being written (Zod `safeParse`, ajv draft-7 compile-and-validate, lossless
+`JSON.stringify` round-trip). `BOOTSTRAP_CONTRACT_ID` was removed from `PENDING_AD31_FIXTURE_CONTRACT_IDS`
+in the same change, and the three `it.todo` cases in `tests/contracts.bootstrap.test.ts` were replaced with
+real, passing assertions mirroring `tests/contracts.round-trip.test.ts`'s own three legs. The shared
+round-trip suite now covers `step.bootstrap` generically as well, since it is no longer excluded there.
+Full gate (`typecheck`, `lint`, `build`, `test`) is green: 111 files, 3205 tests, zero pending cases. The
+real-spawner dispatch proof (frontmatter `deferred`) is a separate, still-open item — see its updated
+evidence note above.
+
 ### 2026-09-25 — a genuine safety bug in `bootstrapPlan`'s own worktree contract
 Found directly (before dispatching the four review layers), by tracing AD-26's `reset-and-rerun` path:
 `bootstrapPlan(repositoryPath)` set `worktree: repositoryPath` — the person's own real repository
@@ -288,13 +304,17 @@ three profile judgement fields `detectDefaults`'s mechanical checks cannot answe
 `mergeBootstrapAnalysis` is a pure function returning an updated `Profile` — nothing in this codebase's
 path from here writes `.orch/profile.toml`, which is what makes "reviewed by the user before first use"
 true by construction. AD-31's own requirement — a recorded real `claude -p` transcript for any new
-model-produced contract — cannot be satisfied in this environment; Deep has agreed to supply one, and the
-gap is named, dated, and tracked (`PENDING_AD31_FIXTURE_CONTRACT_IDS`) rather than faked or silently
-skipped.
+model-produced contract — could not be satisfied inside this build environment; Deep ran that session
+directly (2026-09-25), and the resulting fixture is now committed and verified, closing the gap that was
+tracked as `PENDING_AD31_FIXTURE_CONTRACT_IDS` rather than faked or silently skipped. See the Spec Change
+Log's second entry for the closure details.
 
 **Files changed:**
 - `src/contracts/bootstrap.ts` (new) — `BOOTSTRAP_CONTRACT_ID`, `BootstrapAnalysisSchema`.
-- `src/contracts/registry.ts` — registers the contract; adds `PENDING_AD31_FIXTURE_CONTRACT_IDS`.
+- `src/contracts/registry.ts` — registers the contract; adds, then (2026-09-25) empties,
+  `PENDING_AD31_FIXTURE_CONTRACT_IDS`.
+- `tests/fixtures/structured-output/step.bootstrap.json` (new, 2026-09-25) — the recorded real
+  `claude -p --json-schema` transcript closing the AD-31 gap.
 - `src/contracts/knowledge.ts` — `decay_features` changed to a refinement (required for AD-2 subset
   reuse inside a step contract), fixed during review to use `Number.isSafeInteger`.
 - `src/engine/bootstrap.ts` (new) — `BOOTSTRAP_AGENT_DECLARATION`, `bootstrapPlan`,
@@ -336,9 +356,13 @@ end-to-end against a real spawner.
 **Verification performed:** `npm run typecheck`, `npm run lint`, `npm run build`, and `npm test` all pass
 after the patch (111 files, 3201 tests + 3 honestly-tracked pending, up from 3194 + 3 pre-patch). Directly
 confirmed `src/engine/reconciler.ts`/`spawner.ts`/`src/installer/interview.ts` remain untouched throughout
-both the implementation and patch passes.
+both the implementation and patch passes. Re-run after the 2026-09-25 fixture closure: full gate green
+again, 111 files, 3205 tests, zero pending cases.
 
-**Residual risks:** the deferred finding (no real-spawner dispatch proof yet) and the AD-31 fixture gap
-are the same underlying wait — both close together once Deep supplies the recorded `claude -p` transcript
-for `step.bootstrap`, per the exact steps the implementer's own report and `PENDING_AD31_FIXTURE_CONTRACT_IDS`'s
-doc comment already lay out. No other residual risk identified.
+**Residual risks:** the AD-31 fixture gap itself is closed (2026-09-25) — the recorded transcript is
+committed and verified three ways, and `PENDING_AD31_FIXTURE_CONTRACT_IDS` is empty again. The deferred
+finding is narrower than originally framed: it was the fixture *and* a real-spawner dispatch test that were
+tied together, and only the fixture half has landed. No test yet exercises a real (non-scripted) spawner
+with a custom `grantFor` and `fake-claude.ts` replaying this fixture end-to-end — that remains open, tracked
+in frontmatter `deferred`, and is new test-writing work rather than something the fixture's arrival closes
+by itself. No other residual risk identified.

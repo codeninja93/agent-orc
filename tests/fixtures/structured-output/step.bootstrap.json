@@ -1,0 +1,187 @@
+{
+  "contract_id": "step.bootstrap",
+  "step": "bootstrap-analysis",
+  "status": "completed",
+  "summary": "agent-orcastrator is a single-package TypeScript ESM project on Node >=22.22. It uses Zod v4 contracts, Ink/React for the TUI, and Vitest for tests. A run of it needs no database or cache: CI runs typecheck, lint, build and test with no service containers. The code does provision postgres and redis, but only as leased resources for the target repositories it orchestrates. All of those calls go through an injectable ContainerInvoker. High blast radius sits in these places: the contracts root, which every other unit depends on; the container containment boundary; the reconciler, which hard-resets worktrees when it retries a step; the write executor; runtime redaction; and the Node/npm pin files, CI and the Dockerfile.",
+  "provenance": [
+    "package.json",
+    ".github/workflows/ci.yml",
+    "docs/specs/spec-agent-orchestrator/architecture.md",
+    "src/engine/bootstrap.ts",
+    "src/contracts/bootstrap.ts",
+    "src/contracts/knowledge.ts",
+    "src/contracts/index.ts",
+    "src/container/service.ts",
+    "src/pool/lease.ts",
+    "tests/engine.reconciler.test.ts",
+    "tests/runtime.recorder.test.ts"
+  ],
+  "decisions": [
+    {
+      "question": "Does a run of this repository need postgres or redis?",
+      "answer": "none",
+      "rationale": "The CI workflow runs npm ci, typecheck, lint, build and test with no service containers. The only runtime dependencies are ink, react and zod. The postgres/redis references in src/container/service.ts and src/pool/lease.ts are the resource pool the orchestrator leases to *target* repositories' features (architecture.md, Resource pool). They are not a need of this repo's own runs, and container calls go through an injectable ContainerInvoker."
+    },
+    {
+      "question": "Which paths should force a higher isolation tier?",
+      "answer": "src/contracts, src/container, src/engine/reconciler.ts, src/engine/write-executor.ts, src/runtime/redaction.ts, package.json, package-lock.json, .nvmrc, .npmrc, .github/workflows/ci.yml, docker/Dockerfile",
+      "rationale": "Each of these is either depended on by everything else, is a containment or credential boundary, performs destructive or irreversible git or write actions, or pins the verification floor enforced by CI."
+    },
+    {
+      "question": "Which directories must not be worked on concurrently?",
+      "answer": "src/contracts, src/engine, src/container, src/runtime",
+      "rationale": "src/contracts is the dependency root re-exported through one index.ts. src/engine and src/runtime have enforced import-direction rules and large shared modules (reconciler.ts, spawner.ts, recorder.ts). src/container is the one owner of container flags (AD-20). Two runs editing inside one of these would collide on shared barrels and invariants."
+    }
+  ],
+  "artifacts": [],
+  "questions": [],
+  "write_intents": [],
+  "error": null,
+  "claims": [
+    {
+      "claim": "The repository's own verification gate is npm ci, then typecheck, lint, build and test. It runs on the .nvmrc-pinned Node and on the current Node, with no service containers declared, so a run needs no postgres or redis.",
+      "paths": [
+        ".github/workflows/ci.yml",
+        "package.json",
+        ".nvmrc"
+      ],
+      "provenance": {
+        "step": "bootstrap-analysis",
+        "source": ".github/workflows/ci.yml"
+      }
+    },
+    {
+      "claim": "postgres:17.2-alpine and redis:7.4-alpine appear only as leased service containers that the resource pool provides to orchestrated features. They are not dependencies of this repository's own runs.",
+      "paths": [
+        "src/container/service.ts",
+        "src/pool/lease.ts",
+        "docs/specs/spec-agent-orchestrator/architecture.md"
+      ],
+      "provenance": {
+        "step": "bootstrap-analysis",
+        "source": "src/container/service.ts"
+      }
+    },
+    {
+      "claim": "src/contracts/ is the root of the dependency graph and every other unit depends on it. Importing its index asserts the Node/npm floor, so a change there affects every consumer.",
+      "paths": [
+        "src/contracts/index.ts"
+      ],
+      "provenance": {
+        "step": "bootstrap-analysis",
+        "source": "src/contracts/index.ts"
+      }
+    },
+    {
+      "claim": "The reconciler's reset-and-rerun action runs git reset --hard and git clean -fd against a plan's worktree on ordinary step retries. That makes src/engine/reconciler.ts a high-blast-radius file.",
+      "paths": [
+        "src/engine/reconciler.ts",
+        "src/engine/bootstrap.ts"
+      ],
+      "provenance": {
+        "step": "bootstrap-analysis",
+        "source": "src/engine/bootstrap.ts"
+      }
+    },
+    {
+      "claim": "src/container/ is the single owner of container flags (AD-20). A pool that composed its own flags would create a second, unaudited containment boundary.",
+      "paths": [
+        "src/container/service.ts",
+        "src/container/flags.ts"
+      ],
+      "provenance": {
+        "step": "bootstrap-analysis",
+        "source": "src/container/service.ts"
+      }
+    },
+    {
+      "claim": "Import direction is enforced by tests. src/engine may import only src/contracts, src/runtime and node: builtins. src/runtime may import only src/contracts and node: builtins.",
+      "paths": [
+        "tests/engine.reconciler.test.ts",
+        "tests/runtime.recorder.test.ts",
+        "src/engine",
+        "src/runtime"
+      ],
+      "provenance": {
+        "step": "bootstrap-analysis",
+        "source": "tests/engine.reconciler.test.ts"
+      }
+    }
+  ],
+  "resources": "none",
+  "high_blast_radius_paths": [
+    "src/contracts",
+    "src/container",
+    "src/engine/reconciler.ts",
+    "src/engine/write-executor.ts",
+    "src/runtime/redaction.ts",
+    "package.json",
+    "package-lock.json",
+    ".nvmrc",
+    ".npmrc",
+    ".github/workflows/ci.yml",
+    "docker/Dockerfile"
+  ],
+  "conflict_domains": [
+    "src/contracts",
+    "src/engine",
+    "src/container",
+    "src/runtime"
+  ],
+  "knowledge": [
+    {
+      "anchor": "the dependency direction is fixed",
+      "anchor_kind": "test-name",
+      "claim": "src/engine may import only src/contracts, src/runtime and node: builtins, never src/installer. src/runtime may import only src/contracts and node: builtins. Test suites in tests/engine.reconciler.test.ts and tests/runtime.recorder.test.ts check this structurally.",
+      "provenance": "bootstrap agent, read tests/engine.reconciler.test.ts, tests/runtime.recorder.test.ts and src/engine/bootstrap.ts",
+      "recorded_at": "2026-09-25T00:00:00.000Z",
+      "decay_policy": "until-refactor",
+      "decay_features": 0
+    },
+    {
+      "anchor": "assertNodeFloorOrExit",
+      "anchor_kind": "api-symbol",
+      "claim": "The Node floor (>=22.22) and npm bound (<12) are declared only in .nvmrc and package.json engines, and .npmrc sets engine-strict. Importing src/contracts asserts them at startup. Never add a third literal version anywhere, including CI.",
+      "provenance": "bootstrap agent, read src/contracts/index.ts, package.json and .github/workflows/ci.yml",
+      "recorded_at": "2026-09-25T00:00:00.000Z",
+      "decay_policy": "until-refactor",
+      "decay_features": 0
+    },
+    {
+      "anchor": "npm run typecheck && npm run lint && npm run build && npm test",
+      "anchor_kind": "module-name",
+      "claim": "The verification floor (AD-31) is four commands, each run separately: typecheck (tsc -p tsconfig.json), lint (eslint .), build (tsconfig.build.json then tsconfig.bin.json) and test (vitest run). Some tests spawn jiti-compiled child processes for cross-process races, with a 180s bound.",
+      "provenance": "bootstrap agent, read package.json and .github/workflows/ci.yml",
+      "recorded_at": "2026-09-25T00:00:00.000Z",
+      "decay_policy": "until-refactor",
+      "decay_features": 0
+    },
+    {
+      "anchor": "src/container/runtime.ts",
+      "anchor_kind": "file-path",
+      "claim": "src/container/ owns every container flag (AD-20), and runtime.ts is the only file allowed to name the container runtime. src/pool states intent only. Container calls go through an injectable ContainerInvoker, so tests do not need a real Docker daemon.",
+      "provenance": "bootstrap agent, read src/container/service.ts",
+      "recorded_at": "2026-09-25T00:00:00.000Z",
+      "decay_policy": "until-refactor",
+      "decay_features": 0
+    },
+    {
+      "anchor": "bootstrapPlan",
+      "anchor_kind": "api-symbol",
+      "claim": "bootstrapPlan's worktreePath must be a disposable worktree created by createWorktree, never a live checkout, because a reconciler retry runs git reset --hard and git clean -fd on it. mergeBootstrapAnalysis replaces mechanics.resources and risk.* wholesale, appends knowledge without deduplicating, and refuses non-completed analyses.",
+      "provenance": "bootstrap agent, read src/engine/bootstrap.ts",
+      "recorded_at": "2026-09-25T00:00:00.000Z",
+      "decay_policy": "until-refactor",
+      "decay_features": 0
+    },
+    {
+      "anchor": "KnowledgeEntrySchema",
+      "anchor_kind": "api-symbol",
+      "claim": "A knowledge entry's anchor must be non-blank, have no surrounding whitespace and never be a line number. decay_features must be 0 unless decay_policy is n-features, in which case it must be at least 1. recorded_at is RFC3339 UTC with milliseconds.",
+      "provenance": "bootstrap agent, read src/contracts/knowledge.ts",
+      "recorded_at": "2026-09-25T00:00:00.000Z",
+      "decay_policy": "until-refactor",
+      "decay_features": 0
+    }
+  ]
+}

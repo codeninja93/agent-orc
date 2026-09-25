@@ -367,12 +367,13 @@ export const MODEL_PRODUCED_CONTRACT_IDS: readonly ContractId[] = CONTRACT_IDS.f
  * commits `tests/fixtures/structured-output/<id>.json`, a real recorded transcript — never on its own,
  * which would silently re-admit the very gap this list exists to keep visible.
  *
- * Story 5-5: `step.bootstrap` is new and needs one. Deep has agreed to run the session that supplies it
- * (confirmed directly, 2026-09-25).
+ * Story 5-5: `step.bootstrap` needed one. Deep ran a real `claude -p --json-schema` session against this
+ * contract's exported draft-7 schema on 2026-09-25; the resulting `structured_output` is committed at
+ * `tests/fixtures/structured-output/step.bootstrap.json`, verified against the schema, against the
+ * exported draft-7 JSON Schema, and for lossless round-trip. The list is empty again — the next entry
+ * here should be a new contract's own gap, not this one reopened.
  */
-export const PENDING_AD31_FIXTURE_CONTRACT_IDS: readonly ContractId[] = Object.freeze([
-  BOOTSTRAP_CONTRACT_ID,
-]);
+export const PENDING_AD31_FIXTURE_CONTRACT_IDS: readonly ContractId[] = Object.freeze([]);
 
 /** The draft-07 dialect every export must declare. */
 export const JSON_SCHEMA_DIALECT = 'http://json-schema.org/draft-07/schema#';
