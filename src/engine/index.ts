@@ -69,6 +69,10 @@
  * - `trust-record`, `shadow-gate` — story 3-3's two cross-run folds, in `src/tui/fleet.ts`'s `foldFleet`
  *   style: every run under `runsDir`, read with `listRunIds`/`readEventLog` rather than the projected
  *   `ShellView` a renderer wants, because both need the raw lines a projection does not carry;
+ * - `consolidation` — story 5-1's batch pass: a completed run's last terminal `feature.state_changed`
+ *   folded, with `trust-record`'s own `areaOf`/`territoryFromEvents`, into `KnowledgeEntry`-shaped facts,
+ *   appended idempotently to `ORCH_HOME/projects/<project-id>/memory/consolidated.jsonl` (AD-9). Nothing
+ *   calls its one entry point, `runConsolidationPass`, yet — wiring a trigger is a future story's;
  * The run-start branch-protection assertion is deliberately **not** here. `src/container/lifecycle.ts`
  * already owned it, and a second implementation in this package disagreed with it about the one thing
  * that matters — whether "we could not check" and "it is not protected" have the same consequence. The
@@ -127,4 +131,5 @@ export * from './interruption-count.js';
 export * from './feature-usage.js';
 export * from './trust-record.js';
 export * from './shadow-gate.js';
+export * from './consolidation.js';
 export * from './reconciler.js';

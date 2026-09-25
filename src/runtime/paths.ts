@@ -110,6 +110,25 @@ export const projectRegistrationPath = (
   orchHome: string = resolveOrchHome(),
 ): string => join(projectDir(projectId, orchHome), PROJECT_REGISTRATION_FILE_NAME);
 
+/**
+ * Story 5-1, AD-9 — `projects/<project-id>/memory/consolidated.jsonl`, the durable per-project store the
+ * batch consolidation pass (`src/engine/consolidation.ts`) appends `KnowledgeEntry`-shaped facts to.
+ *
+ * Spelled here for the same reason `projectRegistrationPath` is: `projects/<project-id>/` already holds
+ * the central ledger and memory (this module's own docs reserve it "stories 5-1 and on"), and a second
+ * spelling of this location — one in the writer, another in whatever later story reads the store back —
+ * would be a second on-disk layout for the one thing AD-9 calls "central".
+ */
+export const PROJECT_MEMORY_DIR_NAME = 'memory';
+export const CONSOLIDATED_MEMORY_FILE_NAME = 'consolidated.jsonl';
+
+/** `projects/<project-id>/memory/consolidated.jsonl` for one project id. */
+export const projectMemoryPath = (
+  projectId: string,
+  orchHome: string = resolveOrchHome(),
+): string =>
+  join(projectDir(projectId, orchHome), PROJECT_MEMORY_DIR_NAME, CONSOLIDATED_MEMORY_FILE_NAME);
+
 /** The file names inside a run directory, so no caller spells one itself. */
 export const EVENT_LOG_FILE_NAME = 'events.jsonl';
 export const FETCH_RECORD_FILE_NAME = 'fetch-record.json';
