@@ -313,6 +313,24 @@
     story before the stage 4 gate, where the threat-model minimum guardrail
     set must be complete and tested.
   done_checkpoint: true
+- id: "4-4"
+  title: "Exceptions-only notifications"
+  description: >-
+    Silence means success: a channel that surfaces only runs needing a
+    person's attention (blocked on a gate, handed off, degraded, or failed)
+    rather than every non-terminal run the fleet cards already show. Closes
+    the stage-4-gate audit's one remaining unbuilt guardrail before stage 5
+    begins.
+  done_checkpoint: true
+  invoke_dev_with: >-
+    fleet.ts's inFlightRuns and nextGateFor already show every non-terminal
+    run; this story adds a separate, additive surface for the subset that is
+    an exception, rather than changing what those two already show. Define
+    "exception" as a closed, enumerable set of run/step states already in the
+    contracts (blocked, handed_off, degraded, failed) — do not invent a new
+    classification scheme. No new external delivery channel (email, Slack,
+    push) unless the spec says so explicitly; a terminal/TUI surface that
+    lists only exceptions satisfies "silence means success" on its own.
 - id: "5-1"
   title: "Episodic log and the between-run consolidation pass"
   description: >-
