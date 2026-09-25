@@ -216,8 +216,13 @@ Nothing runs unattended until **all** of these exist and each has been exercised
 **Stage-4-gate audit note (2026-09-25):** items 1–4, 6–12, 14–15, and 17 are built and tested (several —
 redaction, container hardening, the event log — tested against a real container runtime or with heavy
 crash-recovery coverage, well past a "minimum" bar). Items 5, 13, and 16 are not fully satisfied, per the
-notes beside each above. The chaos drill described in this closing line has not been performed as a
-dedicated, deliberate exercise against this real system — individual mechanisms (kill, the event log,
-`take_over`) are each unit- and integration-tested in isolation, which is not the same thing this line
-asks for. Read literally, "nothing runs unattended until all of these exist and each has been exercised
-once on purpose" is not yet true.
+notes beside each above.
+
+**Chaos drill note (2026-09-25):** performed as a dedicated, deliberate exercise against real production
+code — see `docs/demos/chaos-drill-2026-09-25.md`. A real subprocess (replaying a genuine captured
+`claude -p` transcript) was spawned through the real `Reconciler`/spawner/stopper chain and held running,
+then stopped mid-step by a real command-intent file, for both `kill` and `take_over`. Result: `kill`
+leaves the run `killed`/`killed` with the event log intact and exactly-once applied; `take_over` leaves
+the run `handed_off`, genuinely commits the work to a real `orch/takeover/<run-id>` branch, and writes a
+real, legible `HANDOFF.md`. This closing line's three claims are now each confirmed once, on purpose,
+against this real system — not only covered by isolated unit/integration tests.
