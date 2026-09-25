@@ -88,6 +88,11 @@
  *   logs. `matchDecisionLedger` itself is untouched but for exporting `namesAnchor` and `isUnreadableLog`
  *   for this reuse, and nothing calls either new function yet — the same complete-and-unwired precedent
  *   `consolidation.ts` and `knowledge-sweep.ts`/`knowledge-retrieval.ts` already set;
+ * - `pattern-memory` — story 5-4, CAP-19/AD-34's fixed, shared, cross-project home: `recordPattern`
+ *   validates and durably appends an already-composed `CrossRepoPattern` to `ORCH_HOME/memory/
+ *   patterns.jsonl`; `retrievePatterns` is a topic-filtered, budget-capped, most-recent-first read of
+ *   that one store, `retrieveFacts`'s own shape. Complete and unwired, the same precedent as every
+ *   module above;
  * The run-start branch-protection assertion is deliberately **not** here. `src/container/lifecycle.ts`
  * already owned it, and a second implementation in this package disagreed with it about the one thing
  * that matters — whether "we could not check" and "it is not protected" have the same consequence. The
@@ -150,4 +155,5 @@ export * from './consolidation.js';
 export * from './knowledge-sweep.js';
 export * from './knowledge-retrieval.js';
 export * from './decision-index.js';
+export * from './pattern-memory.js';
 export * from './reconciler.js';

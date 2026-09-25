@@ -27,6 +27,7 @@ export * from './installer.js';
 export * from './knowledge.js';
 export * from './node-floor.js';
 export * from './note.js';
+export * from './pattern.js';
 export * from './planning.js';
 export * from './project.js';
 export * from './question.js';
