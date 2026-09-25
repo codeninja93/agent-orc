@@ -67,3 +67,4 @@ Colleague — not butler, not robot. Warmth is expressed through competence, not
 - **Handoff document** — written when the system gives up. Reads as a colleague's note, not a stack trace.
 - **Ambient status line** — a single always-visible shell or multiplexer segment. Never demanding.
 - **Trust record** — per-area history of merged-unchanged versus corrected, used to justify autonomy tiers.
+- **Attention card** — every run needing a person right now (decision point, exception, or completion) across the whole fleet, one line each; literal silence when the answer is none (R1).

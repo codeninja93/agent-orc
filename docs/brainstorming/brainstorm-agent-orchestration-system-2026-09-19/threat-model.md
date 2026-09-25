@@ -209,6 +209,14 @@ Nothing runs unattended until **all** of these exist and each has been exercised
     in the codebase today. Genuinely unbuilt scope, not merely hard to find — worth a proper spec of its
     own rather than a quick patch, given "what counts as an exception" and "what channel delivers it" are
     real design decisions.
+    **Update (2026-09-25, story 4-4):** the classification now exists and is tested —
+    `runsNeedingAttention` and `buildAttentionCard` in `src/tui/fleet.ts` / `src/tui/cards/attention.ts`,
+    covered by `tests/tui.attention.test.ts`. But nothing in production calls it yet: not
+    `src/web/server.ts` (still serves the raw `fleetView` unmodified), not `src/web/static/index.html`
+    (its own hand-rolled `renderFleet`, which never imports `src/tui/cards/`), and no TUI mount point
+    either. So the part of item 16 that means "a person can actually see this" is still open. This is not
+    unique to this story — the same zero-caller status is true of every other card in `src/tui/cards/`
+    today.
 17. **Phase 1 autonomy only**: the system proposes, Deep merges. Autonomy is unlocked per risk tier only after shadow mode shows measured accuracy.
 
 **Before the first unattended night, run the chaos drill once** — kill an agent mid-run and confirm the system halts cleanly, the event log is intact, and the escape hatch works.
