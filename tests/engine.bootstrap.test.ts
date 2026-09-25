@@ -2,23 +2,30 @@
  * Story 5-5 — the bootstrap agent's engine half: `BOOTSTRAP_AGENT_DECLARATION`, `bootstrapPlan` driven
  * through a real `Reconciler`, and `mergeBootstrapAnalysis`'s purity.
  *
- * **What the reconciler-integration test proves, and what it does not.** It proves that a real
- * `Reconciler`, given this plan shape and a scripted (never a real subprocess) executor, accepts and
- * drives it to a terminal state exactly the way it drives any other feature's plan — no engine
- * modification was needed for that. It does **not** prove that a real `createStepSpawner` resolves the
- * correct grant for this plan: the scripted executor here never builds a `SpawnPlan`, never calls
- * `resolveAgentGrant`, and so never exercises the phase-based-lookup mismatch `src/engine/bootstrap.ts`'s
- * own docblock describes (the plan reuses `phase: 'analysis'`, which a real spawner's default `grantFor`
- * would resolve against the *target repository's* `analysis` agent, not `BOOTSTRAP_AGENT_DECLARATION`).
- * That needs a real-spawner test gated on the same AD-31 fixture this story already tracks as pending
- * (`tests/contracts.bootstrap.test.ts`), and is not attempted here.
+ * **Two reconciler-integration tests, proving two different halves.** The scripted-executor one below
+ * proves that a real `Reconciler`, given this plan shape and a scripted (never a real subprocess)
+ * executor, accepts and drives it to a terminal state exactly the way it drives any other feature's
+ * plan — no engine modification was needed for that. It does **not** prove that a real
+ * `createStepSpawner` resolves the correct grant for this plan, because the scripted executor never
+ * builds a `SpawnPlan` and never calls `resolveAgentGrant`.
+ *
+ * The real-spawner test below it closes exactly that gap, gated for its whole life on the AD-31 fixture
+ * (`tests/fixtures/structured-output/step.bootstrap.json`, recorded 2026-09-25): a real `createStepSpawner`
+ * spawns `tests/helpers/fake-claude.ts` as a real subprocess, replaying that fixture as the terminal
+ * `structured_output`, dispatched through a custom `grantFor` that bypasses roster resolution entirely —
+ * the exact fix `src/engine/bootstrap.ts`'s own docblock names for the phase-based-lookup mismatch
+ * (`phase: 'analysis'` would otherwise resolve the *target repository's* `analysis` agent, never
+ * `BOOTSTRAP_AGENT_DECLARATION`).
  */
-import { rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { BOOTSTRAP_CONTRACT_ID, STEP_PHASES } from '../src/contracts/index.js';
-import type { BootstrapAnalysis } from '../src/contracts/index.js';
+import type { BootstrapAnalysis, GrantableTool } from '../src/contracts/index.js';
 import {
   BOOTSTRAP_AGENT_DECLARATION,
   BOOTSTRAP_FEATURE_SLUG,
@@ -27,13 +34,17 @@ import {
   bootstrapPlan,
   createRecordingResetter,
   createScriptedExecutor,
+  createStepSpawner,
   mergeBootstrapAnalysis,
+  startingRung,
   terminated,
 } from '../src/engine/index.js';
+import type { AgentGrant, ChildNode, ClaudeCli } from '../src/engine/index.js';
 import { BUILT_IN_AGENTS } from '../src/installer/interview.js';
+import { Recorder } from '../src/runtime/index.js';
 
 import { fixtureProfile, knowledgeEntry, knowledgeSection } from './helpers/config-fixture.js';
-import { makeHome, planProvider } from './helpers/engine-fixture.js';
+import { makeGitWorktree, makeHome, planProvider } from './helpers/engine-fixture.js';
 
 let home: string;
 const toRemove: string[] = [];
@@ -148,6 +159,112 @@ describe('the bootstrap plan runs through the existing, unmodified reconciler/sp
     expect(final.steps).toStrictEqual([
       expect.objectContaining({ step: BOOTSTRAP_STEP_NAME, disposition: 'completed' }),
     ]);
+  });
+});
+
+describe('a real, non-scripted spawner dispatches the bootstrap step via a custom grantFor', () => {
+  const FAKE_CLI_PATH = fileURLToPath(new URL('./helpers/fake-claude.ts', import.meta.url));
+  const COMPLETED_FIXTURE = fileURLToPath(
+    new URL('./fixtures/stream-json/completed.jsonl', import.meta.url),
+  );
+  /** The AD-31 fixture this test was gated on, closed 2026-09-25 — see registry.ts. */
+  const BOOTSTRAP_STRUCTURED_OUTPUT: unknown = JSON.parse(
+    readFileSync(new URL('./fixtures/structured-output/step.bootstrap.json', import.meta.url), 'utf8'),
+  );
+
+  const fakeCli: ClaudeCli = {
+    path: FAKE_CLI_PATH,
+    version: '2.1.278',
+    auth: 'subscription',
+    interpreter: 'node',
+  };
+  const childNode: ChildNode = { path: process.execPath, version: process.versions.node, source: 'parent' };
+
+  /**
+   * The real stream-json envelope `tests/engine.spawner.test.ts` itself trusts, with its terminal
+   * `structured_output` replaced by the recorded real `step.bootstrap` transcript — so the fake CLI
+   * replays a genuine `claude -p --json-schema` result for *this* contract, not a generic `step.output`
+   * one. The same technique `tests/engine.spawner.test.ts`'s own "carries a step's own blocked status"
+   * case uses.
+   */
+  const bootstrapTranscript = (): string => {
+    const lines = readFileSync(COMPLETED_FIXTURE, 'utf8').trim().split('\n');
+    const result = JSON.parse(lines.at(-1) ?? '{}') as Record<string, unknown>;
+    result['structured_output'] = BOOTSTRAP_STRUCTURED_OUTPUT;
+    const path = join(mkdtempSync(join(tmpdir(), 'orch-bootstrap-real-')), 'bootstrap.jsonl');
+    writeFileSync(path, `${[...lines.slice(0, -1), JSON.stringify(result)].join('\n')}\n`, 'utf8');
+    return path;
+  };
+
+  it('bypasses roster resolution and reaches a completed, schema-valid step over a real subprocess', async () => {
+    const worktree = makeGitWorktree('bootstrap-real-spawn');
+    toRemove.push(worktree.dir);
+    const plan = bootstrapPlan(worktree.dir);
+
+    const recorders = new Map<string, Recorder>();
+    const recorderFor = (run: string, feature: string): Recorder => {
+      const existing = recorders.get(run);
+      if (existing !== undefined) return existing;
+      const opened = Recorder.open({ runId: run, feature, orchHome: home });
+      recorders.set(run, opened);
+      return opened;
+    };
+
+    /**
+     * The grant `bootstrapPlan`'s own docblock says a real dispatch needs: built from
+     * `BOOTSTRAP_AGENT_DECLARATION` directly, never from `rosterAgent`/`grantFromRoster` — there is no
+     * `.orch/agents/` directory anywhere in this test's worktree for those to read. `phase` is left as
+     * whatever the request actually carries ("analysis", `bootstrapPlan`'s own phase) so the mismatch
+     * this test exists to close is visible in the grant itself: the phase that dispatched this step is
+     * not the agent id that served it.
+     */
+    const spawner = createStepSpawner({
+      recorderFor,
+      cli: fakeCli,
+      node: childNode,
+      env: { ...process.env, FAKE_CLAUDE_FIXTURE: bootstrapTranscript() },
+      grantFor: (request): AgentGrant => ({
+        phase: request.phase,
+        agentId: BOOTSTRAP_AGENT_DECLARATION.id,
+        declaredAt: '<in-code: BOOTSTRAP_AGENT_DECLARATION, no .orch/agents/ entry>',
+        rosterDir: '<none: this grant bypasses roster resolution entirely>',
+        tools: BOOTSTRAP_AGENT_DECLARATION.tools as readonly GrantableTool[],
+        elevated: [],
+        reversibility: BOOTSTRAP_AGENT_DECLARATION.reversibility,
+        startTier: startingRung(BOOTSTRAP_AGENT_DECLARATION.model.start_tier),
+        summary:
+          `Phase "${request.phase}" is served here by the bootstrap agent ` +
+          `(id "${BOOTSTRAP_AGENT_DECLARATION.id}") via a custom grantFor, not by roster resolution.`,
+      }),
+    });
+
+    const reconciler = Reconciler.open({
+      orchHome: home,
+      executor: spawner,
+      recorderFor,
+      plans: planProvider(plan),
+      baseline: { currentRef: () => worktree.head, resetTo: () => undefined },
+    });
+    toClose.push(reconciler);
+
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+    await reconciler.runUntilSettled();
+
+    const final = reconciler.load(accepted.run).state;
+    expect(final.state).toBe('committed');
+    expect(final.steps).toStrictEqual([
+      expect.objectContaining({ step: BOOTSTRAP_STEP_NAME, disposition: 'completed' }),
+    ]);
+
+    // The grant actually used to build argv was the bootstrap agent's own — never a roster-resolved
+    // "analysis" agent — even though the phase that dispatched it was "analysis".
+    const plan_ = spawner.lastPlan();
+    expect(plan_?.grant.phase).toBe('analysis');
+    expect(plan_?.grant.agentId).toBe(BOOTSTRAP_AGENT_DECLARATION.id);
+    const toolsFlag = plan_?.cliArgs.indexOf('--tools') ?? -1;
+    expect(toolsFlag).toBeGreaterThanOrEqual(0);
+    expect(plan_?.cliArgs[toolsFlag + 1]).toBe(BOOTSTRAP_AGENT_DECLARATION.tools.join(','));
   });
 });
 

@@ -8,26 +8,7 @@ review_loop_iteration: 0
 followup_review_recommended: true
 context: []
 warnings: ['oversized']
-deferred:
-  - summary: >-
-      No test proves a real (non-scripted) spawner can actually dispatch the bootstrap step against a
-      genuinely unseen repository — grant resolution is by phase, so bootstrapPlan's phase: 'analysis'
-      would resolve the ordinary analysis agent, not BOOTSTRAP_AGENT_DECLARATION, unless a caller
-      supplies a custom grantFor bypassing the target repository's own roster.
-    evidence: |-
-      Confirmed directly: src/engine/agents.ts's grantFromRoster/rosterAgent match by phase against
-      entry.id, and BOOTSTRAP_AGENT_DECLARATION's id 'bootstrap' is never looked up anywhere in the
-      engine. Found independently by two review layers plus direct tracing. The fix path already exists
-      (createStepSpawner's grantFor option is pluggable) and is now documented on bootstrapPlan/
-      BOOTSTRAP_AGENT_DECLARATION. Update, 2026-09-25: the AD-31 fixture this gap was tied to is now
-      recorded (tests/fixtures/structured-output/step.bootstrap.json, real claude -p transcript, verified
-      three ways) and BOOTSTRAP_CONTRACT_ID is no longer in PENDING_AD31_FIXTURE_CONTRACT_IDS — so the
-      blocker on *this* item is gone, but the item itself remains open: nothing yet exercises a real
-      (non-scripted) spawner, a custom grantFor, and fake-claude.ts replaying that fixture end-to-end.
-      That is new test-writing work, not part of the fixture-capture closure, and stays deferred.
-    location: >-
-      src/engine/bootstrap.ts (bootstrapPlan, BOOTSTRAP_AGENT_DECLARATION)
-    severity: medium
+deferred: []
 ---
 
 <intent-contract>
@@ -163,6 +144,20 @@ future work, matching the unwired-but-complete precedent every story since 5-1 h
 
 ## Spec Change Log
 
+### 2026-09-25 — the deferred real-spawner dispatch proof is closed
+`tests/engine.bootstrap.test.ts` gained a second reconciler-integration test, alongside the original
+scripted-executor one: a real `createStepSpawner` spawns `tests/helpers/fake-claude.ts` as a genuine
+subprocess, replaying the now-recorded `tests/fixtures/structured-output/step.bootstrap.json` as the
+terminal `structured_output`, dispatched via a custom `grantFor` built directly from
+`BOOTSTRAP_AGENT_DECLARATION` — never from `rosterAgent`/`grantFromRoster`. The worktree is a real,
+disposable `makeGitWorktree()` repository with no `.orch/agents/` directory at all, the exact "genuinely
+unseen repository" scenario the deferred finding's evidence named. The test asserts the run reaches
+`committed` with the step `completed`, and — the load-bearing check — that the real argv's `--tools` flag
+and the plan's own `grant.agentId` came from the bootstrap declaration (`"bootstrap"`), not from a
+phase-keyed roster lookup, even though the plan dispatches it under the existing `analysis` phase. This
+closes the frontmatter `deferred` item; it is now `[]`. Full gate green after the addition: 111 files, 3206
+tests.
+
 ### 2026-09-25 — AD-31 fixture recorded, `step.bootstrap` gap closed
 Deep ran a real `claude -p --json-schema` session against `exportContract('step.bootstrap')`, per the
 procedure this story's own review pass and `PENDING_AD31_FIXTURE_CONTRACT_IDS`'s doc comment laid out. The
@@ -173,8 +168,8 @@ in the same change, and the three `it.todo` cases in `tests/contracts.bootstrap.
 real, passing assertions mirroring `tests/contracts.round-trip.test.ts`'s own three legs. The shared
 round-trip suite now covers `step.bootstrap` generically as well, since it is no longer excluded there.
 Full gate (`typecheck`, `lint`, `build`, `test`) is green: 111 files, 3205 tests, zero pending cases. The
-real-spawner dispatch proof (frontmatter `deferred`) is a separate, still-open item — see its updated
-evidence note above.
+real-spawner dispatch proof (frontmatter `deferred`) was a separate, still-open item at this point — closed
+in the entry above (dated the same day, added after this one).
 
 ### 2026-09-25 — a genuine safety bug in `bootstrapPlan`'s own worktree contract
 Found directly (before dispatching the four review layers), by tracing AD-26's `reset-and-rerun` path:
@@ -324,6 +319,10 @@ Log's second entry for the closure details.
 - `tests/contracts.bootstrap.test.ts`, `tests/engine.bootstrap.test.ts` (new) — every I/O Matrix row and
   every patched fix; `tests/engine.profile.test.ts`, `tests/contracts.round-trip.test.ts` — the shared
   `decay_features` regression tests and the AD-31 pending-gap mechanism.
+- `tests/engine.bootstrap.test.ts` (2026-09-25, second pass) — a real-spawner reconciler-integration test
+  closing the deferred dispatch-proof gap: `createStepSpawner` over `fake-claude.ts`, a custom `grantFor`
+  built from `BOOTSTRAP_AGENT_DECLARATION`, and the AD-31 fixture replayed as the terminal
+  `structured_output`.
 
 **Review findings breakdown** (21 findings across four layers, plus one found directly before dispatching
 review):
@@ -337,8 +336,9 @@ review):
   refinement (medium, confirmed empirically, found independently by two layers); plus eight lower-severity
   fixes (missing option coverage, an overclaiming "happens once" docblock, a missing exact-shape test, and
   duplicated fixture-existence logic).
-- **Deferred (1, frontmatter `deferred`):** the actual real-spawner dispatch proof — tied to the same
-  AD-31 fixture gap, since both need the same recorded transcript to close.
+- **Deferred, later closed (2026-09-25):** the real-spawner dispatch proof was tied to the AD-31 fixture
+  gap and deferred at this pass; both are now closed — see the Spec Change Log's two entries above and
+  `tests/engine.bootstrap.test.ts`'s second reconciler-integration test. Frontmatter `deferred` is `[]`.
 - **Rejected (7, false):** six intent-alignment readings requiring a fuller profile, a built review UI,
   an unmodified `src/engine/` directory, or full CAP-20 closure — all already explicit, disclosed,
   precedented scope boundaries matching every prior story in this stage; and one pre-existing, unrelated
@@ -357,12 +357,18 @@ end-to-end against a real spawner.
 after the patch (111 files, 3201 tests + 3 honestly-tracked pending, up from 3194 + 3 pre-patch). Directly
 confirmed `src/engine/reconciler.ts`/`spawner.ts`/`src/installer/interview.ts` remain untouched throughout
 both the implementation and patch passes. Re-run after the 2026-09-25 fixture closure: full gate green
-again, 111 files, 3205 tests, zero pending cases.
+again, 111 files, 3205 tests, zero pending cases. Re-run again after the same-day real-spawner test: full
+gate green, 111 files, 3206 tests.
 
-**Residual risks:** the AD-31 fixture gap itself is closed (2026-09-25) — the recorded transcript is
-committed and verified three ways, and `PENDING_AD31_FIXTURE_CONTRACT_IDS` is empty again. The deferred
-finding is narrower than originally framed: it was the fixture *and* a real-spawner dispatch test that were
-tied together, and only the fixture half has landed. No test yet exercises a real (non-scripted) spawner
-with a custom `grantFor` and `fake-claude.ts` replaying this fixture end-to-end — that remains open, tracked
-in frontmatter `deferred`, and is new test-writing work rather than something the fixture's arrival closes
-by itself. No other residual risk identified.
+**Residual risks:** both halves of the original deferred finding are now closed (2026-09-25). The AD-31
+fixture is recorded, verified three ways, and `PENDING_AD31_FIXTURE_CONTRACT_IDS` is empty.
+`tests/engine.bootstrap.test.ts` gained a second reconciler-integration test proving a real, non-scripted
+`createStepSpawner` — spawning `fake-claude.ts` as a genuine subprocess, over a real disposable worktree
+with no `.orch/agents/` directory at all — dispatches the bootstrap step via a custom `grantFor` built from
+`BOOTSTRAP_AGENT_DECLARATION`, never a roster lookup, and reaches `committed`. This was reviewed only by me
+(no fresh four-layer pass), since it is a narrow, additive test with no production-code change; a
+follow-up review remains recommended per this story's own `followup_review_recommended: true`, and should
+look at this addition too. What it still does not prove: there is no CLI command wiring a bootstrap run
+end-to-end for a person to actually invoke (explicit Boundary, future work), and no test exercises this
+against a real, unscripted target repository outside this test suite's own fixtures. No other residual risk
+identified.
