@@ -9,11 +9,10 @@
 # failing step, so any one of the four failing fails the job — which is the acceptance criterion.
 name: CI
 
-# Both events, because they answer different questions: `push` says the branch is sound, and
-# `pull_request` says the branch *merged into its target* is sound, which is what is about to ship.
+# push only: every ref update runs the gate. (`pull_request` was dropped so a PR from a branch in
+# this same repository doesn't double the run count against the same commit.)
 on:
   push:
-  pull_request:
 
 # The gate is read-only. Nothing here writes to the repository, so the token gets nothing but contents.
 permissions:
@@ -23,8 +22,7 @@ permissions:
 #
 # The suite now spawns real child processes — seven jiti-compiling children per cross-process race, three
 # races — so three pushes in a minute would otherwise have three copies of that contending for the same
-# runners while two of them are already answering a question nobody is asking any more. A pull request is
-# deliberately *not* cancelled by its own merge queue: the group keys on the ref.
+# runners while two of them are already answering a question nobody is asking any more.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
