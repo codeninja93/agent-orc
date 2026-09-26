@@ -85,6 +85,7 @@ const main = async (argv: readonly string[]): Promise<number> => {
     const outcome = await runInit({
       repository: parsed.repository,
       io,
+      refresh: parsed.refresh,
       ...(parsed.mode === null ? {} : { mode: parsed.mode }),
     });
     // R3 — the headline stands alone; the detail is one line per file and nothing more.
@@ -94,6 +95,10 @@ const main = async (argv: readonly string[]): Promise<number> => {
     }
     for (const finding of outcome.recovered) {
       process.stdout.write(`  recovered ${finding.path} (was ${finding.reason})\n`);
+    }
+    // Advice, not detail — kept off stdout's own one-line-per-file shape and given room to itself.
+    for (const advisory of outcome.advisories) {
+      process.stderr.write(`\n${advisory}\n`);
     }
     return 0;
   } catch (error) {

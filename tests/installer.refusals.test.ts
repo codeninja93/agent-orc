@@ -166,6 +166,20 @@ describe('the entry point’s arguments decide an exit code, not a guess', () =>
     expect(result.error).toContain('--custom');
   });
 
+  it('reads --refresh, alone or combined with --express or --custom', () => {
+    expect(parseInitArguments(['init'])).toMatchObject({ kind: 'init', refresh: false });
+    expect(parseInitArguments(['init', '--refresh'])).toMatchObject({
+      kind: 'init',
+      refresh: true,
+      mode: null,
+    });
+    expect(parseInitArguments(['init', '--refresh', '--express'])).toMatchObject({
+      kind: 'init',
+      refresh: true,
+      mode: 'express',
+    });
+  });
+
   it('answers --help and --version without running anything', () => {
     expect(parseInitArguments(['--help']).kind).toBe('help');
     expect(parseInitArguments(['--version']).kind).toBe('version');

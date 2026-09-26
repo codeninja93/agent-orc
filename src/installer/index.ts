@@ -32,7 +32,7 @@ import type { RegisteredProject } from '../runtime/projects.js';
 import { detectDefaults } from './detect.js';
 import { orchPaths, readExistingInstall } from './answers.js';
 import { BUILT_IN_AGENT_IDS, completeAnswers, missingQuestions, runInterview } from './interview.js';
-import type { InstallMode, InterviewIo, Prompt, QuestionId } from './interview.js';
+import type { InstallMode, InterviewIo, PartialAnswers, Prompt, QuestionId } from './interview.js';
 import { findHalfInstall } from './manifest.js';
 import type { HalfInstallFinding } from './manifest.js';
 import { writeInstall } from './write.js';
@@ -104,6 +104,13 @@ export interface InitOptions {
    * every question asked, in full.
    */
   readonly mode?: InstallMode;
+  /**
+   * Reopen `mechanics`, `source_layout` and `resources` even though they are already answered — the
+   * three questions detection can inform, offered fresh with whatever is now on disk (new scripts, a
+   * new directory, documentation that did not exist yet). Every other answer is untouched. Default
+   * `false`: a plain re-run stays exactly as quiet as it always was.
+   */
+  readonly refresh?: boolean;
 }
 
 export interface InitOutcome {
@@ -117,6 +124,11 @@ export interface InitOutcome {
   readonly registration: RegisteredProject;
   /** R3 — one headline that stands alone, before any detail. */
   readonly summary: string;
+  /**
+   * Advice that stands beside the install rather than blocking it — currently just the one case: no
+   * documentation was found for detection to read at all. Empty when there is nothing to say.
+   */
+  readonly advisories: readonly string[];
 }
 
 const count = (value: number, singular: string, plural = `${singular}s`): string =>
@@ -222,7 +234,26 @@ export const runInit = async (options: InitOptions): Promise<InitOutcome> => {
     );
   });
   const { custom_agents: _lost, ...withoutCustomAgents } = identified;
-  const settled = lostCustomAgent ? withoutCustomAgents : identified;
+  const reconciled = lostCustomAgent ? withoutCustomAgents : identified;
+
+  /**
+   * `--refresh` — the three questions detection ever actually informs, reopened even though they are
+   * already answered.
+   *
+   * `target_path` and `project` are also `detected`-sourced, and deliberately excluded: AD-10 makes
+   * the project id stable identity, not something a later run re-derives, and re-offering the path is
+   * pointless once the repository has not moved. `mechanics`, `source_layout` and `resources` are the
+   * three whose right answer can genuinely change as a project grows — new scripts, a new directory, a
+   * database mentioned in documentation that did not exist yet — and re-detecting them costs nothing
+   * an ordinary answer already on disk did not: they are offered as suggestions exactly like a first
+   * run, confirmed or corrected at the interview, never silently overwritten.
+   */
+  const withoutRefreshed = (answers: PartialAnswers): PartialAnswers => {
+    const { mechanics: _mechanics, source_layout: _sourceLayout, resources: _resources, ...rest } =
+      answers;
+    return rest;
+  };
+  const settled = options.refresh === true ? withoutRefreshed(reconciled) : reconciled;
 
   /**
    * The express/custom choice is asked at most once per install, and only when there is at least one
@@ -286,6 +317,23 @@ export const runInit = async (options: InitOptions): Promise<InitOutcome> => {
     ...(options.now === undefined ? {} : { now: options.now }),
   });
 
+  /**
+   * The one advisory this installer offers: nothing was there for `resources`, `mechanics` or
+   * `source_layout` to be *informed* by beyond a lockfile and a directory listing, because no
+   * documentation exists yet. Writing one and running `orch init --refresh` re-offers exactly those
+   * three with whatever it can then read, changing nothing else already answered.
+   */
+  const advisories: string[] =
+    detected.documentation.files.length === 0
+      ? [
+          'No project documentation was found (looked for CLAUDE.md, AGENTS.md, README.md, ' +
+            'docs/README.md). Consider adding one describing what this repository is and needs — ' +
+            'in particular, whether it needs a database. Once it exists, run `orch init --refresh` to ' +
+            're-offer mechanics, source_layout and resources with whatever can now be read; nothing ' +
+            'else already answered is touched.',
+        ]
+      : [];
+
   return {
     repository: detected.repositoryPath,
     projectId: complete.project.id,
@@ -302,6 +350,7 @@ export const runInit = async (options: InitOptions): Promise<InitOutcome> => {
       written.gitignore,
       registration,
     ),
+    advisories,
   };
 };
 
@@ -328,11 +377,13 @@ export interface ParsedArguments {
    * {@link InterviewIo.chooseInstallMode} instead of skipping the choice.
    */
   readonly mode: InstallMode | null;
+  /** `init --refresh`: reopen `mechanics`, `source_layout` and `resources`. `false` for every other command. */
+  readonly refresh: boolean;
   /** Present only for `kind: 'help'` reached by a usage error, which exits non-zero. */
   readonly error: string | null;
 }
 
-export const USAGE = `orch init [path] [--express | --custom]
+export const USAGE = `orch init [path] [--express | --custom] [--refresh]
 orch prune <project-id> [--force]
 
 init — onboard a repository: ask what the orchestrator needs to know about it and
@@ -348,6 +399,13 @@ under ORCH_HOME/projects/<project-id>/. Defaults to the current directory.
 
   Neither flag: if the terminal offers a choice, you are asked once, up front,
   which of the two you want. Answers already on disk are never re-asked either way.
+
+  --refresh    reopen mechanics, source_layout and resources even though they are
+               already answered — the three questions detection can inform, offered
+               fresh with whatever is now on disk (new scripts, a new directory,
+               documentation that did not exist yet). Every other answer is left
+               exactly as it was. A repository with no CLAUDE.md, AGENTS.md,
+               README.md or docs/README.md is told to add one and run this after.
 
 prune — remove the central state of one project, named by its project id, which is
 the SHA of its first commit (AD-10). It takes an id and never a path, so standing
@@ -378,7 +436,7 @@ NAMES of the environment variables holding them.`;
 export const parseInitArguments = (argv: readonly string[]): ParsedArguments => {
   const args = argv.filter((argument) => argument !== '');
   const cwd = process.cwd();
-  const base = { repository: cwd, projectId: null, force: false, mode: null } as const;
+  const base = { repository: cwd, projectId: null, force: false, mode: null, refresh: false } as const;
   if (args.includes('--help') || args.includes('-h')) {
     return { ...base, kind: 'help', error: null };
   }
@@ -390,7 +448,9 @@ export const parseInitArguments = (argv: readonly string[]): ParsedArguments => 
   const [command, first, ...rest] = positional;
 
   if (command === 'init') {
-    const unknownFlag = flags.find((flag) => flag !== '--express' && flag !== '--custom');
+    const unknownFlag = flags.find(
+      (flag) => flag !== '--express' && flag !== '--custom' && flag !== '--refresh',
+    );
     if (unknownFlag !== undefined) {
       return { ...base, kind: 'help', error: `Unknown option "${unknownFlag}".` };
     }
@@ -409,7 +469,14 @@ export const parseInitArguments = (argv: readonly string[]): ParsedArguments => 
       };
     }
     const mode = flags.includes('--express') ? 'express' : flags.includes('--custom') ? 'custom' : null;
-    return { ...base, kind: 'init', repository: first ?? cwd, mode, error: null };
+    return {
+      ...base,
+      kind: 'init',
+      repository: first ?? cwd,
+      mode,
+      refresh: flags.includes('--refresh'),
+      error: null,
+    };
   }
 
   if (command === 'prune') {

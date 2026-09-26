@@ -22,7 +22,12 @@
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import type { MechanicsCommandName, MechanicsCommands, PackageManager } from '../contracts/index.js';
+import type {
+  MechanicsCommandName,
+  MechanicsCommands,
+  PackageManager,
+  ResourceNeed,
+} from '../contracts/index.js';
 import { MECHANICS_COMMAND_NAMES } from '../contracts/index.js';
 import { firstCommitSha, gitRemote, gitRoot } from '../runtime/repository.js';
 
@@ -40,6 +45,28 @@ export interface DetectedDefaults {
   readonly packageManager: PackageManager | null;
   readonly commands: MechanicsCommands;
   readonly sourceLayout: readonly string[];
+  readonly documentation: DocumentationSignals;
+}
+
+/**
+ * What the repository's own documentation says about itself, read once alongside everything else
+ * detection can answer without a person or a model.
+ *
+ * This is deliberately a text scan, not a model call: `orch init` runs before any `.orch/` exists to
+ * grant an agent anything, and its whole contract (this file's own docblock) is a pure, instant read.
+ * `src/engine/bootstrap.ts`'s agent is where real understanding of a repository's prose belongs —
+ * this only catches what a few, common, literal mentions already say, offered as a default exactly
+ * like every other detected field: shown, and always overridable.
+ */
+export interface DocumentationSignals {
+  /** Repository-relative paths of every documentation file that was actually found and read. */
+  readonly files: readonly string[];
+  /**
+   * A resource need read off a literal mention in the text, or `null` when nothing there said one.
+   * Never more specific than "postgres, redis, both, or nothing said" — a heuristic that guessed
+   * finer detail than that would be a claim this scan cannot back up.
+   */
+  readonly resourceHint: ResourceNeed | null;
 }
 
 /** Lockfiles, in the order they are looked for. The first that exists decides. */
@@ -143,6 +170,58 @@ export const detectSourceLayout = (repositoryPath: string): readonly string[] =>
     }
   });
 
+/**
+ * Where a project's own account of itself is looked for, in the order they are read.
+ *
+ * `CLAUDE.md`/`AGENTS.md` first: a repository that has already written agent-facing instructions is
+ * making exactly the kind of statement this scan is for. `README.md` and `docs/README.md` follow,
+ * because most repositories that describe themselves at all do it there.
+ */
+const DOCUMENTATION_FILES: readonly string[] = [
+  'CLAUDE.md',
+  'AGENTS.md',
+  'README.md',
+  join('docs', 'README.md'),
+];
+
+/** Every documentation file's contents, concatenated, plus which ones actually existed. */
+const readDocumentation = (
+  repositoryPath: string,
+): { readonly files: readonly string[]; readonly text: string } => {
+  const files: string[] = [];
+  const chunks: string[] = [];
+  for (const name of DOCUMENTATION_FILES) {
+    try {
+      chunks.push(readFileSync(join(repositoryPath, name), 'utf8'));
+      files.push(name);
+    } catch {
+      // Absent, or not a readable text file — either way it says nothing.
+    }
+  }
+  return { files, text: chunks.join('\n\n') };
+};
+
+/**
+ * A resource need read off a literal mention, or `null` when the text names neither.
+ *
+ * Word-boundary matches on the two names `resources` itself can carry, case-insensitive — never a
+ * stronger claim than "one of these two words is somewhere in this text", which is exactly what a
+ * person is asked to confirm or correct at the interview once it is offered as a suggestion.
+ */
+const resourceHintFrom = (text: string): ResourceNeed | null => {
+  const postgres = /\bpostgres(ql)?\b/i.test(text);
+  const redis = /\bredis\b/i.test(text);
+  if (postgres && redis) return 'both';
+  if (postgres) return 'postgres';
+  if (redis) return 'redis';
+  return null;
+};
+
+export const detectDocumentation = (repositoryPath: string): DocumentationSignals => {
+  const { files, text } = readDocumentation(repositoryPath);
+  return { files, resourceHint: resourceHintFrom(text) };
+};
+
 /** Everything the interview can offer without asking, read once. */
 export const detectDefaults = (repositoryPath: string): DetectedDefaults => {
   let resolved = repositoryPath;
@@ -160,5 +239,6 @@ export const detectDefaults = (repositoryPath: string): DetectedDefaults => {
     packageManager: manager,
     commands: detectCommands(resolved, manager),
     sourceLayout: detectSourceLayout(resolved),
+    documentation: detectDocumentation(resolved),
   };
 };

@@ -7,7 +7,7 @@
  * suggestion offered, or on what ends up in the artifact — never on the sentence a person reads. A
  * test that pinned a sentence would pin the one thing the contract deliberately frees.
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -18,7 +18,7 @@ import {
   PROFILE_SCHEMA_VERSION,
   ProfileSchema,
 } from '../src/contracts/index.js';
-import { INTERVIEW, detectDefaults, parseToml, runInit } from '../src/installer/index.js';
+import { INTERVIEW, detectDefaults, detectDocumentation, parseToml, runInit } from '../src/installer/index.js';
 import type { QuestionId } from '../src/installer/index.js';
 import { makeRepository, readTree, scriptedIo } from './helpers/installer-fixture.js';
 
@@ -626,5 +626,135 @@ describe('express and custom install modes', () => {
 
     expect(io.installModeCalls()).toBe(0);
     expect(io.asked).toStrictEqual([]);
+  });
+});
+
+/**
+ * `resources` reads CLAUDE.md, AGENTS.md, README.md and docs/README.md for a literal mention of
+ * postgres or redis, and the installer names the gap when none of those files exist at all.
+ *
+ * **A word-boundary text scan, not understanding.** `detectDocumentation` never claims more than "one
+ * of two words appears somewhere in this text" — real project understanding is the bootstrap agent's
+ * job (`src/engine/bootstrap.ts`), not this pure, instant read. What is pinned here is exactly that
+ * narrow claim, offered as an ordinary overridable suggestion like every other detected field.
+ */
+describe('resources is informed by the repository’s own documentation', () => {
+  it('finds nothing to suggest when no documentation file exists', () => {
+    const signals = detectDocumentation(repository({ node: false }));
+    expect(signals.files).toStrictEqual([]);
+    expect(signals.resourceHint).toBeNull();
+  });
+
+  it.each([
+    ['postgres', 'This app stores everything in Postgres.', 'postgres'],
+    ['postgresql, spelled out', 'Requires PostgreSQL 16 or newer.', 'postgres'],
+    ['redis', 'Session state lives in Redis.', 'redis'],
+    ['both', 'Uses Postgres for storage and Redis for the job queue.', 'both'],
+    ['neither', 'A small static site with no backend at all.', null],
+  ] as const)('reads %s from README.md', (_label, prose, expected) => {
+    const repo = repository({ node: false, files: { 'README.md': prose } });
+    const signals = detectDocumentation(repo);
+    expect(signals.files).toStrictEqual(['README.md']);
+    expect(signals.resourceHint).toBe(expected);
+  });
+
+  it('prefers CLAUDE.md and AGENTS.md, and reads every file that exists rather than only the first', () => {
+    const repo = repository({
+      node: false,
+      files: {
+        'CLAUDE.md': 'A CLI tool, no database.',
+        'AGENTS.md': 'Agents may read the repository.',
+        'README.md': 'Uses Redis for caching.',
+      },
+    });
+    const signals = detectDocumentation(repo);
+    expect(signals.files).toStrictEqual(['CLAUDE.md', 'AGENTS.md', 'README.md']);
+    // Redis is mentioned only in README.md, and is still found: the scan reads all of them together.
+    expect(signals.resourceHint).toBe('redis');
+  });
+
+  it('offers the detected hint as the resources suggestion, confirmed or overridden like any other', async () => {
+    const repo = repository({
+      node: false,
+      files: { 'README.md': 'A queue-backed worker using Postgres.' },
+    });
+    const io = scriptedIo({
+      'mechanics.package_manager': 'npm',
+      'source_layout.directories': 'src',
+    });
+    await runInit({ repository: repo, io, mode: 'custom' });
+    expect(io.suggestions.get('resources.resources')).toBe('postgres');
+  });
+
+  it('names the missing-documentation gap in an advisory, and says nothing when documentation exists', async () => {
+    const undocumented = repository({ node: false });
+    const outcome = await runInit({
+      repository: undocumented,
+      io: scriptedIo({ 'mechanics.package_manager': 'npm', 'source_layout.directories': 'src' }),
+    });
+    expect(outcome.advisories).toHaveLength(1);
+    expect(outcome.advisories[0]).toContain('CLAUDE.md');
+    expect(outcome.advisories[0]).toContain('--refresh');
+
+    const documented = repository({
+      node: false,
+      files: { 'README.md': 'A small library, no backend.' },
+    });
+    const documentedOutcome = await runInit({
+      repository: documented,
+      io: scriptedIo({ 'mechanics.package_manager': 'npm', 'source_layout.directories': 'src' }),
+    });
+    expect(documentedOutcome.advisories).toStrictEqual([]);
+  });
+});
+
+/**
+ * `orch init --refresh` — the one way an already-completed install reopens a settled answer.
+ *
+ * Scoped to exactly `mechanics`, `source_layout` and `resources`: the three questions detection can
+ * inform. Everything else a person already answered — `branch_pattern`, `ceilings`, `builtin_agents`,
+ * and so on — must survive a refresh completely untouched, which is what distinguishes "reopen what
+ * detection can improve on" from "start the interview over".
+ */
+describe('orch init --refresh reopens exactly what detection can inform', () => {
+  it('reopens mechanics, source_layout and resources, and nothing else', async () => {
+    const repo = repository({ node: false });
+    await runInit({
+      repository: repo,
+      io: scriptedIo({
+        'mechanics.package_manager': 'npm',
+        'source_layout.directories': 'src',
+        'branch_pattern.pattern': 'release/<slug>',
+      }),
+    });
+
+    // The repository has grown since the first install: documentation, a lockfile, and real source.
+    writeFileSync(join(repo, 'README.md'), 'Backed by Redis for session storage.', 'utf8');
+    writeFileSync(join(repo, 'package-lock.json'), '{}\n', 'utf8');
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'index.js'), 'module.exports = {};\n', 'utf8');
+
+    const io = scriptedIo();
+    const outcome = await runInit({ repository: repo, io, refresh: true });
+
+    expect([...outcome.asked].sort()).toStrictEqual(['mechanics', 'resources', 'source_layout'].sort());
+    expect(io.suggestions.get('mechanics.package_manager')).toBe('npm');
+    expect(io.suggestions.get('resources.resources')).toBe('redis');
+
+    const profile = parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8'));
+    expect(profile['mechanics']).toMatchObject({ resources: 'redis' });
+    // Untouched: the branch pattern answered on the first install is exactly what a refresh must not
+    // disturb, and nothing here offered it again.
+    expect(profile['branch_pattern']).toBe('release/<slug>');
+    expect(io.asked.some((id) => id.startsWith('branch_pattern.'))).toBe(false);
+  });
+
+  it('is a no-op on a repository with nothing yet to refresh (a first-ever install)', async () => {
+    const repo = repository();
+    const io = scriptedIo();
+    const outcome = await runInit({ repository: repo, io, refresh: true });
+
+    // Identical to an ordinary first run: refresh only changes what counts as already answered.
+    expect(outcome.asked).toStrictEqual(EXPECTED_ORDER);
   });
 });

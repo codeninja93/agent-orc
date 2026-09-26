@@ -516,15 +516,20 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     prompt: 'What does a run of this repository need?',
     description:
       'Whether this repository itself needs a database to run — postgres, redis, both, or none. This ' +
-      'is about what a run of THIS repository needs, not what the orchestrator needs for itself.',
+      'is about what a run of THIS repository needs, not what the orchestrator needs for itself. When ' +
+      'CLAUDE.md, AGENTS.md, README.md or docs/README.md literally mention postgres or redis, that is ' +
+      'offered below — confirm it or correct it, the same as any other suggestion here.',
     form: {
       kind: 'fields',
       fields: [
         {
           key: 'resources',
           prompt: `Resources (${RESOURCE_NEEDS.join(', ')})`,
-          defaultSource: fixed('none'),
-          suggest: always('none'),
+          defaultSource: detectedFrom(
+            'a literal mention in CLAUDE.md, AGENTS.md, README.md or docs/README.md, or "none" when ' +
+              'none of those exist or none of them say so',
+          ),
+          suggest: (detected): string => detected.documentation.resourceHint ?? 'none',
         },
       ],
     },
