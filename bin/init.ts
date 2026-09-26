@@ -82,7 +82,11 @@ const main = async (argv: readonly string[]): Promise<number> => {
 
   const io = terminalIo();
   try {
-    const outcome = await runInit({ repository: parsed.repository, io });
+    const outcome = await runInit({
+      repository: parsed.repository,
+      io,
+      ...(parsed.mode === null ? {} : { mode: parsed.mode }),
+    });
     // R3 — the headline stands alone; the detail is one line per file and nothing more.
     process.stdout.write(`${outcome.summary}\n`);
     for (const file of outcome.dispositions) {

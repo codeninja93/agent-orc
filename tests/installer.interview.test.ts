@@ -506,3 +506,125 @@ describe('question 14 — the Jira tool domain is enabled by name, never by valu
     });
   });
 });
+
+/**
+ * Express and custom install modes.
+ *
+ * **Express is verified by silence, not by what it accepted.** Every field express mode resolves
+ * without asking lands on exactly the same value `collectEntry`'s existing "empty answer takes the
+ * offered default" already gave a person who pressed enter at every prompt — so the behaviour to pin
+ * is that `io.ask` is never called at all, which `io.asked` records precisely.
+ *
+ * **Custom is verified by the description appearing.** `askQuestion` shows a question's description
+ * once, the first time it is actually put to a person — in custom mode, that is every question; in
+ * express mode's fallback, only the one question that could not be silently defaulted.
+ */
+describe('express and custom install modes', () => {
+  it('resolves every question silently on a repository detection can fully answer, asking nothing', async () => {
+    const repo = repository();
+    const io = scriptedIo();
+    const outcome = await runInit({ repository: repo, io, mode: 'express' });
+
+    expect(io.asked).toStrictEqual([]);
+    // Still resolved, just never asked: the summary's own "questions asked" count over silence is the
+    // pre-existing meaning of `asked` (resolved this run), not a claim that a person was interrupted.
+    expect(outcome.asked).toStrictEqual(EXPECTED_ORDER);
+    const profile = ProfileSchema.parse(
+      parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8')),
+    );
+    expect(profile.mechanics.source_layout).toStrictEqual(['src']);
+    expect(profile.autonomy_start).toBe('shadow');
+  });
+
+  it('falls back to asking, with the description shown once, when nothing can default a field', async () => {
+    const repo = repository({ node: false });
+    // A repository with no lockfile and no conventional source directory leaves `mechanics` and
+    // `source_layout` unable to validate silently. The fallback is per *question*, not per field —
+    // `mechanics`'s other five fields (blank commands, all valid) are asked too once package_manager's
+    // silent attempt fails, because one entry answers every field of its question together.
+    const io = scriptedIo({
+      'mechanics.package_manager': 'npm',
+      'source_layout.directories': 'src',
+    });
+    const outcome = await runInit({ repository: repo, io, mode: 'express' });
+
+    expect(io.asked).toStrictEqual([
+      'mechanics.package_manager',
+      'mechanics.typecheck',
+      'mechanics.lint',
+      'mechanics.test',
+      'mechanics.build',
+      'mechanics.run',
+      'source_layout.directories',
+    ]);
+    expect(outcome.asked).toStrictEqual(EXPECTED_ORDER);
+    const mechanicsQuestion = INTERVIEW.find((entry) => entry.id === 'mechanics');
+    const sourceLayoutQuestion = INTERVIEW.find((entry) => entry.id === 'source_layout');
+    expect(io.said).toContain(mechanicsQuestion?.description);
+    expect(io.said).toContain(sourceLayoutQuestion?.description);
+    const profile = ProfileSchema.parse(
+      parseToml(readFileSync(join(repo, '.orch', 'profile.toml'), 'utf8')),
+    );
+    expect(profile.mechanics.source_layout).toStrictEqual(['src']);
+    expect(profile.mechanics.package_manager).toBe('npm');
+  });
+
+  it('custom mode asks every question and shows every description exactly once', async () => {
+    const io = scriptedIo();
+    await runInit({ repository: repository(), io, mode: 'custom' });
+
+    for (const entry of INTERVIEW) {
+      expect(io.said.filter((line) => line === entry.description), entry.id).toHaveLength(1);
+    }
+  });
+
+  it('asks InterviewIo.chooseInstallMode exactly once when a mode was not decided already', async () => {
+    const io = scriptedIo(
+      { 'mechanics.package_manager': 'npm', 'source_layout.directories': 'src' },
+      { installMode: 'express' },
+    );
+    await runInit({ repository: repository({ node: false }), io });
+
+    expect(io.installModeCalls()).toBe(1);
+    // Express was the scripted choice, so only the two questions with nothing to default were asked.
+    expect(io.asked).toStrictEqual([
+      'mechanics.package_manager',
+      'mechanics.typecheck',
+      'mechanics.lint',
+      'mechanics.test',
+      'mechanics.build',
+      'mechanics.run',
+      'source_layout.directories',
+    ]);
+  });
+
+  it('never asks chooseInstallMode when there is nothing left to ask (a settled re-run)', async () => {
+    const repo = repository();
+    await runInit({ repository: repo, io: scriptedIo() });
+
+    const io = scriptedIo({}, { installMode: 'express' });
+    const second = await runInit({ repository: repo, io });
+
+    expect(second.asked).toStrictEqual([]);
+    expect(io.installModeCalls()).toBe(0);
+  });
+
+  it('defaults to custom when the io offers no chooseInstallMode and no mode was given, unchanged from before express mode existed', async () => {
+    const io = scriptedIo();
+    const outcome = await runInit({ repository: repository(), io });
+
+    // Every field asked, exactly as `runInit` behaved before this story — the same shape
+    // `EXPECTED_ORDER`'s own describe block already pins for the default call, restated here as the
+    // explicit default of the new `mode` option rather than an implicit absence of one.
+    expect(outcome.asked).toStrictEqual(EXPECTED_ORDER);
+    expect(io.asked.length).toBeGreaterThan(EXPECTED_ORDER.length);
+  });
+
+  it('an explicit mode option is never overridden by what chooseInstallMode would have said', async () => {
+    const io = scriptedIo({}, { installMode: 'custom' });
+    await runInit({ repository: repository(), io, mode: 'express' });
+
+    expect(io.installModeCalls()).toBe(0);
+    expect(io.asked).toStrictEqual([]);
+  });
+});
