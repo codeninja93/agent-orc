@@ -371,7 +371,18 @@ describe('the environment reaches the refusal, from npm_config_user_agent to the
     else env['npm_config_user_agent'] = userAgent;
     return spawnSync(
       process.execPath,
-      ['--import', jiti, '-e', `import('${contractsUrl}').then(() => { process.stdout.write('imported'); });`],
+      [
+        // jiti's own loader still registers itself with the deprecated `module.register()`, which a
+        // newer Node emits `[DEP0205]` for on every child that loads it — nothing this suite's own
+        // code did, and unrelated to what these cases assert (npm_config_user_agent handling). Left
+        // in, that warning lands on stderr and breaks the "imports cleanly" assertions below on
+        // whichever Node happens to be current when this runs.
+        '--no-deprecation',
+        '--import',
+        jiti,
+        '-e',
+        `import('${contractsUrl}').then(() => { process.stdout.write('imported'); });`,
+      ],
       { encoding: 'utf8', env },
     );
   };
@@ -425,8 +436,8 @@ describe('the environment reaches the refusal, from npm_config_user_agent to the
  * The CI workflow, asserted as a declaration rather than run.
  *
  * GitHub Actions cannot be run here, so what is asserted is what the file *says*: the four commands of the
- * AD-31 gate, each as a step of its own so a failure names which one failed, both triggers, and — the one
- * that would otherwise drift — the Node version taken from `.nvmrc` rather than written out again.
+ * AD-31 gate, each as a step of its own so a failure names which one failed, its one trigger, and — the
+ * one that would otherwise drift — the Node version taken from `.nvmrc` rather than written out again.
  */
 describe('the CI workflow runs the gate on the pinned Node', () => {
   const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
@@ -456,10 +467,12 @@ describe('the CI workflow runs the gate on the pinned Node', () => {
     expect(steps).toContain('- run: npm ci');
   });
 
-  it('runs on a push and on a pull request', () => {
+  it('runs on push only, not on pull_request', () => {
+    // A PR from a branch in this same repository would otherwise run the gate twice per commit — once
+    // for the push, once for the pull_request event against the same sha.
     expect(workflow).toMatch(/^on:$/m);
     expect(workflow).toMatch(/^ {2}push:$/m);
-    expect(workflow).toMatch(/^ {2}pull_request:$/m);
+    expect(workflow).not.toMatch(/^ {2}pull_request:$/m);
   });
 
   it('takes the Node version from .nvmrc, so it cannot disagree with the declared floor', () => {

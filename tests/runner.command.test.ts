@@ -618,28 +618,41 @@ describe('the server the config starts is one that exists (matrix 25, 27)', () =
     expect(Object.keys(servers[MCP_SERVER_NAME]?.['env'] ?? {})).not.toContain('ORCH_STEP_ATTEMPT');
   });
 
-  it('assembles itself from the environment the config sets, reading the run\u2019s own snapshot', () => {
-    /**
-     * Matrix 27 from the server's side: the entry point has to be able to build a runner from
-     * nothing but what the config hands it, or the tool is inert however well the argv is composed.
-     */
-    const { orchHome, worktree } = world('from-env');
-    const configDir = join(orchHome, 'runs', RUN, 'config');
-    mkdirSync(configDir, { recursive: true });
-    writeFileSync(join(configDir, 'profile.toml'), serialiseToml(fixtureProfile()), 'utf8');
+  it(
+    'assembles itself from the environment the config sets, reading the run\u2019s own snapshot',
+    () => {
+      /**
+       * Matrix 27 from the server's side: the entry point has to be able to build a runner from
+       * nothing but what the config hands it, or the tool is inert however well the argv is composed.
+       */
+      const { orchHome, worktree } = world('from-env');
+      const configDir = join(orchHome, 'runs', RUN, 'config');
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(join(configDir, 'profile.toml'), serialiseToml(fixtureProfile()), 'utf8');
 
-    const assembled = createCommandRunnerFromEnvironment({
-      ORCH_HOME: orchHome,
-      ORCH_RUN: RUN,
-      ORCH_STEP: 'verify',
-      ORCH_STEP_ATTEMPT: '2',
-    });
-    expect(assembled.commands.typecheck).toBe('npm run typecheck');
-    // It read the *snapshot*, which is the only configuration a step reads (AD-34).
-    expect(assembled.runner.planFor('typecheck')?.args.some((argument) => argument.includes(worktree))).toBe(
-      true,
-    );
-  });
+      const assembled = createCommandRunnerFromEnvironment({
+        ORCH_HOME: orchHome,
+        ORCH_RUN: RUN,
+        ORCH_STEP: 'verify',
+        ORCH_STEP_ATTEMPT: '2',
+      });
+      expect(assembled.commands.typecheck).toBe('npm run typecheck');
+      // It read the *snapshot*, which is the only configuration a step reads (AD-34).
+      expect(
+        assembled.runner.planFor('typecheck')?.args.some((argument) => argument.includes(worktree)),
+      ).toBe(true);
+    },
+    /**
+     * Every step of this test is synchronous (fs writes, a PATH scan for a container runtime,
+     * `planFor`'s own pure argv build), so it normally finishes in milliseconds — but CI runs it
+     * alongside suites that spawn real child processes (jiti-compiling children for the cross-process
+     * races elsewhere in this run), and a busy CI runner can starve even a synchronous test past
+     * Vitest's tight default. The bound is generous on purpose, the same reasoning
+     * `tests/engine.question-race.test.ts`'s `RACE_TIMEOUT_MS` gives: it exists so a genuine hang fails
+     * rather than runs forever, not to measure how long this normally takes.
+     */
+    30_000,
+  );
 
   it('refuses to start when the environment names no run or no step', () => {
     // A server that guessed would run one step's gates against another's worktree.
