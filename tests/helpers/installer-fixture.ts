@@ -12,7 +12,7 @@ import type { Dirent } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { InterviewIo, Prompt } from '../../src/installer/index.js';
+import type { InstallMode, InterviewIo, Prompt } from '../../src/installer/index.js';
 
 /** A terminal that answers from a script and records what it was asked and told. */
 export interface ScriptedIo extends InterviewIo {
@@ -21,15 +21,23 @@ export interface ScriptedIo extends InterviewIo {
   /** Everything said back to the person: refusals, and what was recovered. */
   readonly said: readonly string[];
   readonly suggestions: ReadonlyMap<string, string | null>;
+  /** How many times {@link InterviewIo.chooseInstallMode} was actually called. */
+  readonly installModeCalls: () => number;
 }
 
 /**
  * Every answer is a queue: a script gives a prompt id one answer per time it is asked, and an id
  * with nothing left answers with the empty string, which takes the offered default. That is what
  * lets one script drive both "accept everything detected" and "override exactly this one".
+ *
+ * `installMode`, when given, scripts {@link InterviewIo.chooseInstallMode}'s answer — a suite testing
+ * express/custom selection passes it; every other suite omits it, so this double offers no such
+ * choice at all, matching a scripted terminal that has no way to present one (`runInit` then defaults
+ * to "custom", the behaviour every install had before express mode existed).
  */
 export const scriptedIo = (
   script: Readonly<Record<string, string | readonly string[]>> = {},
+  options: { readonly installMode?: InstallMode } = {},
 ): ScriptedIo => {
   const queues = new Map<string, string[]>(
     Object.entries(script).map(([id, value]) => [id, typeof value === 'string' ? [value] : [...value]]),
@@ -37,10 +45,12 @@ export const scriptedIo = (
   const asked: string[] = [];
   const said: string[] = [];
   const suggestions = new Map<string, string | null>();
+  let installModeCalls = 0;
   return {
     asked,
     said,
     suggestions,
+    installModeCalls: () => installModeCalls,
     ask: (prompt: Prompt): Promise<string> => {
       asked.push(prompt.id);
       if (!suggestions.has(prompt.id)) suggestions.set(prompt.id, prompt.suggestion);
@@ -49,6 +59,14 @@ export const scriptedIo = (
     say: (line: string): void => {
       said.push(line);
     },
+    ...(options.installMode === undefined
+      ? {}
+      : {
+          chooseInstallMode: (): Promise<InstallMode> => {
+            installModeCalls += 1;
+            return Promise.resolve(options.installMode!);
+          },
+        }),
   };
 };
 

@@ -32,7 +32,7 @@ import type { RegisteredProject } from '../runtime/projects.js';
 import { detectDefaults } from './detect.js';
 import { orchPaths, readExistingInstall } from './answers.js';
 import { BUILT_IN_AGENT_IDS, completeAnswers, missingQuestions, runInterview } from './interview.js';
-import type { InterviewIo, Prompt, QuestionId } from './interview.js';
+import type { InstallMode, InterviewIo, Prompt, QuestionId } from './interview.js';
 import { findHalfInstall } from './manifest.js';
 import type { HalfInstallFinding } from './manifest.js';
 import { writeInstall } from './write.js';
@@ -97,6 +97,13 @@ export interface InitOptions {
    * would leave records behind on the machine it ran on.
    */
   readonly orchHome?: string;
+  /**
+   * "express" or "custom", decided already (typically from a CLI flag) — skips
+   * {@link InterviewIo.chooseInstallMode} entirely. Omitted defers to that, and if the `io` offers no
+   * such choice either, `runInit` proceeds exactly as every install did before express mode existed:
+   * every question asked, in full.
+   */
+  readonly mode?: InstallMode;
 }
 
 export interface InitOutcome {
@@ -217,7 +224,21 @@ export const runInit = async (options: InitOptions): Promise<InitOutcome> => {
   const { custom_agents: _lost, ...withoutCustomAgents } = identified;
   const settled = lostCustomAgent ? withoutCustomAgents : identified;
 
-  const { answers, asked } = await runInterview(settled, options.io, detected);
+  /**
+   * The express/custom choice is asked at most once per install, and only when there is at least one
+   * question actually missing — a re-run that has nothing left to ask must stay exactly that quiet,
+   * which `tests/installer.idempotence.test.ts` holds as "asks nothing at all" (`io.asked` empty).
+   * `chooseInstallMode` is deliberately not routed through `io.ask`/`io.asked`: it is not one of the
+   * fourteen questions, and mixing it into that channel would put a fifteenth id in front of every
+   * caller that already enumerates the interview by its own known order.
+   */
+  const missingBeforeMode = missingQuestions(settled);
+  const mode: InstallMode =
+    options.mode ?? (missingBeforeMode.length === 0 ? 'custom' : ((await options.io.chooseInstallMode?.()) ?? 'custom'));
+
+  const { answers, asked } = await runInterview(settled, options.io, detected, {
+    express: mode === 'express',
+  });
   const complete = completeAnswers(answers);
   if (complete === null) {
     throw new InstallRefusal(
@@ -301,17 +322,32 @@ export interface ParsedArguments {
   readonly projectId: string | null;
   /** `prune --force`: delete a project that still resolves. Off unless it was asked for. */
   readonly force: boolean;
+  /**
+   * `init --express` or `init --custom`, decided on the command line rather than at a prompt.
+   * `null` for every other command, and for `init` with neither flag — which defers to
+   * {@link InterviewIo.chooseInstallMode} instead of skipping the choice.
+   */
+  readonly mode: InstallMode | null;
   /** Present only for `kind: 'help'` reached by a usage error, which exits non-zero. */
   readonly error: string | null;
 }
 
-export const USAGE = `orch init [path]
+export const USAGE = `orch init [path] [--express | --custom]
 orch prune <project-id> [--force]
 
 init — onboard a repository: ask what the orchestrator needs to know about it and
 write <path>/.orch/ — profile.toml, permissions.toml, agents/*.toml and a manifest
 — appending the runtime paths to .gitignore, and registering the project centrally
 under ORCH_HOME/projects/<project-id>/. Defaults to the current directory.
+
+  --express    accept every detected or fixed default silently, asking only about
+               the few things nothing can default (most commonly, where the code
+               actually lives, if nothing conventional was found)
+  --custom     walk through every question, each with an explanation of what it
+               collects and why, before asking
+
+  Neither flag: if the terminal offers a choice, you are asked once, up front,
+  which of the two you want. Answers already on disk are never re-asked either way.
 
 prune — remove the central state of one project, named by its project id, which is
 the SHA of its first commit (AD-10). It takes an id and never a path, so standing
@@ -342,7 +378,7 @@ NAMES of the environment variables holding them.`;
 export const parseInitArguments = (argv: readonly string[]): ParsedArguments => {
   const args = argv.filter((argument) => argument !== '');
   const cwd = process.cwd();
-  const base = { repository: cwd, projectId: null, force: false } as const;
+  const base = { repository: cwd, projectId: null, force: false, mode: null } as const;
   if (args.includes('--help') || args.includes('-h')) {
     return { ...base, kind: 'help', error: null };
   }
@@ -354,9 +390,16 @@ export const parseInitArguments = (argv: readonly string[]): ParsedArguments => 
   const [command, first, ...rest] = positional;
 
   if (command === 'init') {
-    const unknownFlag = flags[0];
+    const unknownFlag = flags.find((flag) => flag !== '--express' && flag !== '--custom');
     if (unknownFlag !== undefined) {
       return { ...base, kind: 'help', error: `Unknown option "${unknownFlag}".` };
+    }
+    if (flags.includes('--express') && flags.includes('--custom')) {
+      return {
+        ...base,
+        kind: 'help',
+        error: '--express and --custom name opposite choices; give at most one.',
+      };
     }
     if (rest.length > 0) {
       return {
@@ -365,7 +408,8 @@ export const parseInitArguments = (argv: readonly string[]): ParsedArguments => 
         error: `init takes at most one path; received ${String(positional.length - 1)}.`,
       };
     }
-    return { ...base, kind: 'init', repository: first ?? cwd, error: null };
+    const mode = flags.includes('--express') ? 'express' : flags.includes('--custom') ? 'custom' : null;
+    return { ...base, kind: 'init', repository: first ?? cwd, mode, error: null };
   }
 
   if (command === 'prune') {
@@ -434,6 +478,23 @@ export const terminalIo = (): InterviewIo & { readonly close: () => void } => {
     },
     say: (line: string): void => {
       process.stderr.write(`${line}\n`);
+    },
+    /**
+     * Read through the same pulled-line iterator `ask` uses, for the reason `ask`'s own doc comment
+     * gives: a second, independent reader (`rl.question`) would drop whatever arrived before it
+     * started listening. Blank, or anything but "express"/"e", is "custom" — the default this
+     * question's own field carries, and the behaviour every install had before this choice existed.
+     */
+    chooseInstallMode: async (): Promise<InstallMode> => {
+      process.stderr.write(
+        'Two ways to answer what follows: "express" accepts every detected or fixed default ' +
+          'silently, asking only about the few things nothing can default; "custom" walks through ' +
+          'every question with an explanation of what it collects and why.\n',
+      );
+      process.stdout.write('Express or custom? (express, custom) [custom]: ');
+      const next = await lines.next();
+      const typed = (next.done === true ? '' : next.value).trim().toLowerCase();
+      return typed === 'express' || typed === 'e' ? 'express' : 'custom';
     },
     close: (): void => {
       rl.close();

@@ -135,6 +135,13 @@ export interface InterviewQuestion<K extends QuestionId> {
   readonly order: number;
   readonly id: K;
   readonly prompt: string;
+  /**
+   * What this question is asking and why, in full sentences — shown once, before the question is
+   * first put to a person (custom mode always; express mode only if it falls back to asking because
+   * nothing could be defaulted). Never shown twice for the same question, even across refusal
+   * retries: the refusal message itself is what a retry needs, not the whole explanation again.
+   */
+  readonly description: string;
   readonly form: QuestionForm;
   readonly parse: (raw: RawAnswer, detected: DetectedDefaults) => Parsed<Pick<Answers, K>>;
 }
@@ -362,6 +369,9 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 1,
     id: 'target_path',
     prompt: 'Which repository is being onboarded?',
+    description:
+      'Confirms which repository this install is for. Almost always the directory the installer was ' +
+      'already pointed at.',
     form: {
       kind: 'fields',
       fields: [
@@ -383,6 +393,10 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 2,
     id: 'project',
     prompt: 'Confirm the project id and remote.',
+    description:
+      'This repository’s identity from here on is the SHA of its very first commit (AD-10) — ' +
+      'confirmed here, never invented, so the central record this creates can never key the wrong ' +
+      'repository. The remote is recorded for reference only.',
     form: {
       kind: 'fields',
       fields: [
@@ -417,6 +431,10 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 3,
     id: 'mechanics',
     prompt: 'How is this repository built and checked?',
+    description:
+      'The package manager, and the exact command for each of typecheck/lint/test/build/run. A blank ' +
+      'command means that gate is skipped entirely for every run, so it is worth naming once real ' +
+      'scripts exist — but leaving one blank now is fine and can be filled in on a later `orch init`.',
     form: {
       kind: 'fields',
       fields: [
@@ -469,6 +487,9 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 4,
     id: 'source_layout',
     prompt: 'Where does the code live?',
+    description:
+      'Scopes what a run reads and writes. There is no default that means "everywhere", so at least ' +
+      'one directory is required — "." names the whole repository if that is genuinely the answer.',
     form: {
       kind: 'fields',
       fields: [
@@ -493,6 +514,9 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 5,
     id: 'resources',
     prompt: 'What does a run of this repository need?',
+    description:
+      'Whether this repository itself needs a database to run — postgres, redis, both, or none. This ' +
+      'is about what a run of THIS repository needs, not what the orchestrator needs for itself.',
     form: {
       kind: 'fields',
       fields: [
@@ -516,6 +540,10 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 6,
     id: 'high_blast_radius_paths',
     prompt: 'Which paths should force a higher isolation tier?',
+    description:
+      'Paths where a mistake would be expensive — CI config, package manifests, migrations. A run ' +
+      'touching one of these is held to a stricter isolation tier. Blank is fine to start with; this ' +
+      'can be tightened later.',
     form: {
       kind: 'fields',
       fields: [
@@ -533,6 +561,9 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 7,
     id: 'conflict_domains',
     prompt: 'Which directories must not be worked on concurrently?',
+    description:
+      'Directories where two runs editing at once would collide — a shared barrel file, a single ' +
+      'config everything imports. Blank is fine if nothing like that exists yet.',
     form: {
       kind: 'fields',
       fields: [
@@ -550,6 +581,9 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 8,
     id: 'branch_pattern',
     prompt: 'What should a feature branch be called?',
+    description:
+      'A template for the branch name every feature lands on. It has to vary per feature (carry a ' +
+      '<slug> placeholder) and has to be something git will actually accept as a branch name.',
     form: {
       kind: 'fields',
       fields: [
@@ -593,6 +627,10 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 9,
     id: 'external_domains',
     prompt: 'Which external domains should be enabled, and which variables hold their credentials?',
+    description:
+      'Any external service (beyond git/GitHub, which every run already has) an agent may need network ' +
+      'access to — and the NAMES of the environment variables holding its credentials, never the ' +
+      'credentials themselves; nothing here is ever looked up or bundled. Blank stops the list.',
     form: {
       kind: 'repeating',
       entry: [
@@ -628,6 +666,10 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 10,
     id: 'builtin_agents',
     prompt: 'Which built-in agents should be enabled?',
+    description:
+      `Which of the ${String(BUILT_IN_AGENT_IDS.length)} built-in pipeline agents (` +
+      `${BUILT_IN_AGENT_IDS.join(', ')}) are enabled for this repository. Most repositories want all ` +
+      'of them; leaving one out means that phase of the pipeline is skipped entirely.',
     form: {
       kind: 'fields',
       fields: [
@@ -656,6 +698,9 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 11,
     id: 'custom_agents',
     prompt: 'Are there custom agents to declare?',
+    description:
+      'Any agent beyond the built-in seven, with its own tool grant and a registered contract id. Most ' +
+      'repositories have none of these — leave the first field blank to skip.',
     form: {
       kind: 'repeating',
       entry: [
@@ -738,6 +783,10 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 12,
     id: 'autonomy_start',
     prompt: 'How much autonomy should this project start with?',
+    description:
+      '"shadow" analyses and proposes but writes nothing at all (AD-27) — nothing is pushed, no pull ' +
+      'request opens. "live" lets a run reach the real write surface: a branch, a pull request, a ' +
+      'commit. Starting with shadow and raising it once a few runs are trusted is the safer order.',
     form: {
       kind: 'fields',
       fields: [
@@ -764,6 +813,10 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 13,
     id: 'ceilings',
     prompt: 'What should a run’s ceilings be?',
+    description:
+      'The hard limits on any one run: how many steps it may take, how long it may run in wall-clock ' +
+      'minutes, and how much of your rate-limit window it may spend before it degrades or hibernates. ' +
+      'The defaults are conservative; raise them once you have seen a few runs complete.',
     form: {
       kind: 'fields',
       fields: [
@@ -828,6 +881,10 @@ export const INTERVIEW: readonly AnyQuestion[] = Object.freeze([
     order: 14,
     id: 'jira',
     prompt: 'Should the Jira tool domain be enabled, and if so, where is its credential and API?',
+    description:
+      'Whether agents may read and write Jira issues through the orchestrator’s own MCP tool server. ' +
+      'Off by default. Enabling it needs the environment variable NAME holding your Jira token (never ' +
+      'the token itself) and your Jira base URL, e.g. https://your-domain.atlassian.net.',
     form: {
       kind: 'fields',
       fields: [
@@ -915,7 +972,22 @@ export interface InterviewIo {
   readonly ask: (prompt: Prompt) => Promise<string>;
   /** Everything the person is told that is not a question: a refusal, or what was recovered. */
   readonly say: (line: string) => void;
+  /**
+   * Offer a choice between "express" (accept every offered default silently, asking only about the
+   * few things nothing can default) and "custom" (walk through every question, with its own
+   * description shown first). Optional, and deliberately not routed through {@link ask}: it is a
+   * session-level choice about *how* the interview runs, not one of the fourteen questions it asks,
+   * so it must never appear beside them in anything that tracks what was asked.
+   *
+   * Omitted entirely by an `InterviewIo` that has no way to offer the choice (a script, a test double)
+   * — `runInit` treats that exactly like an explicit "custom" answer, which is what every install did
+   * before this existed.
+   */
+  readonly chooseInstallMode?: () => Promise<InstallMode>;
 }
+
+/** How the interview answers what it can from defaults. See {@link InterviewIo.chooseInstallMode}. */
+export type InstallMode = 'express' | 'custom';
 
 /** The prompt id a field is addressed by. */
 export const promptId = (questionId: QuestionId, fieldKey: string): string =>
@@ -953,15 +1025,23 @@ const collectEntry = async (
    * fields whatever the first one said, because a blank there is an answer its validator judges.
    */
   stopOnBlankFirstField: boolean,
+  /**
+   * Express mode's first attempt: take every field's offered suggestion without ever calling
+   * {@link InterviewIo.ask}, exactly as if a person had pressed enter at every prompt. A field with
+   * nothing to suggest resolves to blank, the same as a person who typed nothing.
+   */
+  silent: boolean,
 ): Promise<RawEntry> => {
   const collected: Record<string, string> = {};
   for (const [index, spec] of fields.entries()) {
     const suggestion = spec.suggest(detected);
-    const typed = await io.ask({
-      id: promptId(questionId, spec.key),
-      question: spec.prompt,
-      suggestion,
-    });
+    const typed = silent
+      ? (suggestion ?? '')
+      : await io.ask({
+          id: promptId(questionId, spec.key),
+          question: spec.prompt,
+          suggestion,
+        });
     // An empty answer takes the offered default. That is what makes a detected default a default:
     // matrix row 12 wants it offered, and a person who agrees should not have to retype it.
     collected[spec.key] = typed.trim() === '' ? (suggestion ?? '') : typed.trim();
@@ -970,20 +1050,39 @@ const collectEntry = async (
   return collected;
 };
 
+export interface AskQuestionOptions {
+  /**
+   * Try every field's offered default silently on the first attempt, asking nothing. If that does not
+   * validate — nothing to default a required field to, most commonly {@link Answers.source_layout} on
+   * a repository with no conventional directory — every attempt after the first falls back to asking
+   * normally, exactly as "custom" mode always does. Default `false`: ask on every attempt, unchanged
+   * from every install before express mode existed.
+   */
+  readonly express?: boolean;
+}
+
 /** Ask one question until it validates, and answer with the patch it produced. */
 export const askQuestion = async (
   entry: AnyQuestion,
   io: InterviewIo,
   detected: DetectedDefaults,
+  options: AskQuestionOptions = {},
 ): Promise<PartialAnswers> => {
+  const express = options.express ?? false;
+  let descriptionShown = false;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_QUESTION; attempt += 1) {
+    const silent = express && attempt === 1;
+    if (!silent && !descriptionShown) {
+      io.say(entry.description);
+      descriptionShown = true;
+    }
     let raw: RawAnswer;
     if (entry.form.kind === 'fields') {
-      raw = await collectEntry(entry.form.fields, entry.id, io, detected, false);
+      raw = await collectEntry(entry.form.fields, entry.id, io, detected, false, silent);
     } else {
       const collected: RawEntry[] = [];
       for (let index = 0; index < MAX_REPEATING_ENTRIES; index += 1) {
-        const one = await collectEntry(entry.form.entry, entry.id, io, detected, true);
+        const one = await collectEntry(entry.form.entry, entry.id, io, detected, true, silent);
         const first = entry.form.entry[0];
         if (first === undefined || (one[first.key] ?? '') === '') break;
         collected.push(one);
@@ -1014,11 +1113,12 @@ export const runInterview = async (
   existing: PartialAnswers,
   io: InterviewIo,
   detected: DetectedDefaults,
+  options: AskQuestionOptions = {},
 ): Promise<InterviewResult> => {
   let answers: PartialAnswers = existing;
   const asked: QuestionId[] = [];
   for (const entry of missingQuestions(existing)) {
-    answers = { ...answers, ...(await askQuestion(entry, io, detected)) };
+    answers = { ...answers, ...(await askQuestion(entry, io, detected, options)) };
     asked.push(entry.id);
   }
   return { answers, asked };

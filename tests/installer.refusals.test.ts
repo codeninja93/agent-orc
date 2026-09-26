@@ -141,6 +141,29 @@ describe('the entry point’s arguments decide an exit code, not a guess', () =>
       repository: '/tmp/somewhere',
     });
     expect(parseInitArguments(['init']).kind).toBe('init');
+    // Neither flag given: `mode` is `null`, which defers to `InterviewIo.chooseInstallMode` rather
+    // than picking one silently.
+    expect(parseInitArguments(['init']).mode).toBeNull();
+  });
+
+  it('reads `--express` and `--custom`, in either position relative to the path', () => {
+    expect(parseInitArguments(['init', '--express', '/tmp/somewhere'])).toMatchObject({
+      kind: 'init',
+      repository: '/tmp/somewhere',
+      mode: 'express',
+    });
+    expect(parseInitArguments(['init', '/tmp/somewhere', '--custom'])).toMatchObject({
+      kind: 'init',
+      repository: '/tmp/somewhere',
+      mode: 'custom',
+    });
+  });
+
+  it('refuses --express and --custom given together, naming both', () => {
+    const result = parseInitArguments(['init', '--express', '--custom']);
+    expect(result.kind).toBe('help');
+    expect(result.error).toContain('--express');
+    expect(result.error).toContain('--custom');
   });
 
   it('answers --help and --version without running anything', () => {
