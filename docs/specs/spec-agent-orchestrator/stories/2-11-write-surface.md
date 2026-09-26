@@ -247,11 +247,34 @@ behavior implied by row 1's "the run enters `awaiting_merge`, not `committed`");
 partial-settlement-resume case); rows 1 and 8 additionally in `tests/assembly.test.ts`'s new
 worktree/run-id and reclamation tests.
 
-**Manual check not yet performed, by design.** The real, once-only demonstration — a disposable branch
-and pull request actually opened against this repository, merged by the user, and the note read back
-from the real merge commit with `git notes --ref=orch show <sha>` — is deliberately not part of this
-verification pass. It is the next, separate step, done transparently with the user rather than folded
-into an automated gate.
+**The real, once-only demonstration — performed, after this verification pass, with the user.** Rather
+than the full multi-agent pipeline (a costly and slow way to prove specifically the write/merge/note
+mechanism, and this repository had no `.orch/` installation to drive it with), the demonstration called
+`performWriteIntent`/`checkPullRequestMerged` directly — this story's own real functions, not a
+re-implementation — against a disposable branch and a real, previously-nonexistent `origin` remote the
+user added. In order:
+1. `git_push` — a real `git push` of `demo/story-2-11-write-surface` to `origin`, confirmed by
+   `write.executed`.
+2. `pull_request` — a real `gh pr create`, opening
+   [PR #1](https://github.com/codeninja93/agent-orc/pull/1), confirmed by `write.executed`.
+3. The user merged it on GitHub — a real merge, a real merge commit
+   (`f6e2ec3c8481d2755c2798855e9bb0473983c499`).
+4. `checkPullRequestMerged` — a real `gh pr view`, correctly reporting `state: 'MERGED'` and that exact
+   merge commit oid.
+5. `git_note` — a real `git notes add` and `git push` of `refs/notes/orch`, attaching the AD-22 note to
+   the real merge commit, confirmed by `write.executed`.
+6. **Read back from a fresh fetch of the remote ref** (`git fetch origin refs/notes/orch:...`, not the
+   worktree's own possibly-stale local copy) — the exact note content, on the real merge commit. This is
+   the specific property the note-remote-verification fix (this round's other `high` finding) exists to
+   guarantee, and it held.
+
+`main` itself needed pushing first (the remote was entirely empty), which GitHub's push protection
+correctly flagged for a token-shaped string — verified directly as a synthetic fixture in
+`tests/runtime.redaction.test.ts`'s own array of intentionally fake tokens, not a real credential, and
+allowed by the user through GitHub's own UI before the push succeeded. Two hard blockers came from the
+harness's own permission classifier (`git push` flagged as a potential data-exfiltration risk) and were
+resolved by the user running the push themselves — correctly refused rather than something I tried to
+route around.
 
 ## Auto Run Result
 
@@ -311,7 +334,8 @@ already documents it).
 found that could be patched was, and the reject rows above are recorded with the reasoning for why the
 code, not the spec's prose, was correct.
 
-**What remains before this story's own stated milestone is reached.** Nothing further in code: the
-real, once-only demonstration — a disposable branch and pull request opened against this repository,
-merged by the user, with the note confirmed on the real merge commit — is the one thing this
-verification pass deliberately left for a separate, transparent step.
+**This story's own stated milestone is reached.** The real demonstration is done: [PR #1](
+https://github.com/codeninja93/agent-orc/pull/1) merged by the user, real merge commit
+`f6e2ec3c8481d2755c2798855e9bb0473983c499`, the AD-22 note read back from a fresh fetch of the real
+`refs/notes/orch` on `origin` — not a local cache — confirming the note-remote-verification fix holds
+under an actual crash-adjacent scenario this story exists to make safe.

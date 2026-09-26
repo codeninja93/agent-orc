@@ -136,6 +136,48 @@ export const REVIEW_SKIPPED_PAYLOAD_KEYS = {
 } as const;
 
 /**
+ * Story 4-2 — a completed verification step's own per-criterion verdicts, promoted from the artifact
+ * into the durable log.
+ *
+ * `step.verification`'s own docblock draws the line that matters here: a contract sees one artifact and
+ * cannot see the run, so it cannot enforce a rule that spans two steps. Whether every one of `verify`'s
+ * own judgements is `met` is exactly such a rule — the reconciler's spawn-gating check for `adversarial`
+ * needs it on a *later* pass, and AD-4/AD-7 make the log the only place a later pass may read a fact
+ * from. Without this line, a verification step's `judgements` lived only in the terminal output the
+ * spawner already discards for a `completed` step's record beyond `contractOutput`, which does not
+ * survive past the pass that produced it.
+ *
+ * One line per completed step, carrying every judgement at once, rather than one line per judgement the
+ * way `gate.*` does: a gate's per-line split exists so a skip is legible without parsing a payload, and
+ * that reasoning does not carry over to a criterion, which is read back programmatically here rather
+ * than watched live.
+ */
+export const VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE = 'verification.judgements_recorded';
+
+/** The payload keys a `verification.judgements_recorded` line carries. */
+export const VERIFICATION_JUDGEMENTS_RECORDED_PAYLOAD_KEYS = {
+  /** Every judgement the completed output reported: `{ criterion, verdict }` pairs, in the output's order. */
+  Judgements: 'judgements',
+} as const;
+
+/**
+ * Story 4-2 — the `adversarial` step was not spawned because `verify`'s own judgements were not all
+ * `met`.
+ *
+ * The same "declared but not run" shape a skipped deterministic gate already has (`gate.skipped`):
+ * CAP-13's third tier is never spent on an implementation the cheaper tier has already found wanting,
+ * and that has to be a line in the log rather than an absent `agent.spawned` a reader has to interpret.
+ */
+export const ADVERSARIAL_SKIPPED_EVENT_TYPE = 'adversarial.skipped';
+
+/** The payload keys an `adversarial.skipped` line carries. */
+export const ADVERSARIAL_SKIPPED_PAYLOAD_KEYS = {
+  Reason: 'reason',
+  /** The criteria `verify` judged `unmet` or `undetermined`, which is what stopped the spawn. */
+  UnresolvedCriteria: 'unresolved_criteria',
+} as const;
+
+/**
  * AD-24's two ceiling lines, spelled once for the writer and every reader.
  *
  * Both were in {@link EVENT_TYPES} as bare literals from story 1-1 with no emitter, and `src/tui/` spells
@@ -291,6 +333,18 @@ export const WRITE_ATTEMPTED_EVENT_TYPE = 'write.attempted';
 export const WRITE_EXECUTED_EVENT_TYPE = 'write.executed';
 export const WRITE_FAILED_EVENT_TYPE = 'write.failed';
 
+/**
+ * Story 3-2 (AD-27) — what a shadow run's write executor records in place of `write.executed`.
+ *
+ * `write.attempted` and the read-only probe happen exactly as they do for a live run (AD-15's durability
+ * half still holds); this is the "executes" half suppressed, said explicitly rather than left as an
+ * absence. It carries the same `intent_id`/`kind`/`target` identity every write line does, plus whether
+ * the probe found the target already carrying something different from what this run would have produced
+ * — the zero-tolerance case the stage-3 autonomy gate hard-fails on (story 3-3) — and a detail line stating
+ * what the probe found and what would have happened.
+ */
+export const WRITE_SUPPRESSED_EVENT_TYPE = 'write.suppressed';
+
 /** The payload keys every `write.attempted` line carries — the intent, named, before the call. */
 export const WRITE_ATTEMPTED_PAYLOAD_KEYS = {
   /** The AD-15 idempotency key with the run id: `{step}.{kind}`, never minted. */
@@ -324,6 +378,194 @@ export const WRITE_FAILED_PAYLOAD_KEYS = {
   Reason: 'reason',
 } as const;
 
+/** The payload keys a `write.suppressed` line carries — story 3-2, AD-27. */
+export const WRITE_SUPPRESSED_PAYLOAD_KEYS = {
+  IntentId: 'intent_id',
+  Kind: 'kind',
+  Target: 'target',
+  /**
+   * True when the probe found the target already carrying something different from what this run would
+   * have produced — reusing 2-11's own probe verdict (`git ls-remote`/`gh pr list`/`git notes show`)
+   * rather than a second classification axis. False when the target does not yet exist, or exists and
+   * already matches.
+   */
+  Destructive: 'destructive',
+  /** One line, short and punctuated: what the probe found, and what would have happened. */
+  Detail: 'detail',
+} as const;
+
+/**
+ * Story 4-1 — AD-12's reversibility gate, said durably rather than only decided in memory.
+ *
+ * **`write.gate_opened` is what `settlePreMergeWrites` emits in place of calling the write executor**,
+ * for the first not-yet-settled intent of a composed commit whose `reversibility` is one of the
+ * project's `gated_reversibility_classes` (`PermissionsSchema`, `src/contracts/installer.ts`). One line
+ * per gate, never one per intent settled after it opens: `settlePreMergeWrites` checks the run's own
+ * `pending_gate` record (never a per-intent `write.gate_approved` lookup — round-1 review's fix, see
+ * {@link WRITE_GATE_APPROVED_EVENT_TYPE}'s own docblock) before ever opening a second one.
+ *
+ * **`batch` discloses the whole remaining batch, not only the intent whose class triggered the check —
+ * added in round-1 review.** `settlePreMergeWrites`'s settlement loop has no gate check inside it: once
+ * this one gate clears, every intent still unsettled at open time runs in the same pass. The first
+ * version's payload named only the triggering intent, understating what one approval actually authorises;
+ * `batch` lists every one of them (kind and target each), so a person approving sees the real blast
+ * radius.
+ *
+ * **`write.gate_approved`/`write.gate_rejected` are the only two ways a gate closes, and neither clears it
+ * — round-1 review's most serious finding.** Each is recorded by `applyIntent` alongside the
+ * `command.applied` line that retires the `approve`/`reject` intent — before it, for the reason
+ * `handoff.recorded` is: a crash between the two redelivers the intent rather than losing the resolution.
+ * The first version folded either line straight to `pending_gate: null`, which raced the *separate*
+ * `feature.state_changed` line the same effect also emits: a crash landing the resolution durably but not
+ * the state change left the fold reporting no gate at all while the run was still `blocked` — for a
+ * rejection, a later `Command.Approve` would then find nothing to refuse against and silently reverse it.
+ * Fixed: these two lines set `resolution: 'approved'`/`'rejected'` on the *existing* `pending_gate` record
+ * (`src/contracts/state.ts`'s `PendingGateSchema`); only the `feature.state_changed` line that follows,
+ * once it actually lands, clears the record to `null`. Approval carries only the `intent_id`; nothing else
+ * about the write changed. Rejection carries the person's own reason text, which
+ * `ARGUMENT_REQUIRED_COMMANDS` already guarantees `Command.Reject` never reaches here without
+ * (`src/contracts/command.ts`).
+ */
+export const WRITE_GATE_OPENED_EVENT_TYPE = 'write.gate_opened';
+export const WRITE_GATE_APPROVED_EVENT_TYPE = 'write.gate_approved';
+export const WRITE_GATE_REJECTED_EVENT_TYPE = 'write.gate_rejected';
+
+/** One entry of a `write.gate_opened` line's `batch` array: enough to disclose the write, never a payload. */
+export const WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS = {
+  IntentId: 'intent_id',
+  Kind: 'kind',
+  Target: 'target',
+} as const;
+
+/** The payload keys a `write.gate_opened` line carries: the intent, its class, and the step it came from. */
+export const WRITE_GATE_OPENED_PAYLOAD_KEYS = {
+  /** The AD-15 idempotency key of the intent whose `reversibility` triggered the gate. */
+  IntentId: 'intent_id',
+  Kind: 'kind',
+  Target: 'target',
+  /** The class that gated it — always one of the project's own `gated_reversibility_classes`. */
+  Reversibility: 'reversibility',
+  /** The committing step this write's intent belongs to. Never a step that failed: none did. */
+  Step: 'step',
+  /**
+   * Every intent still unsettled when this gate opened, `IntentId`'s own included — the whole remaining
+   * batch one approval or rejection covers, each shaped by {@link WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS}.
+   */
+  Batch: 'batch',
+} as const;
+
+/** The payload keys a `write.gate_approved` line carries: the intent, and nothing else. */
+export const WRITE_GATE_APPROVED_PAYLOAD_KEYS = {
+  IntentId: 'intent_id',
+} as const;
+
+/** The payload keys a `write.gate_rejected` line carries: the intent, and the person's own reason text. */
+export const WRITE_GATE_REJECTED_PAYLOAD_KEYS = {
+  IntentId: 'intent_id',
+  Reason: 'reason',
+} as const;
+
+/**
+ * Story 3-2 (AD-27) — the one raw, per-run result a shadow run produces: its resulting worktree tree
+ * compared against the real merge commit it was shadowing (`src/engine/shadow.ts`'s `compareShadowRun`).
+ * Emitted once, whether the comparison succeeded or failed — a failure to produce it is durably recorded
+ * here too, rather than only ever existing as an in-memory return value nobody else can see, matching the
+ * `write.*` trio's own discipline of never leaving a fact silently un-logged.
+ */
+export const SHADOW_COMPARED_EVENT_TYPE = 'shadow.compared';
+
+/** The payload keys a `shadow.compared` line carries. */
+export const SHADOW_COMPARED_PAYLOAD_KEYS = {
+  /** `'accepted'` or `'material_change'` (`ShadowComparisonOutcome`); absent when the comparison failed. */
+  Outcome: 'outcome',
+  ShadowTreeRef: 'shadow_tree_ref',
+  /** The real, already-merged feature's merge commit this run was shadowing. */
+  RealMergeCommit: 'real_merge_commit',
+  /**
+   * Present only when the comparison itself could not be produced (a `git` read failure) — the run may
+   * still have reached `committed`; only the grading of it is missing. Absent on a successful comparison.
+   */
+  Code: 'code',
+  /** One line, short and punctuated. Never the raw diff: AD-23 makes a diff evidence, not control plane. */
+  Detail: 'detail',
+} as const;
+
+/**
+ * Story 3-3 — the trust record's one new durable fact: a merged pull request's head-branch tree versus
+ * its merge commit's tree, captured once at merge-detection time by
+ * `src/engine/write-executor.ts`'s `mergeFidelityOf` and emitted by the reconciler at the same
+ * `awaiting_merge` → `committed` call site that already confirms the merge.
+ *
+ * Dedicated structured fields rather than a `Detail` free-text line, matching `shadow.compared`'s own
+ * `RealMergeCommit` precedent for why a raw commit SHA in a *named* field is fine even though
+ * `WRITE_EXECUTED_PAYLOAD_KEYS.Detail`'s own comment forbids one in free text: a replay needs the two
+ * oids to reconstruct what was compared, not merely a sentence about it.
+ */
+export const PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE = 'pull_request.merge_fidelity';
+
+/** The payload keys a `pull_request.merge_fidelity` line carries. */
+export const PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS = {
+  /** `'unchanged'` or `'corrected'`. Absent when the comparison itself could not be made (`Code` instead). */
+  Outcome: 'outcome',
+  /** The head branch's own final commit, as `gh pr view` reports it even after the branch is merged. */
+  HeadRefOid: 'head_ref_oid',
+  MergeCommit: 'merge_commit',
+  /**
+   * Present only when a tree could not be read (`git rev-parse <ref>^{tree}` failed on either ref) —
+   * exactly like `SHADOW_COMPARED_PAYLOAD_KEYS.Code`'s own absent-on-success shape. Never guessed as
+   * `unchanged`; absent on a successful comparison.
+   */
+  Code: 'code',
+  /** One line, short and punctuated: what the comparison found, or why it could not be made. */
+  Detail: 'detail',
+} as const;
+
+/**
+ * Story 4-3 — a durable note landed against a run: a person's steering colour (`kind: 'note'`), or a
+ * person-initiated scope reduction (`kind: 'narrow'`, CAP-16's own person-initiated half). One event
+ * type for both, discriminated by `kind`, because the two are the same shape of thing delivered the same
+ * way — a scope-narrowing instruction is a note whose *content* asks for less, not a structurally
+ * different delivery (see this story's own Design Notes on why `narrow` is not folded into story 2-9's
+ * `Degradation` machinery instead).
+ *
+ * Folded into `RunState.pending_note` (`src/contracts/state.ts`), set here and cleared by the next
+ * `step.started` line for the run — the same "set by one event, cleared by a later one" shape story 4-1's
+ * `pending_gate` already established. A second `note.injected` before the first is consumed **replaces**
+ * it: the fold is a plain assignment, never an append, so only one note is ever pending at a time.
+ */
+export const NOTE_INJECTED_EVENT_TYPE = 'note.injected';
+
+/** The payload keys a `note.injected` line carries: the free text, and which of the two it is. */
+export const NOTE_INJECTED_PAYLOAD_KEYS = {
+  Text: 'text',
+  Kind: 'kind',
+} as const;
+
+/**
+ * Story 4-3 — a run was forked into a wholly new, independent run, seeded from this run's own current
+ * worktree state. Emitted on the *source* run's own log — never the forked run's — so a person reading
+ * the source run's timeline sees that it was forked and where to; the source run's own `FeatureState` and
+ * step disposition are untouched, which is why this is not folded into anything (`fork` is not an
+ * `IntentEffect`: see `src/engine/steering.ts`'s own docblock for why that shape only ever mutates the
+ * *same* run).
+ *
+ * `IntentId` is carried in addition to the one key this story's own Tasks list names (`forked_run`), for
+ * a reason that key alone cannot cover: AD-19's delivery is at-least-once, and forking a run is not an
+ * idempotent side effect the way `escapeHatch`/`writeHandoff` are — a naive redelivery would mint and
+ * create a *second* new run. Carrying the intent id lets the engine recognise "this exact fork already
+ * happened" from the log alone, before ever creating another one, the same way `WRITE_GATE_APPROVED_
+ * PAYLOAD_KEYS.IntentId` lets a redelivered approval catch up rather than re-approve.
+ */
+export const RUN_FORKED_EVENT_TYPE = 'run.forked';
+
+/** The payload keys a `run.forked` line carries. */
+export const RUN_FORKED_PAYLOAD_KEYS = {
+  /** The new, independent run's own id. */
+  ForkedRun: 'forked_run',
+  /** The `fork` intent's id, so a redelivery is recognised without creating a second run. */
+  IntentId: 'intent_id',
+} as const;
+
 /**
  * The declared event vocabulary. Dot-namespaced and past-tense. The vocabulary is open by
  * design: a reader meeting a type absent from this list accepts the envelope and ignores the
@@ -336,6 +578,8 @@ export const EVENT_TYPES = [
   WRITE_ATTEMPTED_EVENT_TYPE,
   WRITE_EXECUTED_EVENT_TYPE,
   WRITE_FAILED_EVENT_TYPE,
+  /** Story 3-2 (AD-27) — a shadow run's write executor records this in place of `write.executed`. */
+  WRITE_SUPPRESSED_EVENT_TYPE,
   'permission.denied',
   'redaction.failed',
   BUDGET_DEGRADED_EVENT_TYPE,
@@ -387,10 +631,26 @@ export const EVENT_TYPES = [
   GATE_SKIPPED_EVENT_TYPE,
   /** No model-based review was spawned, and why (CAP-13's economics, said out loud). */
   REVIEW_SKIPPED_EVENT_TYPE,
+  /** Story 4-2 — a completed verification step's own per-criterion verdicts, read back by a later pass. */
+  VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE,
+  /** Story 4-2 — the adversarial step was not spawned because a preceding judgement was not `met`. */
+  ADVERSARIAL_SKIPPED_EVENT_TYPE,
   /** What the run-start branch-protection assertion concluded, including that it could not be made. */
   BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
   /** The branch, the three write intents and the note a completed committing step composed (AD-22). */
   COMMIT_COMPOSED_EVENT_TYPE,
+  /** Story 3-2 (AD-27) — a shadow run's own tree-comparison result, or that producing one failed. */
+  SHADOW_COMPARED_EVENT_TYPE,
+  /** Story 3-3 — a confirmed merge's head-branch tree compared against its merge commit's tree. */
+  PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
+  /** Story 4-1 — AD-12's reversibility gate opened, and the two ways it closes. */
+  WRITE_GATE_OPENED_EVENT_TYPE,
+  WRITE_GATE_APPROVED_EVENT_TYPE,
+  WRITE_GATE_REJECTED_EVENT_TYPE,
+  /** Story 4-3 — a durable note or person-initiated narrowing landed against a run. */
+  NOTE_INJECTED_EVENT_TYPE,
+  /** Story 4-3 — a run was forked into a wholly new, independent run. */
+  RUN_FORKED_EVENT_TYPE,
 ] as const;
 
 export type DeclaredEventType = (typeof EVENT_TYPES)[number];
@@ -473,6 +733,48 @@ export const EVENT_ENVELOPE_VERBATIM_FIELDS = [
 ] as const;
 
 export type EventEnvelopeVerbatimField = (typeof EVENT_ENVELOPE_VERBATIM_FIELDS)[number];
+
+/**
+ * Story 3-3's own review round — the payload-scoped counterpart to {@link EVENT_ENVELOPE_VERBATIM_FIELDS}.
+ *
+ * `EVENT_ENVELOPE_VERBATIM_FIELDS` only ever restores a *top-level envelope* key by name; it has no
+ * mechanism reaching into `payload`, so a commit SHA nested under a payload key — `pull_request.
+ * merge_fidelity`'s own `head_ref_oid`/`merge_commit` — was silently destroyed by the AD-21 entropy pass
+ * with no rescue at all (a real 40-character hex SHA scores ~3.58 bits/char, above the pass's default
+ * 3.5-bit/24-length threshold). This is a second, narrower allow-list rather than a widening of the first,
+ * because the two live at different depths in the envelope and `src/runtime/recorder.ts`'s
+ * `preservePassthrough` walks the envelope's own top-level keys only.
+ *
+ * By field *name*, not by event type: both keys are unique to `pull_request.merge_fidelity` today, so no
+ * per-event-type scoping is needed, and a later event type reusing either name gets the same rescue for
+ * the same reason (a commit SHA is a commit SHA regardless of which line carries it).
+ *
+ * Story 4-3 adds `forked_run`: `run.forked` carries the new run's own id — an unbroken ULID — in its
+ * payload rather than in an envelope field, because `EVENT_ENVELOPE_VERBATIM_FIELDS`'s own `run` field
+ * already means *this* line's own run (the source, per every other event type), and `run.forked` is the
+ * one line whose payload has to name a *second*, different run. Without this it would be silently
+ * destroyed the same way `head_ref_oid`/`merge_commit` were before this list existed.
+ *
+ * **Story 4-3, round-1 review — a map from field to the *one* shape it is allowed, never a flat list
+ * checked against every declared shape.** The first draft of this addition was a plain array, and
+ * `src/runtime/recorder.ts`'s `preservePassthroughPayload` checked each entry against *every* shape in
+ * {@link EVENT_ENVELOPE_IDENTITY_SHAPES} — which would have let a ULID-shaped value survive redaction
+ * under `head_ref_oid`/`merge_commit`, fields that should only ever hold a commit SHA. Still caught by
+ * `provesPatternFree` if the value were a real secret, but a genuine loss of the field-specific precision
+ * {@link hasEventIdentityShape} already established at the envelope level — extended here to the
+ * payload-scoped fields by the same convention, rather than invented separately: each value names the
+ * *one* `EVENT_ENVELOPE_IDENTITY_SHAPES` key that field's value must match, and `hasEventIdentityShape`
+ * is the one function either level actually tests a value against a shape with.
+ */
+export const EVENT_PAYLOAD_VERBATIM_FIELDS: Readonly<
+  Record<string, keyof typeof EVENT_ENVELOPE_IDENTITY_SHAPES>
+> = Object.freeze({
+  head_ref_oid: 'baseline_ref',
+  merge_commit: 'baseline_ref',
+  forked_run: 'run',
+});
+
+export type EventPayloadVerbatimField = keyof typeof EVENT_PAYLOAD_VERBATIM_FIELDS;
 
 /**
  * The two AD-5 stream-origin fields, which are verbatim-or-dropped: the pass may not rewrite them,

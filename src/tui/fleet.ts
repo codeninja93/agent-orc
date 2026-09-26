@@ -113,3 +113,69 @@ export const foldFleet = (options: FoldFleetOptions = {}): FleetView => {
 /** The in-flight runs, which is what CAP-22's one screen is a screen of. */
 export const inFlightRuns = (fleet: FleetView): readonly FleetRun[] =>
   fleet.runs.filter((run) => run.inFlight);
+
+/**
+ * Story 4-4 — why a run needs a person right now, per R1 ("notify only on exception, decision point, or
+ * completion") and threat-model.md item 16.
+ *
+ * Three reasons, not a fourth: R1 names exactly these three occasions, and a run that fits none of them
+ * is ordinary unattended progress, which is the case silence is for.
+ */
+export const ATTENTION_REASONS = ['decision_point', 'exception', 'completion'] as const;
+
+export type AttentionReason = (typeof ATTENTION_REASONS)[number];
+
+/** One run that needs a person, and why. */
+export interface AttentionEntry {
+  readonly run: FleetRun;
+  readonly reason: AttentionReason;
+}
+
+/**
+ * The reason one folded view needs a person, or `null` for silence.
+ *
+ * Order matters and mirrors `cardForView`'s own precedence:
+ *
+ * 1. an unreadable log (`view.problem !== null`) is `'exception'`, checked first — an unknown state is
+ *    never silence, the same reasoning `isRunInFlight` already applies to the identical case;
+ * 2. a pending question is `'decision_point'` regardless of `featureState`, because a person is never
+ *    missed on account of the state around the question not being one of the switch's own cases;
+ * 3. otherwise the feature state decides. `blocked` and `interrupted` are a decision point; `hibernated`
+ *    and `handed_off` are an exception — a ceiling reached or a run giving up is news, even though
+ *    `cardForView` also draws no per-run card for either (that silence is about which of the four
+ *    live-run gestures still apply, not about whether the person already knows); `committed` is a
+ *    completion. `killed` gets no reason: the person issued that stop themselves. Every other state —
+ *    `drafting`, `confirmed`, `running`, `verifying`, `degraded`, `awaiting_merge`, and `null` — is
+ *    ordinary progress or a self-resolving or externally-notified wait, and stays silent (Boundaries).
+ */
+const attentionReasonFor = (view: ShellView): AttentionReason | null => {
+  if (view.problem !== null) return 'exception';
+  if (view.question.state === 'pending') return 'decision_point';
+  switch (view.featureState) {
+    case 'blocked':
+    case 'interrupted':
+      return 'decision_point';
+    case 'hibernated':
+    case 'handed_off':
+      return 'exception';
+    case 'committed':
+      return 'completion';
+    default:
+      return null;
+  }
+};
+
+/**
+ * Every run in the fleet that needs a person, and why — the fold R1 and threat-model.md item 16 exist
+ * for.
+ *
+ * Over `fleet.runs`, not `inFlightRuns(fleet)`: `hibernated`, `handed_off` and `committed` are terminal
+ * and `inFlightRuns` excludes them, but they are exactly the states this fold exists to surface. An
+ * empty result reads the same whether the fleet is empty or every run in it is quiet — R1 does not
+ * require distinguishing "nothing to report" from "nothing is wrong".
+ */
+export const runsNeedingAttention = (fleet: FleetView): readonly AttentionEntry[] =>
+  fleet.runs.flatMap((run) => {
+    const reason = attentionReasonFor(run.view);
+    return reason === null ? [] : [{ run, reason }];
+  });

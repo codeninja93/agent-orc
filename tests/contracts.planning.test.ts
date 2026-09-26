@@ -178,6 +178,7 @@ describe('planning re-grounds on the request, because there is nothing else to r
       acceptance_criteria: ['--tools carries the roster grant'],
       decisions: [],
       evidence: [],
+      steering_note: null,
       // Empty for every phase but `verification`: the gates the engine ran before it spawned a
       // review (story 2-6), and a planning step is spawned before any of them exist.
       gates: [],
@@ -196,6 +197,8 @@ describe('the phase vocabulary, widened safely (matrix 14, 15)', () => {
       'implementation',
       'testing',
       'verification',
+      // Story 4-2: `adversarial` was a declared agent with no phase, so nothing could spawn it.
+      'adversarial',
       // Story 2-7: `committing` was a declared agent with no phase, so nothing could spawn it.
       'committing',
     ]);

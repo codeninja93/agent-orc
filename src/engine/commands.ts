@@ -213,6 +213,17 @@ export const INTENT_REFUSAL_REASONS = [
   'missing-answer',
   /** A question command for a run with no question to answer, or none still open. */
   'no-open-question',
+  /**
+   * Story 4-1 — a `reject` arriving while both a pending AD-12 gate and an active question exist.
+   *
+   * `reject` has two independent meanings today — CAP-18's decline of an answer, and this story's
+   * decline of a gated write — and nothing about the intent itself says which a person meant. Guessing
+   * either way risks swallowing the other: resolving the gate would hand the run off with the question
+   * left open forever; resolving the question would leave the gate standing when the person meant to
+   * reject it. Refused naming both, so a person retries with whichever is actually meant, rather than
+   * this build silently picking one.
+   */
+  'ambiguous-target',
   /** The command is declared but not honoured by this build; the owning story is named. */
   'not-yet-honoured',
   /**

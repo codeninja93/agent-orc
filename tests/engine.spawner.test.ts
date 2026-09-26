@@ -580,6 +580,31 @@ describe('the disposition mapping', () => {
     expect(harness.spawner.kill('implement')).toBe(false);
   });
 
+  /**
+   * Story 4-3, round-1 review — a real, in-flight `pause` behaved identically to `kill` until this test's
+   * own subject existed: `kill()` called the internal `stop(true)` unconditionally, so the step's own
+   * termination always read `killed`, even for a command that asked for a resumable halt. `options:
+   * {resumable: true}` is the fix — the *same* SIGTERM/grace sequence, reaching the *same* real,
+   * signal-terminated child as the test just above, but reported `interrupted`: exactly AD-8's own
+   * resumable disposition, through the exact production `kill()` entry point (not a fixture asserting
+   * what it should do).
+   */
+  it('maps a resumable stop to interrupted, never killed, given options.resumable (row 12)', async () => {
+    const harness = openTracked({
+      fixture: 'no-terminal-output.jsonl',
+      fakeEnv: { FAKE_CLAUDE_HANG: '1' },
+    });
+    const running = harness.spawner.start(harness.request());
+    while (harness.sessionIds.length === 0) await new Promise((resolve) => setImmediate(resolve));
+
+    expect(harness.spawner.kill('implement', undefined, { resumable: true })).toBe(true);
+    const termination = await running;
+    expect(termination.disposition).toBe('interrupted');
+    expect(termination.sessionId).toBe(REAL_SESSION_ID);
+    // A resumable stop still spends the live attempt: nothing is left to kill a second time.
+    expect(harness.spawner.kill('implement', undefined, { resumable: true })).toBe(false);
+  });
+
   it('maps a non-zero exit with no terminal output to failed, with a code the table knows', async () => {
     const harness = openTracked({
       fixture: 'no-terminal-output.jsonl',

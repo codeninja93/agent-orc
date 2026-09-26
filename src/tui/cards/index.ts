@@ -46,6 +46,16 @@ export * from './brief.js';
 export * from './kill.js';
 export * from './completion.js';
 export * from './handoff.js';
+/**
+ * Story 4-4's attention card. Re-exported alongside the six required surfaces above without joining
+ * `CARD_KINDS`, the `Card` union, or `cardForView` (Boundaries) — not because it is fleet-wide (`BriefCard`
+ * is a fleet-wide card and *is* a member of `CARD_KINDS`/`Card`; it is only excluded from `cardForView`'s
+ * switch), but because `src/tui/cards.tsx`'s `CardView` switch is documented as total over `Card['kind']`
+ * ("a seventh surface is a compile error here rather than a card that silently draws nothing"). Joining
+ * `CARD_KINDS`/`Card` would force an `AttentionCardView` Ink component into existence purely to satisfy
+ * that exhaustiveness check, for a card nothing mounts yet — out of scope for this story.
+ */
+export * from './attention.js';
 
 /** The six surfaces, named once so a dispatch over them can be made total. */
 export const CARD_KINDS = [
@@ -80,11 +90,21 @@ export type Card =
   | HandoffCard
   | BriefCard;
 
-/** One card as lines: the headline first, then the body. What the component draws, and what a suite reads. */
-export const cardLines = (card: CardBody): readonly string[] => [card.title, ...card.lines];
+/**
+ * One card as lines: the headline first, then the body. What the component draws, and what a suite reads.
+ *
+ * Typed over `Pick<CardBody, 'title' | 'lines'>` rather than `CardBody` itself, so a card-shaped structure
+ * that is deliberately not a `Card` — the attention card (Boundaries) — can still be joined with the same
+ * helper a `Card` suite uses, instead of a caller hand-rolling `[card.title, ...card.lines].join('\n')`.
+ * Backward compatible: every existing caller already satisfies the narrower type.
+ */
+export const cardLines = (card: Pick<CardBody, 'title' | 'lines'>): readonly string[] => [
+  card.title,
+  ...card.lines,
+];
 
 /** One card as text, for a suite and for anything that is not a terminal. */
-export const cardText = (card: CardBody): string => cardLines(card).join('\n');
+export const cardText = (card: Pick<CardBody, 'title' | 'lines'>): string => cardLines(card).join('\n');
 
 /** The facts a card accepts beyond the view, each optional and each `(not recorded)` when absent. */
 export interface CardInputs {

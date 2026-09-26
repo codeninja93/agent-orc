@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>orch — web control surface</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-monospace, Menlo, Consolas, monospace; max-width: 48rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.1rem; }
+  h2 { font-size: 1rem; margin-top: 2rem; }
+  ul { padding-left: 1.2rem; }
+  form.control { display: inline-block; margin: 0.15rem 0.4rem 0.15rem 0; }
+  form.control input { width: 12rem; }
+  .problem { color: #b00; }
+  #feedback { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>agent orchestrator — web control surface</h1>
+<p>Loopback only: this page talks to nothing but the server that served it.</p>
+<div id="fleet"></div>
+<div id="run"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  // Kept in the same key/label/argument shape as `src/tui/controls.ts`'s `CONTROLS` table, purely so a
+  // button says what it does. The dispatch itself is not this list: every submit below posts the key
+  // to the server, which always resolves it through `invokeControlByKey` — the one table AD-3 makes
+  // authoritative. A label here going stale can mislabel a button; it cannot invoke the wrong command
+  // or skip a check, because none of the checking happens in this file.
+  var CONTROLS = [
+    { key: "a", label: "answer", argument: "required" },
+    { key: "c", label: "confirm", argument: "none" },
+    { key: "e", label: "edit criterion", argument: "required" },
+    { key: "y", label: "approve", argument: "optional" },
+    { key: "n", label: "reject", argument: "required" },
+    { key: "g", label: "continue", argument: "optional" },
+    { key: "w", label: "narrow", argument: "required" },
+    { key: "p", label: "pause", argument: "optional" },
+    { key: "i", label: "note", argument: "required" },
+    { key: "k", label: "kill step", argument: "optional" },
+    { key: "f", label: "fork", argument: "optional" },
+    { key: "t", label: "take over", argument: "optional" },
+    { key: "x", label: "stop", argument: "optional" },
+    { key: "j", label: "just do it", argument: "optional" }
+  ];
+
+  var params = new URLSearchParams(location.search);
+  var runId = params.get("run");
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function renderFleet(fleet) {
+    var el = document.getElementById("fleet");
+    if (runId !== null) {
+      el.innerHTML = '<p><a href="/">&larr; all runs</a></p>';
+      return;
+    }
+    var rows = fleet.runs.map(function (run) {
+      var feature = run.view.feature === null ? "(no feature recorded)" : run.view.feature;
+      var state = run.view.featureState === null ? "unknown" : run.view.featureState;
+      return "<li><a href=\"/?run=" + encodeURIComponent(run.runId) + "\">" + escapeHtml(feature) +
+        "</a> — " + escapeHtml(state) + (run.inFlight ? "" : " (finished)") + "</li>";
+    });
+    var notRead = fleet.notRead > 0 ? "<p>" + fleet.notRead + " older run(s) not shown.</p>" : "";
+    el.innerHTML = "<h2>Runs</h2><ul>" + rows.join("") + "</ul>" + notRead;
+  }
+
+  function submitCommand(key, argument) {
+    return fetch("/api/runs/" + encodeURIComponent(runId) + "/commands", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: key, argument: argument === "" ? null : argument })
+    }).then(function (response) {
+      return response.json().then(function (body) {
+        return { ok: response.ok, body: body };
+      });
+    });
+  }
+
+  function renderRun(view) {
+    var el = document.getElementById("run");
+    var controls = CONTROLS.map(function (control) {
+      var needsArg = control.argument !== "none";
+      var input = needsArg
+        ? '<input type="text" name="argument" placeholder="' +
+          (control.argument === "required" ? "required text" : "optional text") + '">'
+        : "";
+      return '<form class="control" data-key="' + control.key + '">' +
+        '<button type="submit">' + escapeHtml(control.label) + " (" + control.key + ")</button>" +
+        input + "</form>";
+    }).join("");
+
+    var notices = view.notices.map(function (notice) {
+      return "<li>" + escapeHtml(notice.text) + "</li>";
+    }).join("");
+
+    el.innerHTML =
+      "<h2>" + escapeHtml(view.feature === null ? runId : view.feature) + "</h2>" +
+      "<p>state: " + escapeHtml(view.featureState === null ? "unknown" : view.featureState) +
+      " — mode: " + escapeHtml(view.autonomy) + "</p>" +
+      "<p>next: " + escapeHtml(view.progress.nextGate) + "</p>" +
+      (view.problem !== null ? '<p class="problem">' + escapeHtml(view.problem) + "</p>" : "") +
+      "<h2>Notices</h2><ul>" + notices + "</ul>" +
+      "<h2>Controls</h2>" + controls +
+      '<pre id="feedback"></pre>';
+
+    Array.prototype.forEach.call(el.querySelectorAll("form.control"), function (form) {
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var key = form.getAttribute("data-key");
+        var input = form.querySelector('input[name="argument"]');
+        var argument = input === null ? "" : input.value;
+        submitCommand(key, argument).then(function (result) {
+          var feedback = document.getElementById("feedback");
+          feedback.textContent = result.ok
+            ? "sent: " + result.body.command + " (" + result.body.intentId + ")"
+            : "refused: " + result.body.error;
+        });
+      });
+    });
+  }
+
+  // Checks the response before parsing it as JSON, and never lets a rejection reach the caller
+  // unhandled: an error response's body is not the shape the render functions expect, and an unchecked
+  // `.json()` on one of those would throw a `TypeError` deep inside a render call with nothing to catch
+  // it.
+  function fetchJson(url) {
+    return fetch(url).then(function (response) {
+      if (!response.ok) {
+        throw new Error("request to " + url + " failed with status " + response.status);
+      }
+      return response.json();
+    });
+  }
+
+  function reportFetchError(elementId, error) {
+    var el = document.getElementById(elementId);
+    if (el !== null) {
+      el.innerHTML = '<p class="problem">' + escapeHtml(error.message || String(error)) + "</p>";
+    }
+  }
+
+  function refreshFleet() {
+    return fetchJson("/api/fleet").then(renderFleet).catch(function (error) {
+      reportFetchError("fleet", error);
+    });
+  }
+
+  if (runId === null) {
+    refreshFleet();
+    setInterval(refreshFleet, 5000);
+  } else {
+    fetchJson("/api/runs/" + encodeURIComponent(runId)).then(renderRun).catch(function (error) {
+      reportFetchError("run", error);
+    });
+    var source = new EventSource("/api/runs/" + encodeURIComponent(runId) + "/events");
+    source.onmessage = function (event) {
+      renderRun(JSON.parse(event.data));
+    };
+    renderFleet({ runs: [], notRead: 0 });
+  }
+})();
+</script>
+</body>
+</html>

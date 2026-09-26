@@ -22,7 +22,7 @@ import { z } from 'zod';
 import { TimestampSchema } from './event.js';
 import { OrchErrorSchema } from './error.js';
 import { versioned } from './schema-version.js';
-import { RUN_MODES, STEP_DISPOSITIONS } from './step.js';
+import { REVERSIBILITY_CLASSES, RUN_MODES, STEP_DISPOSITIONS, WRITE_INTENT_KINDS } from './step.js';
 
 /** The registry id this artifact is registered under (AD-17), spelled once. */
 export const RUN_STATE_CONTRACT_ID = 'run.state';
@@ -108,6 +108,13 @@ export const STEP_PHASES = [
   // standard plan runs them, which is also the order a person reads a run in.
   'testing',
   'verification',
+  // Story 4-2 — CAP-13's other half. `verify` judges the change against criteria fixed before it was
+  // written; nothing tried to break what it judged until this phase existed. It sits after
+  // `verification` and before `committing` because it is spawned only once every one of `verify`'s own
+  // judgements is `met` (`src/engine/reconciler.ts`'s spawn-gating check), extending the two-tier
+  // economics CAP-13 already states into a third tier that is never spent on a run the cheaper one has
+  // already found wanting.
+  'adversarial',
   // Story 2-7, and the same gap one phase later: `committing` was a declared agent with no phase, so
   // nothing could spawn it — the roster offered it and ADR-003 fixed its grant, while the one word that
   // lets a step be planned for it was missing. It is last because AD-22 has the committer write the note
@@ -277,6 +284,96 @@ export const DegradationSchema = z.object({
 export type Degradation = z.infer<typeof DegradationSchema>;
 
 /**
+ * Story 4-1 — AD-12's reversibility gate, standing until a person answers it.
+ *
+ * **Parallel to {@link HandoffSchema}, never a repurposing of it, and never a step disposition either.**
+ * `settlePreMergeWrites` (`src/engine/reconciler.ts`) checks a composed commit's declared `reversibility`
+ * against the project's `gated_reversibility_classes` *after* the committing step has already completed
+ * — so nothing about any step failed, and folding this into a synthetic `blocked` step disposition would
+ * corrupt AD-8's termination record for a failure that never happened. This is its own fact instead: the
+ * gated write's identity, so `decideSteering`'s `approve`/`reject` cases (`src/engine/steering.ts`) know
+ * there is a gate to resolve without asking `blockedStepOf`'s question — "which step failed" — of a run
+ * where none did.
+ *
+ * **`resolution` is what changes; the record itself is never nulled by a resolving event — round-1
+ * review's most serious finding.** The first version cleared this whole record to `null` directly on
+ * `write.gate_approved`/`write.gate_rejected`, which races the *separate* `feature.state_changed` line the
+ * same effect also emits (to `running`/`degraded` for an approval, `handed_off` for a rejection): a crash
+ * landing the resolving event durably but not the state-change one left `pending_gate` reading `null`
+ * while `state.state` was still `blocked`. For a rejection that is not merely untidy — a later, redelivered
+ * `Command.Approve` would find no gate on record, fall through to the pre-existing step-failure branch
+ * (which finds no blocked step and answers `toState: 'running'` unconditionally), and silently reverse a
+ * person's explicit rejection of an irreversible write. So `write.gate_approved`/`write.gate_rejected` set
+ * `resolution` on *this same* record instead; only the `feature.state_changed` line that follows — once it
+ * actually lands — clears the whole record to `null`. A crash in between therefore leaves a fully truthful
+ * intermediate fold: "this gate was rejected, and the run hasn't finished handing off yet."
+ */
+export const PENDING_GATE_RESOLUTIONS = ['pending', 'approved', 'rejected'] as const;
+
+export type PendingGateResolution = (typeof PENDING_GATE_RESOLUTIONS)[number];
+
+/**
+ * One intent still unsettled when the gate opened — the disclosure round-1 review added.
+ *
+ * `settlePreMergeWrites`'s own settlement loop has no gate check inside it: once the one gate on a
+ * composed commit clears, every remaining intent runs in the same pass. The first version's disclosure
+ * named only the intent whose `reversibility` triggered the check, which understated what a person's one
+ * approval actually authorises. `kind`, not `target`, because this is the *persisted* identity a later
+ * fold reads back to know which writes this gate covers — the richer disclosure (`target` included) lives
+ * on the `write.gate_opened` event payload itself, read once, at the moment a person needs to see it.
+ */
+export const PendingGateBatchEntrySchema = z.object({
+  intent_id: z.string(),
+  kind: z.enum(WRITE_INTENT_KINDS),
+});
+
+export type PendingGateBatchEntry = z.infer<typeof PendingGateBatchEntrySchema>;
+
+export const PendingGateSchema = z.object({
+  /** The committing step this write's intent belongs to. Never a step that "failed": none did. */
+  step: z.string(),
+  /** The AD-15 idempotency key of the intent whose `reversibility` triggered this gate. */
+  intent_id: z.string(),
+  kind: z.enum(WRITE_INTENT_KINDS),
+  /** Always one of the project's own `gated_reversibility_classes` — that is why this gate exists at all. */
+  reversibility: z.enum(REVERSIBILITY_CLASSES),
+  /** Every intent still unsettled when this gate opened, `intent_id` included — the whole remaining batch. */
+  batch: z.array(PendingGateBatchEntrySchema),
+  resolution: z.enum(PENDING_GATE_RESOLUTIONS),
+});
+
+export type PendingGate = z.infer<typeof PendingGateSchema>;
+
+/**
+ * Story 4-3 — which of two things a durable note is: a person's steering colour, or a person-initiated
+ * scope reduction (CAP-16's own person-initiated half, folded into this story rather than built as a
+ * second mechanism — see the story's own Design Notes).
+ */
+export const NOTE_KINDS = ['note', 'narrow'] as const;
+
+export type NoteKind = (typeof NOTE_KINDS)[number];
+
+/**
+ * Story 4-3 — a durable note waiting to be delivered to whichever step's input this run builds next.
+ *
+ * **Parallel to {@link PendingGateSchema}, the same "set by one event, cleared by a later one" shape.**
+ * `note.injected` sets it; the next `step.started` line for this run clears it, once that step's own
+ * `StepInput.steering_note` has been populated from it (`src/engine/reconciler.ts`'s `stepInput`). A
+ * second `note.injected` before the first is consumed replaces this record outright — the fold is a
+ * plain assignment, never an append, so exactly one note is ever pending (I/O matrix row 5).
+ *
+ * **Never `StepInput.acceptance_criteria`.** `kind: 'narrow'` carries the same free text
+ * `inject_note` does; it is delivered as a note the agent reads and interprets, and it never reopens the
+ * confirmed criteria CAP-2 protects.
+ */
+export const PendingNoteSchema = z.object({
+  text: z.string(),
+  kind: z.enum(NOTE_KINDS),
+});
+
+export type PendingNote = z.infer<typeof PendingNoteSchema>;
+
+/**
  * `runs/<run-id>/state.json`.
  *
  * `last_event_seq` is the hinge of AD-4: it names the log position this checkpoint was folded from,
@@ -312,6 +409,25 @@ export const RunStateSchema = versioned({
    * `budget.degraded` disagrees with such a checkpoint and the checkpoint is rebuilt.
    */
   degradation: DegradationSchema.nullable().default(null),
+  /**
+   * Story 4-1 — the standing AD-12 gate, or `null` for a run with none open.
+   *
+   * Defaulted to `null` on the way in, exactly as `degradation` is and for the same reason: a
+   * `state.json` written before this story still parses as the checkpoint it is, and the log then
+   * decides, as it always does (AD-4) — a run whose log carries `write.gate_opened` disagrees with such
+   * a checkpoint and the checkpoint is rebuilt.
+   */
+  pending_gate: PendingGateSchema.nullable().default(null),
+  /**
+   * Story 4-3 — the standing note waiting for the run's next step input, or `null` for a run with none
+   * pending.
+   *
+   * Defaulted to `null` on the way in, exactly as `degradation`/`pending_gate` are and for the same
+   * reason: a `state.json` written before this story still parses as the checkpoint it is, and the log
+   * then decides, as it always does (AD-4) — a run whose log carries `note.injected` disagrees with such
+   * a checkpoint and the checkpoint is rebuilt.
+   */
+  pending_note: PendingNoteSchema.nullable().default(null),
 }).refine(
   (state) => new Set(state.steps.map((step) => step.step)).size === state.steps.length,
   {

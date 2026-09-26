@@ -677,6 +677,8 @@ const stateFixture = (): RunState => ({
   updated_at: '2026-09-23T09:00:00.000Z',
   handoff: null,
   degradation: null,
+  pending_gate: null,
+  pending_note: null,
 });
 
 describe('the ceilings a run is held to come from its snapshot, or the fallback, never silently from neither', () => {

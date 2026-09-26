@@ -60,6 +60,39 @@
  * - `deflection-rate` — Q4's reported rate, folded from `question.asked`/`question.deflected` lines;
  * - `interviewer` — spec echo and question compression as the logic a live turn calls into. The live
  *   conversation itself is not here; it is the one component architecture.md requires to be a model;
+ * - `shadow` — story 3-2 (AD-27): `compareShadowRun`, the tree diff and `accepted`/`material_change`
+ *   classification a completed shadow run's resulting tree is graded by, against the real merge commit it
+ *   was shadowing. No rolling window and no gate verdict here — that is story 3-3's, computed from this
+ *   module's one raw, per-run result;
+ * - `rework-rate`, `interruption-count`, `feature-usage` — story 3-3's per-feature stage-3 gate signals,
+ *   each a pure fold over `events: readonly EventEnvelope[]` in `deflection-rate`'s own idiom;
+ * - `trust-record`, `shadow-gate` — story 3-3's two cross-run folds, in `src/tui/fleet.ts`'s `foldFleet`
+ *   style: every run under `runsDir`, read with `listRunIds`/`readEventLog` rather than the projected
+ *   `ShellView` a renderer wants, because both need the raw lines a projection does not carry;
+ * - `consolidation` — story 5-1's batch pass: a completed run's last terminal `feature.state_changed`
+ *   folded, with `trust-record`'s own `areaOf`/`territoryFromEvents`, into `KnowledgeEntry`-shaped facts,
+ *   appended idempotently to `ORCH_HOME/projects/<project-id>/memory/consolidated.jsonl` (AD-9). Nothing
+ *   calls its one entry point, `runConsolidationPass`, yet — wiring a trigger is a future story's;
+ * - `knowledge-sweep` — story 5-2: `sweepProfileKnowledge` retires an AD-16-contradicted or
+ *   anchor-`'dead'` entry from `profile.toml` by rewriting it (`serialiseToml`/`writeFileIfChanged`, now in
+ *   `src/runtime/commands.ts`); `sweepConsolidatedKnowledge` only *reports* the same check against L3's
+ *   append-only `consolidated.jsonl`, never rewriting it. `anchorResolution` is the one filesystem check
+ *   both share, and it is conservative by construction: `'dead'` only for a `module-name`/`file-path`
+ *   anchor actually checked and absent, `'unchecked'` for `api-symbol`/`test-name`, never a guess;
+ * - `knowledge-retrieval` — story 5-2's other half: `retrieveFacts` reads L3 back, filtered to a caller's
+ *   declared areas and capped at a plain per-feature entry-count budget, most-recent-first;
+ * - `decision-index` — story 5-3's queryable index over `decision.recorded` lines: `buildDecisionIndex`
+ *   replays `decisionsInLog` out of a batch of ledger runs and appends idempotently, by question id, to
+ *   `ORCH_HOME/projects/<project-id>/memory/decisions.jsonl`; `queryDecisionIndex` reproduces
+ *   `deflection.ts`'s `matchDecisionLedger` semantics against the indexed entries instead of raw event
+ *   logs. `matchDecisionLedger` itself is untouched but for exporting `namesAnchor` and `isUnreadableLog`
+ *   for this reuse, and nothing calls either new function yet — the same complete-and-unwired precedent
+ *   `consolidation.ts` and `knowledge-sweep.ts`/`knowledge-retrieval.ts` already set;
+ * - `pattern-memory` — story 5-4, CAP-19/AD-34's fixed, shared, cross-project home: `recordPattern`
+ *   validates and durably appends an already-composed `CrossRepoPattern` to `ORCH_HOME/memory/
+ *   patterns.jsonl`; `retrievePatterns` is a topic-filtered, budget-capped, most-recent-first read of
+ *   that one store, `retrieveFacts`'s own shape. Complete and unwired, the same precedent as every
+ *   module above;
  * The run-start branch-protection assertion is deliberately **not** here. `src/container/lifecycle.ts`
  * already owned it, and a second implementation in this package disagreed with it about the one thing
  * that matters — whether "we could not check" and "it is not protected" have the same consequence. The
@@ -85,6 +118,7 @@ export * from './ulid.js';
 export * from './lock.js';
 export * from './checkpoint.js';
 export * from './rebuild.js';
+export * from './bootstrap.js';
 export * from './promotion.js';
 export * from './ceilings.js';
 export * from './dispositions.js';
@@ -108,8 +142,19 @@ export * from './agents.js';
 export * from './config-snapshot.js';
 export * from './committer.js';
 export * from './write-executor.js';
+export * from './shadow.js';
 export * from './deflection.js';
 export * from './question-merge.js';
 export * from './deflection-rate.js';
 export * from './interviewer.js';
+export * from './rework-rate.js';
+export * from './interruption-count.js';
+export * from './feature-usage.js';
+export * from './trust-record.js';
+export * from './shadow-gate.js';
+export * from './consolidation.js';
+export * from './knowledge-sweep.js';
+export * from './knowledge-retrieval.js';
+export * from './decision-index.js';
+export * from './pattern-memory.js';
 export * from './reconciler.js';

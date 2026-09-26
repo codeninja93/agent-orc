@@ -1,12 +1,14 @@
 /**
  * Story 2-11, matrix rows 1–3, 6, 9 — the write executor, driven in isolation.
+ * Story 3-2 (AD-27), matrix rows 1–6 — the same performers under `mode: 'shadow'`.
  *
  * `src/engine/write-executor.ts` is the one unit AD-15 lets perform a `git push`, a pull-request creation
  * or a git note: `write.attempted` durable before the call, and a reconciliation check before ever
  * repeating one. Every test here drives the real performers (`performWriteIntent`, `checkPullRequestMerged`)
  * against a fake `git`/`gh` — never a real repository or a real GitHub — so the claim under test is the
  * *shape* of the calls and the *order* of the durable lines, not that a particular host answers a
- * particular way.
+ * particular way. Under `mode: 'shadow'` the claim is the same probe, never the mutating call: every test
+ * in that section asserts the mutating `git push`/`gh pr create`/`git notes add` is never even attempted.
  */
 import { describe, expect, it } from 'vitest';
 
@@ -16,6 +18,7 @@ import {
   NoteMergeCommitUnknown,
   WriteKindNotImplemented,
   checkPullRequestMerged,
+  mergeFidelityOf,
   performWriteIntent,
   writeIntentSettled,
 } from '../src/engine/index.js';
@@ -438,6 +441,376 @@ describe('checkPullRequestMerged — the bounded, cheap per-pass read', () => {
   });
 });
 
+describe('mergeFidelityOf — story 3-3, matrix rows 11-13, 19', () => {
+  const proposedHead = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+  const mergeCommit = 'f9e8d7c6b5a4938271605f4e3d2c1b0a99887766';
+  const mergeBase = '00112233445566778899aabbccddeeff0011223';
+
+  /**
+   * A fake `git` covering every call `mergeFidelityOf` makes, in order: `rev-parse HEAD`, `rev-parse
+   * --verify <mergeCommit>^2` (the two-parent check), `merge-base <mergeCommit>^1 <proposedHead>`,
+   * `diff --name-only <mergeBase> <proposedHead>` (this run's own touched paths), and the final
+   * path-scoped `diff --name-only <proposedHead> <mergeCommit> -- <touchedPaths...>`.
+   */
+  const fakeGit = (overrides: {
+    readonly head?: WriteCallResult;
+    readonly secondParent?: WriteCallResult;
+    readonly mergeBaseResult?: WriteCallResult;
+    readonly touchedPaths?: WriteCallResult;
+    readonly comparison?: WriteCallResult;
+  }): { readonly git: GitCall; readonly calls: (readonly string[])[] } =>
+    recordingGit((args) => {
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD') return overrides.head ?? ok(`${proposedHead}\n`);
+      if (args[0] === 'rev-parse' && args[1] === '--verify') {
+        return overrides.secondParent ?? ok(`${mergeCommit}\n`);
+      }
+      if (args[0] === 'merge-base') return overrides.mergeBaseResult ?? ok(`${mergeBase}\n`);
+      if (args[0] === 'diff' && args[2] === mergeBase) return overrides.touchedPaths ?? ok('src/a.ts\n');
+      if (args[0] === 'diff' && args[2] === proposedHead) return overrides.comparison ?? ok('');
+      throw new Error(`unexpected git call: ${args.join(' ')}`);
+    });
+
+  it('reports unchanged when the touched-paths comparison is empty (row 11)', () => {
+    const { git } = fakeGit({});
+    expect(mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit)).toStrictEqual({
+      outcome: 'unchanged',
+      code: null,
+      detail: `${mergeCommit.slice(0, 12)} carries this run's own touched paths unchanged from ${proposedHead.slice(0, 12)}`,
+      proposedHead,
+    });
+  });
+
+  it('reports unchanged, with no diff call at all, when this run touched no paths', () => {
+    const { calls, git } = fakeGit({ touchedPaths: ok('') });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBe('unchanged');
+    expect(result.code).toBeNull();
+    // The final comparison is never even attempted for an empty touched-paths list.
+    expect(calls.filter((args) => args[0] === 'diff')).toHaveLength(1);
+  });
+
+  it('reports corrected when the merge commit differs on a path this run touched (row 12)', () => {
+    const { git } = fakeGit({ comparison: ok('src/a.ts\n') });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBe('corrected');
+    expect(result.code).toBeNull();
+    expect(result.proposedHead).toBe(proposedHead);
+  });
+
+  it('never reports a false correction from unrelated main drift outside the run’s own touched paths (row 19)', () => {
+    // main advanced with a change to `src/unrelated.ts`, which this run never touched — the final
+    // comparison is restricted to `src/a.ts` alone (the run's own touched path) and reports it unchanged,
+    // regardless of what else differs between proposedHead and mergeCommit on unrelated paths.
+    const { calls, git } = fakeGit({ touchedPaths: ok('src/a.ts\n'), comparison: ok('') });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBe('unchanged');
+    const finalDiff = calls.find((args) => args[0] === 'diff' && args[2] === proposedHead);
+    expect(finalDiff).toStrictEqual(['diff', '--name-only', proposedHead, mergeCommit, '--', 'src/a.ts']);
+  });
+
+  it('records a code, never a guessed outcome, when this run’s own worktree HEAD cannot be read (row 13)', () => {
+    const { git } = fakeGit({ head: failed() });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBeNull();
+    expect(result.code).toBe('pull_request.merge_fidelity_head_unreadable');
+    expect(result.proposedHead).toBeNull();
+  });
+
+  it('records a code, never a guessed outcome, when mergeCommit has fewer than two parents (row 13)', () => {
+    const { git } = fakeGit({ secondParent: failed() });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBeNull();
+    expect(result.code).toBe('pull_request.merge_fidelity_not_a_merge_commit');
+    // The worktree HEAD was already read before this check, so it is still reported.
+    expect(result.proposedHead).toBe(proposedHead);
+  });
+
+  it('records a code, never a guessed outcome, when the fork point cannot be found (row 13)', () => {
+    const { git } = fakeGit({ mergeBaseResult: failed() });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBeNull();
+    expect(result.code).toBe('pull_request.merge_fidelity_merge_base_unreadable');
+  });
+
+  it('records a code, never a guessed outcome, when this run’s own touched paths cannot be read (row 13)', () => {
+    const { git } = fakeGit({ touchedPaths: failed() });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBeNull();
+    expect(result.code).toBe('pull_request.merge_fidelity_touched_paths_unreadable');
+  });
+
+  it('records a code, never a guessed outcome, when the final path-scoped comparison fails (row 13)', () => {
+    const { git } = fakeGit({ comparison: failed() });
+    const result = mergeFidelityOf(git, '/tmp/no-such-worktree', mergeCommit);
+    expect(result.outcome).toBeNull();
+    expect(result.code).toBe('pull_request.merge_fidelity_comparison_unreadable');
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Story 3-2 (AD-27) — `mode: 'shadow'` suppresses the mutating call, never the probe (matrix rows 1–6).
+// Row 4 ("the same intents under mode: 'live'") is every test above this section, run unmodified — the
+// whole point of `context.mode` defaulting to `'live'` is that none of them needed to change.
+// -------------------------------------------------------------------------------------------------
+
+describe('git_push under mode: "shadow" — matrix rows 1, 5, 6', () => {
+  it('suppresses the push and records not-destructive when the target does not yet exist (row 5)', async () => {
+    const { git, calls } = recordingGit((args) => {
+      if (args[0] === 'rev-parse') return ok('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n');
+      if (args[0] === 'ls-remote') return ok(''); // nothing at that ref yet
+      throw new Error(`unexpected git call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ git, mode: 'shadow' });
+
+    const result = await performWriteIntent(intent('git_push', 'feature/write-surface'), context);
+
+    expect(result.status).toBe('suppressed');
+    expect(result.status === 'suppressed' && result.destructive).toBe(false);
+    expect(events.emitted.map((event) => event.type)).toStrictEqual(['write.attempted', 'write.suppressed']);
+    expect(events.emitted[1]?.payload['destructive']).toBe(false);
+    // Never a real push, under any probe finding, while shadowing.
+    expect(calls.some((args) => args[0] === 'push')).toBe(false);
+  });
+
+  it('suppresses the push and records not-destructive when the remote already matches', async () => {
+    const sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const { git, calls } = recordingGit((args) => {
+      if (args[0] === 'rev-parse') return ok(`${sha}\n`);
+      if (args[0] === 'ls-remote') return ok(`${sha}\trefs/heads/feature/write-surface\n`);
+      throw new Error(`unexpected git call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ git, mode: 'shadow' });
+
+    const result = await performWriteIntent(intent('git_push', 'feature/write-surface'), context);
+
+    expect(result.status).toBe('suppressed');
+    expect(result.status === 'suppressed' && result.destructive).toBe(false);
+    expect(calls.some((args) => args[0] === 'push')).toBe(false);
+  });
+
+  it('suppresses the push and records destructive when the remote already carries something different (row 6)', async () => {
+    const { git, calls } = recordingGit((args) => {
+      if (args[0] === 'rev-parse') return ok('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n');
+      if (args[0] === 'ls-remote') return ok('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/feature/write-surface\n');
+      throw new Error(`unexpected git call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ git, mode: 'shadow' });
+
+    const result = await performWriteIntent(intent('git_push', 'feature/write-surface'), context);
+
+    expect(result.status).toBe('suppressed');
+    expect(result.status === 'suppressed' && result.destructive).toBe(true);
+    expect(events.emitted[1]?.payload['destructive']).toBe(true);
+    expect(calls.some((args) => args[0] === 'push')).toBe(false);
+  });
+
+  /**
+   * A live run's real push call would still succeed or fail on the ground truth regardless of what
+   * `ls-remote` found; a shadow run never makes that call, so a failed read here has nothing to fall back
+   * on and must not be guessed at as "clean".
+   */
+  it('records write.failed, never a clean suppression, when the remote probe itself cannot be read', async () => {
+    const { git, calls } = recordingGit((args) => {
+      if (args[0] === 'rev-parse') return ok('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n');
+      if (args[0] === 'ls-remote') return failed('unable to access remote: network unreachable');
+      throw new Error(`unexpected git call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ git, mode: 'shadow' });
+
+    const result = await performWriteIntent(intent('git_push', 'feature/write-surface'), context);
+
+    expect(result.status).toBe('failed');
+    expect(result.status === 'failed' && result.error.code).toBe('write.push_failed');
+    expect(calls.some((args) => args[0] === 'push')).toBe(false);
+  });
+});
+
+describe('pull_request under mode: "shadow" — matrix rows 2, 5, 6', () => {
+  it('suppresses and records not-destructive when no pull request exists yet (row 5)', async () => {
+    const { gh, calls } = recordingGh((args) => {
+      if (args[0] === 'pr' && args[1] === 'list') return ok('[]');
+      throw new Error(`unexpected gh call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ gh, mode: 'shadow' });
+
+    const result = await performWriteIntent(intent('pull_request', 'feature/write-surface'), context);
+
+    expect(result.status).toBe('suppressed');
+    expect(result.status === 'suppressed' && result.destructive).toBe(false);
+    expect(events.emitted.map((event) => event.type)).toStrictEqual(['write.attempted', 'write.suppressed']);
+    expect(calls.some((args) => args[0] === 'pr' && args[1] === 'create')).toBe(false);
+  });
+
+  it('suppresses and records destructive when an existing pull request has no known expected merge commit to compare against (row 6)', async () => {
+    const { gh, calls } = recordingGh((args) => {
+      if (args[0] === 'pr' && args[1] === 'list') {
+        return ok(JSON.stringify([{ number: 7, url: 'https://example.invalid/pr/7' }]));
+      }
+      throw new Error(`unexpected gh call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ gh, mode: 'shadow' });
+
+    const result = await performWriteIntent(intent('pull_request', 'feature/write-surface'), context);
+
+    expect(result.status).toBe('suppressed');
+    expect(result.status === 'suppressed' && result.destructive).toBe(true);
+    expect(result.status === 'suppressed' && result.detail).toContain('#7');
+    expect(calls.some((args) => args[0] === 'pr' && args[1] === 'create')).toBe(false);
+  });
+
+  /**
+   * **The critical fix.** `branchFor` (`src/engine/committer.ts`) derives the branch name from the feature
+   * slug alone, never the run id, so shadowing an already-merged feature finds that exact feature's own
+   * real, already-merged pull request on *every single run*. Treating any found pull request as
+   * destructive, unconditionally, would misclassify this story's own primary use case every time — the
+   * fix compares the found pull request's own merge commit against `context.shadowRealMergeCommit`.
+   */
+  it('is NOT destructive when the found pull request is the expected historical one this run is shadowing', async () => {
+    const shadowedMergeCommit = 'f6e2ec3c8481d2755c2798855e9bb0473983c499';
+    const { gh } = recordingGh((args) => {
+      if (args[0] === 'pr' && args[1] === 'list') {
+        return ok(
+          JSON.stringify([
+            { number: 1, url: 'https://example.invalid/pr/1', mergeCommit: { oid: shadowedMergeCommit } },
+          ]),
+        );
+      }
+      throw new Error(`unexpected gh call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ gh, mode: 'shadow', shadowRealMergeCommit: shadowedMergeCommit });
+
+    const result = await performWriteIntent(intent('pull_request', 'feature/write-surface'), context);
+
+    expect(result.status).toBe('suppressed');
+    expect(result.status === 'suppressed' && result.destructive).toBe(false);
+    expect(result.status === 'suppressed' && result.detail).toContain('matches the real merge commit');
+  });
+
+  it('is destructive when the found pull request does not match the real merge commit being shadowed', async () => {
+    const { gh } = recordingGh((args) => {
+      if (args[0] === 'pr' && args[1] === 'list') {
+        return ok(
+          JSON.stringify([
+            { number: 2, url: 'https://example.invalid/pr/2', mergeCommit: { oid: 'a'.repeat(40) } },
+          ]),
+        );
+      }
+      throw new Error(`unexpected gh call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ gh, mode: 'shadow', shadowRealMergeCommit: 'b'.repeat(40) });
+
+    const result = await performWriteIntent(intent('pull_request', 'feature/write-surface'), context);
+
+    expect(result.status).toBe('suppressed');
+    expect(result.status === 'suppressed' && result.destructive).toBe(true);
+    expect(result.status === 'suppressed' && result.detail).toContain('does not match');
+  });
+
+  it('still refuses rather than guessing when the probe read itself fails, even while shadowing', async () => {
+    const { gh, calls } = recordingGh((args) => {
+      if (args[0] === 'pr' && args[1] === 'list') return failed('gh: authentication required');
+      throw new Error(`unexpected gh call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ gh, mode: 'shadow' });
+
+    const result = await performWriteIntent(intent('pull_request', 'feature/write-surface'), context);
+
+    expect(result.status).toBe('failed');
+    expect(calls.some((args) => args[0] === 'pr' && args[1] === 'create')).toBe(false);
+  });
+});
+
+describe('git_note under mode: "shadow" — matrix rows 3, 5, 6', () => {
+  it('never throws NoteMergeCommitUnknown, and probes the worktree’s own HEAD when no merge commit is known', async () => {
+    const { git, calls } = recordingGit((args) => {
+      if (args[0] === 'rev-parse') return ok('cccccccccccccccccccccccccccccccccccccccc\n');
+      if (args[0] === 'fetch') return ok();
+      if (args[0] === 'notes' && args[2] === 'show') return failed('no note found');
+      throw new Error(`unexpected git call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ git, mode: 'shadow', mergeCommit: null });
+
+    const result = await performWriteIntent(intent('git_note', 'refs/notes/orch'), context);
+
+    expect(result.status).toBe('suppressed');
+    expect(result.status === 'suppressed' && result.destructive).toBe(false);
+    expect(events.emitted.map((event) => event.type)).toStrictEqual(['write.attempted', 'write.suppressed']);
+    expect(calls.some((args) => args[0] === 'notes' && args[2] === 'add')).toBe(false);
+    expect(calls.some((args) => args[0] === 'push')).toBe(false);
+    // The probe ran against HEAD, the shadow run's own stand-in for a commit that will never merge.
+    expect(calls.some((args) => args[0] === 'notes' && args.includes('cccccccccccccccccccccccccccccccccccccccc'))).toBe(true);
+  });
+
+  it('records not-destructive when the target already carries exactly the note this run would add', async () => {
+    const mergeCommit = 'dddddddddddddddddddddddddddddddddddddddd';
+    const expectedBody = `${JSON.stringify(NOTE, null, 2)}\n`;
+    const { git, calls } = recordingGit((args) => {
+      if (args[0] === 'fetch') return ok();
+      if (args[0] === 'notes' && args[2] === 'show') return ok(expectedBody);
+      throw new Error(`unexpected git call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ git, mode: 'shadow', mergeCommit });
+
+    const result = await performWriteIntent(intent('git_note', 'refs/notes/orch'), context);
+
+    expect(result.status).toBe('suppressed');
+    expect(result.status === 'suppressed' && result.destructive).toBe(false);
+    expect(calls.some((args) => args[0] === 'notes' && args[2] === 'add')).toBe(false);
+  });
+
+  it('records destructive when the target already carries a different note (row 6)', async () => {
+    const mergeCommit = 'dddddddddddddddddddddddddddddddddddddddd';
+    const { git, calls } = recordingGit((args) => {
+      if (args[0] === 'fetch') return ok();
+      if (args[0] === 'notes' && args[2] === 'show') return ok('a wholly different note body\n');
+      throw new Error(`unexpected git call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ git, mode: 'shadow', mergeCommit });
+
+    const result = await performWriteIntent(intent('git_note', 'refs/notes/orch'), context);
+
+    expect(result.status).toBe('suppressed');
+    expect(result.status === 'suppressed' && result.destructive).toBe(true);
+    expect(calls.some((args) => args[0] === 'notes' && args[2] === 'add')).toBe(false);
+    expect(calls.some((args) => args[0] === 'push')).toBe(false);
+  });
+
+  /**
+   * A live run's real `git notes add` would still land or fail on its own regardless of what this read
+   * found; a shadow run never makes that call, so a `git notes show` failure that is not positively "no
+   * note here" (a repository fault, here) carries no evidence either way and must not be guessed at as
+   * "clean".
+   */
+  it('records write.failed, never a clean suppression, when the note probe fails for a reason other than "no note"', async () => {
+    const mergeCommit = 'dddddddddddddddddddddddddddddddddddddddd';
+    const { git, calls } = recordingGit((args) => {
+      if (args[0] === 'fetch') return ok();
+      if (args[0] === 'notes' && args[2] === 'show') return failed('fatal: not a git repository');
+      throw new Error(`unexpected git call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ git, mode: 'shadow', mergeCommit });
+
+    const result = await performWriteIntent(intent('git_note', 'refs/notes/orch'), context);
+
+    expect(result.status).toBe('failed');
+    expect(result.status === 'failed' && result.error.code).toBe('git.note_write_failed');
+    expect(calls.some((args) => args[0] === 'notes' && args[2] === 'add')).toBe(false);
+  });
+
+  it('gives the HEAD-unreadable case its own distinct code, never git.note_write_failed', async () => {
+    const { git } = recordingGit((args) => {
+      if (args[0] === 'rev-parse') return failed('fatal: not a git repository');
+      throw new Error(`unexpected git call: ${args.join(' ')}`);
+    });
+    const context = contextFor({ git, mode: 'shadow', mergeCommit: null });
+
+    const result = await performWriteIntent(intent('git_note', 'refs/notes/orch'), context);
+
+    expect(result.status).toBe('failed');
+    expect(result.status === 'failed' && result.error.code).toBe('shadow.head_unreadable');
+  });
+});
+
 describe('writeIntentSettled — the log-side half of the reconciliation check', () => {
   const eventOf = (type: string, intentId: string): EventEnvelope => ({
     ts: '2026-09-24T00:00:00.000Z',
@@ -459,5 +832,10 @@ describe('writeIntentSettled — the log-side half of the reconciliation check',
     const log = [eventOf('write.attempted', 'commit.git_push')];
     expect(writeIntentSettled(log, 'commit.git_push')).toBe(false);
     expect(writeIntentSettled(log, 'commit.pull_request')).toBe(false);
+  });
+
+  it('is true once a write.suppressed line for that intent id exists (AD-27, story 3-2)', () => {
+    const log = [eventOf('write.attempted', 'commit.git_push'), eventOf('write.suppressed', 'commit.git_push')];
+    expect(writeIntentSettled(log, 'commit.git_push')).toBe(true);
   });
 });

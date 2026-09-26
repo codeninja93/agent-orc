@@ -42,6 +42,9 @@ import {
 import { dirname, join } from 'node:path';
 
 import {
+  ADVERSARIAL_CONTRACT_ID,
+  ADVERSARIAL_SKIPPED_EVENT_TYPE,
+  ADVERSARIAL_SKIPPED_PAYLOAD_KEYS,
   ANALYSIS_CONTRACT_ID,
   BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
   BUDGET_DEGRADED_EVENT_TYPE,
@@ -52,8 +55,13 @@ import {
   COMMIT_COMPOSED_EVENT_TYPE,
   COMMIT_COMPOSED_PAYLOAD_KEYS,
   DETERMINISTIC_GATE_NAMES,
+  GATED_REVERSIBILITY_CLASSES,
   NOTE_REF,
+  VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE,
+  VERIFICATION_JUDGEMENTS_RECORDED_PAYLOAD_KEYS,
+  brokenAttemptIn,
   composedProseIn,
+  judgementVerdictsIn,
   totalUsage,
   usageFromPayload,
   IMPLEMENTATION_CONTRACT_ID,
@@ -64,14 +72,27 @@ import {
   DECLARATION_PAYLOAD_KEYS,
   PLANNING_CONTRACT_ID,
   MODEL_RUNGS,
+  NOTE_INJECTED_EVENT_TYPE,
+  NOTE_INJECTED_PAYLOAD_KEYS,
+  PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
+  PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS,
   REPAIRED_PAYLOAD_KEY,
   REVIEW_SKIPPED_PAYLOAD_KEYS,
+  RUN_FORKED_EVENT_TYPE,
+  RUN_FORKED_PAYLOAD_KEYS,
   SPEC_CRITERION_EDITED_EVENT_TYPE,
   SPEC_RECORDED_EVENT_TYPE,
   SpecCriterionEditedPayloadSchema,
   SpecRecordedPayloadSchema,
   StepInputSchema,
   USAGE_PAYLOAD_KEY,
+  WRITE_GATE_APPROVED_EVENT_TYPE,
+  WRITE_GATE_APPROVED_PAYLOAD_KEYS,
+  WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS,
+  WRITE_GATE_OPENED_EVENT_TYPE,
+  WRITE_GATE_OPENED_PAYLOAD_KEYS,
+  WRITE_GATE_REJECTED_EVENT_TYPE,
+  WRITE_GATE_REJECTED_PAYLOAD_KEYS,
   compareEventOrder,
   featureStateFingerprint,
   findStepRecord,
@@ -98,6 +119,7 @@ import type {
   OrchError,
   Principal,
   QuestionDraft,
+  ReversibilityClass,
   StepPhase,
   QuestionState,
   RunState,
@@ -211,7 +233,7 @@ import type { TerritoryCandidate, TerritoryDeferral } from './territory.js';
 import { EngineLock } from './lock.js';
 import { resolveAgentGrant } from './agents.js';
 import { readStepConfiguration } from './config-snapshot.js';
-import { ProfileNotFound } from './profile.js';
+import { ProfileNotFound, loadPermissions } from './profile.js';
 import { decisionsInLog } from './decision.js';
 import {
   BranchPatternRefused,
@@ -220,8 +242,9 @@ import {
   commitRunRecordFrom,
   composeCommit,
 } from './committer.js';
-import { writeIntentSettled } from './write-executor.js';
+import { mergeFidelityOf, realGitCall, writeIntentSettled } from './write-executor.js';
 import type {
+  GitCall,
   MergeCheckPort,
   WriteExecutionContext,
   WriteExecutorPort,
@@ -331,6 +354,12 @@ export const STANDARD_PLAN_STEPS: readonly PlanStep[] = Object.freeze([
   // one that mattered most: `step.verification` is what makes a gate outcome and a per-criterion
   // verdict sayable at all, and under `step.output` every refusal it adds was unreachable.
   { step: 'verify', contract_id: VERIFICATION_CONTRACT_ID, phase: 'verification' },
+  // Story 4-2. CAP-13's other half: `verify` judges the change against fixed criteria, and until this
+  // story nothing in the plan ever tried to break what it judged. It sits between `verify` and `commit`
+  // because it is spawned only once every one of `verify`'s own judgements is `met`
+  // (`adversarialSpawnGates`, below) — the third tier of CAP-13's economics, never spent on a run the
+  // cheaper two have already found wanting.
+  { step: 'adversarial', contract_id: ADVERSARIAL_CONTRACT_ID, phase: 'adversarial' },
   // Story 2-7. `committing` was a declared agent with no phase and no step, so the standard plan ended at
   // the verdict and nothing in it ever reached AD-22's note — the one record that survives the worktree.
   // It is last because the note is written on the merge commit, which is the end of the run.
@@ -537,10 +566,52 @@ export interface StopObservation {
   readonly observedAt: string;
 }
 
-/** Adapt story 1-4's spawner to {@link StepStopper}, structurally so no type crosses the boundary. */
+/**
+ * Adapt story 1-4's spawner to {@link StepStopper}, structurally so no type crosses the boundary.
+ *
+ * Story 4-3 — `target.command` was already carried on `StepStopper`'s own target and discarded here
+ * unread; a real, in-flight `pause` reached the spawner exactly as a `kill` did, so `spawner.ts`'s own
+ * outcome-handling durably recorded the step `killed` — before `decideSteering`'s `pauseEffect` ever ran,
+ * and by then too late for it to correct (a step no longer `disposition: null` is not "in flight").
+ * `resumable: target.command === 'pause'` is the one bit that closes it: the spawner's own `kill` takes
+ * it from here (`src/engine/spawner.ts`'s `StepStopOptions`), and reports `interrupted` rather than
+ * `killed` for exactly this one command, through the exact SIGTERM-then-`stop(false)` path the wall-clock
+ * timeout already uses.
+ */
 export const stepStopperFrom = (spawner: {
-  readonly kill: (step: string, run?: string) => boolean;
-}): StepStopper => (target): boolean => spawner.kill(target.step, target.run);
+  readonly kill: (step: string, run?: string, options?: { readonly resumable?: boolean }) => boolean;
+}): StepStopper => (target): boolean =>
+  spawner.kill(target.step, target.run, { resumable: target.command === 'pause' });
+
+/**
+ * The port {@link Reconciler.forkFeature} creates the forked run's own worktree through.
+ *
+ * See {@link ReconcilerOptions.forkWorktree}'s own docblock for why this is a structural port rather
+ * than an import of `createWorktree` (`src/pool/worktree.ts`). The request carries exactly the two
+ * fields a fork needs from `WorktreeCreateRequest`: the run id the new worktree is named for, and the ref
+ * its branch starts at — pinned to the source run's own current worktree `HEAD` rather than the
+ * repository's, so the fork continues from whatever `implement`/`test` work has landed there so far.
+ */
+export type ForkWorktreePort = (request: {
+  readonly run: string;
+  readonly ref: string;
+}) => { readonly path: string };
+
+/**
+ * The forked run's own feature slug: the source's, with a short suffix from the new run's own id.
+ *
+ * `branchFor` (`src/engine/committer.ts`) derives a branch name from the feature slug alone, never the
+ * run id (confirmed by story 3-2's own investigation into the identical hazard for shadow-mode branch
+ * collisions) — so two runs sharing one feature slug reaching `commit` would compute the identical branch
+ * name. The suffix is the new run's own id's **last** six characters, lowercased for the kebab-case
+ * convention — never the *first* six: a ULID's leading ten characters are its millisecond timestamp
+ * (AD-29), identical for any two runs minted in the same millisecond, which forking twice in quick
+ * succession is exactly the case most likely to do. The trailing characters fall inside the id's 80 bits
+ * of per-millisecond randomness (monotonically incremented when two mints share a millisecond), which is
+ * what actually disambiguates them — with no change to `branchFor` itself.
+ */
+export const forkedFeatureSlug = (feature: string, forkedRun: string): string =>
+  `${feature}-fork-${forkedRun.slice(-6).toLowerCase()}`;
 
 /** What one intent's consumption did. */
 export const INTENT_OUTCOMES = [
@@ -1102,6 +1173,119 @@ export interface GateRunRequest {
 }
 
 /**
+ * Story 4-2 — the full deterministic-gate report a step's latest attempt left in the log, read back
+ * rather than re-run.
+ *
+ * `gateOutcomesOfLatestAttempt` (`src/engine/ceilings.ts`) already answers a narrower version of this
+ * question — whether each gate passed, failed or was skipped — for the review-skip decision, which
+ * never needed the declared command, the exit status or the evidence pointer back. `adversarialSpawnGates`
+ * does: `step.adversarial`'s input carries the very same `GateOutcomeRecord`s `verify`'s own input did,
+ * copied rather than re-derived, and this is what reconstructs them from the `gate.*` lines the loop
+ * already wrote while running `verify`'s own gates.
+ *
+ * Scoped to the lines after the step's *last* `step.started`, the same reasoning
+ * `gateOutcomesOfLatestAttempt` states: a resume does not re-run the gates, so a resumed step's report is
+ * taken from what its attempt already recorded.
+ */
+const gatesOfLatestAttempt = (
+  events: readonly EventEnvelope[],
+  step: string,
+): readonly GateOutcomeRecord[] => {
+  const ordered = [...events].sort(compareEventOrder);
+  let outcomes: GateOutcomeRecord[] = [];
+  for (const event of ordered) {
+    if (event.step !== step) continue;
+    if (event.type === ENGINE_EVENT_TYPES.StepStarted) {
+      outcomes = [];
+      continue;
+    }
+    const outcome =
+      event.type === ENGINE_EVENT_TYPES.GatePassed
+        ? 'passed'
+        : event.type === ENGINE_EVENT_TYPES.GateFailed
+          ? 'failed'
+          : event.type === ENGINE_EVENT_TYPES.GateSkipped
+            ? 'skipped'
+            : null;
+    if (outcome === null) continue;
+    const payload = event.payload;
+    const gateName = typeof payload['gate'] === 'string' ? payload['gate'] : '';
+    const declared = typeof payload['command'] === 'string' ? payload['command'] : '';
+    const exitStatus = typeof payload['exit_status'] === 'number' ? payload['exit_status'] : null;
+    const evidence = typeof payload['evidence'] === 'string' ? payload['evidence'] : '';
+    const summary = typeof payload['reason'] === 'string' ? payload['reason'] : '';
+    // One outcome survives per gate per attempt; a later line for the same gate replaces an earlier one
+    // rather than appending a second entry for it.
+    outcomes = [
+      ...outcomes.filter((existing) => existing.command !== gateName),
+      { command: gateName, declared, outcome, exitStatus, evidence, containerName: null, summary },
+    ];
+  }
+  return outcomes;
+};
+
+/**
+ * Story 4-2 — a completed verification step's own per-criterion verdicts, read back from the
+ * `verification.judgements_recorded` line its termination wrote, for the step's latest attempt.
+ *
+ * The spawn-gating check for `adversarial` runs on a *later* pass than the one that recorded them (AD-4,
+ * AD-7: the checkpoint is rebuilt from the log, and nothing here holds a fact only in memory), so this
+ * is the read half of {@link Reconciler.recordVerificationJudgements}'s write.
+ */
+const judgementVerdictsOfLatestAttempt = (
+  events: readonly EventEnvelope[],
+  step: string,
+): readonly { readonly criterion: string; readonly verdict: string }[] => {
+  const ordered = [...events].sort(compareEventOrder);
+  let latest: readonly { readonly criterion: string; readonly verdict: string }[] = [];
+  for (const event of ordered) {
+    if (event.step !== step) continue;
+    if (event.type === ENGINE_EVENT_TYPES.StepStarted) {
+      latest = [];
+      continue;
+    }
+    if (event.type !== VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE) continue;
+    const carried = event.payload[VERIFICATION_JUDGEMENTS_RECORDED_PAYLOAD_KEYS.Judgements];
+    latest = Array.isArray(carried)
+      ? carried.filter(
+          (entry): entry is { readonly criterion: string; readonly verdict: string } =>
+            typeof entry === 'object' &&
+            entry !== null &&
+            typeof (entry as Record<string, unknown>)['criterion'] === 'string' &&
+            typeof (entry as Record<string, unknown>)['verdict'] === 'string',
+        )
+      : [];
+  }
+  return latest;
+};
+
+/**
+ * Story 4-2 — a completed adversarial output that found a break is not this step's own failure to fix;
+ * it is the implementation's, and this step cannot edit what it attacked. So the termination routes
+ * through `step.adversarial_break_found` (`escalate-to-human`, AD-35) instead of completing quietly with
+ * nobody told a break was found.
+ *
+ * **Keyed on the field, not the phase** — the same reason {@link Reconciler.recordDeclaredTerritory} is:
+ * asking "is this the adversarial step" would be a second place deciding what that agent is, and
+ * {@link brokenAttemptIn} already answers the only question that matters, from the output alone.
+ */
+const adversarialBreakTermination = (termination: StepTermination): StepTermination => {
+  if (termination.disposition !== 'completed') return termination;
+  if (!brokenAttemptIn(termination.contractOutput)) return termination;
+  return {
+    ...termination,
+    disposition: 'failed',
+    error: makeError(
+      'step.adversarial_break_found',
+      'The adversarial tester found at least one attempt that broke the implementation it attacked. ' +
+        'That is a defect in the implementation, not in this step, and this engine has no mechanism to ' +
+        'send it back to an earlier plan step for a fix — so a person reviews the finding and decides ' +
+        '(CAP-23).',
+    ),
+  };
+};
+
+/**
  * The run's profile exists and cannot be read, so which gates it declares is unknown.
  *
  * Its own class rather than a re-raise, because the *reason* a gate did not run is the thing a
@@ -1123,6 +1307,35 @@ export class UnreadableGateConfiguration extends Error {
       { cause },
     );
     this.name = 'UnreadableGateConfiguration';
+    this.run = run;
+  }
+}
+
+/**
+ * Story 4-1's Never list — a composed commit whose intents disagree about `reversibility`.
+ *
+ * `settlePreMergeWrites` reads only the first not-yet-settled intent's class and treats one gate decision
+ * as covering the whole remaining batch, which is only sound while `COMMIT_WRITE_REVERSIBILITY`
+ * (`src/engine/committer.ts`) really does class every intent of a composed commit alike — true of every
+ * write kind this build implements, and asserted here rather than silently trusted, so a future write kind
+ * that broke the assumption would fail loudly instead of quietly under-gating a higher-class intent riding
+ * in the same batch as an approved lower-class one. Deliberately left uncaught by its one call site, the
+ * same treatment `ComposedCommitUnreadable` already gets: there is no recovery to route an assumption this
+ * method's own logic depends on being false to.
+ */
+export class MixedReversibilityBatch extends Error {
+  readonly code = 'internal.invariant_violated';
+  readonly run: string;
+
+  constructor(run: string, classified: readonly string[]) {
+    super(
+      `Refusing to settle the composed commit for run ${run}: its intents do not share one reversibility ` +
+        `class (${classified.join(', ')}), but COMMIT_WRITE_REVERSIBILITY classes a whole composed commit ` +
+        'uniformly and settlePreMergeWrites reads only the first unsettled intent\'s class for the whole ' +
+        'remaining batch. Treating one gate decision as covering intents of a class nobody checked would ' +
+        'silently under-gate whichever of them is more irreversible than the one actually approved.',
+    );
+    this.name = 'MixedReversibilityBatch';
     this.run = run;
   }
 }
@@ -1274,6 +1487,28 @@ export interface ReconcilerOptions {
    * named, visible gap rather than a guess.
    */
   readonly mergeChecker?: MergeCheckPort | null;
+  /**
+   * Story 3-3 — how the reconciler reads the two trees `mergeFidelityOf` compares, once a merge is
+   * confirmed. Defaults to real `git` (`src/engine/write-executor.ts`'s own port and its own default),
+   * so a production assembly needs no wiring; a suite substitutes a double that never touches a real
+   * repository, the same seam every other git-shelling port on this interface already gets.
+   */
+  readonly mergeFidelityGit?: GitCall;
+  /**
+   * CAP-15 — how `forkFeature` creates the forked run's own worktree, pinned to the source run's own
+   * current worktree `HEAD`. A function rather than importing `createWorktree`
+   * (`src/pool/worktree.ts`) directly, for the same dependency-direction reason `writeExecutor`/
+   * `branchProtection`/`mergeChecker` are all ports: `src/engine/` may import only `src/contracts/`,
+   * `src/runtime/` and node builtins (`tests/engine.reconciler.test.ts`'s own guard), and worktree
+   * creation belongs to `src/pool/`. A real adapter is a thin wrapper over `createWorktree`, passing
+   * this request's `run` and `ref` straight through — no new worktree capability, exactly as
+   * `WorktreeCreateRequest.ref` already accepting an arbitrary starting ref promised.
+   *
+   * `null` is a genuine gap, stated plainly rather than guessed past — `forkFeature` refuses loudly when
+   * asked to act with none wired, exactly as `writeExecutor: null` leaves a write composed but never
+   * performed rather than pretending nothing was asked.
+   */
+  readonly forkWorktree?: ForkWorktreePort | null;
 }
 
 /**
@@ -1349,6 +1584,8 @@ export class Reconciler {
   private readonly branchProtection: BranchProtectionAssertion | null;
   private readonly writeExecutor: WriteExecutorPort | null;
   private readonly mergeChecker: MergeCheckPort | null;
+  private readonly mergeFidelityGit: GitCall;
+  private readonly forkWorktree: ForkWorktreePort | null;
   /** Open recorders, keyed by run id. An I/O handle, not run state: nothing is read back from it. */
   private readonly recorders = new Map<string, Recorder>();
   private closed = false;
@@ -1397,6 +1634,8 @@ export class Reconciler {
     this.branchProtection = options.branchProtection ?? null;
     this.writeExecutor = options.writeExecutor ?? null;
     this.mergeChecker = options.mergeChecker ?? null;
+    this.mergeFidelityGit = options.mergeFidelityGit ?? realGitCall;
+    this.forkWorktree = options.forkWorktree ?? null;
   }
 
   /**
@@ -1447,8 +1686,21 @@ export class Reconciler {
    * (CAP-2), which is why the initial state is `drafting` rather than `running`.
    */
   acceptFeature(plan: FeaturePlan): AcceptedFeature {
+    return this.acceptRun(this.minter.mint(), plan);
+  }
+
+  /**
+   * `acceptFeature`'s own body, taking the run id as a parameter rather than minting one.
+   *
+   * `acceptFeature` still mints here and nowhere else for its own callers (AD-29's promise is
+   * unchanged), but {@link forkFeature} has its own reason to see the id *before* this runs: the forked
+   * run's worktree has to be created — at the id `ForkWorktreePort` names it by — before the plan handed
+   * in here can even be built, because the plan's own `worktree` field has to name where that worktree
+   * landed. Splitting the id out is exactly that seam and nothing else; every line below is
+   * `acceptFeature`'s own, unchanged.
+   */
+  private acceptRun(run: string, plan: FeaturePlan): AcceptedFeature {
     this.assertOpen();
-    const run = this.minter.mint();
     const paths = runPaths(run, this.orchHome);
     mkdirSync(paths.runDir, { recursive: true });
 
@@ -1548,6 +1800,58 @@ export class Reconciler {
     }
 
     return { run, state: this.checkpointFromLog(paths, plan) };
+  }
+
+  /**
+   * CAP-15 — fork a run into a wholly new, independent run, seeded from its own current worktree state.
+   *
+   * Mirrors {@link acceptRun}'s own shape exactly — a fresh ULID, `run.created` on the *new* run's own
+   * log, a fresh plan starting at `drafting` — never a copy of the source run's own step history: nothing
+   * in this codebase's architecture supports seeding one run's checkpoint from another's, and inventing
+   * that is out of this story's own scope (see its Never list). What *is* inherited is the worktree's
+   * file contents: {@link ForkWorktreePort} is asked to create the new run's own worktree with its `ref`
+   * pinned to the source run's own current worktree `HEAD` — whatever `implement`/`test` work has landed
+   * there so far — rather than the repository's own unrelated `HEAD`. The forked run's feature slug
+   * carries a short suffix derived from its own new run id ({@link forkedFeatureSlug}), so `branchFor`
+   * (`src/engine/committer.ts`, read here, never changed) naturally produces a distinct branch with no
+   * change to `branchFor` itself.
+   *
+   * **Never called for the source run's own sake.** This method creates the new run and returns it;
+   * it does not touch the source run's own state, emit anything on the source run's own log, or mark any
+   * intent applied — that is `consumeIntents`'s own job, in the `fork`-specific check beside (never
+   * inside) `decideSteering`'s per-command switch, which is the only caller of this method in this build.
+   */
+  forkFeature(sourceRun: string): AcceptedFeature {
+    this.assertOpen();
+    if (this.forkWorktree === null) {
+      throw new Error(
+        `Cannot fork run ${sourceRun}: this engine has no fork-worktree port wired ` +
+          '(ReconcilerOptions.forkWorktree), so there is nowhere to create the forked run’s own ' +
+          'worktree. Wire one — a thin adapter over `src/pool/worktree.ts`’s `createWorktree` — before ' +
+          'forking a run, rather than guessing where it should live.',
+      );
+    }
+    const source = this.load(sourceRun);
+    const head = this.worktreeGit(source.plan.worktree, ['rev-parse', 'HEAD']);
+    if (head.status !== 0) {
+      throw new Error(
+        `Cannot fork run ${sourceRun}: could not read the current HEAD of its worktree ` +
+          `(${source.plan.worktree}): ${head.stderr.trim()}`,
+      );
+    }
+    const newRun = this.minter.mint();
+    const worktree = this.forkWorktree({ run: newRun, ref: head.stdout.trim() });
+    const plan: FeaturePlan = {
+      feature: forkedFeatureSlug(source.plan.feature, newRun),
+      mode: source.plan.mode,
+      territory: [...source.plan.territory],
+      steps: source.plan.steps,
+      request: source.plan.request,
+      acceptance_criteria: [...source.plan.acceptance_criteria],
+      starting_model_tier: source.plan.starting_model_tier,
+      worktree: worktree.path,
+    };
+    return this.acceptRun(newRun, plan);
   }
 
   /**
@@ -1701,6 +2005,37 @@ export class Reconciler {
     return this.steer(run, 'take_over', options);
   }
 
+  /**
+   * CAP-15 — pause the run: the same live-stop signal `kill` uses, but the step in flight (if any)
+   * records `interrupted`, never `killed`. A paused run resumes exactly as any other AD-8-interrupted
+   * run, by session id — no method of its own for that; the next ordinary pass does it.
+   */
+  pause(run: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'pause', options);
+  }
+
+  /**
+   * CAP-15 — inject a note, delivered once, into whichever step's input this run builds next.
+   *
+   * Never into the process already running (a `claude` subprocess reads its input file once, at start),
+   * and never a second time: a second `inject_note` before the first is consumed replaces it rather than
+   * queuing (`RunState.pending_note`, `src/contracts/state.ts`).
+   */
+  injectNote(run: string, text: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'inject_note', { ...options, argument: text });
+  }
+
+  /**
+   * CAP-16 — narrow the run's scope with free text, delivered through the exact same mechanism
+   * {@link injectNote} uses, tagged `kind: 'narrow'` rather than `kind: 'note'` in the durable log.
+   *
+   * Never touches `StepInput.acceptance_criteria`: the text is delivered as a note the agent reads and
+   * interprets, so a run's confirmed criteria (CAP-2) are never reopened by it.
+   */
+  narrow(run: string, text: string, options: SteerOptions = {}): RunState {
+    return this.steer(run, 'narrow', { ...options, argument: text });
+  }
+
   // ---------------------------------------------------------------------------------------------
   // Asking and resolving a question (AD-25)
   // ---------------------------------------------------------------------------------------------
@@ -1841,7 +2176,15 @@ export class Reconciler {
 
     for (const pending of read.pending) {
       const intent = pending.intent;
-      const decision = decideSteering(intent, state, { applied });
+      /**
+       * Story 4-1, row 10 — read fresh for each intent, exactly as `state` is refreshed after each one
+       * applies: an earlier intent in this same pass (an `answer`, say) can settle the very question a
+       * later `reject` in the same batch would otherwise have found still open.
+       */
+      const decision = decideSteering(intent, state, {
+        applied,
+        activeQuestionId: activeQuestion(paths)?.questionId ?? null,
+      });
       const outcome = (kind: IntentOutcomeKind, reason: string): IntentOutcome => ({
         intentId: intent.intent_id,
         command: intent.command,
@@ -1911,6 +2254,8 @@ export class Reconciler {
               clearsStepError: false,
               escapeHatch: false,
               handoff: null,
+              gateResolution: null,
+              injectedNote: null,
             },
             resolved.reason,
           );
@@ -1925,6 +2270,42 @@ export class Reconciler {
         case 'apply': {
           const effect = decision.kind === 'apply' ? decision.effect : null;
           try {
+            /**
+             * Story 4-3 — `fork`'s real effect, beside (never inside) `decideSteering`'s own switch.
+             *
+             * `decideSteering`'s `case 'fork'` already decided this intent is a fresh, non-terminal-run
+             * gesture (its own exactly-once and terminal-run guards, reused rather than duplicated a
+             * second time here) and handed back a same-run no-op `IntentEffect` — because forking creates
+             * a *different* run, a shape that field can never describe. This is the actual side effect:
+             * a new run, and a `run.forked` line recording it, both landing before the `command.applied`
+             * line just below retires the file.
+             *
+             * **Guarded against redelivery by more than the id map below.** AD-19 is at-least-once, and
+             * unlike `escapeHatch`/`writeHandoff`, minting a new run is not naturally idempotent — calling
+             * `forkFeature` twice creates two runs. A crash between `run.forked` landing and this same
+             * intent's own `command.applied` landing would otherwise redeliver the intent past the
+             * `applied` map (which is only set *after* this succeeds) and fork a second time. So the
+             * check is the log itself: a `run.forked` already naming this exact `intent_id` means the
+             * fork already happened, and only the still-missing `command.applied` line is caught up.
+             */
+            if (decision.kind === 'apply' && intent.command === 'fork') {
+              const alreadyForked = loaded.events.some(
+                (event) =>
+                  event.type === RUN_FORKED_EVENT_TYPE &&
+                  event.payload[RUN_FORKED_PAYLOAD_KEYS.IntentId] === intent.intent_id,
+              );
+              if (!alreadyForked) {
+                const forked = this.forkFeature(state.run);
+                this.emit(this.recorderFor(state.run, state.feature), {
+                  step: null,
+                  type: RUN_FORKED_EVENT_TYPE,
+                  payload: {
+                    [RUN_FORKED_PAYLOAD_KEYS.ForkedRun]: forked.run,
+                    [RUN_FORKED_PAYLOAD_KEYS.IntentId]: intent.intent_id,
+                  },
+                });
+              }
+            }
             this.applyIntent(paths, plan, state, pending, effect, decision.reason);
           } catch (thrown: unknown) {
             /**
@@ -2092,6 +2473,56 @@ export class Reconciler {
         step: effect === null ? pending.intent.step : effect.step,
         type: ENGINE_EVENT_TYPES.HandoffRecorded,
         payload: { code: corrected.handoff.code, reason: corrected.handoff.reason },
+      });
+    }
+
+    /**
+     * Story 4-1 — an approved or rejected AD-12 gate reaches the log as its own line, not only as
+     * `command.applied`'s `effect` summary.
+     *
+     * Before `command.applied`, for the reason every other side effect here is: `RunState.pendingGate` is
+     * folded from this line alone, so a crash between this emit and `command.applied` leaves the intent
+     * unretired — the file is still in `commands/`, `decideSteering` sees `pendingGate` already cleared on
+     * the next pass, and applies the run-level transition through its own ordinary-approval branch instead
+     * (`state.state` is still `blocked`, no step is, so `blockedStepOf` still finds none). The opposite
+     * order is the one that cannot be recovered from: `command.applied` landing without this line would
+     * retire the intent with the gate still open in the checkpoint, and nothing would ever revisit it.
+     */
+    if (corrected !== null && corrected.gateResolution !== null) {
+      const { intentId, outcome } = corrected.gateResolution;
+      this.emit(recorder, {
+        step: null,
+        type: outcome === 'approved' ? WRITE_GATE_APPROVED_EVENT_TYPE : WRITE_GATE_REJECTED_EVENT_TYPE,
+        payload:
+          outcome === 'approved'
+            ? { [WRITE_GATE_APPROVED_PAYLOAD_KEYS.IntentId]: intentId }
+            : {
+                [WRITE_GATE_REJECTED_PAYLOAD_KEYS.IntentId]: intentId,
+                // Guaranteed non-blank: `decideSteering`'s own gate-reject branch already refuses a blank
+                // one with `missing-answer`, and `ARGUMENT_REQUIRED_COMMANDS` refuses one at the door.
+                [WRITE_GATE_REJECTED_PAYLOAD_KEYS.Reason]: pending.intent.argument ?? '',
+              },
+      });
+    }
+
+    /**
+     * Story 4-3 — an injected note or scope-narrowing reaches the log as its own line, not only as
+     * `command.applied`'s own summary.
+     *
+     * `RunState.pending_note` is folded from this line alone (`rebuild.ts`), so it goes before
+     * `command.applied` for the reason every other side effect here does: a crash between the two
+     * redelivers the intent, `decideSteering` recomputes the identical `injectedNote` from the same
+     * intent, and this line is simply written again — which the fold absorbs as a plain overwrite, never
+     * a queue, exactly as a second genuinely new note would be (I/O matrix row 5).
+     */
+    if (corrected !== null && corrected.injectedNote !== null) {
+      this.emit(recorder, {
+        step: null,
+        type: NOTE_INJECTED_EVENT_TYPE,
+        payload: {
+          [NOTE_INJECTED_PAYLOAD_KEYS.Text]: corrected.injectedNote.text,
+          [NOTE_INJECTED_PAYLOAD_KEYS.Kind]: corrected.injectedNote.kind,
+        },
       });
     }
 
@@ -3219,18 +3650,87 @@ export class Reconciler {
          * the run in `awaiting_merge` rather than `committed`. `settlePreMergeWrites` returning `'none'`
          * (no executor, or nothing composed) is the one case that still commits directly, unchanged from
          * every build before this story.
+         *
+         * **Story 3-2 (AD-27) — a shadow run never enters `awaiting_merge`.** Under shadow, the push and
+         * pull-request intents settle as `write.suppressed` rather than `write.executed` — there is no real
+         * pull request ever opened, so there is nothing to wait on. `settlePreMergeWrites` already settles
+         * a shadow run's `git_note` intent in the same pass (see its own docblock), so once it reports
+         * `'awaiting-merge'` for a shadow run, every one of the three composed intents is already settled
+         * and the run proceeds straight to `committed` — the one branch this story adds to this method's
+         * own step-driving logic, downstream of the write executor's own suppression exactly the way the
+         * existing `awaiting_merge` transition is already downstream of a live run's real push/PR landing.
          */
         let to: FeatureState = action.to;
         let reason = action.reason;
         if (action.to === 'committed') {
-          const settlement = await this.settlePreMergeWrites(paths, plan, recorder);
+          const settlement = await this.settlePreMergeWrites(paths, plan, state, recorder);
           if (settlement === 'unsettled') return null;
+          if (settlement === 'gated') {
+            /**
+             * Story 4-1 — CAP-12's success criterion made visible: "irreversible ones block,
+             * demonstrably". `settlePreMergeWrites` has already made `write.gate_opened` durable (or found
+             * one already open, on a re-entered pass — see that method's own docblock) and returned before
+             * calling the write executor at all, so the only thing left here is the same visible signal
+             * every other block in this file gives — a `feature.state_changed` line naming why.
+             *
+             * **Read back by re-folding the log, not by re-parsing the raw event.** `RunState.pending_gate`
+             * already carries everything this reason needs — `intent_id`, `reversibility` and the whole
+             * remaining `batch` — so the fold is the one reader of it, and the two can never say different
+             * things about the same gate the way a hand-rolled second parse of the payload could.
+             *
+             * **The disclosure names every intent in the batch, not only the one that triggered the
+             * check** — round-1 review's fix: one approval settles the whole remaining batch
+             * (`settlePreMergeWrites`'s own settlement loop has no gate check inside it), so a person
+             * reading this reason has to see everything their one decision actually authorises. `target` is
+             * read from the composed commit, since `pending_gate.batch` itself persists only `intent_id`
+             * and `kind` (`PendingGateBatchEntrySchema`'s own docblock says why).
+             */
+            const refreshed = rebuildFromLog(readEventLog(paths.eventLog), {
+              run: paths.runId,
+              plan,
+              now: this.now,
+            });
+            const gate = refreshed.pending_gate;
+            const composed = this.readComposedCommit(paths);
+            const describeBatchEntry = (entry: { readonly intent_id: string; readonly kind: string }): string => {
+              const intent = composed?.intents.find((candidate) => candidate.intent_id === entry.intent_id);
+              return intent === undefined ? entry.kind : `${entry.kind} (${intent.target})`;
+            };
+            this.emit(recorder, {
+              step: null,
+              type: ENGINE_EVENT_TYPES.FeatureStateChanged,
+              payload: {
+                from: state.state,
+                to: 'blocked',
+                reason:
+                  gate === null
+                    ? 'A composed commit\'s write is gated by this project\'s permissions (AD-12), so the ' +
+                      'run stops here rather than performing it unattended. Approve or reject to continue ' +
+                      '(CAP-12).'
+                    : `The write "${gate.intent_id}" is classed "${gate.reversibility}", which this ` +
+                      'project\'s permissions gate behind a person (AD-12). Approving settles the whole ' +
+                      `remaining batch: ${gate.batch.map(describeBatchEntry).join(', ')}. The run stops ` +
+                      'here rather than performing any of it unattended — approve or reject to continue ' +
+                      '(CAP-12).',
+              },
+            });
+            return null;
+          }
           if (settlement === 'awaiting-merge') {
-            to = 'awaiting_merge';
-            reason =
-              'The composed commit’s push and pull-request intents have landed. AD-22 binds the ' +
-              'durable note to the merge commit, which does not exist until a person merges the pull ' +
-              'request, so the run waits here rather than claiming a terminal state early (AD-32).';
+            if (plan.mode === 'shadow') {
+              reason =
+                'Under mode: shadow, the composed commit’s push, pull-request and note intents all ' +
+                'settled as write.suppressed — no real pull request was ever opened, so there is nothing ' +
+                'to wait on, and the run reaches its terminal state directly rather than parking in ' +
+                'awaiting_merge for a merge that will never happen (AD-27).';
+              // `to` stays `'committed'`, `action.to`'s own value — no override needed.
+            } else {
+              to = 'awaiting_merge';
+              reason =
+                'The composed commit’s push and pull-request intents have landed. AD-22 binds the ' +
+                'durable note to the merge commit, which does not exist until a person merges the pull ' +
+                'request, so the run waits here rather than claiming a terminal state early (AD-32).';
+            }
           }
         }
         this.emit(recorder, {
@@ -3316,6 +3816,38 @@ export class Reconciler {
           outcome = null;
         }
         if (outcome === null || outcome.status === 'failed') return null;
+
+        /**
+         * Story 3-3 — the trust record's one new durable fact, captured exactly once, right here: the same
+         * call site that already confirms the merge and is about to transition the run to `committed`. A
+         * comparison failure is recorded as `code`, never guessed as `unchanged`, and never blocks the
+         * commit — this is a measurement taken alongside the transition, not a gate on it.
+         *
+         * **Guarded against a re-entered pass.** This `check-merge` action runs again every pass until the
+         * run leaves `awaiting_merge`, and a crash between this emit and the `committed`-transition emit
+         * just below would otherwise leave the next pass computing and emitting a second line for the same
+         * merge. Checking the run's own log first — the same "check before acting" discipline
+         * `write-executor.ts`'s own `notePushedToRemote` already uses — makes the whole action idempotent
+         * rather than adding a new pattern.
+         */
+        const alreadyRecorded = readEventLog(paths.eventLog).some(
+          (event) => event.type === PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
+        );
+        if (!alreadyRecorded) {
+          const fidelity = mergeFidelityOf(this.mergeFidelityGit, plan.worktree, check.mergeCommit);
+          this.emit(recorder, {
+            step: null,
+            type: PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
+            payload: {
+              [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.HeadRefOid]: fidelity.proposedHead,
+              [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.MergeCommit]: check.mergeCommit,
+              ...(fidelity.outcome === null
+                ? { [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Code]: fidelity.code }
+                : { [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Outcome]: fidelity.outcome }),
+              [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Detail]: fidelity.detail,
+            },
+          });
+        }
 
         this.emit(recorder, {
           step: null,
@@ -3580,7 +4112,7 @@ export class Reconciler {
      * is how the economics are asserted in `tests/engine.gate-economics.test.ts`, by absence rather
      * than by a counter that could read zero because nothing incremented it.
      */
-    const gates = this.runGatesBeforeReview(
+    const gatesFromReview = this.runGatesBeforeReview(
       plan,
       state,
       options.step,
@@ -3588,7 +4120,32 @@ export class Reconciler {
       options.transitionTo,
       attempt,
     );
-    if (gates === null) return;
+    if (gatesFromReview === null) return;
+
+    /**
+     * Story 4-2's third tier, one phase after CAP-13's own two.
+     *
+     * `runGatesBeforeReview` already returns `[]` unchanged for any phase but `verification` — it never
+     * runs a gate for `adversarial`, which is exactly right (Design Notes: nothing changes the worktree
+     * between `verify` and `adversarial`, so re-running would cost real time for zero new information).
+     * What `adversarial` still needs is *content* for that field — `verify`'s own report, copied — and
+     * the decision of whether to spawn at all, which is `adversarialSpawnGates`'s job: analogous to
+     * `runGatesBeforeReview`, and a different question, over the *preceding* step's own recorded verdicts
+     * rather than this step's own gates.
+     */
+    let gates = gatesFromReview;
+    if (options.step.phase === 'adversarial') {
+      const prepared = this.adversarialSpawnGates(
+        paths,
+        plan,
+        state,
+        options.step,
+        baselineRef,
+        options.transitionTo,
+      );
+      if (prepared === null) return;
+      gates = prepared;
+    }
 
     /**
      * AD-24's "narrowing scope", and nothing wider: a degraded run's verification step stops after its
@@ -3996,9 +4553,13 @@ export class Reconciler {
     state: RunState,
     step: PlanStep,
     baselineRef: string,
-    termination: StepTermination,
+    rawTermination: StepTermination,
     context: { readonly transitionTo: FeatureState; readonly plan: FeaturePlan },
   ): void {
+    // Story 4-2 — a completed output reporting a broken attempt is re-dispositioned before a single line
+    // is written, so `step.terminated` itself carries the AD-35 code rather than a later reader having to
+    // reach into `contractOutput` to learn what a `completed` disposition here does not say.
+    const termination = adversarialBreakTermination(rawTermination);
     const recorder = this.recorderFor(state.run, state.feature);
     this.emit(recorder, {
       step: step.step,
@@ -4024,6 +4585,7 @@ export class Reconciler {
     if (termination.disposition === 'completed') {
       this.recordDeclaredTerritory(state, step, recorder, termination);
       this.recordComposedCommit(state, context.plan, step, recorder, termination);
+      this.recordVerificationJudgements(step, recorder, termination);
     }
 
     if (termination.disposition === 'interrupted' && context.transitionTo !== 'interrupted') {
@@ -4384,6 +4946,74 @@ export class Reconciler {
   }
 
   /**
+   * Story 4-2's third-tier spawn gate: before spawning `adversarial`, read what the preceding `verify`
+   * step's own output actually judged, and refuse to spend the model turn on an implementation the
+   * cheaper tier has already found wanting.
+   *
+   * **Analogous to {@link runGatesBeforeReview}, and a different question.** That decision reads the
+   * *engine's own* gate outcomes, because a spawn is the thing that costs and a step cannot decline to
+   * be spawned; this one reads the *preceding step's own recorded verdicts*, one tier later, for the
+   * identical reason. Every judgement must be `met` — an `unmet` or `undetermined` skips the spawn
+   * exactly as a failing gate skips verification's own review, and the skip is recorded
+   * (`adversarial.skipped`) rather than silent, the same "declared but not run" shape a skipped
+   * deterministic gate already has. A `verify` step recording no judgements at all — a plan with no
+   * verification step, or a step whose contract output never reached the fold — is not a recorded
+   * `unmet`, so the spawn proceeds: this check refuses what it can prove is wanting, and does not invent
+   * a refusal for what it cannot see (the pre-existing gap named in this story's own Deferred section).
+   *
+   * **The gates travel, never re-run.** Nothing changes the worktree between `verify` and `adversarial`
+   * — neither step writes to it — so the outcomes `verify`'s own input already carried are still true,
+   * and this is what copies them for `step.adversarial`'s own input.
+   *
+   * Returns `null` when the pass is already over — the skip was recorded and the step terminated
+   * `completed` with no model spent — and the gate outcomes to copy into the step input otherwise.
+   */
+  private adversarialSpawnGates(
+    paths: RunPaths,
+    plan: FeaturePlan,
+    state: RunState,
+    step: PlanStep,
+    baselineRef: string,
+    transitionTo: FeatureState,
+  ): readonly GateOutcomeRecord[] | null {
+    const events = readEventLog(paths.eventLog);
+    const verifyStep = plan.steps.find((entry) => entry.phase === 'verification');
+    const judgements =
+      verifyStep === undefined ? [] : judgementVerdictsOfLatestAttempt(events, verifyStep.step);
+    const unresolved = judgements.filter((judgement) => judgement.verdict !== 'met');
+
+    if (unresolved.length > 0) {
+      const recorder = this.recorderFor(state.run, state.feature);
+      this.emit(recorder, {
+        step: step.step,
+        type: ADVERSARIAL_SKIPPED_EVENT_TYPE,
+        payload: {
+          [ADVERSARIAL_SKIPPED_PAYLOAD_KEYS.Reason]:
+            `verify judged ${unresolved
+              .map((judgement) => `"${judgement.criterion}" ${judgement.verdict}`)
+              .join(', ')}, so the adversarial tester is not spawned: CAP-13's third tier is spent only ` +
+            'once every criterion is judged met, never on a run the cheaper tier has already found ' +
+            'wanting.',
+          [ADVERSARIAL_SKIPPED_PAYLOAD_KEYS.UnresolvedCriteria]: unresolved.map(
+            (judgement) => judgement.criterion,
+          ),
+        },
+        baselineRef,
+      });
+      this.recordTermination(
+        state,
+        step,
+        baselineRef,
+        { step: step.step, disposition: 'completed', sessionId: null, output: null, error: null, usage: null },
+        { transitionTo, plan },
+      );
+      return null;
+    }
+
+    return verifyStep === undefined ? [] : gatesOfLatestAttempt(events, verifyStep.step);
+  }
+
+  /**
    * The commands the run's profile declares, from its AD-9 snapshot, or `null` when it has none.
    *
    * Read from the snapshot rather than from `.orch/`, for the reason every other configuration read
@@ -4450,6 +5080,36 @@ export class Reconciler {
     // AD-4: a correction the log does not carry is one the next pass will not see, so a dropped line is
     // the same unrecorded action every other emit treats as one rather than something to carry on past.
     if (!recorded.recorded) throw new UnrecordedAction(TERRITORY_DECLARED_EVENT_TYPE);
+  }
+
+  /**
+   * Story 4-2 — promote a completed step's own per-criterion verdicts from its output into the durable
+   * log, so a later pass can read them back (AD-4, AD-7).
+   *
+   * **Keyed on the field, not the phase** — the same reason {@link recordDeclaredTerritory} is: asking
+   * "is this the verify step" would be a second place deciding what that agent is, and
+   * {@link judgementVerdictsIn} already answers the only question that matters, from the output alone.
+   * `adversarialSpawnGates` is the read half of this write, over `judgementVerdictsOfLatestAttempt`.
+   */
+  private recordVerificationJudgements(
+    step: PlanStep,
+    recorder: Recorder,
+    termination: StepTermination,
+  ): void {
+    const judgements = judgementVerdictsIn(termination.contractOutput);
+    // Not an output that judges criteria. Every other contract reaches here too, and says nothing.
+    if (judgements === null) return;
+
+    this.emit(recorder, {
+      step: step.step,
+      type: VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE,
+      payload: {
+        [VERIFICATION_JUDGEMENTS_RECORDED_PAYLOAD_KEYS.Judgements]: judgements.map((judgement) => ({
+          criterion: judgement.criterion,
+          verdict: judgement.verdict,
+        })),
+      },
+    });
   }
 
   /**
@@ -4626,6 +5286,14 @@ export class Reconciler {
   ): WriteExecutionContext {
     return {
       run: recorder.paths.runId,
+      // AD-27 — threaded through unchanged: every non-write-surface component behaves identically under
+      // `mode: 'shadow'` and `mode: 'live'`, and this is the one place the write executor itself learns
+      // which it is.
+      mode: plan.mode,
+      // The real merge commit this run is shadowing, or `null` for a live run — how `performPullRequest`
+      // tells the one pull request a shadow run expects to find (never destructive) apart from any other
+      // (destructive). See `WriteExecutionContext.shadowRealMergeCommit`'s own docblock.
+      shadowRealMergeCommit: plan.shadowRealMergeCommit ?? null,
       // The run's own worktree (AD-26): a worktree shares its repository's remotes, so pushing from here
       // reaches the same `origin` the committer named the branch and the pull request against.
       repository: plan.worktree,
@@ -4640,39 +5308,128 @@ export class Reconciler {
 
   /**
    * Story 2-11 — perform a completed committing step's `git_push` and `pull_request` intents, durably,
-   * before letting the run wait for a merge. `git_note` is deliberately never performed here: AD-22 binds
-   * the note to the merge commit, which does not exist yet at this point in the run (see
-   * `src/engine/write-executor.ts`'s own docblock), so it is held back for the `check-merge` action below.
+   * before letting the run wait for a merge. `git_note` is deliberately never performed here **for a live
+   * run**: AD-22 binds the note to the merge commit, which does not exist yet at this point in the run
+   * (see `src/engine/write-executor.ts`'s own docblock), so it is held back for the `check-merge` action
+   * below.
+   *
+   * **Story 3-2 (AD-27) — a shadow run's `git_note` is settled right here, alongside the other two.** A
+   * shadow run never opens a real pull request, so no real merge commit will ever exist for `check-merge`
+   * to wait on — holding the note back for it would park a shadow run in `awaiting_merge` forever, waiting
+   * for a merge that can never happen (this story's own Boundaries call this out explicitly). All three
+   * composed intents are therefore settled in this one pass under shadow, each recording `write.suppressed`
+   * (`src/engine/write-executor.ts`'s `performGitNoteShadow` probes the worktree's own `HEAD` in place of a
+   * merge commit that will never exist), and the caller below routes a shadow run straight to `committed`.
    *
    * - `'none'` — no executor is wired, or nothing was composed for this run (no committing step in the
    *   plan, or one that composed no prose). The caller commits exactly as every build before this story
    *   did: composed and logged, performed by nobody — the same "no production assembly point" gap already
    *   carried as a high-severity deferred entry since story 2-4, not a new hole this story opens.
-   * - `'awaiting-merge'` — both pre-merge intents are `executed`, either because this pass's call landed
-   *   or because the reconciliation check found it already had (AD-15: never a second push, never a
-   *   second pull request). The caller transitions to `awaiting_merge` rather than `committed`.
+   * - `'awaiting-merge'` — every intent this call is responsible for is settled (`executed` for a live
+   *   run's push and pull request, `suppressed` for all three of a shadow run's), either because this
+   *   pass's call landed or because the reconciliation check found it already had (AD-15: never a second
+   *   push, never a second pull request). The caller transitions to `awaiting_merge` for a live run, or
+   *   straight to `committed` for a shadow one (AD-27) — see the `advance-state` case.
    * - `'unsettled'` — a real write failed and neither kind refused by name. Nothing is emitted here: the
    *   executor already recorded its own `write.attempted`/`write.failed` lines, so the caller leaves the
    *   run where it is and the next pass tries again from the top, which costs at most one wasted
    *   "already present" lookup on the intent that already succeeded, never a duplicate write.
+   * - `'gated'` — story 4-1. Either a fresh gate just opened (the first not-yet-settled intent's
+   *   `reversibility` is one of this project's `gated_reversibility_classes`, and `write.gate_opened` is
+   *   now durable), or an existing `pending_gate` record was found and is not yet `'approved'` — either
+   *   way the write executor is never called this pass and the caller transitions the run to `blocked`
+   *   rather than to `awaiting_merge`.
    */
   private async settlePreMergeWrites(
     paths: RunPaths,
     plan: FeaturePlan,
+    state: RunState,
     recorder: Recorder,
-  ): Promise<'none' | 'awaiting-merge' | 'unsettled'> {
+  ): Promise<'none' | 'awaiting-merge' | 'unsettled' | 'gated'> {
     if (this.writeExecutor === null) return 'none';
     const composed = this.readComposedCommit(paths);
     if (composed === null) return 'none';
 
+    /**
+     * Never — the whole-batch-one-class assumption `COMMIT_WRITE_REVERSIBILITY` makes today, asserted
+     * rather than silently trusted. Every read below treats the first unsettled intent's `reversibility`
+     * as the whole remaining batch's; a future write kind whose composed intents genuinely disagree would
+     * have this method approve a lower-class intent and silently release a higher-class one riding in the
+     * same batch. Thrown, deliberately uncaught here — the same "a corrupt or impossible artifact escapes
+     * this pass as a refusal" treatment {@link ComposedCommitUnreadable} already gets — because there is
+     * no recovery to route to for an assumption this method's own logic depends on being false.
+     */
+    const reversibilities = new Set(composed.intents.map((intent) => intent.reversibility));
+    if (reversibilities.size > 1) {
+      throw new MixedReversibilityBatch(
+        paths.runId,
+        composed.intents.map((intent) => `${intent.intent_id}:${intent.reversibility}`),
+      );
+    }
+
     const events = readEventLog(paths.eventLog);
     const context = this.writeExecutionContextFor(plan, recorder, composed, null);
+    const remaining = composed.intents.filter(
+      (intent) =>
+        !(intent.kind === 'git_note' && plan.mode !== 'shadow') && !writeIntentSettled(events, intent.intent_id),
+    );
 
-    for (const intent of composed.intents) {
-      // `git_note` is the third composed intent and is never performed from here (see this method's own
-      // docblock); everything else is `git_push` and `pull_request`, in that order.
-      if (intent.kind === 'git_note') continue;
-      if (writeIntentSettled(events, intent.intent_id)) continue;
+    /**
+     * Story 4-1, round-1 review — the *existing* `pending_gate` record's `resolution` decides everything
+     * here, never a per-intent `write.gate_approved` lookup. The first version matched the approval
+     * against whichever intent happened to be `firstUnsettled` at the moment the gate opened; a crash
+     * after only the first of two remaining intents settled left `firstUnsettled` naming the *next* one
+     * on the next pass, whose id carried no approval line of its own — re-opening a second gate for a
+     * batch a person had already approved once (row 12). Reading the record's own `resolution` instead
+     * means `'approved'` covers the whole remaining batch regardless of which intent is `firstUnsettled`
+     * now, and `'pending'`/`'rejected'` both refuse to proceed without ever re-deriving anything per intent.
+     */
+    const gate = state.pending_gate;
+    if (gate !== null) {
+      if (gate.resolution !== 'approved') {
+        // `'pending'` — still open, undecided; nothing new to emit (`write.gate_opened` fires once per
+        // gate). `'rejected'` — never calls the write executor and never re-opens. Either way the run
+        // stays gated; `decideSteering`'s `approve`/`reject` cases are the only way this record changes.
+        return 'gated';
+      }
+      // `'approved'`: fall through and run the settlement loop for the whole remaining batch.
+    } else if (remaining.length > 0) {
+      const [triggering] = remaining;
+      if (triggering !== undefined) {
+        const gatedClasses = this.declaredGatedReversibilityClasses(paths.runId);
+        if (gatedClasses.includes(triggering.reversibility)) {
+          // The committing step's own id, so `RunState.pending_gate` and a `write.gate_opened` reader can
+          // name which step's write this is — never the step that "failed", because none did. Envelope
+          // `step: null` matches the write-executor trio's own convention (`writeExecutionContextFor`'s
+          // `emit` closure): these are run-level facts about a write, not about a step in flight.
+          const committingStep =
+            events.find((event) => event.type === COMMIT_COMPOSED_EVENT_TYPE)?.step ?? '';
+          this.emit(recorder, {
+            step: null,
+            type: WRITE_GATE_OPENED_EVENT_TYPE,
+            payload: {
+              [WRITE_GATE_OPENED_PAYLOAD_KEYS.IntentId]: triggering.intent_id,
+              [WRITE_GATE_OPENED_PAYLOAD_KEYS.Kind]: triggering.kind,
+              [WRITE_GATE_OPENED_PAYLOAD_KEYS.Target]: triggering.target,
+              [WRITE_GATE_OPENED_PAYLOAD_KEYS.Reversibility]: triggering.reversibility,
+              [WRITE_GATE_OPENED_PAYLOAD_KEYS.Step]: committingStep,
+              /**
+               * Round-1 review — every intent still unsettled at open time, not only the triggering one:
+               * this settlement loop has no gate check inside it, so one approval covers all of them.
+               */
+              [WRITE_GATE_OPENED_PAYLOAD_KEYS.Batch]: remaining.map((intent) => ({
+                [WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS.IntentId]: intent.intent_id,
+                [WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS.Kind]: intent.kind,
+                [WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS.Target]: intent.target,
+              })),
+            },
+          });
+          return 'gated';
+        }
+      }
+    }
+
+    for (const intent of remaining) {
       let outcome: WriteIntentResult;
       try {
         outcome = await this.writeExecutor(intent, context);
@@ -4701,6 +5458,39 @@ export class Reconciler {
       return readStepConfiguration(run, { orchHome: this.orchHome }).profile.profile.branch_pattern;
     } catch (thrown: unknown) {
       if (thrown instanceof ProfileNotFound) return null;
+      throw new UnreadableGateConfiguration(run, thrown);
+    }
+  }
+
+  /**
+   * Story 4-1 — the reversibility classes this run's project gates behind a person.
+   *
+   * Read from the AD-9 run snapshot, the same source and the same absent-versus-unreadable distinction
+   * {@link declaredCommands} and {@link declaredBranchPattern} already draw.
+   *
+   * **Round-1 review — an absent policy fails closed, not open.** The first version answered `null` for
+   * a snapshot with no `permissions.toml` at all (or no profile at all), and `settlePreMergeWrites` read
+   * `null` as "no gate at all" — so a project onboarded before this file existed, or one that lost it,
+   * had every irreversible write proceed completely unattended, with no visible signal anything was
+   * skipped. That directly contradicts CAP-12's unconditional "irreversible ones block, demonstrably".
+   * Fixed: absence — `loadPermissions` returning `null`, or the snapshot itself not existing
+   * (`ProfileNotFound`) — falls back to {@link GATED_REVERSIBILITY_CLASSES}, the installer's own default,
+   * imported from `src/contracts/` rather than duplicated. "No policy on disk" now means "the safe
+   * default applies," never "no gate at all" (matrix row 9).
+   *
+   * **A *present* policy is still honoured exactly as written**, including one that explicitly gates
+   * nothing (matrix row 6) — this fallback is for the file's outright absence only, never for a real
+   * answer this build merely disagrees with. A genuinely unreadable file (present but corrupt, or any
+   * failure other than "not found") still throws {@link UnreadableGateConfiguration}: an unreadable
+   * policy is not silently "no gate" or "the default" either, because neither is what the file actually
+   * says — it says nothing this build could read at all.
+   */
+  private declaredGatedReversibilityClasses(run: string): readonly ReversibilityClass[] {
+    try {
+      const source = readStepConfiguration(run, { orchHome: this.orchHome }).source;
+      return loadPermissions(source)?.gated_reversibility_classes ?? GATED_REVERSIBILITY_CLASSES;
+    } catch (thrown: unknown) {
+      if (thrown instanceof ProfileNotFound) return GATED_REVERSIBILITY_CLASSES;
       throw new UnreadableGateConfiguration(run, thrown);
     }
   }
@@ -4793,7 +5583,23 @@ export class Reconciler {
          * re-run would hand the step the *previous* attempt's exit statuses and evidence pointers,
          * which is a step judging one run of the gates while the log records another.
          */
-        JSON.stringify(parsed.data.gates) === JSON.stringify(recorded)
+        JSON.stringify(parsed.data.gates) === JSON.stringify(recorded) &&
+        /**
+         * Story 4-3, round-1 review (row 13) — a pending note always forces a fresh rebuild, bypassing
+         * this cache.
+         *
+         * An ordinary AD-8 resume calls this method with the *same* `baseline_ref` and (for any
+         * non-verification phase) the same empty `gates` as the attempt it is resuming, so it satisfies
+         * every clause above on essentially every resume — precisely the "pause, inject a note, resume"
+         * sequence this story's own CAP-15 wording is about. Left unguarded, the cache-hit branch above
+         * returns the on-disk file *verbatim* without ever reaching `steering_note` below, so an injected
+         * note would be silently dropped (no fresh step ever starts to deliver it) or misdelivered later,
+         * into an unrelated step. This is a narrow, deliberate exception to CAP-6's "a re-run reads the
+         * same bytes" rule, not a violation of it: the note is new content this run is intentionally
+         * introducing, exactly as `inject_note`'s own existence already implies "this step's next input
+         * may legitimately differ from its last."
+         */
+        state.pending_note === null
       ) {
         return { value: parsed.data, relativePath };
       }
@@ -4835,6 +5641,16 @@ export class Reconciler {
           path: gate.evidence,
           description: `the output of the ${gate.command} gate, which ran "${gate.declared}"`,
         })),
+      /**
+       * Story 4-3 — whatever note was pending the moment this step's input was built, or `null`.
+       *
+       * Read here and nowhere else: this is "whichever step's input is built next" — the one moment the
+       * design settled on for delivering a note into a running agent's next input, because a `claude`
+       * subprocess reads its input file once at start and nothing re-polls it mid-flight. `pendingNote`
+       * is cleared by the `step.started` line this same call site writes just before calling this method
+       * (see `rebuild.ts`'s own fold), so the clearing and the delivery are two sides of one moment.
+       */
+      steering_note: state.pending_note?.text ?? null,
       gates: recorded,
       /**
        * AD-24's three ceilings, measured for real rather than passed through as constants.

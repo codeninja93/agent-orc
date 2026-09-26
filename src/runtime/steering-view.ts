@@ -2,11 +2,12 @@
  * How this build treats each member of the `Command` enum, as data any surface may read.
  *
  * The table itself is story 1-3's and its wording is unchanged; what story 1-10 changed is where it
- * lives. The kill card is specified to offer `continue / narrow / kill / take over`, and `narrow` is
- * `{ kind: 'awaiting', owner: 'story 4-3…' }` — the intent file is written and deliberately left
- * unconsumed. A card that said so from a string of its own would drift the day the table changed, and a
- * card that hid the control would be worse: AD-19 makes the intent durable precisely so it is not lost,
- * and a person who presses a key deserves to know the file is written and who will act on it.
+ * lives. The kill card is specified to offer `continue / narrow / kill / take over`, and until story 4-3
+ * closed the loop, `narrow` read `{ kind: 'awaiting', owner: 'story 4-3…' }` — the intent file was
+ * written and deliberately left unconsumed. A card that said so from a string of its own would drift the
+ * day the table changed, and a card that hid the control would be worse: AD-19 makes the intent durable
+ * precisely so it is not lost, and a person who presses a key deserves to know the file is written and
+ * who will act on it.
  *
  * So the table moved to `src/runtime/`, where the spine's dependency graph lets a renderer read it —
  * `tui -> contracts, runtime`, with no edge to the engine — and `src/engine/steering.ts` re-exports every
@@ -60,27 +61,30 @@ export const COMMAND_HANDLING: CommandMap<CommandHandling> = {
     kind: 'acknowledge',
     note: 'the run continues unchanged; the command is recorded so the decision is attributable',
   },
-  narrow: {
-    kind: 'awaiting',
-    owner:
-      'story 4-3, which owns the other steering controls on a live run — `narrow` itself is not yet ' +
-      'named in any story’s accepted scope; story 2-9 built the ceilings’ own automatic ' +
-      'scope-narrowing, never a person-initiated one',
-  },
-  pause: {
-    kind: 'awaiting',
-    owner:
-      'story 4-3, "Steerable observability — pause, inject, kill, fork", which names pause among its ' +
-      'controls; story 2-9’s hibernation is terminal, not the non-terminal halt pause needs',
-  },
-  inject_note: {
-    kind: 'awaiting',
-    owner:
-      'story 4-3, "Steerable observability — pause, inject, kill, fork", which names inject among its ' +
-      'controls; nothing this build has shipped yet injects a note into a running agent’s next input',
-  },
+  /**
+   * Story 4-3 — CAP-16's person-initiated half, folded into the same delivery mechanism `inject_note`
+   * uses rather than built as a second one: a scope-narrowing instruction is a note whose *content* asks
+   * for less, never a structurally different delivery. Story 2-9's own automatic, ceiling-triggered
+   * narrowing is unrelated and unchanged — this is only ever a person's own free text.
+   */
+  narrow: { kind: 'effect' },
+  /**
+   * Story 4-3 — reuses `kill`'s own live-stop signal unchanged (`STOP_COMMANDS`, below), recording
+   * `interrupted` rather than `killed`. Story 2-9's hibernation is terminal; this is the non-terminal
+   * halt `pause` needs, resumed exactly as any other AD-8-interrupted run.
+   */
+  pause: { kind: 'effect' },
+  /**
+   * Story 4-3 — delivered once, into whichever step's input this run builds next
+   * (`StepInput.steering_note`), never into a process already running.
+   */
+  inject_note: { kind: 'effect' },
   kill: { kind: 'effect' },
-  fork: { kind: 'awaiting', owner: 'story 4-3, which owns forking a run from its current point' },
+  /**
+   * Story 4-3 — a wholly new, independent run, seeded from this run's own current worktree state; this
+   * run's own state is never touched by it.
+   */
+  fork: { kind: 'effect' },
   take_over: { kind: 'effect' },
   disengage: { kind: 'effect' },
   just_do_it: {
@@ -98,13 +102,19 @@ export const COMMAND_HANDLING: CommandMap<CommandHandling> = {
  * `take_over` is one of them because the escape hatch takes the work away from the run: leaving the step
  * running would have the system and a person editing one worktree at the same time.
  *
+ * **Story 4-3 adds `pause` as a fourth.** `pause` reuses this exact live-stop signal unchanged — the
+ * same `SIGTERM`/grace/`SIGKILL` sequence `kill` already gets — and differs from the other three only in
+ * what the step's own termination records once the subprocess actually stops (`interrupted`, never
+ * `killed`; see `src/engine/steering.ts`'s `pauseEffect`). A step must not keep running past a pause any
+ * more than it may past a kill, so the same watcher has to see it.
+ *
  * It lives here, beside {@link COMMAND_HANDLING}, because the engine's reader and the engine's orderer are
  * two modules with an import edge in one direction only — the orderer is in `commands.ts` and the watcher
  * is in `reconciler.ts`, which imports it — so a list declared in the watcher could not be read by the
  * orderer without a cycle. One list, read by both, is the point: a stop command that sorted last would
  * make "always available" mean "after whatever else arrived first".
  */
-export const STOP_COMMANDS: readonly Command[] = Object.freeze(['kill', 'disengage', 'take_over']);
+export const STOP_COMMANDS: readonly Command[] = Object.freeze(['kill', 'disengage', 'take_over', 'pause']);
 
 /** True when this command stops work already in flight, and so outranks everything that does not. */
 export const isStopCommand = (command: Command): boolean => STOP_COMMANDS.includes(command);

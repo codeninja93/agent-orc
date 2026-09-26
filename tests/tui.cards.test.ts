@@ -10,8 +10,8 @@
  * Three of these tests are about drift rather than about behaviour, and they are the ones that would
  * otherwise fail silently:
  *
- * - the kill card's `narrow` row is compared against `commandAvailability` itself, so a card that hard-coded
- *   the owner would pass today and lie the day story 2-9 lands;
+ * - the kill card's rows are compared against `commandAvailability` itself, so a card that hard-coded a
+ *   control's disposition would pass today and lie the day the steering table next changes;
  * - the spec echo's keystrokes are compared against the control table, for the same reason;
  * - the completion notice is checked for what it does *not* say, because R8's failure mode is a notice that
  *   reads as a pass rather than one that reads as wrong.
@@ -522,46 +522,48 @@ describe('the kill card states usage and elapsed against estimate', () => {
   });
 });
 
-describe('a control nothing acts on yet says so, in the words of the table that knows', () => {
+describe('every kill-card control is honoured, in the words of the table that knows (story 4-3)', () => {
   const card = buildKillCard({ view: overEstimateView(), now: OVER_ESTIMATE_NOW });
   const narrow = card.controls.find((control) => control.command === Command.Narrow);
 
-  it('renders narrow rather than hiding it, because the intent file is durable (AD-19)', () => {
+  it('renders narrow rather than hiding it', () => {
     expect(narrow).toBeDefined();
     expect(cardText(card)).toContain('narrow');
   });
 
-  it('names the owner the steering table names, rather than a literal of its own', () => {
+  /**
+   * Until story 4-3, `narrow` was `{ kind: 'awaiting', owner: 'story 4-3…' }` and this suite asserted the
+   * card rendered that owner rather than a literal of its own. The owner is gone because nothing is
+   * awaited any longer — asserted below — so what is left worth pinning is that the card's own claim
+   * about `narrow` still comes from {@link commandAvailability} rather than a hard-coded sentence: a card
+   * that stopped asking the table would pass today and lie the day a later story parks a new command the
+   * same way.
+   */
+  it('names narrow as effective, reading that from the steering table rather than a literal of its own', () => {
     const declared = commandAvailability(Command.Narrow);
-    expect(declared.owner).not.toBeNull();
-    // The card is asserted against the table itself: a card carrying its own copy of this sentence would
-    // pass today and be wrong the day the table changes.
+    expect(declared.kind).toBe('effect');
+    expect(declared.owner).toBeNull();
+    expect(narrow?.honoured).toBe(declared.honoured);
     expect(narrow?.owner).toBe(declared.owner);
-    expect(cardText(card)).toContain(declared.owner ?? 'an owner the table names');
   });
 
-  it('does not present narrow as effective, and does present kill and take over as effective', () => {
-    expect(narrow?.honoured).toBe(false);
-    expect(narrow?.availability).toContain('written and kept');
-    // Neutral about *what* is awaited, because the same phrase serves `pause`, `inject_note` and `fork`:
-    // it said "nothing narrows yet" for all four, describing one control by the behaviour of another.
-    expect(narrow?.availability).toContain('nothing acts on it yet');
-    expect(narrow?.availability).not.toContain('narrows yet');
-    for (const command of [Command.Kill, Command.TakeOver]) {
-      expect(card.controls.find((control) => control.command === command)?.honoured).toBe(true);
+  it('presents narrow, pause, inject_note and fork as effective, exactly as kill and take over are', () => {
+    // The whole of CAP-15's own success line: none of these four is parked on a later story any more.
+    for (const command of [
+      Command.Narrow,
+      Command.Pause,
+      Command.InjectNote,
+      Command.Fork,
+      Command.Kill,
+      Command.TakeOver,
+    ]) {
+      const control = killCardControl(command);
+      expect(control.honoured, command).toBe(true);
+      expect(control.owner, command).toBeNull();
+      expect(control.availability, command).toBe('takes effect when the loop picks the file up');
+      expect(control.availability, command).not.toContain('written and kept');
     }
   });
-
-  it.each([Command.Pause, Command.InjectNote, Command.Fork])(
-    '%s is described by what is awaited, not by what narrowing would do',
-    (command) => {
-      const control = killCardControl(command);
-      expect(control.honoured).toBe(false);
-      expect(control.availability).toContain('written and kept');
-      expect(control.availability).not.toContain('narrow');
-      expect(control.availability).toContain(commandAvailability(command).owner ?? 'an owner');
-    },
-  );
 });
 
 /** A run the log records as committed, with one verification step that completed. */

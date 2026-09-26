@@ -5,13 +5,13 @@
  * early is easy" — and this card is the moment that sentence is cashed in. So the four controls are all
  * offered together, and each one says what pressing it will actually do.
  *
- * **A control the system cannot honour says so, in the words of the table that knows.** `narrow` is
- * `{ kind: 'awaiting', owner: 'story 2-9…' }` in the steering table: the intent file is written and
- * deliberately left unconsumed. The card reads that from {@link commandAvailability} rather than from a
- * string of its own, so a control's availability cannot drift from the table that decides it — change the
- * table and this card changes with it. Hiding the control would be worse than saying so: AD-19 makes the
- * intent durable precisely so it is not lost, and a person who presses a key deserves to know that the
- * file is written and who will act on it.
+ * **A control the system cannot honour says so, in the words of the table that knows.** Until story 4-3
+ * closed the loop, `narrow` read `{ kind: 'awaiting', owner: 'story 4-3…' }` in the steering table: the
+ * intent file was written and deliberately left unconsumed, and this card read that straight from
+ * {@link commandAvailability} rather than from a string of its own — so a control's availability could
+ * never drift from the table that decides it. All four of this card's controls are honoured now, but the
+ * seam stays: a future story parking a fifth command the same way costs this card nothing to render
+ * honestly, because it still asks the table rather than assuming every control is honoured.
  *
  * **Nothing here enforces a ceiling.** AD-24's ceilings and their degradation are story 2-9's. This card
  * displays consumed budget and elapsed against estimate and offers the four gestures; what it never does

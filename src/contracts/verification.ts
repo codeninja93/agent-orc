@@ -468,6 +468,31 @@ export const criteriaNotJudged = (
   return accepted.filter((criterion) => !judged.has(criterion));
 };
 
+/** The shape of "an output that judges criteria with a verdict attached", for the discriminator below. */
+const JudgementVerdictOutputSchema = z.object({
+  judgements: z.array(z.object({ criterion: z.string(), verdict: z.enum(CRITERION_VERDICTS) })),
+});
+
+/**
+ * The criterion/verdict pairs an output judged, or `null` for an output that judges none.
+ *
+ * Story 4-2 — the reconciler's spawn-gating check for `adversarial` needs `verify`'s own recorded
+ * verdicts, and a contract sees one artifact while that check runs on a *later* pass over the durable
+ * log (AD-4, AD-7): nothing here writes the log, but this is the one place that knows what "an output
+ * that judges criteria with a verdict" looks like, so the engine's own event-recording and log-reading
+ * functions (`src/engine/reconciler.ts`) ask this rather than re-deriving the shape.
+ *
+ * Keyed on the field, the same discriminator idiom {@link criteriaNotAccepted} uses and for the same
+ * reason: pinning this to `step.verification` would leave a later contract that also judges criteria
+ * silently unread.
+ */
+export const judgementVerdictsIn = (
+  output: unknown,
+): readonly { readonly criterion: string; readonly verdict: CriterionVerdict }[] | null => {
+  const parsed = JudgementVerdictOutputSchema.safeParse(output);
+  return parsed.success ? parsed.data.judgements : null;
+};
+
 /** The shape of "an output that reports gates", for the same discriminator reason as above. */
 const GateReportingOutputSchema = z.object({
   gates: z.array(

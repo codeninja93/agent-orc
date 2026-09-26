@@ -52,8 +52,14 @@ export const normaliseTerritoryPath = (declared: string): string => {
  * comparing two paths and wrong for asking what a path *starts* with, since `~/../x` would answer `x`.
  * The empty string is returned for a path with no segments at all, which the caller has already refused
  * on other grounds.
+ *
+ * **Exported for story 3-3's reuse, not reimplemented.** The trust record's "area" is a declared path's
+ * first *meaningful* segment (this function's whole job) once a leading `src` has been stripped, and
+ * `src/engine/trust-record.ts` needs exactly this primitive to answer it — a second implementation is
+ * the same failure this file's own docblock warns about: two spellings of "the first segment" that
+ * disagree would attribute one trust signal to two different areas.
  */
-const firstPathSegment = (declared: string): string => {
+export const firstPathSegment = (declared: string): string => {
   const slashed = declared.trim().split(sep).join('/').split('\\').join('/');
   return slashed.split('/').find((segment) => segment !== '' && segment !== '.') ?? '';
 };

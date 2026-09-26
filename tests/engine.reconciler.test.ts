@@ -10,24 +10,57 @@
  * engine never opens `events.jsonl` itself — both structural, both invisible until a later story
  * breaks them.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  ADVERSARIAL_SKIPPED_EVENT_TYPE,
   BRANCH_PROTECTION_ASSERTED_EVENT_TYPE,
   CommittingOutputSchema,
+  VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE,
+  VERIFICATION_JUDGEMENTS_RECORDED_PAYLOAD_KEYS,
+  NOTE_INJECTED_EVENT_TYPE,
+  NOTE_INJECTED_PAYLOAD_KEYS,
+  PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
+  PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS,
+  RUN_FORKED_EVENT_TYPE,
+  RUN_FORKED_PAYLOAD_KEYS,
   RUN_STATE_FILE_NAME,
   StepInputSchema,
   StepOutputSchema,
+  WRITE_GATE_APPROVED_EVENT_TYPE,
+  WRITE_GATE_APPROVED_PAYLOAD_KEYS,
+  WRITE_GATE_OPENED_EVENT_TYPE,
+  WRITE_GATE_OPENED_PAYLOAD_KEYS,
+  WRITE_GATE_REJECTED_EVENT_TYPE,
+  WRITE_GATE_REJECTED_PAYLOAD_KEYS,
   dispositionFor,
   makeError,
 } from '../src/contracts/index.js';
-import type { EventEnvelope, ModelRung, OrchError, StepDisposition } from '../src/contracts/index.js';
+import type {
+  Command,
+  EventEnvelope,
+  ModelRung,
+  OrchError,
+  QuestionDraft,
+  ReversibilityClass,
+  StepDisposition,
+} from '../src/contracts/index.js';
 import { Recorder, RunFetchRecord, readEventLog, runPaths, runsDir } from '../src/runtime/index.js';
 import {
   BaselineResetError,
+  COMMAND_EVENT_TYPES,
+  COMPOSED_COMMIT_RELATIVE_PATH,
   ENGINE_EMITTER,
   ENGINE_EVENT_TYPES,
   SPEC_RECORDED_EVENT_TYPE,
@@ -37,26 +70,49 @@ import {
   ResumeRefused,
   SteeringRefused,
   StepSpawnFailed,
+  branchFor,
   createRecordingResetter,
   createScriptedExecutor,
   createUlidMinter,
+  forkedFeatureSlug,
   gitBaselineResetter,
   isUlid,
   measureConsumption,
+  mintIntentId,
+  mintRunId,
+  newCommandIntent,
+  performWriteIntent,
+  readIntentFiles,
   rebuildFromLog,
   routeRefusedResume,
   routeTermination,
+  takeConfigSnapshot,
   terminated,
+  writeCommandIntent,
 } from '../src/engine/index.js';
 import type {
   BaselineResetter,
+  DeterministicGateRunner,
   FeaturePlan,
+  ForkWorktreePort,
+  GateOutcomeRecord,
+  GateRunRequest,
+  GhCall,
+  GitCall,
   MergeCheck,
   MergeCheckPort,
   ScriptedExecutorOptions,
+  WorktreeGit,
   WriteExecutorPort,
 } from '../src/engine/index.js';
 
+import {
+  fixturePermissions,
+  fixtureProfile,
+  makeWorkspace,
+  writePermissions,
+  writeProfile,
+} from './helpers/config-fixture.js';
 import { makeGitWorktree, makeHome, makePlan, planProvider } from './helpers/engine-fixture.js';
 
 /**
@@ -1654,6 +1710,36 @@ const controllableMergeChecker = (): { readonly checker: MergeCheckPort; readonl
   return { checker, state };
 };
 
+/**
+ * Story 4-1 — a real config snapshot whose permissions explicitly gate nothing.
+ *
+ * Round-1 review's row-9 fix makes an *absent* snapshot fall back to the installer's own default
+ * (`irreversible` gated), so every fixture below that composes a real commit and never cared about
+ * gating before this story would otherwise now block on it incidentally. This gives such a fixture an
+ * explicit, present, empty `gated_reversibility_classes` — row 6's own policy — so its pre-existing
+ * subject (`awaiting_merge`, a shadow run's suppression, a flaky write retrying) stays undisturbed.
+ */
+const ungatedConfigSnapshot = (runId: string, orchHome: string): void => {
+  const repository = makeWorkspace('ungated-repo');
+  toRemove.push(repository);
+  // Blank mechanics commands, so CAP-13's deterministic gates are declared *none* rather than
+  // dispatched to a real runner none of these fixtures wire — the same reason `buildGatedRun` blanks
+  // them below; a real snapshot's own default commands would otherwise try to run for real.
+  writeProfile(
+    repository,
+    fixtureProfile({
+      mechanics: {
+        package_manager: 'npm',
+        commands: { test: '', typecheck: '', lint: '', build: '', run: '' },
+        source_layout: ['src', 'tests'],
+        resources: 'none',
+      },
+    }),
+  );
+  writePermissions(repository, fixturePermissions({ gated_reversibility_classes: [] }));
+  takeConfigSnapshot({ repository, runId, orchHome });
+};
+
 describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
   const buildRun = (): {
     readonly reconciler: Reconciler;
@@ -1676,19 +1762,23 @@ describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
     });
     toClose.push(reconciler);
     const accepted = reconciler.acceptFeature(plan);
+    // Story 4-1 — an ungated snapshot, so this suite's own subject (`awaiting_merge`) is undisturbed by
+    // the AD-12 gate a run with no snapshot at all would now hit by default (row 9's own fallback).
+    ungatedConfigSnapshot(accepted.run, orchHome);
     reconciler.confirm(accepted.run);
     return { reconciler, run: accepted.run, writes, merge };
   };
 
   /**
-   * Analyse, plan, implement, test, verify, commit — one pass each, `STANDARD_PLAN_STEPS`'s own order —
-   * then the pass that executes the pre-merge intents and transitions to `awaiting_merge`. Seven passes,
-   * exactly: `tests/engine.committer.test.ts` already drives the same six steps to a completed `commit`
-   * step in six, and this story adds exactly one more action (the `advance-state` that now settles the
-   * write surface before it can claim `committed`).
+   * Analyse, plan, implement, test, verify, adversarial, commit — one pass each,
+   * `STANDARD_PLAN_STEPS`'s own order — then the pass that executes the pre-merge intents and
+   * transitions to `awaiting_merge`. Eight passes, exactly: story 4-2 added one more declared step
+   * (`adversarial`, spawned once `committingCapableScript`'s own bare `verify` completion leaves no
+   * recorded judgement to find `unmet`, so the spawn proceeds rather than skipping) between `verify`
+   * and `commit`, and this story's own settlement pass is unchanged from before it.
    */
   const driveToAwaitingMerge = async (reconciler: Reconciler): Promise<void> => {
-    for (let index = 0; index < 7; index += 1) await reconciler.pass();
+    for (let index = 0; index < 8; index += 1) await reconciler.pass();
   };
 
   it('lands git_push and pull_request and enters awaiting_merge, not committed (matrix row 1)', async () => {
@@ -1734,6 +1824,210 @@ describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
     );
     expect(attempted).toHaveLength(1);
     expect(executed).toHaveLength(1);
+  });
+
+  /**
+   * Story 3-3 — the trust record's one new durable fact, emitted at exactly this call site, once,
+   * alongside the transition to `committed`. Fixture SHAs are real (non-repeated-character) hex, not
+   * `'a'.repeat(40)`-style zero-entropy stand-ins, so these tests exercise the same AD-21 redaction path a
+   * real run's payload goes through — a repeated-character fixture has zero Shannon entropy and would
+   * never trip the pass, silently hiding the exact defect row 21 exists to catch.
+   */
+  describe('pull_request.merge_fidelity — matrix rows 12, 19, 20', () => {
+    const buildMergeFidelityRun = (
+      label: string,
+      mergeFidelityGit: GitCall,
+    ): {
+      readonly reconciler: Reconciler;
+      readonly run: string;
+      readonly merge: ReturnType<typeof controllableMergeChecker>;
+    } => {
+      const orchHome = makeHome(label);
+      toRemove.push(orchHome);
+      const plan = makePlan({ feature: label, steps: STANDARD_PLAN_STEPS });
+      const writes: RecordedWrite[] = [];
+      const merge = controllableMergeChecker();
+      const reconciler = Reconciler.open({
+        orchHome,
+        plans: planProvider(plan),
+        baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+        executor: createScriptedExecutor(committingCapableScript()),
+        writeExecutor: recordingWriteExecutor(writes),
+        mergeChecker: merge.checker,
+        mergeFidelityGit,
+      });
+      toClose.push(reconciler);
+      const accepted = reconciler.acceptFeature(plan);
+      ungatedConfigSnapshot(accepted.run, orchHome);
+      reconciler.confirm(accepted.run);
+      return { reconciler, run: accepted.run, merge };
+    };
+
+    /** A fake `git` covering `mergeFidelityOf`'s exact call sequence, canned per test. */
+    const fakeMergeFidelityGit = (options: {
+      readonly proposedHead: string;
+      readonly mergeCommit: string;
+      readonly mergeBase: string;
+      readonly touchedPaths: readonly string[];
+      readonly comparisonStdout: string;
+    }): GitCall => {
+      const { proposedHead, mergeCommit, mergeBase, touchedPaths, comparisonStdout } = options;
+      return (args) => {
+        if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
+          return { status: 0, stdout: `${proposedHead}\n`, stderr: '' };
+        }
+        if (args[0] === 'rev-parse' && args[1] === '--verify') {
+          return { status: 0, stdout: `${mergeCommit}\n`, stderr: '' };
+        }
+        if (args[0] === 'merge-base') return { status: 0, stdout: `${mergeBase}\n`, stderr: '' };
+        if (args[0] === 'diff' && args[2] === mergeBase) {
+          return { status: 0, stdout: touchedPaths.length === 0 ? '' : `${touchedPaths.join('\n')}\n`, stderr: '' };
+        }
+        if (args[0] === 'diff' && args[2] === proposedHead) {
+          return { status: 0, stdout: comparisonStdout, stderr: '' };
+        }
+        throw new Error(`unexpected git call in mergeFidelityOf fixture: ${args.join(' ')}`);
+      };
+    };
+
+    it('records outcome: corrected when the merge commit differs on this run’s own touched path (row 12)', async () => {
+      const proposedHead = 'c1de83cbc3a7312c08d943dbecc23783912b82cd';
+      const mergeCommit = '2c40b18d69d0996f02eade0028dbcd0ee646ced5';
+      const mergeBase = 'a9af53ccce93aa8c1025571c7500f36788fabdf9';
+      const { reconciler, run, merge } = buildMergeFidelityRun(
+        'merge-fidelity-corrected',
+        fakeMergeFidelityGit({
+          proposedHead,
+          mergeCommit,
+          mergeBase,
+          touchedPaths: ['src/a.ts'],
+          comparisonStdout: 'src/a.ts\n',
+        }),
+      );
+      await driveToAwaitingMerge(reconciler);
+      merge.state.answer = { state: 'MERGED', mergeCommit };
+
+      await reconciler.pass();
+
+      expect(reconciler.load(run).state.state).toBe('committed');
+      const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+      const fidelity = events.filter((event) => event.type === PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE);
+      expect(fidelity).toHaveLength(1);
+      // The real, non-repeated-character SHAs survive the AD-21 pass verbatim (row 21, exercised here too).
+      const payload = fidelity[0]?.payload ?? {};
+      expect(payload).toMatchObject({
+        [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Outcome]: 'corrected',
+        [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.HeadRefOid]: proposedHead,
+        [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.MergeCommit]: mergeCommit,
+      });
+      expect(Object.keys(payload)).toHaveLength(4);
+      expect(typeof payload[PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Detail]).toBe('string');
+    });
+
+    it('records outcome: unchanged when only unrelated main drift differs, never a false correction (row 19)', async () => {
+      // The touched-paths diff (mergeBase..proposedHead) says this run only ever touched `src/a.ts`. The
+      // final comparison is restricted to exactly that path and finds it unchanged — so this reports
+      // `unchanged` regardless of whatever else `main` picked up on other paths between fork and merge; a
+      // whole-tree comparison would have had no way to tell that drift apart from a real correction.
+      const proposedHead = 'e78c0692580b39a09582a11611be0e8139cdce93';
+      const mergeCommit = 'e9d50f06faec4c587fb25e73cfc435ee6078c6bc';
+      const mergeBase = '33c8fd427ee0179acf4234c7eaf7383fcad9d853';
+      const { reconciler, run, merge } = buildMergeFidelityRun(
+        'merge-fidelity-unchanged-main-drift',
+        fakeMergeFidelityGit({
+          proposedHead,
+          mergeCommit,
+          mergeBase,
+          touchedPaths: ['src/a.ts'],
+          comparisonStdout: '',
+        }),
+      );
+      await driveToAwaitingMerge(reconciler);
+      merge.state.answer = { state: 'MERGED', mergeCommit };
+
+      await reconciler.pass();
+
+      expect(reconciler.load(run).state.state).toBe('committed');
+      const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+      const fidelity = events.filter((event) => event.type === PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE);
+      expect(fidelity).toHaveLength(1);
+      const payload = fidelity[0]?.payload ?? {};
+      expect(payload).toMatchObject({
+        [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Outcome]: 'unchanged',
+        [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.HeadRefOid]: proposedHead,
+        [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.MergeCommit]: mergeCommit,
+      });
+      expect(Object.keys(payload)).toHaveLength(4);
+      expect(typeof payload[PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Detail]).toBe('string');
+    });
+
+    it('records code, never a guessed outcome, when the comparison itself cannot be made (row 13)', async () => {
+      const mergeCommit = '1aa05d03b5192ef1e76faa214c9a5c5009aac4c4';
+      const { reconciler, run, merge } = buildMergeFidelityRun('merge-fidelity-unreadable', () => ({
+        status: 1,
+        stdout: '',
+        stderr: 'boom',
+      }));
+      await driveToAwaitingMerge(reconciler);
+      merge.state.answer = { state: 'MERGED', mergeCommit };
+
+      await reconciler.pass();
+
+      expect(reconciler.load(run).state.state).toBe('committed');
+      const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+      const fidelity = events.filter((event) => event.type === PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE);
+      expect(fidelity).toHaveLength(1);
+      expect(fidelity[0]?.payload[PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Outcome]).toBeUndefined();
+      expect(fidelity[0]?.payload[PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Code]).toBe(
+        'pull_request.merge_fidelity_head_unreadable',
+      );
+    });
+
+    it('never emits a second line when the run’s log already carries one (row 20)', async () => {
+      const mergeCommit = '5ea6748cb81c7e053093927c9815d5e559fcaabb';
+      const mergeFidelityGit: GitCall = () => {
+        throw new Error('mergeFidelityOf must not be called once the line is already recorded');
+      };
+      const { reconciler, run, merge } = buildMergeFidelityRun(
+        'merge-fidelity-idempotent',
+        mergeFidelityGit,
+      );
+      await driveToAwaitingMerge(reconciler);
+
+      // Simulate the established crash-injection seam: a prior pass already recorded the line and crashed
+      // before the following `committed`-transition emit landed, so the run is still `awaiting_merge`.
+      const paths = runPaths(run, reconciler.orchHome);
+      const before = readEventLog(paths.eventLog);
+      const maxSeq = before.reduce((max, event) => Math.max(max, event.seq), 0);
+      const priorLine = {
+        ts: '2026-09-24T10:00:00.000Z',
+        seq: maxSeq + 1,
+        feature: before[0]?.feature ?? 'merge-fidelity-idempotent',
+        run,
+        step: null,
+        emitter: 'engine.reconciler',
+        type: PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE,
+        payload: {
+          [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Outcome]: 'unchanged',
+          [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.HeadRefOid]: 'a-prior-pass-already-recorded-this',
+          [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.MergeCommit]: mergeCommit,
+          [PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.Detail]: 'recorded by a prior, interrupted pass',
+        },
+      };
+      appendFileSync(paths.eventLog, `${JSON.stringify(priorLine)}\n`, 'utf8');
+      expect(reconciler.load(run).state.state).toBe('awaiting_merge');
+
+      merge.state.answer = { state: 'MERGED', mergeCommit };
+      await reconciler.pass();
+
+      expect(reconciler.load(run).state.state).toBe('committed');
+      const events = readEventLog(paths.eventLog);
+      const fidelity = events.filter((event) => event.type === PULL_REQUEST_MERGE_FIDELITY_EVENT_TYPE);
+      expect(fidelity).toHaveLength(1);
+      expect(fidelity[0]?.payload[PULL_REQUEST_MERGE_FIDELITY_PAYLOAD_KEYS.HeadRefOid]).toBe(
+        'a-prior-pass-already-recorded-this',
+      );
+    });
   });
 
   /**
@@ -1790,9 +2084,10 @@ describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
     });
     toClose.push(reconciler);
     const accepted = reconciler.acceptFeature(plan);
+    ungatedConfigSnapshot(accepted.run, orchHome);
     reconciler.confirm(accepted.run);
 
-    for (let index = 0; index < 6; index += 1) await reconciler.pass(); // analyse .. commit
+    for (let index = 0; index < 7; index += 1) await reconciler.pass(); // analyse .. commit
     await reconciler.pass(); // the settlement pass: git_push fails, so this is 'unsettled'
 
     expect(reconciler.load(accepted.run).state.state).not.toBe('awaiting_merge');
@@ -1828,9 +2123,10 @@ describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
     });
     toClose.push(reconciler);
     const accepted = reconciler.acceptFeature(plan);
+    ungatedConfigSnapshot(accepted.run, orchHome);
     reconciler.confirm(accepted.run);
 
-    for (let index = 0; index < 6; index += 1) await reconciler.pass();
+    for (let index = 0; index < 7; index += 1) await reconciler.pass();
     await reconciler.pass(); // git_push succeeds; pull_request fails -> 'unsettled'
 
     expect(flaky.writes.map((write) => write.kind)).toStrictEqual(['git_push', 'pull_request']);
@@ -1843,6 +2139,686 @@ describe('AD-22, AD-15 — awaiting_merge and the bounded merge check', () => {
     // git_push is not attempted a second time: `writeIntentSettled` found its `write.executed` line.
     expect(flaky.writes.map((write) => write.kind)).toStrictEqual(['pull_request']);
     expect(reconciler.load(accepted.run).state.state).toBe('awaiting_merge');
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Story 4-1 (AD-12) — the reversibility gate: every row of the story's own I/O matrix.
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * A run whose project declares a real `gated_reversibility_classes` policy, read the way
+ * `settlePreMergeWrites` reads every project's: from the AD-9 config snapshot, never a hardcoded
+ * constant. `takeConfigSnapshot` is called between `acceptFeature` and `confirm`, exactly the order
+ * `tests/engine.gate-economics.test.ts` already establishes for a run that needs one.
+ */
+const buildGatedRun = (options: {
+  readonly label: string;
+  readonly gatedClasses: readonly ReversibilityClass[];
+  readonly mode?: 'live' | 'shadow';
+  /**
+   * Row 9 — omit `permissions.toml` from the snapshot entirely, rather than writing one that
+   * declares `gatedClasses`. `options.gatedClasses` is then unused; the point of the row is what the
+   * *absence* of the file falls back to.
+   */
+  readonly noPermissionsFile?: boolean;
+}): {
+  readonly reconciler: Reconciler;
+  readonly run: string;
+  readonly writes: RecordedWrite[];
+  readonly feature: string;
+} => {
+  const orchHome = makeHome(options.label);
+  toRemove.push(orchHome);
+  const repository = makeWorkspace(`${options.label}-repo`);
+  toRemove.push(repository);
+  // Blank mechanics commands, so CAP-13's deterministic gates are declared *none* rather than
+  // dispatched to a real runner this fixture never wires — the fixture's own concern is AD-12's write
+  // gate, not the gate economics `tests/engine.gate-economics.test.ts` already covers.
+  writeProfile(
+    repository,
+    fixtureProfile({
+      mechanics: {
+        package_manager: 'npm',
+        commands: { test: '', typecheck: '', lint: '', build: '', run: '' },
+        source_layout: ['src', 'tests'],
+        resources: 'none',
+      },
+    }),
+  );
+  if (options.noPermissionsFile !== true) {
+    writePermissions(
+      repository,
+      fixturePermissions({ gated_reversibility_classes: [...options.gatedClasses] }),
+    );
+  }
+  const plan = makePlan({
+    feature: options.label,
+    mode: options.mode ?? 'live',
+    steps: STANDARD_PLAN_STEPS,
+  });
+  const writes: RecordedWrite[] = [];
+  const reconciler = Reconciler.open({
+    orchHome,
+    plans: planProvider(plan),
+    baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+    executor: createScriptedExecutor(committingCapableScript()),
+    writeExecutor:
+      options.mode === 'shadow' ? recordingShadowWriteExecutor(writes) : recordingWriteExecutor(writes),
+  });
+  toClose.push(reconciler);
+  const accepted = reconciler.acceptFeature(plan);
+  takeConfigSnapshot({ repository, runId: accepted.run, orchHome });
+  reconciler.confirm(accepted.run);
+  return { reconciler, run: accepted.run, writes, feature: options.label };
+};
+
+describe('AD-12, CAP-12, story 4-1 — the reversibility gate', () => {
+  it(
+    'emits write.gate_opened for the first unsettled intent, blocks, and never calls the write ' +
+      'executor (matrix row 1)',
+    async () => {
+      const { reconciler, run, writes } = buildGatedRun({
+        label: 'gate-row-1',
+        gatedClasses: ['irreversible'],
+      });
+      for (let index = 0; index < 8; index += 1) await reconciler.pass();
+
+      const state = reconciler.load(run).state;
+      expect(state.state).toBe('blocked');
+      expect(writes).toStrictEqual([]);
+      expect(state.pending_gate).toStrictEqual({
+        step: 'commit',
+        intent_id: 'commit.git_push',
+        kind: 'git_push',
+        reversibility: 'irreversible',
+        // The whole remaining batch, not only the triggering intent — round-1 review's disclosure fix.
+        batch: [
+          { intent_id: 'commit.git_push', kind: 'git_push' },
+          { intent_id: 'commit.pull_request', kind: 'pull_request' },
+        ],
+        resolution: 'pending',
+      });
+
+      const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+      const opened = events.filter((event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE);
+      expect(opened).toHaveLength(1);
+      expect(opened[0]?.payload[WRITE_GATE_OPENED_PAYLOAD_KEYS.IntentId]).toBe('commit.git_push');
+      expect(opened[0]?.payload[WRITE_GATE_OPENED_PAYLOAD_KEYS.Kind]).toBe('git_push');
+      expect(opened[0]?.payload[WRITE_GATE_OPENED_PAYLOAD_KEYS.Reversibility]).toBe('irreversible');
+      expect(opened[0]?.payload[WRITE_GATE_OPENED_PAYLOAD_KEYS.Step]).toBe('commit');
+      expect(opened[0]?.payload[WRITE_GATE_OPENED_PAYLOAD_KEYS.Batch]).toStrictEqual([
+        { intent_id: 'commit.git_push', kind: 'git_push', target: 'feature/gate-row-1' },
+        { intent_id: 'commit.pull_request', kind: 'pull_request', target: 'feature/gate-row-1' },
+      ]);
+    },
+  );
+
+  it('records write.gate_approved and returns to running with no step disposition touched (matrix row 2)', async () => {
+    const { reconciler, run } = buildGatedRun({ label: 'gate-row-2', gatedClasses: ['irreversible'] });
+    for (let index = 0; index < 8; index += 1) await reconciler.pass();
+    const commitStepBefore = reconciler.load(run).state.steps.find((record) => record.step === 'commit');
+
+    const after = reconciler.approve(run);
+
+    expect(after.state).toBe('running');
+    // The record stays on disk with `resolution: 'approved'` until the whole batch it names actually
+    // settles (round-1 review, rows 3/12) — cleared only once every intent in it carries a
+    // `write.executed`/`write.suppressed` line, which approving alone does not yet make happen.
+    expect(after.pending_gate?.resolution).toBe('approved');
+    expect(after.pending_gate?.intent_id).toBe('commit.git_push');
+    // No step's disposition changed — the committing step's own record is untouched.
+    expect(after.steps.find((record) => record.step === 'commit')).toStrictEqual(commitStepBefore);
+
+    const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+    const approved = events.filter((event) => event.type === WRITE_GATE_APPROVED_EVENT_TYPE);
+    expect(approved).toHaveLength(1);
+    expect(approved[0]?.payload[WRITE_GATE_APPROVED_PAYLOAD_KEYS.IntentId]).toBe('commit.git_push');
+  });
+
+  it('calls the write executor on the next pass once approved, and never re-opens the gate (matrix row 3)', async () => {
+    const { reconciler, run, writes } = buildGatedRun({ label: 'gate-row-3', gatedClasses: ['irreversible'] });
+    for (let index = 0; index < 8; index += 1) await reconciler.pass();
+    reconciler.approve(run);
+    expect(writes).toStrictEqual([]); // approving itself performs no write
+
+    await reconciler.pass();
+
+    expect(writes.map((write) => write.kind)).toStrictEqual(['git_push', 'pull_request']);
+    expect(reconciler.load(run).state.state).toBe('awaiting_merge');
+    const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+    expect(events.filter((event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE)).toHaveLength(1);
+  });
+
+  it('records write.gate_rejected with the reason and hands the run off, never retrying (matrix row 4)', async () => {
+    const { reconciler, run, writes } = buildGatedRun({ label: 'gate-row-4', gatedClasses: ['irreversible'] });
+    for (let index = 0; index < 8; index += 1) await reconciler.pass();
+
+    const after = reconciler.reject(run, 'This push touches a path nobody has reviewed yet.');
+
+    expect(after.state).toBe('handed_off');
+    expect(after.pending_gate).toBeNull();
+    expect(after.handoff?.code).toBe('user.gate_rejected');
+    expect(writes).toStrictEqual([]);
+
+    const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+    const rejected = events.filter((event) => event.type === WRITE_GATE_REJECTED_EVENT_TYPE);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.payload[WRITE_GATE_REJECTED_PAYLOAD_KEYS.IntentId]).toBe('commit.git_push');
+    expect(rejected[0]?.payload[WRITE_GATE_REJECTED_PAYLOAD_KEYS.Reason]).toBe(
+      'This push touches a path nobody has reviewed yet.',
+    );
+
+    // A further pass does not retry the rejected write: the run is terminal.
+    await reconciler.pass();
+    expect(writes).toStrictEqual([]);
+  });
+
+  it(
+    'leaves approve/reject byte-for-byte unchanged for an ordinary step-failure block, with no gate ' +
+      'pending (matrix row 5)',
+    () => {
+      // A run that never composed a commit at all has no `pendingGate` and no write to gate — the
+      // ordinary `permission.denied` escalation this suite already drives elsewhere is `approve`'s other,
+      // pre-existing branch, unreached here on purpose: this asserts the *refusal* half of row 5, that an
+      // approval finds nothing to approve when no gate and no step failure exist, exactly as before this
+      // story.
+      const { reconciler, run } = buildGatedRun({ label: 'gate-row-5', gatedClasses: ['irreversible'] });
+      expect(reconciler.load(run).state.pending_gate).toBeNull();
+      expect(() => reconciler.approve(run)).toThrow(SteeringRefused);
+      // `reject` with no gate pending falls through unchanged to its pre-existing question handling,
+      // which finds no open question either and refuses — never the new gate-scoped branch.
+      expect(() => reconciler.reject(run, 'nothing to reject here')).toThrow(SteeringRefused);
+    },
+  );
+
+  it('performs the write immediately when the project’s policy does not gate irreversible writes (matrix row 6)', async () => {
+    const { reconciler, run, writes } = buildGatedRun({ label: 'gate-row-6', gatedClasses: [] });
+    for (let index = 0; index < 8; index += 1) await reconciler.pass();
+
+    expect(reconciler.load(run).state.state).toBe('awaiting_merge');
+    expect(writes.map((write) => write.kind)).toStrictEqual(['git_push', 'pull_request']);
+    const events = readEventLog(runPaths(run, reconciler.orchHome).eventLog);
+    expect(events.some((event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE)).toBe(false);
+  });
+
+  it('reads no reversibility at all once every intent is already settled — a re-entered pass (matrix row 7)', async () => {
+    const { reconciler, run, writes, feature } = buildGatedRun({
+      label: 'gate-row-7',
+      gatedClasses: ['irreversible'],
+    });
+    for (let index = 0; index < 7; index += 1) await reconciler.pass(); // analyse .. commit; not yet settled
+
+    // Simulate the crash-recovery re-entrancy `settlePreMergeWrites`'s own docblock describes: both
+    // pre-merge intents already landed durably, but the `feature.state_changed` to `awaiting_merge` did
+    // not — so the next pass re-enters `settlePreMergeWrites` and must find both already settled.
+    const paths = runPaths(run, reconciler.orchHome);
+    const before = readEventLog(paths.eventLog);
+    const maxSeq = before.reduce((max, event) => Math.max(max, event.seq), 0);
+    const priorLine = (seq: number, intentId: string, kind: string) => ({
+      ts: '2026-09-24T10:00:00.000Z',
+      seq,
+      feature,
+      run,
+      step: null,
+      emitter: 'engine.reconciler',
+      type: 'write.executed',
+      payload: {
+        intent_id: intentId,
+        kind,
+        target: 'feature/gate-row-7',
+        already_present: false,
+        detail: 'pre-settled by a prior, interrupted pass',
+      },
+    });
+    appendFileSync(paths.eventLog, `${JSON.stringify(priorLine(maxSeq + 1, 'commit.git_push', 'git_push'))}\n`, 'utf8');
+    appendFileSync(
+      paths.eventLog,
+      `${JSON.stringify(priorLine(maxSeq + 2, 'commit.pull_request', 'pull_request'))}\n`,
+      'utf8',
+    );
+
+    await reconciler.pass(); // the re-entered settlement pass
+
+    expect(writes).toStrictEqual([]); // the executor is never called for either
+    const events = readEventLog(paths.eventLog);
+    expect(events.some((event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE)).toBe(false);
+    expect(reconciler.load(run).state.state).toBe('awaiting_merge');
+  });
+
+  it('gates a shadow run exactly the same as a live run (matrix row 8)', async () => {
+    const { reconciler, run, writes } = buildGatedRun({
+      label: 'gate-row-8',
+      gatedClasses: ['irreversible'],
+      mode: 'shadow',
+    });
+    for (let index = 0; index < 8; index += 1) await reconciler.pass();
+
+    expect(reconciler.load(run).state.state).toBe('blocked');
+    expect(writes).toStrictEqual([]);
+    const opened = readEventLog(runPaths(run, reconciler.orchHome).eventLog).filter(
+      (event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE,
+    );
+    expect(opened).toHaveLength(1);
+
+    // Once approved, a shadow run settles exactly the way `mode: 'shadow'` already does for an ungated
+    // one (story 3-2): all three intents suppress in the one pass and it reaches `committed` directly.
+    reconciler.approve(run);
+    for (
+      let index = 0;
+      index < 5 && reconciler.load(run).state.state !== 'committed';
+      index += 1
+    ) {
+      await reconciler.pass();
+    }
+    expect(reconciler.load(run).state.state).toBe('committed');
+    expect(writes.map((write) => write.kind)).toStrictEqual(['git_push', 'pull_request', 'git_note']);
+  });
+
+  it('falls back to the installer’s own default when permissions.toml is absent, and still gates (matrix row 9)', async () => {
+    const { reconciler, run, writes } = buildGatedRun({
+      label: 'gate-row-9',
+      gatedClasses: [],
+      noPermissionsFile: true,
+    });
+    for (let index = 0; index < 8; index += 1) await reconciler.pass();
+
+    expect(reconciler.load(run).state.state).toBe('blocked');
+    expect(writes).toStrictEqual([]);
+    const opened = readEventLog(runPaths(run, reconciler.orchHome).eventLog).filter(
+      (event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE,
+    );
+    expect(opened).toHaveLength(1);
+    expect(opened[0]?.payload[WRITE_GATE_OPENED_PAYLOAD_KEYS.Reversibility]).toBe('irreversible');
+  });
+
+  it(
+    'refuses a reject naming both a pending gate and an open question, resolving neither (matrix row 10)',
+    async () => {
+      const { reconciler, run, writes } = buildGatedRun({
+        label: 'gate-row-10',
+        gatedClasses: ['irreversible'],
+      });
+      for (let index = 0; index < 8; index += 1) await reconciler.pass();
+      expect(reconciler.load(run).state.state).toBe('blocked');
+
+      const draft: QuestionDraft = {
+        prompt: 'Does this touch a shared config file?',
+        brief: 'A long-window question left open while the run reached the commit step and gated.',
+        options: [
+          { id: 'yes', label: 'Yes', consequence: 'Narrow the territory.' },
+          { id: 'no', label: 'No', consequence: 'Proceed as declared.' },
+        ],
+        escape: { id: 'decide-later', label: 'Ask me later', consequence: 'Nothing changes yet.' },
+        recommended_option_id: 'no',
+        default_action: 'No is assumed.',
+        default_window_ms: 15 * 60 * 1000,
+      };
+      reconciler.ask(run, draft);
+
+      expect(() => reconciler.reject(run, 'reject the gate, or is this about the question?')).toThrow(
+        SteeringRefused,
+      );
+      // Neither the gate nor the question moved.
+      expect(reconciler.load(run).state.pending_gate?.resolution).toBe('pending');
+      expect(reconciler.load(run).state.state).toBe('blocked');
+      expect(writes).toStrictEqual([]);
+      const rejected = readEventLog(runPaths(run, reconciler.orchHome).eventLog).filter(
+        (event) => event.type === WRITE_GATE_REJECTED_EVENT_TYPE,
+      );
+      expect(rejected).toStrictEqual([]);
+    },
+  );
+
+  it(
+    'refuses a later approve when a rejection landed but the hand-off transition did not — a crash ' +
+      'window (matrix row 11)',
+    async () => {
+      const { reconciler, run, writes, feature } = buildGatedRun({
+        label: 'gate-row-11',
+        gatedClasses: ['irreversible'],
+      });
+      for (let index = 0; index < 8; index += 1) await reconciler.pass();
+      expect(reconciler.load(run).state.state).toBe('blocked');
+
+      // Simulate the crash the story's own review round traced by hand: `write.gate_rejected` lands
+      // durably, but the `command.applied` line carrying the `handed_off` transition does not.
+      const paths = runPaths(run, reconciler.orchHome);
+      const before = readEventLog(paths.eventLog);
+      const maxSeq = before.reduce((max, event) => Math.max(max, event.seq), 0);
+      const priorLine = {
+        ts: '2026-09-24T10:00:00.000Z',
+        seq: maxSeq + 1,
+        feature,
+        run,
+        step: null,
+        emitter: 'engine.reconciler',
+        type: WRITE_GATE_REJECTED_EVENT_TYPE,
+        payload: {
+          [WRITE_GATE_REJECTED_PAYLOAD_KEYS.IntentId]: 'commit.git_push',
+          [WRITE_GATE_REJECTED_PAYLOAD_KEYS.Reason]: 'a prior, interrupted pass already rejected this',
+        },
+      };
+      appendFileSync(paths.eventLog, `${JSON.stringify(priorLine)}\n`, 'utf8');
+
+      const loaded = reconciler.load(run).state;
+      expect(loaded.state).toBe('blocked'); // the transition never landed
+      expect(loaded.pending_gate?.resolution).toBe('rejected'); // but the decision is on record
+
+      expect(() => reconciler.approve(run)).toThrow(SteeringRefused);
+      expect(reconciler.load(run).state.state).toBe('blocked'); // never silently resumed
+      expect(writes).toStrictEqual([]);
+    },
+  );
+
+  it(
+    'runs the remaining intents without a second approval once one of an approved batch already ' +
+      'settled — a crash window (matrix row 12)',
+    async () => {
+      const { reconciler, run, writes, feature } = buildGatedRun({
+        label: 'gate-row-12',
+        gatedClasses: ['irreversible'],
+      });
+      for (let index = 0; index < 8; index += 1) await reconciler.pass();
+      reconciler.approve(run);
+      expect(reconciler.load(run).state.pending_gate?.resolution).toBe('approved');
+
+      // Simulate the crash: the first intent of the approved batch settled durably; the reconciler died
+      // before the write executor was ever asked for the second.
+      const paths = runPaths(run, reconciler.orchHome);
+      const before = readEventLog(paths.eventLog);
+      const maxSeq = before.reduce((max, event) => Math.max(max, event.seq), 0);
+      const priorLine = {
+        ts: '2026-09-24T10:00:00.000Z',
+        seq: maxSeq + 1,
+        feature,
+        run,
+        step: null,
+        emitter: 'engine.reconciler',
+        type: 'write.executed',
+        payload: {
+          intent_id: 'commit.git_push',
+          kind: 'git_push',
+          target: `feature/${feature}`,
+          already_present: false,
+          detail: 'pre-settled by a prior, interrupted pass',
+        },
+      };
+      appendFileSync(paths.eventLog, `${JSON.stringify(priorLine)}\n`, 'utf8');
+
+      await reconciler.pass(); // the re-entered settlement pass
+
+      // git_push is never handed to the executor a second time; only pull_request is.
+      expect(writes.map((write) => write.kind)).toStrictEqual(['pull_request']);
+      expect(reconciler.load(run).state.state).toBe('awaiting_merge');
+      const opened = readEventLog(paths.eventLog).filter(
+        (event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE,
+      );
+      expect(opened).toHaveLength(1); // never a second gate for the same batch
+    },
+  );
+
+  it(
+    'self-heals a crash between write.gate_opened landing and the following blocked transition ' +
+      'landing, without opening a second gate',
+    async () => {
+      const { reconciler, run, writes, feature } = buildGatedRun({
+        label: 'gate-row-crash-open',
+        gatedClasses: ['irreversible'],
+      });
+      for (let index = 0; index < 7; index += 1) await reconciler.pass(); // analyse .. commit only
+
+      // Fabricate exactly the durable half of the gate-opening pass, without the `blocked` transition
+      // that pass would otherwise also emit — the window `settlePreMergeWrites`'s own docblock names.
+      const paths = runPaths(run, reconciler.orchHome);
+      const before = readEventLog(paths.eventLog);
+      const maxSeq = before.reduce((max, event) => Math.max(max, event.seq), 0);
+      const priorLine = {
+        ts: '2026-09-24T10:00:00.000Z',
+        seq: maxSeq + 1,
+        feature,
+        run,
+        step: null,
+        emitter: 'engine.reconciler',
+        type: WRITE_GATE_OPENED_EVENT_TYPE,
+        payload: {
+          [WRITE_GATE_OPENED_PAYLOAD_KEYS.IntentId]: 'commit.git_push',
+          [WRITE_GATE_OPENED_PAYLOAD_KEYS.Kind]: 'git_push',
+          [WRITE_GATE_OPENED_PAYLOAD_KEYS.Target]: `feature/${feature}`,
+          [WRITE_GATE_OPENED_PAYLOAD_KEYS.Reversibility]: 'irreversible',
+          [WRITE_GATE_OPENED_PAYLOAD_KEYS.Step]: 'commit',
+          [WRITE_GATE_OPENED_PAYLOAD_KEYS.Batch]: [
+            { intent_id: 'commit.git_push', kind: 'git_push', target: `feature/${feature}` },
+            { intent_id: 'commit.pull_request', kind: 'pull_request', target: `feature/${feature}` },
+          ],
+        },
+      };
+      appendFileSync(paths.eventLog, `${JSON.stringify(priorLine)}\n`, 'utf8');
+      expect(reconciler.load(run).state.state).not.toBe('blocked'); // the transition truly never landed
+
+      await reconciler.pass(); // the re-entered pass completes the transition, opening nothing new
+
+      expect(reconciler.load(run).state.state).toBe('blocked');
+      expect(writes).toStrictEqual([]);
+      const opened = readEventLog(paths.eventLog).filter(
+        (event) => event.type === WRITE_GATE_OPENED_EVENT_TYPE,
+      );
+      expect(opened).toHaveLength(1); // the fabricated line stands; no second one was ever emitted
+    },
+  );
+
+  it('refuses the run with MixedReversibilityBatch rather than under-gating, when a composed commit’s intents disagree', async () => {
+    const { reconciler, run, writes } = buildGatedRun({
+      label: 'gate-row-mixed',
+      gatedClasses: ['irreversible'],
+    });
+    for (let index = 0; index < 7; index += 1) await reconciler.pass(); // analyse .. commit
+
+    const paths = runPaths(run, reconciler.orchHome);
+    const artifactPath = join(paths.runDir, COMPOSED_COMMIT_RELATIVE_PATH);
+    const composed = JSON.parse(readFileSync(artifactPath, 'utf8')) as {
+      intents: { kind: string; reversibility: string }[];
+    };
+    const pullRequestIntent = composed.intents.find((intent) => intent.kind === 'pull_request');
+    expect(pullRequestIntent).toBeDefined();
+    if (pullRequestIntent !== undefined) pullRequestIntent.reversibility = 'reversible';
+    writeFileSync(artifactPath, `${JSON.stringify(composed, null, 2)}\n`, 'utf8');
+
+    // A per-run refusal (`tests/engine.reconciler.test.ts`'s own "one unreadable run does not stop
+    // every other feature" discipline), not a rejected promise — `MixedReversibilityBatch` is deliberately
+    // left uncaught by `settlePreMergeWrites`'s one call site and caught here, at `pass()`'s own boundary.
+    const result = await reconciler.pass();
+    expect(result.refusals).toHaveLength(1);
+    expect(result.refusals[0]?.run).toBe(run);
+    expect(result.refusals[0]?.code).toBe('internal.invariant_violated');
+    expect(result.refusals[0]?.reason).toContain('MixedReversibilityBatch');
+    expect(writes).toStrictEqual([]);
+  });
+
+  it('refuses the run with UnreadableGateConfiguration for a genuinely corrupt permissions.toml, never treating it as no gate or the default', async () => {
+    const label = 'gate-row-unreadable';
+    const orchHome = makeHome(label);
+    toRemove.push(orchHome);
+    const repository = makeWorkspace(`${label}-repo`);
+    toRemove.push(repository);
+    writeProfile(
+      repository,
+      fixtureProfile({
+        mechanics: {
+          package_manager: 'npm',
+          commands: { test: '', typecheck: '', lint: '', build: '', run: '' },
+          source_layout: ['src', 'tests'],
+          resources: 'none',
+        },
+      }),
+    );
+    // A corrupt `permissions.toml`, present but not this build's TOML subset — never merely absent.
+    mkdirSync(join(repository, '.orch'), { recursive: true });
+    writeFileSync(join(repository, '.orch', 'permissions.toml'), '][not toml', 'utf8');
+
+    const plan = makePlan({ feature: label, steps: STANDARD_PLAN_STEPS });
+    const writes: RecordedWrite[] = [];
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(plan),
+      baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+      executor: createScriptedExecutor(committingCapableScript()),
+      writeExecutor: recordingWriteExecutor(writes),
+    });
+    toClose.push(reconciler);
+    const accepted = reconciler.acceptFeature(plan);
+    takeConfigSnapshot({ repository, runId: accepted.run, orchHome });
+    reconciler.confirm(accepted.run);
+
+    for (let index = 0; index < 7; index += 1) await reconciler.pass(); // analyse .. commit
+    // A per-run refusal, not a rejected promise — the same "one unreadable run does not stop every
+    // other feature" boundary the mixed-batch test above documents.
+    const result = await reconciler.pass();
+    expect(result.refusals).toHaveLength(1);
+    expect(result.refusals[0]?.run).toBe(accepted.run);
+    expect(result.refusals[0]?.code).toBe('config.invalid');
+    expect(result.refusals[0]?.reason).toContain('UnreadableGateConfiguration');
+    expect(writes).toStrictEqual([]);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Story 3-2 (AD-27) — a shadow run never enters `awaiting_merge` (matrix row 10).
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * A write executor that emits the shadow shape — `write.attempted` then `write.suppressed`, never
+ * `write.executed` — for every intent it is handed. The suppression logic itself
+ * (`performWriteIntent`/`performGitNoteShadow` under `mode: 'shadow'`) is `src/engine/write-executor.ts`'s
+ * own subject, proven in `tests/engine.write-executor.test.ts`; what this file's own test needs is only
+ * that the reconciler routes a run whose intents settle this way straight to `committed`.
+ */
+const recordingShadowWriteExecutor = (writes: RecordedWrite[]): WriteExecutorPort => {
+  const port: WriteExecutorPort = (intent, context) => {
+    writes.push({ kind: intent.kind, mergeCommit: context.mergeCommit });
+    context.emit('write.attempted', {
+      intent_id: intent.intent_id,
+      kind: intent.kind,
+      target: intent.target,
+    });
+    context.emit('write.suppressed', {
+      intent_id: intent.intent_id,
+      kind: intent.kind,
+      target: intent.target,
+      destructive: false,
+      detail: 'suppressed by the test double',
+    });
+    return Promise.resolve({
+      status: 'suppressed' as const,
+      destructive: false,
+      detail: 'suppressed by the test double',
+    });
+  };
+  return port;
+};
+
+describe('AD-27, story 3-2 — a shadow run never enters awaiting_merge (matrix row 10)', () => {
+  it('reaches committed directly once push, pull-request and note all settle as write.suppressed', async () => {
+    const orchHome = makeHome('shadow-committed');
+    toRemove.push(orchHome);
+    const plan = makePlan({ feature: 'shadow-committed', mode: 'shadow', steps: STANDARD_PLAN_STEPS });
+    const writes: RecordedWrite[] = [];
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(plan),
+      baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+      executor: createScriptedExecutor(committingCapableScript()),
+      writeExecutor: recordingShadowWriteExecutor(writes),
+      // Deliberately no `mergeChecker`: a shadow run must never need one, since it never enters
+      // `awaiting_merge` to begin with — wiring one here would leave a bug that reached for it unnoticed.
+    });
+    toClose.push(reconciler);
+    const accepted = reconciler.acceptFeature(plan);
+    ungatedConfigSnapshot(accepted.run, orchHome);
+    reconciler.confirm(accepted.run);
+
+    const seenStates: string[] = [];
+    for (let index = 0; index < 10 && reconciler.load(accepted.run).state.state !== 'committed'; index += 1) {
+      await reconciler.pass();
+      seenStates.push(reconciler.load(accepted.run).state.state);
+    }
+
+    expect(reconciler.load(accepted.run).state.state).toBe('committed');
+    expect(seenStates).not.toContain('awaiting_merge');
+    // All three composed intents settle in this one pass, unlike a live run's push/pull-request-then-note
+    // split — there is no merge to wait on, so nothing is held back.
+    expect(writes.map((write) => write.kind)).toStrictEqual(['git_push', 'pull_request', 'git_note']);
+    expect(writes.every((write) => write.mergeCommit === null)).toBe(true);
+
+    const events = readEventLog(runPaths(accepted.run, reconciler.orchHome).eventLog);
+    expect(events.some((event) => event.type === 'write.executed')).toBe(false);
+    expect(
+      events.filter((event) => event.type === 'write.suppressed').map((event) => event.payload['kind']),
+    ).toStrictEqual(['git_push', 'pull_request', 'git_note']);
+  });
+});
+
+/**
+ * The reconciler's `mode: plan.mode` wiring, exercised against the *real* `performWriteIntent` — every
+ * other shadow test above drives a hand-rolled stub that never reads `context.mode` at all, so none of
+ * them can prove the reconciler actually threads it through correctly. This wraps the real function with
+ * fake `git`/`gh` calls, the same pattern `tests/engine.write-executor.test.ts` drives it with directly,
+ * so the only thing injected is the process boundary — the mode-branching logic under test is 3-2's own.
+ */
+describe('AD-27, story 3-2 — the real performWriteIntent, through a Reconciler, under mode: shadow', () => {
+  it('never issues a real mutating git/gh call for a shadow run', async () => {
+    const orchHome = makeHome('shadow-real-executor');
+    toRemove.push(orchHome);
+    const plan = makePlan({ feature: 'shadow-real-executor', mode: 'shadow', steps: STANDARD_PLAN_STEPS });
+
+    const calls: string[] = [];
+    const git: GitCall = (args) => {
+      calls.push(`git ${args.join(' ')}`);
+      if (args[0] === 'rev-parse') return { status: 0, stdout: `${'a'.repeat(40)}\n`, stderr: '' };
+      if (args[0] === 'ls-remote') return { status: 0, stdout: '', stderr: '' }; // nothing found yet
+      if (args[0] === 'fetch') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'notes' && args[2] === 'show') {
+        return { status: 1, stdout: '', stderr: 'error: no note found for object.' };
+      }
+      throw new Error(`a shadow run must never reach this real git call: ${args.join(' ')}`);
+    };
+    const gh: GhCall = (args) => {
+      calls.push(`gh ${args.join(' ')}`);
+      if (args[0] === 'pr' && args[1] === 'list') return Promise.resolve({ status: 0, stdout: '[]', stderr: '' });
+      throw new Error(`a shadow run must never reach this real gh call: ${args.join(' ')}`);
+    };
+    // The real performer, with only its process boundary faked — exactly `tests/engine.write-executor.test.ts`'s
+    // own pattern (`contextFor({ git, gh, mode: 'shadow' })`), reached this time through a real `Reconciler`.
+    const writeExecutor: WriteExecutorPort = (intent, context) =>
+      performWriteIntent(intent, { ...context, git, gh });
+
+    const reconciler = Reconciler.open({
+      orchHome,
+      plans: planProvider(plan),
+      baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+      executor: createScriptedExecutor(committingCapableScript()),
+      writeExecutor,
+    });
+    toClose.push(reconciler);
+    const accepted = reconciler.acceptFeature(plan);
+    ungatedConfigSnapshot(accepted.run, orchHome);
+    reconciler.confirm(accepted.run);
+
+    for (let index = 0; index < 10 && reconciler.load(accepted.run).state.state !== 'committed'; index += 1) {
+      await reconciler.pass();
+    }
+
+    expect(reconciler.load(accepted.run).state.state).toBe('committed');
+    // The real performer did run real probes (this is not vacuous)...
+    expect(calls.length).toBeGreaterThan(0);
+    // ...but never once the mutating half of any of the three kinds.
+    expect(calls.some((call) => call.startsWith('git push'))).toBe(false);
+    expect(calls.some((call) => call.includes('notes') && call.includes(' add'))).toBe(false);
+    expect(calls.some((call) => call.startsWith('gh pr create'))).toBe(false);
+
+    const events = readEventLog(runPaths(accepted.run, reconciler.orchHome).eventLog);
+    expect(events.some((event) => event.type === 'write.executed')).toBe(false);
+    expect(events.filter((event) => event.type === 'write.suppressed')).toHaveLength(3);
   });
 });
 
@@ -1890,5 +2866,836 @@ describe('AD-24 — awaiting_merge is excluded from the wall-clock ceiling (matr
     // Elapsed since creation is 24h10m; `drafting` (00:00–00:05) and `awaiting_merge` (00:10 onward) are
     // both excluded, leaving only the five `running` minutes in between — never the 24 hours of waiting.
     expect(consumption.wallClockMs).toBe(5 * 60 * 1000);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Story 4-2 — the adversarial spawn-gating check (I/O matrix rows 1-3), and the hand-off routing a
+// broken attempt takes (row 5).
+// -------------------------------------------------------------------------------------------------
+
+describe('story 4-2 — the adversarial spawn-gating check and hand-off routing', () => {
+  const CRITERIA = ['the runner takes a declared name, never a command string', 'a skip is never a pass'];
+
+  /** `verify`'s own output, judging `CRITERIA` with the verdicts given, one per criterion in order. */
+  const verificationOutput = (verdicts: readonly string[]): Record<string, unknown> => ({
+    contract_id: 'step.verification',
+    step: 'verify',
+    status: 'completed',
+    summary: 'The gates passed; verdicts as scripted for this test.',
+    provenance: [],
+    decisions: [],
+    artifacts: [],
+    questions: [],
+    write_intents: [],
+    error: null,
+    gates: [],
+    judgements: CRITERIA.map((criterion, index) => ({
+      criterion,
+      verdict: verdicts[index],
+      grounds: 'scripted for this test',
+      provenance: { step: 'verify', source: 'src/runner/commands.ts' },
+    })),
+  });
+
+  /** `adversarial`'s own output: one attempt, `held` unless `overrides` says otherwise. */
+  const adversarialOutput = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    contract_id: 'step.adversarial',
+    step: 'adversarial',
+    status: 'completed',
+    summary: 'One attempt, scripted for this test.',
+    provenance: [],
+    decisions: [],
+    artifacts: [],
+    questions: [],
+    write_intents: [],
+    error: null,
+    gates: [],
+    attempts: [
+      {
+        attempted: 'Tried to smuggle an arbitrary command past the declared-command enum.',
+        observed: 'Held, unless this test overrides it.',
+        verdict: 'held',
+        provenance: { step: 'adversarial', source: 'src/runner/commands.ts' },
+      },
+    ],
+    verdict: 'held',
+    ...overrides,
+  });
+
+  /**
+   * A scripted executor completing every phase on its first attempt, `verify` and `adversarial` with
+   * the outputs above — everything else (including `commit`, which composes no prose here) with a bare
+   * completion. Every started step's id is pushed to `spawned`, in order, which is how a skip is told
+   * from a spawn: a skipped `adversarial` never reaches this callback at all.
+   */
+  const script = (
+    spawned: string[],
+    verifyVerdicts: readonly string[],
+    adversarialOverrides: Record<string, unknown> = {},
+  ): ScriptedExecutorOptions => ({
+    onStart: (request) => {
+      spawned.push(request.step);
+      if (request.phase === 'verification') {
+        const raw = verificationOutput(verifyVerdicts);
+        return terminated(request.step, 'completed', {
+          output: StepOutputSchema.parse(raw),
+          contractOutput: raw,
+        });
+      }
+      if (request.phase === 'adversarial') {
+        const raw = adversarialOutput(adversarialOverrides);
+        return terminated(request.step, 'completed', {
+          output: StepOutputSchema.parse(raw),
+          contractOutput: raw,
+        });
+      }
+      return terminated(request.step, 'completed', {});
+    },
+  });
+
+  /** Analyse, plan, implement, test, verify — one pass each, which is every step before `adversarial`. */
+  const driveThroughVerify = async (reconciler: Reconciler): Promise<void> => {
+    for (let index = 0; index < 5; index += 1) await reconciler.pass();
+  };
+
+  it("spawns adversarial, and the plan advances, once every one of verify's judgements is met (row 1)", async () => {
+    const plan = makePlan({ steps: STANDARD_PLAN_STEPS, acceptance_criteria: CRITERIA });
+    const spawned: string[] = [];
+    const { reconciler } = openReconciler({ plan, script: script(spawned, ['met', 'met']) });
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    await driveThroughVerify(reconciler);
+    await reconciler.pass(); // the pass that decides whether to spawn adversarial
+
+    expect(spawned).toContain('adversarial');
+    const events = readEventLog(runPaths(accepted.run, home).eventLog);
+    expect(events.some((event) => event.type === ADVERSARIAL_SKIPPED_EVENT_TYPE)).toBe(false);
+    const record = reconciler.load(accepted.run).state.steps.find((entry) => entry.step === 'adversarial');
+    expect(record?.disposition).toBe('completed');
+
+    // The plan advances: the very next pass reaches for `commit`.
+    await reconciler.pass();
+    expect(spawned).toContain('commit');
+  });
+
+  it.each([
+    ['unmet', ['unmet', 'met']],
+    ['undetermined', ['undetermined', 'met']],
+  ])('skips adversarial and records why when a judgement is %s (rows 2, 3)', async (_label, verdicts) => {
+    const plan = makePlan({ steps: STANDARD_PLAN_STEPS, acceptance_criteria: CRITERIA });
+    const spawned: string[] = [];
+    const { reconciler } = openReconciler({ plan, script: script(spawned, verdicts) });
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    await driveThroughVerify(reconciler);
+    await reconciler.pass(); // the pass that would otherwise have spawned adversarial
+
+    // The skip is recorded, never silent (the same "declared but not run" shape a skipped gate has) —
+    // and the step never reaches the executor at all.
+    expect(spawned).not.toContain('adversarial');
+    const events = readEventLog(runPaths(accepted.run, home).eventLog);
+    const skip = events.find((event) => event.type === ADVERSARIAL_SKIPPED_EVENT_TYPE);
+    expect(skip).toBeDefined();
+    expect(skip?.step).toBe('adversarial');
+    expect(skip?.payload['unresolved_criteria']).toStrictEqual([CRITERIA[0]]);
+
+    // The step still completes — no model was spent — and the plan proceeds to `commit` exactly as it
+    // does today.
+    const record = reconciler.load(accepted.run).state.steps.find((entry) => entry.step === 'adversarial');
+    expect(record?.disposition).toBe('completed');
+    expect(record?.error).toBeNull();
+    await reconciler.pass();
+    expect(spawned).toContain('commit');
+  });
+
+  it('routes a broken attempt through step.adversarial_break_found and blocks for a person (row 5)', async () => {
+    const plan = makePlan({ steps: STANDARD_PLAN_STEPS, acceptance_criteria: CRITERIA });
+    const spawned: string[] = [];
+    const { reconciler } = openReconciler({
+      plan,
+      script: script(spawned, ['met', 'met'], {
+        attempts: [
+          {
+            attempted: 'Ran the declared test command with a crafted argument.',
+            observed: 'The argument reached a real shell, unrestricted by the declared-command boundary.',
+            verdict: 'broken',
+            provenance: { step: 'adversarial', source: 'src/runner/index.ts' },
+          },
+        ],
+        verdict: 'broken',
+      }),
+    });
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    await driveThroughVerify(reconciler);
+    await reconciler.pass(); // spawns adversarial, which reports the break
+    await reconciler.pass(); // routes the termination: escalate-to-human, per AD-35
+
+    const state = reconciler.load(accepted.run).state;
+    const record = state.steps.find((entry) => entry.step === 'adversarial');
+    expect(record?.disposition).toBe('failed');
+    expect(record?.error?.code).toBe('step.adversarial_break_found');
+    expect(dispositionFor('step.adversarial_break_found')).toBe('escalate-to-human');
+    // Never auto-retried and never auto-promoted: the run blocks for a person rather than re-running
+    // the same step or climbing the model ladder against a defect in the implementation it cannot edit.
+    expect(state.state).toBe('blocked');
+    expect(spawned.filter((step) => step === 'adversarial')).toHaveLength(1);
+  });
+
+  /**
+   * Round-1 review's own highest-value finding: nothing proved the `gates` field copied into
+   * `adversarial`'s own input actually equals `verify`'s own recorded gate report — the central
+   * "read, never re-run" economics claim this story's third tier depends on. Proven a real gap by
+   * mutation, not just argued: mutating `adversarialSpawnGates`'s `gatesOfLatestAttempt(...)` call to
+   * unconditionally return `[]` left the entire suite passing before this test existed.
+   *
+   * A *real* fake gate runner is wired in (`Reconciler.open`'s own `gates` seam, the same one
+   * `tests/engine.gate-economics.test.ts` drives), reporting three distinct, non-trivial outcomes —
+   * never the degenerate all-empty or all-default shape a weaker fixture could pass by accident.
+   */
+  it(
+    "gives adversarial's own step input verify's identical gate report, and never runs a gate " +
+      'command a second time for it',
+    async () => {
+      const plan = makePlan({ steps: STANDARD_PLAN_STEPS, acceptance_criteria: CRITERIA });
+      const repository = makeWorkspace('adversarial-gate-copy-repo');
+      toRemove.push(repository);
+      writeProfile(repository, fixtureProfile());
+
+      /** Every call, by step and gate command — this is what proves "never a second time". */
+      const invocations: { readonly step: string; readonly command: string }[] = [];
+      const gates = (request: GateRunRequest): DeterministicGateRunner => ({
+        run: (command: string): GateOutcomeRecord => {
+          invocations.push({ step: request.step, command });
+          return {
+            command,
+            declared: `npm run ${command}`,
+            outcome: 'passed',
+            exitStatus: 0,
+            evidence: `evidence/${command}-1.log`,
+            containerName: `orch-${request.run}-${request.step}-${command}-${String(request.attempt)}`,
+            summary: `the ${command} gate passed`,
+          };
+        },
+      });
+
+      const spawned: string[] = [];
+      const reconciler = Reconciler.open({
+        orchHome: home,
+        executor: createScriptedExecutor(script(spawned, ['met', 'met'])),
+        plans: planProvider(plan),
+        baseline: { currentRef: () => 'a'.repeat(40), resetTo: () => undefined },
+        gates,
+      });
+      toClose.push(reconciler);
+
+      const accepted = reconciler.acceptFeature(plan);
+      takeConfigSnapshot({ repository, runId: accepted.run, orchHome: home });
+      reconciler.confirm(accepted.run);
+
+      await driveThroughVerify(reconciler); // the real gates run once, for `verify`'s own attempt
+      await reconciler.pass(); // spawns `adversarial`, which must not run them again
+
+      // Every gate ran exactly once, and only ever for `verify`.
+      expect(invocations).toStrictEqual([
+        { step: 'verify', command: 'typecheck' },
+        { step: 'verify', command: 'lint' },
+        { step: 'verify', command: 'test' },
+      ]);
+      expect(spawned).toContain('adversarial');
+
+      // The step input the reconciler wrote for `adversarial` carries the identical report, byte for
+      // byte — read from disk, the same artifact a real step agent would read.
+      const inputPath = join(runPaths(accepted.run, home).runDir, 'steps', 'adversarial', 'input.json');
+      const input = StepInputSchema.parse(JSON.parse(readFileSync(inputPath, 'utf8')));
+      expect(input.gates).toStrictEqual([
+        {
+          command: 'typecheck',
+          declared: 'npm run typecheck',
+          outcome: 'passed',
+          exit_status: 0,
+          evidence: 'evidence/typecheck-1.log',
+        },
+        {
+          command: 'lint',
+          declared: 'npm run lint',
+          outcome: 'passed',
+          exit_status: 0,
+          evidence: 'evidence/lint-1.log',
+        },
+        {
+          command: 'test',
+          declared: 'npm run test',
+          outcome: 'passed',
+          exit_status: 0,
+          evidence: 'evidence/test-1.log',
+        },
+      ]);
+    },
+  );
+
+  /**
+   * Two recorded `verify` attempts for one run: the real one this suite drives, plus a second,
+   * constructed directly on the log — the same way this file's own "self-heals a crash..." and
+   * "reads no reversibility at all... — a re-entered pass" tests fabricate a prior line. A step's
+   * `StepStarted` marks the boundary `judgementVerdictsOfLatestAttempt` resets its reading at, so a
+   * second, later attempt with different judgements is what proves the reader is not simply "the
+   * first (or only) one it happens to find".
+   */
+  it('reads only the latest recorded verify attempt, never a stale earlier judgement set', async () => {
+    const plan = makePlan({ steps: STANDARD_PLAN_STEPS, acceptance_criteria: CRITERIA });
+    const spawned: string[] = [];
+    const { reconciler } = openReconciler({ plan, script: script(spawned, ['met', 'met']) });
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+    await driveThroughVerify(reconciler); // the real, first attempt: every judgement met
+
+    const paths = runPaths(accepted.run, home);
+    const before = readEventLog(paths.eventLog);
+    const maxSeq = before.reduce((max, event) => Math.max(max, event.seq), 0);
+    const envelope = (seq: number, type: string, payload: Record<string, unknown>): EventEnvelope => ({
+      ts: '2026-09-24T11:00:00.000Z',
+      seq,
+      feature: plan.feature,
+      run: accepted.run,
+      step: 'verify',
+      emitter: 'engine.reconciler',
+      type,
+      payload,
+    });
+    // A second, later attempt at the same step id, carrying a judgement the first did not: a
+    // fresh `StepStarted` boundary, the recorded verdicts, then a `completed` termination — so the
+    // checkpoint folds `verify` as `completed` again rather than as an orphaned, in-flight step.
+    appendFileSync(
+      paths.eventLog,
+      `${JSON.stringify(envelope(maxSeq + 1, ENGINE_EVENT_TYPES.StepStarted, {}))}\n`,
+      'utf8',
+    );
+    appendFileSync(
+      paths.eventLog,
+      `${JSON.stringify(
+        envelope(maxSeq + 2, VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE, {
+          [VERIFICATION_JUDGEMENTS_RECORDED_PAYLOAD_KEYS.Judgements]: [
+            { criterion: CRITERIA[0], verdict: 'unmet' },
+            { criterion: CRITERIA[1], verdict: 'met' },
+          ],
+        }),
+      )}\n`,
+      'utf8',
+    );
+    appendFileSync(
+      paths.eventLog,
+      `${JSON.stringify(envelope(maxSeq + 3, ENGINE_EVENT_TYPES.StepTerminated, { disposition: 'completed' }))}\n`,
+      'utf8',
+    );
+
+    // A reader that used the first, stale attempt (every criterion met) would spawn `adversarial`
+    // here. Reading the *latest* attempt — one `unmet` criterion — must skip it instead.
+    await reconciler.pass();
+
+    expect(spawned).not.toContain('adversarial');
+    const events = readEventLog(paths.eventLog);
+    const skip = events.find((event) => event.type === ADVERSARIAL_SKIPPED_EVENT_TYPE);
+    expect(skip, 'the latest attempt, not the stale first one, decided the spawn').toBeDefined();
+    expect(skip?.payload['unresolved_criteria']).toStrictEqual([CRITERIA[0]]);
+  });
+
+  /**
+   * `recordVerificationJudgements` is keyed on the output's own field shape, not on phase or contract
+   * id (the same idiom `recordDeclaredTerritory`/`recordComposedCommit` already use) — asserted here
+   * directly, against the event itself, rather than only through its end-to-end spawn/skip effect.
+   */
+  it(
+    'records verification.judgements_recorded only for a step whose output judges criteria, never ' +
+      "for adversarial's own",
+    async () => {
+      const plan = makePlan({ steps: STANDARD_PLAN_STEPS, acceptance_criteria: CRITERIA });
+      const spawned: string[] = [];
+      const { reconciler } = openReconciler({ plan, script: script(spawned, ['met', 'met']) });
+      const accepted = reconciler.acceptFeature(plan);
+      reconciler.confirm(accepted.run);
+
+      await driveThroughVerify(reconciler);
+      await reconciler.pass(); // spawns and completes adversarial, whose own output has no `judgements`
+
+      const events = readEventLog(runPaths(accepted.run, home).eventLog);
+      const recorded = events.filter(
+        (event) => event.type === VERIFICATION_JUDGEMENTS_RECORDED_EVENT_TYPE,
+      );
+
+      // Exactly one line, for `verify`, carrying the scripted verdicts verbatim.
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0]?.step).toBe('verify');
+      expect(recorded[0]?.payload[VERIFICATION_JUDGEMENTS_RECORDED_PAYLOAD_KEYS.Judgements]).toStrictEqual([
+        { criterion: CRITERIA[0], verdict: 'met' },
+        { criterion: CRITERIA[1], verdict: 'met' },
+      ]);
+
+      // Never for `adversarial`'s own completion: its output carries `attempts`/`verdict`, not
+      // `judgements`, so the field-keyed discriminator says nothing about it.
+      expect(recorded.some((event) => event.step === 'adversarial')).toBe(false);
+    },
+  );
+
+  /**
+   * `adversarialBreakTermination`'s `disposition !== 'completed'` guard, isolated. The scenario it
+   * guards against cannot arise from a real spawn today — `src/engine/spawner.ts` attaches
+   * `contractOutput` only when `output.status === 'completed'` — but the guard is what keeps that a
+   * fact about `spawner.ts` rather than a silent assumption inside the reconciler, so this proves it
+   * holds even when a termination is handed to the reconciler carrying a broken-attempt
+   * `contractOutput` on a non-`completed` disposition.
+   */
+  it(
+    'never re-dispositions a non-completed termination through step.adversarial_break_found, even ' +
+      'if it somehow carried a broken-attempt contractOutput',
+    async () => {
+      const plan = makePlan({ steps: STANDARD_PLAN_STEPS, acceptance_criteria: CRITERIA });
+      const spawned: string[] = [];
+      const brokenAdversarialOutput = adversarialOutput({
+        attempts: [
+          {
+            attempted: 'x',
+            observed: 'y',
+            verdict: 'broken',
+            provenance: { step: 'adversarial', source: 'z' },
+          },
+        ],
+        verdict: 'broken',
+      });
+      const { reconciler } = openReconciler({
+        plan,
+        script: {
+          onStart: (request) => {
+            spawned.push(request.step);
+            if (request.phase === 'verification') {
+              const raw = verificationOutput(['met', 'met']);
+              return terminated(request.step, 'completed', {
+                output: StepOutputSchema.parse(raw),
+                contractOutput: raw,
+              });
+            }
+            if (request.phase === 'adversarial') {
+              // Not a reachable production shape — `spawner.ts` never attaches `contractOutput` to a
+              // non-completed termination — which is exactly what this hypothetical exists to probe.
+              return terminated(request.step, 'failed', {
+                error: makeError('step.timed_out', 'a technical failure unrelated to any broken attempt'),
+                contractOutput: brokenAdversarialOutput,
+              });
+            }
+            return terminated(request.step, 'completed', {});
+          },
+        },
+      });
+      const accepted = reconciler.acceptFeature(plan);
+      reconciler.confirm(accepted.run);
+
+      await driveThroughVerify(reconciler);
+      await reconciler.pass(); // `adversarial` fails for an unrelated, technical reason
+
+      const record = reconciler.load(accepted.run).state.steps.find((entry) => entry.step === 'adversarial');
+      expect(record?.disposition).toBe('failed');
+      // The broken-attempt `contractOutput` is ignored: the reported error stands, untouched.
+      expect(record?.error?.code).toBe('step.timed_out');
+      expect(record?.error?.code).not.toBe('step.adversarial_break_found');
+    },
+  );
+});
+
+// -------------------------------------------------------------------------------------------------
+// Story 4-3 — pause, inject a note, person-initiated narrow, and fork
+// -------------------------------------------------------------------------------------------------
+
+/** Write an intent as a renderer would, for the commands story 4-3 adds no method wrapper for. */
+const writeForkIntent = (
+  run: string,
+  feature: string,
+  command: Command,
+  options: { readonly intentId?: string; readonly argument?: string | null } = {},
+): string => {
+  const intentId = options.intentId ?? mintIntentId(mintRunId());
+  writeCommandIntent(
+    runPaths(run, home),
+    newCommandIntent({
+      intentId,
+      command,
+      run,
+      feature,
+      principal: { kind: 'user', id: 'deep' },
+      source: 'tui',
+      argument: options.argument ?? null,
+    }),
+  );
+  return intentId;
+};
+
+describe('story 4-3 — injecting a note and person-initiated narrow (I/O matrix rows 3-6)', () => {
+  it('records note.injected and sets pending_note between steps, changing nothing else yet (row 3)', () => {
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+    const before = reconciler.load(accepted.run).state;
+
+    const after = reconciler.injectNote(accepted.run, 'watch the refund path');
+
+    expect(after.pending_note).toStrictEqual({ text: 'watch the refund path', kind: 'note' });
+    // Nothing else moved: no step started, the feature state stands.
+    expect(after.state).toBe(before.state);
+    expect(after.steps).toStrictEqual([]);
+
+    const injected = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === NOTE_INJECTED_EVENT_TYPE,
+    );
+    expect(injected).toHaveLength(1);
+    expect(injected[0]?.payload[NOTE_INJECTED_PAYLOAD_KEYS.Text]).toBe('watch the refund path');
+    expect(injected[0]?.payload[NOTE_INJECTED_PAYLOAD_KEYS.Kind]).toBe('note');
+  });
+
+  it('delivers the note into the next step’s own input, then clears pending_note (row 4)', async () => {
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+    reconciler.injectNote(accepted.run, 'watch the refund path');
+
+    await reconciler.pass(); // starts and completes `implement`, the first declared step
+
+    const inputPath = join(runPaths(accepted.run, home).runDir, 'steps', 'implement', 'input.json');
+    const input = StepInputSchema.parse(JSON.parse(readFileSync(inputPath, 'utf8')));
+    expect(input.steering_note).toBe('watch the refund path');
+    expect(reconciler.load(accepted.run).state.pending_note).toBeNull();
+  });
+
+  /**
+   * Story 4-3, round-1 review (row 13) — the case row 4's own test does not cover: a note injected while
+   * the *next* input this run writes is a **resume** of the step already in flight, not a fresh start.
+   *
+   * `stepInput()`'s pre-existing cache-reuse branch (CAP-6, unrelated to this story) returns the on-disk
+   * `input.json` verbatim whenever `baseline_ref`/`contract_id`/`gates` match — which an ordinary AD-8
+   * resume always does, since none of the three changes between an interruption and its resume. Before
+   * the fix, this test's own resumed request would have carried `steering_note: null`: the exact
+   * "pause, inject a note, resume" sequence this story's own CAP-15 wording is about, silently dropped.
+   */
+  it('delivers the note into a resumed step’s own input, bypassing the cache, and clears pending_note (row 13)', async () => {
+    const { reconciler, executor } = openReconciler({
+      script: {
+        sessionIdFor: () => 'sess-implement',
+        // The first attempt is interrupted — not by a steering command, just an ordinary AD-8
+        // interruption — leaving a resumable step and a real `steps/implement/input.json` on disk.
+        onStart: () => terminated('implement', 'interrupted', { sessionId: 'sess-implement' }),
+        onResume: () => terminated('implement', 'completed', { sessionId: 'sess-implement' }),
+      },
+    });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+    await reconciler.pass(); // `implement` starts and is interrupted; its input.json now exists on disk
+    expect(reconciler.load(accepted.run).state.steps[0]?.disposition).toBe('interrupted');
+
+    reconciler.injectNote(accepted.run, 'watch the refund path');
+    expect(reconciler.load(accepted.run).state.pending_note).not.toBeNull();
+
+    const result = await reconciler.pass(); // resumes `implement`, never a fresh start
+    expect(result.actions.map((action) => action.kind)).toStrictEqual(['resume-step']);
+
+    // The resume request itself carries the note — read directly off what the executor was actually
+    // handed, not only off the file the cache-bypass rewrote, so a regression in *either* half is caught.
+    expect(executor.resumed).toHaveLength(1);
+    expect(executor.resumed[0]?.input.steering_note).toBe('watch the refund path');
+
+    const inputPath = join(runPaths(accepted.run, home).runDir, 'steps', 'implement', 'input.json');
+    const input = StepInputSchema.parse(JSON.parse(readFileSync(inputPath, 'utf8')));
+    expect(input.steering_note).toBe('watch the refund path');
+
+    expect(reconciler.load(accepted.run).state.pending_note).toBeNull();
+    expect(reconciler.load(accepted.run).state.steps[0]?.disposition).toBe('completed');
+  });
+
+  it('replaces rather than queues a second note before the first is consumed (row 5)', async () => {
+    const { reconciler } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+
+    reconciler.injectNote(accepted.run, 'first note');
+    const after = reconciler.injectNote(accepted.run, 'second note');
+    expect(after.pending_note).toStrictEqual({ text: 'second note', kind: 'note' });
+
+    await reconciler.pass();
+    const inputPath = join(runPaths(accepted.run, home).runDir, 'steps', 'implement', 'input.json');
+    const input = StepInputSchema.parse(JSON.parse(readFileSync(inputPath, 'utf8')));
+    // Only the second stands: never a queue, never the first note delivered alongside it.
+    expect(input.steering_note).toBe('second note');
+
+    // Both notes are durably recorded — the log is never lossy, even though only one is ever pending.
+    const injected = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === NOTE_INJECTED_EVENT_TYPE,
+    );
+    expect(injected.map((event) => event.payload[NOTE_INJECTED_PAYLOAD_KEYS.Text])).toStrictEqual([
+      'first note',
+      'second note',
+    ]);
+  });
+
+  it('delivers a person-initiated narrow through the exact same mechanism, tagged "narrow" (row 6)', async () => {
+    const { reconciler, plan } = openReconciler({ script: alwaysCompletes });
+    const accepted = reconciler.acceptFeature(makePlan());
+    reconciler.confirm(accepted.run);
+
+    const after = reconciler.narrow(accepted.run, 'just the refund path');
+    expect(after.pending_note).toStrictEqual({ text: 'just the refund path', kind: 'narrow' });
+
+    const injected = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === NOTE_INJECTED_EVENT_TYPE,
+    );
+    expect(injected[0]?.payload[NOTE_INJECTED_PAYLOAD_KEYS.Kind]).toBe('narrow');
+
+    await reconciler.pass();
+    const inputPath = join(runPaths(accepted.run, home).runDir, 'steps', 'implement', 'input.json');
+    const input = StepInputSchema.parse(JSON.parse(readFileSync(inputPath, 'utf8')));
+    expect(input.steering_note).toBe('just the refund path');
+    // Never a new criterion (CAP-2's "Never" rule): the plan's own declared criteria stand, untouched.
+    expect(input.acceptance_criteria).toStrictEqual([...plan.acceptance_criteria]);
+  });
+});
+
+describe('story 4-3 — terminal-run refusal, for all four (I/O matrix row 10)', () => {
+  it.each(['pause', 'inject_note', 'narrow', 'fork'] as const)(
+    'refuses %s on a run that has already reached a terminal state, the run standing unchanged',
+    async (command) => {
+      const { reconciler } = openReconciler({ script: alwaysCompletes });
+      const accepted = reconciler.acceptFeature(makePlan());
+      reconciler.confirm(accepted.run);
+      await reconciler.runUntilSettled();
+      expect(reconciler.load(accepted.run).state.state).toBe('committed');
+
+      const needsArgument = command === 'inject_note' || command === 'narrow';
+      expect(() =>
+        reconciler.steer(accepted.run, command, needsArgument ? { argument: 'text' } : {}),
+      ).toThrowError(SteeringRefused);
+      expect(reconciler.load(accepted.run).state.state).toBe('committed');
+    },
+  );
+});
+
+describe('story 4-3 — forking a run (I/O matrix rows 7-9, 11)', () => {
+  /** A commit SHA the source run's own worktree stands at, per the fake `worktreeGit` below. */
+  const SOURCE_HEAD = 'a'.repeat(40);
+
+  /** `rev-parse HEAD` in the source worktree, and nothing else — this fixture asks for nothing more. */
+  const fakeWorktreeGit: WorktreeGit = (_worktree, args) =>
+    args[0] === 'rev-parse' && args[1] === 'HEAD'
+      ? { status: 0, stdout: `${SOURCE_HEAD}\n`, stderr: '' }
+      : { status: 1, stdout: '', stderr: `unsupported git args in this fixture: ${args.join(' ')}` };
+
+  /** A `ForkWorktreePort` double that records every request and answers with a distinct fake path. */
+  const trackedForkWorktree = (): {
+    readonly port: ForkWorktreePort;
+    readonly calls: { readonly run: string; readonly ref: string }[];
+  } => {
+    const calls: { readonly run: string; readonly ref: string }[] = [];
+    return {
+      calls,
+      port: (request): { readonly path: string } => {
+        calls.push(request);
+        return { path: `/fake/fork-worktree/${request.run}` };
+      },
+    };
+  };
+
+  const openForkable = (
+    forkWorktree: ForkWorktreePort | null,
+  ): { readonly reconciler: Reconciler; readonly plan: FeaturePlan } => {
+    const plan = makePlan({ feature: 'fork-source' });
+    const reconciler = Reconciler.open({
+      orchHome: home,
+      executor: createScriptedExecutor(alwaysCompletes),
+      plans: planProvider(plan),
+      baseline: createRecordingResetter(BASELINE),
+      worktreeGit: fakeWorktreeGit,
+      ...(forkWorktree === null ? {} : { forkWorktree }),
+    });
+    toClose.push(reconciler);
+    return { reconciler, plan };
+  };
+
+  it('creates a new, independent run seeded from the source worktree’s HEAD, and touches the source not at all (row 7)', async () => {
+    const { port: forkWorktree, calls } = trackedForkWorktree();
+    const { reconciler, plan } = openForkable(forkWorktree);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+    const sourceBefore = reconciler.load(accepted.run).state;
+
+    const intentId = writeForkIntent(accepted.run, plan.feature, 'fork');
+    const result = await reconciler.pass();
+
+    // The worktree port saw exactly the source run's own current HEAD, never the repository's own.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.ref).toBe(SOURCE_HEAD);
+
+    // `run.forked` on the *source* run's own log, naming the new run.
+    const forkedLine = readEventLog(runPaths(accepted.run, home).eventLog).find(
+      (event) => event.type === RUN_FORKED_EVENT_TYPE,
+    );
+    expect(forkedLine).toBeDefined();
+    const forkedRun = forkedLine?.payload[RUN_FORKED_PAYLOAD_KEYS.ForkedRun];
+    expect(typeof forkedRun).toBe('string');
+    expect(forkedLine?.payload[RUN_FORKED_PAYLOAD_KEYS.IntentId]).toBe(intentId);
+    expect(calls[0]?.run).toBe(forkedRun);
+
+    // The source run's own state is byte-for-byte the same as before the fork, but for the log position
+    // the `run.forked`/`command.applied` lines themselves advance.
+    const sourceAfter = reconciler.load(accepted.run).state;
+    expect(sourceAfter.state).toBe(sourceBefore.state);
+    expect(sourceAfter.steps).toStrictEqual(sourceBefore.steps);
+    expect(sourceAfter.feature).toBe(sourceBefore.feature);
+
+    // The forked run exists, is its own run, and starts fresh at `drafting` — never a copy of the
+    // source's own step history (nothing had run on the source yet either, but the new run's log proves
+    // it independently: only `run.created` and the declaration lines, never a `step.*` line).
+    const forkedRunId = String(forkedRun);
+    const forkedLog = readEventLog(runPaths(forkedRunId, home).eventLog);
+    expect(forkedLog.some((event) => event.type === ENGINE_EVENT_TYPES.RunCreated)).toBe(true);
+    expect(forkedLog.some((event) => event.type.startsWith('step.'))).toBe(false);
+    const forkedCheckpoint = JSON.parse(
+      readFileSync(join(runPaths(forkedRunId, home).runDir, RUN_STATE_FILE_NAME), 'utf8'),
+    ) as { readonly state: string; readonly feature: string };
+    expect(forkedCheckpoint.state).toBe('drafting');
+    // Disambiguated: the source's own slug, with a suffix derived from the new run's own id.
+    expect(forkedCheckpoint.feature).toBe(forkedFeatureSlug(plan.feature, forkedRunId));
+    expect(forkedCheckpoint.feature).not.toBe(plan.feature);
+
+    expect(result.actions.map((action) => action.kind)).not.toContain('run-step');
+  });
+
+  it('creates two independent runs for two forks of the same source, each disambiguated from the other (row 8)', async () => {
+    const { port: forkWorktree } = trackedForkWorktree();
+    const { reconciler, plan } = openForkable(forkWorktree);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    writeForkIntent(accepted.run, plan.feature, 'fork');
+    await reconciler.pass();
+    writeForkIntent(accepted.run, plan.feature, 'fork');
+    await reconciler.pass();
+
+    const forkedLines = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === RUN_FORKED_EVENT_TYPE,
+    );
+    expect(forkedLines).toHaveLength(2);
+    const forkedRuns = forkedLines.map((event) => String(event.payload[RUN_FORKED_PAYLOAD_KEYS.ForkedRun]));
+    expect(new Set(forkedRuns).size).toBe(2);
+
+    const slugs = forkedRuns.map((run) => forkedFeatureSlug(plan.feature, run));
+    expect(new Set(slugs).size).toBe(2);
+    expect(slugs).not.toContain(plan.feature);
+  });
+
+  it('never creates a second run for a fork intent redelivered after it already applied (row 11)', async () => {
+    const { port: forkWorktree, calls } = trackedForkWorktree();
+    const { reconciler, plan } = openForkable(forkWorktree);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    const intentId = writeForkIntent(accepted.run, plan.feature, 'fork');
+    await reconciler.pass();
+    expect(calls).toHaveLength(1);
+
+    // The exact same intent id, redelivered — AD-19's at-least-once, the ordinary case: a renderer whose
+    // write may or may not have landed rewrites the file under the same id.
+    writeForkIntent(accepted.run, plan.feature, 'fork', { intentId });
+    await reconciler.pass();
+
+    // No second worktree, no second `run.forked` — the id is already in `appliedIntents`.
+    expect(calls).toHaveLength(1);
+    const forkedLines = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === RUN_FORKED_EVENT_TYPE,
+    );
+    expect(forkedLines).toHaveLength(1);
+  });
+
+  /**
+   * The subtler half of row 11: a crash landing `run.forked` durably but not this same intent's own
+   * `command.applied` — the file is still pending, and nothing in `appliedIntents` (folded from
+   * `command.applied` lines alone) yet knows the id. Without the log-scan guard in `consumeIntents`
+   * (`src/engine/reconciler.ts`, beside `decideSteering`'s own switch), the next pass would fork a
+   * *second* time before ever reaching the still-missing ledger line.
+   */
+  it('catches up the missing ledger line rather than forking again, when only run.forked landed', async () => {
+    const { port: forkWorktree, calls } = trackedForkWorktree();
+    const first = openForkable(forkWorktree);
+    const accepted = first.reconciler.acceptFeature(first.plan);
+    first.reconciler.confirm(accepted.run);
+    // AD-30's single-writer claim is per process, held for the reconciler's own lifetime — closed before
+    // a standalone `Recorder` appends to the same log, exactly as the crash-injection fixtures elsewhere
+    // in this suite do (see "a disengage written while a *resumed* step is running").
+    first.reconciler.close();
+
+    const intentId = mintIntentId(mintRunId());
+    // Simulate the crash window: `run.forked` is durable, `command.applied` for this id is not.
+    const recorder = Recorder.open({ runId: accepted.run, feature: first.plan.feature, orchHome: home });
+    try {
+      recorder.record({
+        feature: first.plan.feature,
+        run: accepted.run,
+        step: null,
+        emitter: ENGINE_EMITTER,
+        type: RUN_FORKED_EVENT_TYPE,
+        payload: {
+          [RUN_FORKED_PAYLOAD_KEYS.ForkedRun]: 'already-forked-run-id',
+          [RUN_FORKED_PAYLOAD_KEYS.IntentId]: intentId,
+        },
+      });
+    } finally {
+      recorder.close();
+    }
+    writeForkIntent(accepted.run, first.plan.feature, 'fork', { intentId });
+
+    const { reconciler } = openForkable(forkWorktree);
+    await reconciler.pass();
+
+    // Nothing was forked again: the port was never called.
+    expect(calls).toStrictEqual([]);
+    const forkedLines = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === RUN_FORKED_EVENT_TYPE,
+    );
+    expect(forkedLines).toHaveLength(1);
+    // The still-missing ledger line is caught up, so the intent is retired rather than met forever.
+    const applied = readEventLog(runPaths(accepted.run, home).eventLog).filter(
+      (event) => event.type === COMMAND_EVENT_TYPES.Applied && event.payload['intent_id'] === intentId,
+    );
+    expect(applied).toHaveLength(1);
+    expect(readIntentFiles(runPaths(accepted.run, home)).pending).toStrictEqual([]);
+  });
+
+  it('refuses loudly rather than guessing where to put a worktree, with no port wired', async () => {
+    const { reconciler, plan } = openForkable(null);
+    const accepted = reconciler.acceptFeature(plan);
+    reconciler.confirm(accepted.run);
+
+    writeForkIntent(accepted.run, plan.feature, 'fork');
+    const result = await reconciler.pass();
+
+    const refused = result.steering.flatMap((entry) => entry.refused);
+    expect(refused).toHaveLength(1);
+    expect(refused[0]?.reason).toBe('effect-failed');
+    expect(refused[0]?.detail).toContain('no fork-worktree port wired');
+  });
+
+  it('never collides with the source run’s own eventual branch name (row 9)', () => {
+    // A pure-function check of the guarantee the disambiguated slug exists for: `branchFor` (read here,
+    // never changed) derives a branch name from the feature slug alone, so two slugs that differ produce
+    // two branches that differ, with no change to `branchFor` itself.
+    const forkedRun = '01K5NQ9ZJ7V3M2P9XQWRTC4BDF';
+    const sourceSlug = 'fork-source';
+    const forkedSlug = forkedFeatureSlug(sourceSlug, forkedRun);
+    expect(forkedSlug).not.toBe(sourceSlug);
+    expect(branchFor(null, forkedSlug)).not.toBe(branchFor(null, sourceSlug));
+
+    // Two forks of the same source produce two more slugs, all four pairwise distinct.
+    const secondForkedRun = '01K5NQ9ZJ7V3M2P9XQWRTC4BDG';
+    const secondForkedSlug = forkedFeatureSlug(sourceSlug, secondForkedRun);
+    const branches = [sourceSlug, forkedSlug, secondForkedSlug].map((slug) => branchFor(null, slug));
+    expect(new Set(branches).size).toBe(3);
   });
 });

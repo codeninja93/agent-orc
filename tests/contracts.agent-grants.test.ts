@@ -72,6 +72,11 @@ const DECLARED: Readonly<Record<string, { readonly tools: readonly string[]; rea
     tools: ['Read', 'Grep', 'Glob', 'RunDeclaredCommand'],
     contract: 'step.verification',
   },
+  /**
+   * Story 4-2 — ADR-003's seventh row. `verification`'s own grant, verbatim: it must not be able to
+   * edit what it attacks, and it holds no `RunDeclaredCommand` because it never re-runs a gate.
+   */
+  adversarial: { tools: ['Read', 'Grep', 'Glob'], contract: 'step.adversarial' },
   // Story 2-7 pointed it at a contract of its own. Under `step.output` nothing stopped a committing
   // output declaring a write intent or restating a step's disposition, both of which AD-22 reserves
   // to the engine — the same pairing failure this table caught in story 2-4's declarations.
@@ -83,7 +88,7 @@ const GRANTED: Readonly<Record<string, readonly string[]>> = Object.fromEntries(
 );
 
 describe('the built-in roster grants exactly what ADR-003 decided, as ADR-004 amended it', () => {
-  it('declares the six built-ins the table names, and no others', () => {
+  it('declares the seven built-ins the table names, and no others', () => {
     expect(BUILT_IN_AGENTS.map((agent) => agent.id).sort()).toStrictEqual(Object.keys(GRANTED).sort());
   });
 
@@ -111,7 +116,7 @@ describe('the built-in roster grants exactly what ADR-003 decided, as ADR-004 am
    * declaration naming `step.output` fails its own contract at AD-1's re-parse — every time, for every
    * default install. A test that checked only "the id is registered" would pass on exactly that.
    */
-  it.each(['analysis', 'planning', 'implementation', 'testing', 'verification'])(
+  it.each(['analysis', 'planning', 'implementation', 'testing', 'verification', 'adversarial'])(
     'gives %s a contract whose own pinned id is the one it declares',
     (id) => {
       const agent = BUILT_IN_AGENTS.find((candidate) => candidate.id === id);
@@ -136,6 +141,8 @@ describe('the built-in roster grants exactly what ADR-003 decided, as ADR-004 am
         tests: [],
         gates: [],
         judgements: [],
+        attempts: [],
+        verdict: 'held',
       });
       expect(probe.success, `${id} accepted an output claiming step.output`).toBe(false);
     },

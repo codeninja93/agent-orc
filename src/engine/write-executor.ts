@@ -43,6 +43,17 @@
  * still exhaustive over all five {@link WriteIntentKind} members: a sixth kind added later without a
  * case here is a compile-time error, not a silent gap.
  *
+ * **Story 3-2 (AD-27) — `mode: 'shadow'` suppresses the mutating call, never the probe.** Every performer
+ * below still records `write.attempted` and still runs its own read-only probe exactly as it does for a
+ * live run — skipping the probe would leave the destructive classification blind rather than merely quiet,
+ * and AD-15's "the engine executes exactly once" durability half still holds either way. What changes is
+ * the last step: under shadow, the mutating `git`/`gh` call is never made, and a `write.suppressed` event
+ * is recorded in place of `write.executed`, carrying what the probe found and whether it was destructive —
+ * the target already existing with content different from what this run would have produced, the same
+ * probe verdict a live run already computes, never a second classification axis. `WriteExecutionContext`'s
+ * `mode` field is optional and defaults to `'live'`, so every context built before this story keeps its
+ * exact prior behaviour unchanged.
+ *
  * **Where the note lands, and when.** `src/contracts/note.ts` states plainly that "on the merge commit"
  * is this unit's binding to make, because no merge commit exists at the moment the committer composes
  * the note — the branch is not yet pushed and the pull request does not yet exist. It does not exist at
@@ -64,9 +75,18 @@ import {
   WRITE_EXECUTED_PAYLOAD_KEYS,
   WRITE_FAILED_EVENT_TYPE,
   WRITE_FAILED_PAYLOAD_KEYS,
+  WRITE_SUPPRESSED_EVENT_TYPE,
+  WRITE_SUPPRESSED_PAYLOAD_KEYS,
   makeError,
 } from '../contracts/index.js';
-import type { EventEnvelope, GitNote, OrchError, WriteIntent, WriteIntentKind } from '../contracts/index.js';
+import type {
+  EventEnvelope,
+  GitNote,
+  OrchError,
+  RunMode,
+  WriteIntent,
+  WriteIntentKind,
+} from '../contracts/index.js';
 
 import type { PullRequestPlan } from './committer.js';
 
@@ -148,6 +168,12 @@ export const realGhCall: GhCall = (args, cwd) =>
 export interface WriteExecutionContext {
   readonly run: string;
   /**
+   * AD-27 — `'shadow'` suppresses every performer's mutating call, never its probe. Optional and defaults
+   * to `'live'`, so a context built before story 3-2 keeps its exact prior behaviour with no change at the
+   * call site.
+   */
+  readonly mode?: RunMode;
+  /**
    * The git working tree the intents act in — the run's own worktree (AD-26). A worktree shares its
    * repository's remotes rather than owning a separate clone, so a push, a note or a `gh` call made here
    * reaches the same `origin` the committer named the branch and the pull request against.
@@ -160,16 +186,32 @@ export interface WriteExecutionContext {
   /**
    * The real merge commit `git_note` attaches to, or `null` before one is known.
    *
-   * `git_push` and `pull_request` ignore this field entirely. `git_note` refuses to run while it is
-   * `null` ({@link NoteMergeCommitUnknown}) rather than falling back to the branch tip — see this file's
-   * own docblock for why a fallback here would be a silent wrong-commit bug, not a convenience.
+   * `git_push` and `pull_request` ignore this field entirely. Under `mode: 'live'`, `git_note` refuses to
+   * run while it is `null` ({@link NoteMergeCommitUnknown}) rather than falling back to the branch tip —
+   * see this file's own docblock for why a fallback here would be a silent wrong-commit bug, not a
+   * convenience. Under `mode: 'shadow'` a real merge commit will never exist, so `null` here is the
+   * ordinary case: {@link performGitNoteShadow} probes the worktree's own `HEAD` instead.
    */
   readonly mergeCommit: string | null;
   /**
-   * Durably record one `write.attempted`/`write.executed`/`write.failed` line. Synchronous and never
-   * swallowed: a caller whose durable log refuses this line (AD-4) must see that as a thrown failure,
-   * not as a line quietly not written, because AD-15's whole ordering depends on the record actually
-   * having landed before the call it is about.
+   * Story 3-2 (AD-27) — the real, already-merged feature's merge commit this run shadows, or `null` for a
+   * live run, or when it is not (yet) known to the caller.
+   *
+   * Read only by {@link performPullRequest} under `mode: 'shadow'`, to tell apart the one pull request a
+   * shadow run *expects* `gh pr list` to find — the historical one it is reproducing — from any other. A
+   * shadow run's own `branchFor` (`src/engine/committer.ts`) derives its branch name from the feature slug
+   * alone, never the run id, so shadowing an already-merged feature finds that exact feature's own real,
+   * already-merged pull request on every single run; treating any found pull request as destructive,
+   * unconditionally, would misclassify this story's own primary use case every time. The expected
+   * historical pull request (the one whose own merge commit equals this field) is never destructive; one
+   * that does not match it is.
+   */
+  readonly shadowRealMergeCommit?: string | null;
+  /**
+   * Durably record one `write.attempted`/`write.executed`/`write.failed`/`write.suppressed` line.
+   * Synchronous and never swallowed: a caller whose durable log refuses this line (AD-4) must see that as
+   * a thrown failure, not as a line quietly not written, because AD-15's whole ordering depends on the
+   * record actually having landed before the call it is about.
    */
   readonly emit: (type: string, payload: Record<string, unknown>) => void;
   /** Injectable `git`. Defaults to {@link realGitCall}. */
@@ -181,7 +223,13 @@ export interface WriteExecutionContext {
 /** What performing one intent produced. */
 export type WriteIntentResult =
   | { readonly status: 'executed'; readonly alreadyPresent: boolean; readonly detail: string }
-  | { readonly status: 'failed'; readonly error: OrchError };
+  | { readonly status: 'failed'; readonly error: OrchError }
+  /**
+   * AD-27 — the mutating call was never made because `context.mode` was `'shadow'`. `destructive` is the
+   * probe's own verdict: the target already exists with content different from what this run would have
+   * produced. Never returned when `context.mode` is `'live'` or unset.
+   */
+  | { readonly status: 'suppressed'; readonly destructive: boolean; readonly detail: string };
 
 /** The dispatcher's own type, so a caller assembling a `Reconciler` names it once. */
 export type WriteExecutorPort = (
@@ -190,17 +238,18 @@ export type WriteExecutorPort = (
 ) => Promise<WriteIntentResult>;
 
 /**
- * Whether the log already carries a `write.executed` line for this intent id.
+ * Whether the log already carries a `write.executed` or `write.suppressed` line for this intent id.
  *
  * A pass that calls the performer again anyway is still safe — every performer below checks the target
  * before acting — but reading the log first is what keeps a settled intent from shelling out to `git`/
- * `gh` on every subsequent pass for no reason: once `write.executed` is durable, the effect is done and
- * re-probing buys nothing but noise in the log and an avoidable network call.
+ * `gh` on every subsequent pass for no reason: once either line is durable, this intent is done — executed
+ * for a live run, suppressed for a shadow one (AD-27) — and re-probing buys nothing but noise in the log
+ * and an avoidable network call.
  */
 export const writeIntentSettled = (events: readonly EventEnvelope[], intentId: string): boolean =>
   events.some(
     (event) =>
-      event.type === WRITE_EXECUTED_EVENT_TYPE &&
+      (event.type === WRITE_EXECUTED_EVENT_TYPE || event.type === WRITE_SUPPRESSED_EVENT_TYPE) &&
       event.payload[WRITE_EXECUTED_PAYLOAD_KEYS.IntentId] === intentId,
   );
 
@@ -293,6 +342,178 @@ const detailOf = (result: WriteCallResult): string =>
       ? result.stdout.trim()
       : `exited with status ${String(result.status)}`;
 
+/** The two outcomes the merge-fidelity comparison can settle on — story 3-3, matrix rows 11-13, 19. */
+export type MergeFidelityOutcome = 'unchanged' | 'corrected';
+
+/**
+ * What the merge-fidelity comparison found, or why it could not be made. `outcome` and `code` are
+ * mutually exclusive, exactly like `SHADOW_COMPARED_PAYLOAD_KEYS`' own absent-on-success shape: a read
+ * failure is reported as itself, never guessed as `'unchanged'`.
+ */
+export interface MergeFidelity {
+  readonly outcome: MergeFidelityOutcome | null;
+  /** Present only when `outcome` is `null`. A short, stable code, never a raw `git` error string. */
+  readonly code: string | null;
+  /** One line, short and punctuated: what was found, or why it could not be. */
+  readonly detail: string;
+  /**
+   * This run's own worktree `HEAD`, once read — the value the `pull_request.merge_fidelity` payload's
+   * `head_ref_oid` field carries. `null` only when even that first read failed.
+   */
+  readonly proposedHead: string | null;
+}
+
+/** `mergeCommit` has fewer than two parents, so it is not a real merge commit this comparison can trust. */
+export const MERGE_FIDELITY_NOT_A_MERGE_COMMIT = 'pull_request.merge_fidelity_not_a_merge_commit';
+
+/** This run's own worktree `HEAD` could not be read. */
+export const MERGE_FIDELITY_HEAD_UNREADABLE = 'pull_request.merge_fidelity_head_unreadable';
+
+/** `git merge-base <mergeCommit>^1 <proposedHead>` failed. */
+export const MERGE_FIDELITY_MERGE_BASE_UNREADABLE = 'pull_request.merge_fidelity_merge_base_unreadable';
+
+/** `git diff --name-only <mergeBase> <proposedHead>` (this run's own touched paths) failed. */
+export const MERGE_FIDELITY_TOUCHED_PATHS_UNREADABLE =
+  'pull_request.merge_fidelity_touched_paths_unreadable';
+
+/** The final, path-scoped `git diff --name-only <proposedHead> <mergeCommit> -- <touchedPaths...>` failed. */
+export const MERGE_FIDELITY_COMPARISON_UNREADABLE = 'pull_request.merge_fidelity_comparison_unreadable';
+
+/**
+ * Whether the files *this run's own feature branch actually touched* landed in the merge commit exactly
+ * as this run's worktree last held them — the trust record's one new durable fact (story 3-3, matrix rows
+ * 11-13, 19). Redesigned in this story's own review pass (see the spec's Spec Change Log) after an earlier
+ * whole-tree design proved wrong two ways: comparing two trees rooted at different base states flags
+ * unrelated `main` drift as a false correction on every fleet-concurrent feature, and reading the head
+ * fresh from `gh pr view` after the merge is confirmed can already reflect a correction that happened
+ * before this check ever ran, hiding a real correction as a false `'unchanged'`.
+ *
+ * **Scoped to this run's own already-local worktree state, never a live remote read.** `proposedHead` is
+ * `plan.worktree`'s own `HEAD` — the commit this run itself produced and pushed, untouched by anything
+ * else between this run's own push and merge-detection — never a `gh pr view` field, which by
+ * merge-detection time may already name a *later* commit someone else pushed to the same branch.
+ *
+ * **Scoped to only the paths this run's own commits touched, never the whole tree.** `mergeBase` is found
+ * via the merge commit's first parent (`mergeCommit^1`, `main`'s tip immediately before this merge), never
+ * via `merge-base(mergeCommit, proposedHead)` directly — `proposedHead` is already an ancestor of
+ * `mergeCommit`, so that call would trivially answer `proposedHead` itself and say nothing about the fork
+ * point. `touchedPaths` is `git diff --name-only mergeBase proposedHead`: exactly the files this run's own
+ * commits changed. The final comparison, `git diff --name-only proposedHead mergeCommit -- touchedPaths`,
+ * is restricted to exactly those paths, so unrelated `main` drift outside them never reports as a
+ * correction (matrix row 19) — the same lesson `compareShadowRun` applies by pinning both sides of its own
+ * comparison to one base, generalised here to a path restriction because this comparison's two sides are
+ * never rooted at the same base to begin with.
+ *
+ * **Assumes `mergeCommit` is a real two-parent merge commit** (this project's own merges are); one with
+ * fewer than two parents — a fast-forward or a squash landed by hand outside this system — is a read
+ * failure (`code`), never guessed at, because `mergeCommit^1` would otherwise silently resolve to that
+ * single parent and compute a meaningless "fork point" rather than failing loudly.
+ *
+ * **Fetches nothing itself.** `performGitNote`'s own prior `git fetch REMOTE mergeCommit`, in the same
+ * call sequence immediately before this runs, already brings `mergeCommit` and its ancestry (including its
+ * first parent) into the local object database; `proposedHead` is always already local by construction.
+ *
+ * Never `git diff --quiet`: its exit status `1` means "a real difference was found," not "the command
+ * failed," and treating the two alike is exactly the "guessed past a failure" mistake this function must
+ * never make. `--name-only` always exits `0` on success whether or not it found a difference, so a
+ * non-zero exit here is unambiguously a read failure.
+ */
+export const mergeFidelityOf = (git: GitCall, worktree: string, mergeCommit: string): MergeFidelity => {
+  const head = git(['rev-parse', 'HEAD'], worktree);
+  if (head.status !== 0) {
+    return {
+      outcome: null,
+      code: MERGE_FIDELITY_HEAD_UNREADABLE,
+      detail: `could not read this run's own worktree HEAD: ${detailOf(head)}`,
+      proposedHead: null,
+    };
+  }
+  const proposedHead = head.stdout.trim();
+
+  // Verified before `mergeCommit^1` is trusted as "the fork point on main": a one-parent commit's `^1`
+  // resolves fine, to that single parent, so a missing second parent would otherwise pass through
+  // silently rather than failing loudly as the story's own Boundaries require.
+  const secondParent = git(['rev-parse', '--verify', `${mergeCommit}^2`], worktree);
+  if (secondParent.status !== 0) {
+    return {
+      outcome: null,
+      code: MERGE_FIDELITY_NOT_A_MERGE_COMMIT,
+      detail:
+        `${mergeCommit.slice(0, 12)} has fewer than two parents, so it is not a real merge commit this ` +
+        `comparison can trust: ${detailOf(secondParent)}`,
+      proposedHead,
+    };
+  }
+
+  const base = git(['merge-base', `${mergeCommit}^1`, proposedHead], worktree);
+  if (base.status !== 0) {
+    return {
+      outcome: null,
+      code: MERGE_FIDELITY_MERGE_BASE_UNREADABLE,
+      detail:
+        `git merge-base ${mergeCommit.slice(0, 12)}^1 ${proposedHead.slice(0, 12)} failed: ` +
+        detailOf(base),
+      proposedHead,
+    };
+  }
+  const mergeBase = base.stdout.trim();
+
+  const touched = git(['diff', '--name-only', mergeBase, proposedHead], worktree);
+  if (touched.status !== 0) {
+    return {
+      outcome: null,
+      code: MERGE_FIDELITY_TOUCHED_PATHS_UNREADABLE,
+      detail:
+        `git diff --name-only ${mergeBase.slice(0, 12)} ${proposedHead.slice(0, 12)} (this run's own ` +
+        `touched paths) failed: ${detailOf(touched)}`,
+      proposedHead,
+    };
+  }
+  const touchedPaths = touched.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '');
+
+  if (touchedPaths.length === 0) {
+    // A no-op diff, trivially unchanged: this run touched nothing relative to its own fork point, so
+    // there is nothing it could have been corrected on.
+    return {
+      outcome: 'unchanged',
+      code: null,
+      detail:
+        `${proposedHead.slice(0, 12)} touched no paths relative to its fork point ` +
+        `${mergeBase.slice(0, 12)}, so there is nothing to have been corrected`,
+      proposedHead,
+    };
+  }
+
+  const comparison = git(
+    ['diff', '--name-only', proposedHead, mergeCommit, '--', ...touchedPaths],
+    worktree,
+  );
+  if (comparison.status !== 0) {
+    return {
+      outcome: null,
+      code: MERGE_FIDELITY_COMPARISON_UNREADABLE,
+      detail:
+        `git diff --name-only ${proposedHead.slice(0, 12)} ${mergeCommit.slice(0, 12)} over this run's ` +
+        `own touched paths failed: ${detailOf(comparison)}`,
+      proposedHead,
+    };
+  }
+  const matches = comparison.stdout.trim() === '';
+  return {
+    outcome: matches ? 'unchanged' : 'corrected',
+    code: null,
+    detail: matches
+      ? `${mergeCommit.slice(0, 12)} carries this run's own touched paths unchanged from ` +
+        proposedHead.slice(0, 12)
+      : `${mergeCommit.slice(0, 12)} differs from ${proposedHead.slice(0, 12)} on at least one path ` +
+        'this run’s own commits touched',
+    proposedHead,
+  };
+};
+
 const recordAttempted = (intent: WriteIntent, context: WriteExecutionContext): void => {
   context.emit(WRITE_ATTEMPTED_EVENT_TYPE, {
     [WRITE_ATTEMPTED_PAYLOAD_KEYS.IntentId]: intent.intent_id,
@@ -334,7 +555,28 @@ const recordFailed = (
 };
 
 /**
- * `git_push` — matrix rows 1, 2, 7.
+ * AD-27 — record `write.suppressed` in place of `write.executed`, the mutating call never made.
+ * `destructive` and `detail` are the probe's own verdict, computed by the caller before the mutating call
+ * would otherwise have been made — this function performs nothing itself.
+ */
+const recordSuppressed = (
+  intent: WriteIntent,
+  context: WriteExecutionContext,
+  destructive: boolean,
+  detail: string,
+): WriteIntentResult => {
+  context.emit(WRITE_SUPPRESSED_EVENT_TYPE, {
+    [WRITE_SUPPRESSED_PAYLOAD_KEYS.IntentId]: intent.intent_id,
+    [WRITE_SUPPRESSED_PAYLOAD_KEYS.Kind]: intent.kind,
+    [WRITE_SUPPRESSED_PAYLOAD_KEYS.Target]: intent.target,
+    [WRITE_SUPPRESSED_PAYLOAD_KEYS.Destructive]: destructive,
+    [WRITE_SUPPRESSED_PAYLOAD_KEYS.Detail]: detail,
+  });
+  return { status: 'suppressed', destructive, detail };
+};
+
+/**
+ * `git_push` — matrix rows 1, 2, 7 (story 2-11); story 3-2's own matrix rows 1, 5, 6 under `mode: 'shadow'`.
  *
  * Durable-before-call, then reconcile: read the worktree's own `HEAD`, ask the remote what
  * `refs/heads/<target>` already carries, and only push when the two disagree. A crash between the
@@ -343,6 +585,7 @@ const recordFailed = (
  */
 const performGitPush = (intent: WriteIntent, context: WriteExecutionContext): WriteIntentResult => {
   const git = context.git ?? realGitCall;
+  const mode = context.mode ?? 'live';
   recordAttempted(intent, context);
 
   const head = git(['rev-parse', 'HEAD'], context.repository);
@@ -357,16 +600,46 @@ const performGitPush = (intent: WriteIntent, context: WriteExecutionContext): Wr
   const expected = head.stdout.trim();
 
   const remote = git(['ls-remote', REMOTE, `refs/heads/${intent.target}`], context.repository);
-  if (remote.status === 0) {
-    const [sha] = remote.stdout.trim().split(/\s+/);
-    if (sha !== undefined && sha === expected) {
-      return recordExecuted(
-        intent,
-        context,
-        true,
-        `${REMOTE}/${intent.target} already carries the expected commit`,
-      );
-    }
+
+  if (mode === 'shadow' && remote.status !== 0) {
+    // AD-27 — a live run's real push call would still succeed or fail on the ground truth regardless of
+    // what this read found, so a live run just proceeds past a failed read (below). A shadow run never
+    // makes that call, so an unreadable probe here carries no evidence either way and must be reported as
+    // a failure, never guessed at as "clean" (matching the discipline `performPullRequest`'s own read
+    // failure already has).
+    return recordFailed(
+      intent,
+      context,
+      'write.push_failed',
+      `git ls-remote ${REMOTE} refs/heads/${intent.target} failed, so whether the target already carries ` +
+        `something different from what this run would produce could not be checked: ${detailOf(remote)}`,
+    );
+  }
+
+  const remoteTrimmed = remote.status === 0 ? remote.stdout.trim() : '';
+  const existingSha = remoteTrimmed === '' ? undefined : remoteTrimmed.split(/\s+/)[0];
+  const matches = existingSha !== undefined && existingSha === expected;
+
+  if (mode === 'shadow') {
+    // AD-27 — the probe already ran; only the mutating `git push` is skipped. Destructive exactly when
+    // the remote already carries something other than what this run would have pushed there.
+    const destructive = existingSha !== undefined && !matches;
+    const detail = matches
+      ? `${REMOTE}/${intent.target} already carries the expected commit; nothing would have been pushed`
+      : destructive
+        ? `${REMOTE}/${intent.target} already carries ${existingSha ?? ''}, which differs from the ` +
+          `commit this run would push (${expected})`
+        : `${REMOTE}/${intent.target} does not yet exist; this run would have pushed ${expected} there`;
+    return recordSuppressed(intent, context, destructive, detail);
+  }
+
+  if (matches) {
+    return recordExecuted(
+      intent,
+      context,
+      true,
+      `${REMOTE}/${intent.target} already carries the expected commit`,
+    );
   }
 
   // Never `--force`: `WriteIntentSchema` carries no field through which one could be asked for, and
@@ -383,10 +656,11 @@ const performGitPush = (intent: WriteIntent, context: WriteExecutionContext): Wr
   return recordExecuted(intent, context, false, `pushed to ${REMOTE}/${intent.target}`);
 };
 
-/** The shape of one entry `gh pr list --json number,url` returns. Read defensively; `gh`'s own concern. */
+/** The shape of one entry `gh pr list --json number,url,mergeCommit` returns. Read defensively. */
 interface ExistingPullRequest {
   readonly number?: unknown;
   readonly url?: unknown;
+  readonly mergeCommit?: unknown;
 }
 
 const firstExisting = (stdout: string): ExistingPullRequest | null => {
@@ -402,8 +676,15 @@ const firstExisting = (stdout: string): ExistingPullRequest | null => {
   return typeof first === 'object' && first !== null ? first : null;
 };
 
+/** The merge-commit oid a found pull request itself carries, or `null` when it has none (still open). */
+const existingMergeCommitOid = (existing: ExistingPullRequest): string | null => {
+  const field = existing.mergeCommit;
+  const oid = typeof field === 'object' && field !== null ? (field as Record<string, unknown>)['oid'] : null;
+  return typeof oid === 'string' && oid !== '' ? oid : null;
+};
+
 /**
- * `pull_request` — matrix rows 1, 3, 7.
+ * `pull_request` — matrix rows 1, 3, 7 (story 2-11); story 3-2's own matrix row 2 under `mode: 'shadow'`.
  *
  * Durable-before-call, then reconcile: `gh pr list --head <branch>` before `gh pr create`, so a PR
  * opened by an earlier attempt that crashed before recording its outcome is found, not duplicated.
@@ -413,16 +694,18 @@ const performPullRequest = async (
   context: WriteExecutionContext,
 ): Promise<WriteIntentResult> => {
   const gh = context.gh ?? realGhCall;
+  const mode = context.mode ?? 'live';
   recordAttempted(intent, context);
 
   const list = await gh(
-    ['pr', 'list', '--head', context.pullRequest.head, '--state', 'all', '--json', 'number,url'],
+    ['pr', 'list', '--head', context.pullRequest.head, '--state', 'all', '--json', 'number,url,mergeCommit'],
     context.repository,
   );
   if (list.status !== 0) {
     // A failed read is not "nothing found": proceeding to `gh pr create` here would risk opening a
     // second pull request for a branch that already has one, exactly the duplicate matrix row 3 exists
-    // to prevent. Refuse instead of guessing.
+    // to prevent. Refuse instead of guessing. Applies under shadow too: an unreadable probe is not
+    // evidence either way, so this is a genuine failure, never a suppression.
     return recordFailed(
       intent,
       context,
@@ -432,6 +715,39 @@ const performPullRequest = async (
     );
   }
   const existing = firstExisting(list.stdout);
+
+  if (mode === 'shadow') {
+    // AD-27 — under shadow this run never itself calls `gh pr create`, so any pull request the probe
+    // finds was opened by something else. **That "something else" is expected, not foreign, for this
+    // story's own primary use case**: `branchFor` (`src/engine/committer.ts`) derives the branch name from
+    // the feature slug alone, never the run id, so shadowing an already-merged feature finds that exact
+    // feature's own real, already-merged pull request on every single run. The found pull request is
+    // therefore compared against `context.shadowRealMergeCommit` — the real merge commit this run is
+    // shadowing — exactly as `git_push`/`git_note`'s own probes compare content rather than merely
+    // presence: the expected historical pull request is not destructive; one that does not match it
+    // (a different merge commit, or none — still open) is.
+    const number = existing !== null && typeof existing.number === 'number' ? existing.number : null;
+    const url = existing !== null && typeof existing.url === 'string' ? existing.url : '';
+    const shadowedOid = context.shadowRealMergeCommit ?? null;
+    const foundOid = existing === null ? null : existingMergeCommitOid(existing);
+    const isExpectedHistoricalPr = existing !== null && shadowedOid !== null && foundOid === shadowedOid;
+    const destructive = existing !== null && !isExpectedHistoricalPr;
+    const detail =
+      existing === null
+        ? `no pull request from ${context.pullRequest.head} exists yet; this run would have opened one`
+        : isExpectedHistoricalPr
+          ? `a pull request from ${context.pullRequest.head} already exists` +
+            (number === null ? '' : ` (#${String(number)})`) +
+            ` and matches the real merge commit this run is shadowing (${shadowedOid ?? ''})`
+          : `a pull request from ${context.pullRequest.head} already exists` +
+            (number === null ? '' : ` (#${String(number)})`) +
+            (url === '' ? '' : `: ${url}`) +
+            (shadowedOid === null
+              ? ', and no real merge commit is known to compare it against'
+              : ` but does not match the real merge commit this run is shadowing (${shadowedOid})`);
+    return recordSuppressed(intent, context, destructive, detail);
+  }
+
   if (existing !== null) {
     const number = typeof existing.number === 'number' ? existing.number : null;
     const url = typeof existing.url === 'string' ? existing.url : '';
@@ -490,6 +806,18 @@ export class NoteMergeCommitUnknown extends Error {
     this.orchError = makeError(this.code, message);
   }
 }
+
+/**
+ * Whether a failed `git notes show` means "no note exists for this commit", as opposed to some other read
+ * failure (a bad commit reference, a corrupted repository, an IO error).
+ *
+ * Real `git` prints "error: no note found for object <sha>." to stderr and exits non-zero for the first
+ * case, and something else (typically a `fatal:`-prefixed message) for the second. The live performer
+ * below does not need this distinction — any non-zero status there just falls through to `add`, and a
+ * deeper problem then fails loudly at the `add`/`push` step instead — but a shadow run never reaches an
+ * `add`/`push` step to catch it there, so {@link performGitNoteShadow} needs the positive signal.
+ */
+const noteProbeFoundNothing = (result: WriteCallResult): boolean => /no note found/i.test(result.stderr);
 
 /**
  * Whether the local notes ref's own tip is exactly what `origin` already carries.
@@ -601,6 +929,78 @@ const performGitNote = (
   );
 };
 
+/**
+ * `git_note` under `mode: 'shadow'` — story 3-2's own matrix row 3.
+ *
+ * AD-27's whole point is that a shadow run never opens a real pull request, so no real merge commit will
+ * ever exist for this intent to attach to — {@link NoteMergeCommitUnknown} is a live-run-only refusal and
+ * is never thrown under shadow. Rather than leaving the note out of the shadow run entirely (which would
+ * make AD-27's "recording every write intent" untrue for exactly one of the three), this probes against
+ * the shadow worktree's own current `HEAD` — the commit this run's composed work actually produced, and
+ * the nearest honest stand-in for "the commit this write would have landed on" a run that never merges
+ * has. `context.mergeCommit`, when the caller happens to supply one anyway, is used instead of `HEAD`:
+ * there is no reason to prefer a computed stand-in over a real answer if one is ever known.
+ */
+const performGitNoteShadow = (intent: WriteIntent, context: WriteExecutionContext): WriteIntentResult => {
+  const git = context.git ?? realGitCall;
+  recordAttempted(intent, context);
+
+  let commit = context.mergeCommit;
+  if (commit === null) {
+    const head = git(['rev-parse', 'HEAD'], context.repository);
+    if (head.status !== 0) {
+      // A distinct code from `git.note_write_failed`: this is not a failure to write a note, it is a
+      // failure to resolve the stand-in commit a shadow run substitutes for the merge commit it will never
+      // have — a different fact a person routing this needs to see named correctly.
+      return recordFailed(
+        intent,
+        context,
+        'shadow.head_unreadable',
+        `could not read the worktree's HEAD to probe for an existing note (mode: shadow has no real merge ` +
+          `commit to use instead): ${detailOf(head)}`,
+      );
+    }
+    commit = head.stdout.trim();
+  }
+
+  // Best-effort, exactly as the live performer's own fetch is: a repository that already holds the object
+  // has nothing to fetch, and a failure here is not itself evidence either way.
+  git(['fetch', REMOTE, commit], context.repository);
+
+  const show = git(['notes', `--ref=${intent.target}`, 'show', commit], context.repository);
+  if (show.status !== 0) {
+    if (!noteProbeFoundNothing(show)) {
+      // A live run's real `git notes add` would still land or fail on its own regardless of what this
+      // read found; a shadow run never makes that call, so a read failure that is not positively "no note
+      // here" carries no evidence either way and must be reported as a failure, never guessed at as
+      // "clean" — the same discipline `performGitPush`'s own read failure has under shadow.
+      return recordFailed(
+        intent,
+        context,
+        'git.note_write_failed',
+        `git notes --ref=${intent.target} show ${commit.slice(0, 12)} failed, so whether the target ` +
+          `already carries a note could not be checked: ${detailOf(show)}`,
+      );
+    }
+    return recordSuppressed(
+      intent,
+      context,
+      false,
+      `${commit.slice(0, 12)} carries no note under ${intent.target} yet; this run would have added one`,
+    );
+  }
+  const expectedBody = `${JSON.stringify(context.note, null, 2)}\n`;
+  const matches = show.stdout === expectedBody;
+  return recordSuppressed(
+    intent,
+    context,
+    !matches,
+    matches
+      ? `${commit.slice(0, 12)} already carries the expected note under ${intent.target}`
+      : `${commit.slice(0, 12)} already carries a different note under ${intent.target}`,
+  );
+};
+
 /** A `never`-typed guard, so a `WriteIntentKind` added later without a case above fails to compile. */
 const assertNeverWriteIntentKind = (kind: never): never => {
   throw new Error(`Unhandled write intent kind: ${String(kind)}`);
@@ -623,6 +1023,7 @@ export const performWriteIntent: WriteExecutorPort = async (
     case 'pull_request':
       return performPullRequest(intent, context);
     case 'git_note':
+      if ((context.mode ?? 'live') === 'shadow') return performGitNoteShadow(intent, context);
       if (context.mergeCommit === null) throw new NoteMergeCommitUnknown(intent);
       return performGitNote(intent, context, context.mergeCommit);
     case 'git_tag':

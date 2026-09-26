@@ -27,12 +27,22 @@ import {
   GATE_PASSED_EVENT_TYPE,
   GATE_SKIPPED_EVENT_TYPE,
   MODEL_RUNGS,
+  NOTE_INJECTED_EVENT_TYPE,
+  NOTE_INJECTED_PAYLOAD_KEYS,
+  NOTE_KINDS,
   OrchErrorSchema,
+  REVERSIBILITY_CLASSES,
   REVIEW_SKIPPED_EVENT_TYPE,
   RUN_MODES,
   STEP_DISPOSITIONS,
   STEP_PHASES,
   STEP_TIER_DOWNSHIFTED_EVENT_TYPE,
+  WRITE_GATE_APPROVED_EVENT_TYPE,
+  WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS,
+  WRITE_GATE_OPENED_EVENT_TYPE,
+  WRITE_GATE_OPENED_PAYLOAD_KEYS,
+  WRITE_GATE_REJECTED_EVENT_TYPE,
+  WRITE_INTENT_KINDS,
   formatTimestamp,
 } from '../contracts/index.js';
 import type {
@@ -42,6 +52,10 @@ import type {
   Handoff,
   ModelRung,
   OrchError,
+  PendingGate,
+  PendingGateBatchEntry,
+  PendingGateResolution,
+  PendingNote,
   RunMode,
   RunState,
   StepDisposition,
@@ -51,6 +65,7 @@ import type {
 
 import { COMMAND_EVENT_TYPES } from './commands.js';
 import { ModelRungUnrecognised } from './promotion.js';
+import { writeIntentSettled } from './write-executor.js';
 
 /** The emitter name every event the reconciler originates carries. */
 export const ENGINE_EMITTER = 'engine.reconciler';
@@ -130,6 +145,22 @@ export const ENGINE_EVENT_TYPES = {
    * cannot say whether a review was skipped or the run never got that far.
    */
   ReviewSkipped: REVIEW_SKIPPED_EVENT_TYPE,
+  /**
+   * Story 4-1 — AD-12's reversibility gate opened by `settlePreMergeWrites`, before it would otherwise
+   * have called the write executor. Folded into `pendingGate`; the checkpoint's one durable record that a
+   * write is waiting on a person, distinct from a step's own `blocked` disposition because no step failed.
+   */
+  WriteGateOpened: WRITE_GATE_OPENED_EVENT_TYPE,
+  /** A person approved the pending gate (CAP-12), so the write executor may proceed. Clears `pendingGate`. */
+  WriteGateApproved: WRITE_GATE_APPROVED_EVENT_TYPE,
+  /** A person rejected the pending gate (CAP-23), so the run hands off. Clears `pendingGate`. */
+  WriteGateRejected: WRITE_GATE_REJECTED_EVENT_TYPE,
+  /**
+   * Story 4-3 — a durable note or person-initiated narrowing landed against the run. Folded into
+   * `pendingNote`; the next `step.started` for this run clears it, mirroring `pendingGate`'s own
+   * set-by-one-event, cleared-by-a-later-one shape.
+   */
+  NoteInjected: NOTE_INJECTED_EVENT_TYPE,
 } as const;
 
 export type EngineEventType = (typeof ENGINE_EVENT_TYPES)[keyof typeof ENGINE_EVENT_TYPES];
@@ -174,6 +205,12 @@ export const FOLDED_EVENT_TYPES: readonly string[] = Object.freeze([
   ENGINE_EVENT_TYPES.StepTierPromoted,
   ENGINE_EVENT_TYPES.HandoffRecorded,
   ENGINE_EVENT_TYPES.BudgetDegraded,
+  /** Story 4-1 — the standing gate, set by the first and cleared by whichever of the other two lands. */
+  ENGINE_EVENT_TYPES.WriteGateOpened,
+  ENGINE_EVENT_TYPES.WriteGateApproved,
+  ENGINE_EVENT_TYPES.WriteGateRejected,
+  /** Story 4-3 — the standing note, set by `note.injected` and cleared by the run's next `step.started`. */
+  ENGINE_EVENT_TYPES.NoteInjected,
   /**
    * AD-19's ledger entry *and* the effect it records, in one line.
    *
@@ -226,6 +263,15 @@ export interface FeaturePlan {
   readonly starting_model_tier: ModelRung;
   /** The worktree a step's baseline ref is taken in and reset against (AD-26). */
   readonly worktree: string;
+  /**
+   * Story 3-2 (AD-27) — the real, already-merged feature's merge commit this run shadows, or `null`/absent
+   * for a live run. Read by the write executor's `pull_request` performer under `mode: 'shadow'` to tell
+   * the one pull request a shadow run *expects* to find (the historical one it is reproducing, never
+   * destructive) apart from any other, genuinely unexpected one (destructive) — see
+   * `src/engine/write-executor.ts`'s own docblock. Optional so no existing caller or fixture that builds a
+   * `FeaturePlan` needs to change.
+   */
+  readonly shadowRealMergeCommit?: string | null;
 }
 
 const isOneOf = <T extends string>(members: readonly T[], value: unknown): value is T =>
@@ -242,6 +288,47 @@ const payloadError = (event: EventEnvelope, key: string): OrchError | null => {
   const parsed = OrchErrorSchema.safeParse(value);
   return parsed.success ? parsed.data : null;
 };
+
+/**
+ * A `write.gate_opened` line's `batch`, narrowed to the persisted shape — `intent_id`/`kind` only, never
+ * `target` (that richer disclosure lives on the event payload itself; see {@link PendingGateBatchEntry}'s
+ * own docblock for why the two shapes differ). `null` for anything not shaped as an array of entries this
+ * build can place, the same defence every other gate field here gives an unplaceable value: a batch this
+ * reader cannot describe is not a batch it can safely claim covers anything.
+ */
+const payloadGateBatch = (event: EventEnvelope, key: string): PendingGateBatchEntry[] | null => {
+  const value = event.payload[key];
+  if (!Array.isArray(value)) return null;
+  const entries: PendingGateBatchEntry[] = [];
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null) return null;
+    const intentId = (item as Record<string, unknown>)[WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS.IntentId];
+    const kind = (item as Record<string, unknown>)[WRITE_GATE_BATCH_ENTRY_PAYLOAD_KEYS.Kind];
+    if (typeof intentId !== 'string' || !isOneOf(WRITE_INTENT_KINDS, kind)) return null;
+    entries.push({ intent_id: intentId, kind });
+  }
+  return entries;
+};
+
+/**
+ * A pending gate record with its `resolution` replaced, everything else carried over.
+ *
+ * A plain top-level function, taking the open gate as a parameter, rather than an inline
+ * `{ ...pendingGate, resolution }` at the fold's own call site. The loop-carried `let pendingGate`
+ * variable is reassigned in an earlier `case` of the very same `switch`, and TypeScript's control-flow
+ * narrowing for a mutable loop variable spread back into itself in a later case collapses to `never` at
+ * that point (a known compiler limitation with no useful workaround short of this one) — a plain
+ * function call breaks that direct self-reference, because a parameter is typed by its declaration, not
+ * by the call site's own control-flow history.
+ */
+const withGateResolution = (gate: PendingGate, resolution: PendingGateResolution): PendingGate => ({
+  step: gate.step,
+  intent_id: gate.intent_id,
+  kind: gate.kind,
+  reversibility: gate.reversibility,
+  batch: gate.batch,
+  resolution,
+});
 
 /** The envelope field, when it is a non-empty string. `null` covers absent, null and blank alike. */
 const envelopeString = (event: EventEnvelope, key: 'baseline_ref' | 'session_id'): string | null => {
@@ -274,6 +361,8 @@ export const emptyRunState = (options: RebuildOptions): RunState => {
     updated_at: at,
     handoff: null,
     degradation: null,
+    pending_gate: null,
+    pending_note: null,
   };
 };
 
@@ -318,6 +407,9 @@ export const rebuildFromLog = (
   let mode: RunMode = options.plan.mode;
   let handoff: Handoff | null = null;
   let degradation: Degradation | null = null;
+  let pendingGate: PendingGate | null = null;
+  /** Story 4-3 — the standing note, set by `note.injected` and cleared by the run's next `step.started`. */
+  let pendingNote: PendingNote | null = null;
   let createdAt: string | null = null;
   let updatedAt: string | null = null;
   let lastSeq = 0;
@@ -362,6 +454,14 @@ export const rebuildFromLog = (
       }
 
       case ENGINE_EVENT_TYPES.StepStarted: {
+        /**
+         * Story 4-3 — this is "whichever step's input is built next" (the one moment `stepInput`
+         * delivers a pending note into), so any `step.started` line for this run clears it, unconditionally
+         * — the note was either delivered into *this* step's own input, or there was none pending at all.
+         * Cleared even if the line names no readable step below, because the fact this clears is about the
+         * run having started a step, not about which one.
+         */
+        pendingNote = null;
         const id = event.step;
         if (id === null) break;
         const existing = steps.get(id);
@@ -443,6 +543,16 @@ export const rebuildFromLog = (
       }
 
       case ENGINE_EVENT_TYPES.StepResumeAttempted: {
+        /**
+         * Story 4-3, round-1 review — a resume is "the next input this run writes" exactly as much as a
+         * fresh start is (row 13): `stepInput()` is called on the resume path too, and a note pending when
+         * the resume began was delivered into *this* attempt's own input (or there was none pending at
+         * all). Clearing only on `step.started` left a note injected while a step was `interrupted`
+         * uncleared for ever, since a resume never emits that type. Unconditional, the same as the
+         * `step.started` case's own clear: the fact this clears is about the run having resumed a step,
+         * not about which one or whether the bound-counting line below even applies.
+         */
+        pendingNote = null;
         const record = stepOf(event);
         if (record === null) break;
         /**
@@ -516,6 +626,22 @@ export const rebuildFromLog = (
         const to = payloadString(event, 'to_state');
         if (isOneOf(FEATURE_STATES, to)) state = to;
 
+        /**
+         * Story 4-1, round-1 review — a *rejected* gate is cleared here, once its own hand-off
+         * transition actually lands; an *approved* one is cleared later, once its whole batch actually
+         * settles (see the post-loop finalisation this fold does after the `for` above, right before the
+         * checkpoint is returned) — never here, because `settlePreMergeWrites` still needs to find
+         * `resolution: 'approved'` on a later pass to run the batch at all (rows 3, 12).
+         *
+         * `state !== 'blocked'` rather than `to === 'handed_off'` specifically: a rejected gate's own
+         * transition is always to `handed_off`, but a `kill`/`disengage`/`take_over` landing first (this
+         * story changes no guard on those — see its own Never list) also moves the run off `blocked`,
+         * and a stale rejected-gate record serves nothing once the run has left it behind either way.
+         */
+        if (pendingGate !== null && pendingGate.resolution === 'rejected' && state !== 'blocked') {
+          pendingGate = null;
+        }
+
         const record = stepOf(event);
         const declared = payloadString(event, 'step_disposition');
         if (record !== null && isOneOf(STEP_DISPOSITIONS, declared)) {
@@ -583,9 +709,94 @@ export const rebuildFromLog = (
         break;
       }
 
+      case ENGINE_EVENT_TYPES.WriteGateOpened: {
+        /**
+         * Story 4-1 — a line naming a kind, a reversibility class or a batch this build cannot place is
+         * ignored rather than folded as a guess, the same defence {@link loggedRung} gives an unplaceable
+         * rung: a gate this reader cannot describe is not a gate it can safely claim is open.
+         */
+        const intentId = payloadString(event, WRITE_GATE_OPENED_PAYLOAD_KEYS.IntentId);
+        const kind = payloadString(event, WRITE_GATE_OPENED_PAYLOAD_KEYS.Kind);
+        const reversibility = payloadString(event, WRITE_GATE_OPENED_PAYLOAD_KEYS.Reversibility);
+        const step = payloadString(event, WRITE_GATE_OPENED_PAYLOAD_KEYS.Step);
+        const batch = payloadGateBatch(event, WRITE_GATE_OPENED_PAYLOAD_KEYS.Batch);
+        if (
+          intentId !== null &&
+          isOneOf(WRITE_INTENT_KINDS, kind) &&
+          isOneOf(REVERSIBILITY_CLASSES, reversibility) &&
+          batch !== null
+        ) {
+          pendingGate = {
+            step: step ?? '',
+            intent_id: intentId,
+            kind,
+            reversibility,
+            batch,
+            resolution: 'pending',
+          };
+        }
+        break;
+      }
+
+      case ENGINE_EVENT_TYPES.NoteInjected: {
+        /**
+         * A second `note.injected` before the first is consumed **replaces** it — this is a plain
+         * assignment, never an append, which is the whole of "only one pending note at a time" (I/O
+         * matrix row 5). A line naming a `kind` this build cannot place is ignored rather than folded as
+         * a guess, the same defence {@link loggedRung} gives an unplaceable rung.
+         */
+        const text = payloadString(event, NOTE_INJECTED_PAYLOAD_KEYS.Text);
+        const kind = payloadString(event, NOTE_INJECTED_PAYLOAD_KEYS.Kind);
+        if (text !== null && isOneOf(NOTE_KINDS, kind)) {
+          pendingNote = { text, kind };
+        }
+        break;
+      }
+
+      /**
+       * Story 4-1, round-1 review's most serious fix — `resolution` is what these two lines change, never
+       * the whole record going to `null` directly. Clearing straight to `null` here raced the *separate*
+       * `command.applied` line the resolving effect also emits (folded below, in its own case): a crash
+       * landing this line durably but not that one left `pending_gate` reading `null` while `state.state`
+       * was still `blocked`, so a later, redelivered `Command.Approve` found no gate on record and — for a
+       * rejection — silently reversed it. Setting `resolution` in place instead leaves a fully truthful
+       * intermediate fold across that exact crash; only the `command.applied` line's own `to_state`, once
+       * it lands, clears the whole record (see that case, below).
+       *
+       * A line naming a gate this fold has no open record for is ignored: there is nothing to resolve.
+       */
+      case ENGINE_EVENT_TYPES.WriteGateApproved:
+      case ENGINE_EVENT_TYPES.WriteGateRejected: {
+        if (pendingGate === null) break;
+        pendingGate = withGateResolution(
+          pendingGate,
+          event.type === ENGINE_EVENT_TYPES.WriteGateApproved ? 'approved' : 'rejected',
+        );
+        break;
+      }
+
       default:
         // AD-5 — a reader ignores an unknown type rather than erroring.
         break;
+    }
+  }
+
+  /**
+   * Story 4-1, round-1 review — the *only* place an `'approved'` gate is cleared to `null`.
+   *
+   * Not on the resolving `command.applied` line the way a `'rejected'` gate is (above): rows 3 and 12
+   * both require `settlePreMergeWrites` to still find `resolution: 'approved'` on a *later* pass, so it
+   * can run the whole remaining batch without a per-intent lookup or a second approval — clearing the
+   * record the moment the approval's own `running`/`degraded` transition landed would erase exactly the
+   * fact that later pass depends on, before the batch it approves has actually settled. So an approved
+   * gate stays on record until every intent in its own `batch` carries a `write.executed`/
+   * `write.suppressed` line — `writeIntentSettled` is the same idempotency check `settlePreMergeWrites`
+   * itself already makes per intent, read here once, after the whole log is folded, rather than
+   * threaded through the loop above as a running tally.
+   */
+  if (pendingGate !== null && pendingGate.resolution === 'approved') {
+    if (pendingGate.batch.every((entry) => writeIntentSettled(ordered, entry.intent_id))) {
+      pendingGate = null;
     }
   }
 
@@ -600,6 +811,8 @@ export const rebuildFromLog = (
     updated_at: updatedAt ?? base.updated_at,
     handoff,
     degradation,
+    pending_gate: pendingGate,
+    pending_note: pendingNote,
   };
 };
 
@@ -658,6 +871,12 @@ export const compareCheckpointToLog = (
   // A checkpoint that has forgotten a degradation the log records would put a degraded run back on the
   // ordinary tier and the ordinary review, which is the un-degrading story 2-9 forbids.
   compare('degradation', checkpoint.degradation, rebuilt.degradation);
+  // A checkpoint that has forgotten a pending gate the log still holds open would let `approve`/`reject`
+  // fall through to the ordinary step-failure branches for a run where no step failed (story 4-1).
+  compare('pending_gate', checkpoint.pending_gate, rebuilt.pending_gate);
+  // A checkpoint that has forgotten a pending note would build the run's next step input with no
+  // `steering_note`, silently dropping a person's own words (story 4-3).
+  compare('pending_note', checkpoint.pending_note, rebuilt.pending_note);
 
   const fromLog = new Map(rebuilt.steps.map((record) => [record.step, record]));
   for (const record of checkpoint.steps) {

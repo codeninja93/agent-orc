@@ -73,13 +73,22 @@ export const resolveOrchHome = (env: NodeJS.ProcessEnv = process.env): string =>
   return isAbsolute(declared) ? declared : resolve(declared);
 };
 
-/** The four top-level directories AD-9 places under `ORCH_HOME`. */
+/** The five top-level directories AD-9 places under `ORCH_HOME`. */
 export const runsDir = (orchHome: string = resolveOrchHome()): string => join(orchHome, 'runs');
 export const worktreesDir = (orchHome: string = resolveOrchHome()): string =>
   join(orchHome, 'worktrees');
 export const poolDir = (orchHome: string = resolveOrchHome()): string => join(orchHome, 'pool');
 export const projectsDir = (orchHome: string = resolveOrchHome()): string =>
   join(orchHome, 'projects');
+
+/**
+ * Story 5-4, AD-34 — `ORCH_HOME/memory/`, the fixed home for cross-project memory: "it spans projects and
+ * can belong to no repository". AD-34's own fifth top-level directory, sibling to `runs/`, `worktrees/`,
+ * `pool/` and `projects/` — the last of which holds every *per-project* memory store this stage has built
+ * so far (`consolidated.jsonl`, `decisions.jsonl`). This one is the opposite: not scoped under any
+ * `project-id`, because it is the one store every project reads and writes.
+ */
+export const memoryDir = (orchHome: string = resolveOrchHome()): string => join(orchHome, 'memory');
 
 /** `worktrees/<run-id>/` — the checkout a run's steps work in (AD-9). */
 export const worktreeDir = (runId: string, orchHome: string = resolveOrchHome()): string =>
@@ -109,6 +118,58 @@ export const projectRegistrationPath = (
   projectId: string,
   orchHome: string = resolveOrchHome(),
 ): string => join(projectDir(projectId, orchHome), PROJECT_REGISTRATION_FILE_NAME);
+
+/**
+ * Story 5-1, AD-9 — `projects/<project-id>/memory/consolidated.jsonl`, the durable per-project store the
+ * batch consolidation pass (`src/engine/consolidation.ts`) appends `KnowledgeEntry`-shaped facts to.
+ *
+ * Spelled here for the same reason `projectRegistrationPath` is: `projects/<project-id>/` already holds
+ * the central ledger and memory (this module's own docs reserve it "stories 5-1 and on"), and a second
+ * spelling of this location — one in the writer, another in whatever later story reads the store back —
+ * would be a second on-disk layout for the one thing AD-9 calls "central".
+ */
+export const PROJECT_MEMORY_DIR_NAME = 'memory';
+export const CONSOLIDATED_MEMORY_FILE_NAME = 'consolidated.jsonl';
+
+/** `projects/<project-id>/memory/consolidated.jsonl` for one project id. */
+export const projectMemoryPath = (
+  projectId: string,
+  orchHome: string = resolveOrchHome(),
+): string =>
+  join(projectDir(projectId, orchHome), PROJECT_MEMORY_DIR_NAME, CONSOLIDATED_MEMORY_FILE_NAME);
+
+/**
+ * Story 5-3, AD-9 — `projects/<project-id>/memory/decisions.jsonl`, the durable per-project index the
+ * decision-ledger query (`src/engine/decision-index.ts`) appends `decision.recorded` lines to.
+ *
+ * Spelled here beside `projectMemoryPath` for the same reason that name is: `projects/<project-id>/memory/`
+ * already holds one derived-projection store (story 5-1's `consolidated.jsonl`), and this is the second,
+ * so a second spelling of the directory — one in this file, another wherever a future reader is built —
+ * would be the same two-on-disk-layouts split AD-9 exists to prevent.
+ */
+export const DECISION_INDEX_FILE_NAME = 'decisions.jsonl';
+
+/** `projects/<project-id>/memory/decisions.jsonl` for one project id. */
+export const decisionIndexPath = (
+  projectId: string,
+  orchHome: string = resolveOrchHome(),
+): string => join(projectDir(projectId, orchHome), PROJECT_MEMORY_DIR_NAME, DECISION_INDEX_FILE_NAME);
+
+/**
+ * Story 5-4, AD-34 — `ORCH_HOME/memory/patterns.jsonl`, the one shared, cross-project store
+ * `src/engine/pattern-memory.ts` appends `CrossRepoPattern`-shaped records to.
+ *
+ * Spelled here beside `projectMemoryPath`/`decisionIndexPath` for the same reason those are: a second
+ * spelling of this location — one in the writer, another in whatever later story reads the store back —
+ * would be a second on-disk layout for the one thing AD-34 fixes. Unlike those two, this path takes no
+ * `project-id`: `memoryDir` is not scoped under `projects/<project-id>/` at all, which is the entire point
+ * of AD-34's fixed cross-project home.
+ */
+export const PATTERNS_FILE_NAME = 'patterns.jsonl';
+
+/** `ORCH_HOME/memory/patterns.jsonl`. */
+export const patternsPath = (orchHome: string = resolveOrchHome()): string =>
+  join(memoryDir(orchHome), PATTERNS_FILE_NAME);
 
 /** The file names inside a run directory, so no caller spells one itself. */
 export const EVENT_LOG_FILE_NAME = 'events.jsonl';

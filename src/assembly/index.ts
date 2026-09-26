@@ -28,30 +28,44 @@
  * of its own; running {@link runFeatureToCompletion} against a real repository does, which is why the
  * only calls this project's own automated suites make into it use a fake `git`/`gh` or a disposable
  * local scratch repository, never this repository's real `origin`.
+ *
+ * **Story 3-2 (AD-27) adds `mode`/`shadowing`.** A shadow run is this exact same assembly, given
+ * `mode: 'shadow'` and a `shadowing.realMergeCommit` naming the real feature it shadows — see
+ * {@link runFeatureToCompletion}'s own docblock for what changes.
  */
 import { execFileSync } from 'node:child_process';
 
 import {
+  SHADOW_COMPARED_EVENT_TYPE,
+  SHADOW_COMPARED_PAYLOAD_KEYS,
   WRITE_EXECUTED_EVENT_TYPE,
   WRITE_EXECUTED_PAYLOAD_KEYS,
   isModelRung,
   isTerminalFeatureState,
 } from '../contracts/index.js';
-import type { EventEnvelope, FeatureState, ModelRung } from '../contracts/index.js';
+import type { EventEnvelope, FeatureState, ModelRung, RunMode } from '../contracts/index.js';
 import {
+  ENGINE_EMITTER,
   REMOTE,
   Reconciler,
   STANDARD_PLAN_STEPS,
   WRITE_GH_TIMEOUT_MS,
   WRITE_GIT_TIMEOUT_MS,
   checkPullRequestMerged,
+  compareShadowRun,
   createStepSpawner,
   createUlidMinter,
   mintRunId,
   performWriteIntent,
   takeConfigSnapshot,
 } from '../engine/index.js';
-import type { FeaturePlan, PassAction, StepSpawner, UlidMinter } from '../engine/index.js';
+import type {
+  FeaturePlan,
+  PassAction,
+  ShadowComparisonReport,
+  StepSpawner,
+  UlidMinter,
+} from '../engine/index.js';
 import { checkDefaultBranchProtection } from '../container/index.js';
 import type { BranchProtection, BranchProtectionProbe } from '../container/index.js';
 import { createWorktree, reconcilerReclamation } from '../pool/index.js';
@@ -90,6 +104,18 @@ export interface RunFeatureOptions {
   /** The repository this run works against — its default branch is what the pull request targets. */
   readonly repository: string;
   readonly spec: ConfirmedFeatureSpec;
+  /**
+   * AD-27 — `'shadow'` is an ordinary run carrying a mode flag. Defaults to `'live'`, unchanged for every
+   * existing caller. A shadow run requires {@link shadowing}.
+   */
+  readonly mode?: RunMode;
+  /**
+   * Required when {@link mode} is `'shadow'`: the real, already-merged feature's own merge commit this
+   * run shadows. The worktree is created at that commit's *parent* — `createWorktree`'s existing `ref`
+   * option, no new worktree capability — so the run drives the full pipeline from the same starting point
+   * the real feature itself started from, rather than from current `HEAD`.
+   */
+  readonly shadowing?: { readonly realMergeCommit: string };
   /** Defaults to the AD-9 resolution. */
   readonly orchHome?: string;
   /**
@@ -134,6 +160,12 @@ export interface RunFeatureOutcome {
   readonly state: FeatureState;
   /** The real git worktree this run worked in. */
   readonly worktree: string;
+  /**
+   * AD-27 — present exactly for a shadow run that reached `committed`: the shadow run's resulting tree
+   * compared against the real merge commit it was shadowing. `null` for a live run, or a shadow run that
+   * did not reach `committed` within `maxPasses`.
+   */
+  readonly shadowComparison: ShadowComparisonReport | null;
 }
 
 const isStringArray = (value: unknown): value is readonly string[] =>
@@ -244,6 +276,41 @@ export const ghDefaultBranchProtectionProbe: BranchProtectionProbe = (repository
 };
 
 /**
+ * AD-27 — the ref a shadow run's worktree is created at: the parent of the named, already-merged
+ * feature's real merge commit, never the merge commit itself and never current `HEAD`.
+ *
+ * `createWorktree`'s existing `ref` option already accepts anything other than `HEAD`
+ * (`WorktreeCreateRequest.ref`), so this is the one new thing a shadow run needs at the worktree layer:
+ * naming the right starting commit. No new worktree capability is built.
+ */
+export class ShadowStartRefUnresolvable extends Error {
+  readonly realMergeCommit: string;
+
+  constructor(realMergeCommit: string, detail: string) {
+    super(
+      `Could not resolve the parent of ${realMergeCommit} to start this shadow run's worktree at: ${detail}`,
+    );
+    this.name = 'ShadowStartRefUnresolvable';
+    this.realMergeCommit = realMergeCommit;
+  }
+}
+
+export const resolveShadowStartRef = (repository: string, realMergeCommit: string): string => {
+  try {
+    return execFileSync('git', ['-C', repository, 'rev-parse', `${realMergeCommit}^`], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: WRITE_GIT_TIMEOUT_MS,
+    }).trim();
+  } catch (thrown: unknown) {
+    throw new ShadowStartRefUnresolvable(
+      realMergeCommit,
+      thrown instanceof Error ? thrown.message : String(thrown),
+    );
+  }
+};
+
+/**
  * A minter whose first `mint()` returns `firstId`, and a real monotonic minter after that.
  *
  * **The fix for a critical id mismatch.** `Reconciler.acceptFeature` mints its own run id internally
@@ -311,6 +378,56 @@ const pullRequestUrlFrom = (events: readonly EventEnvelope[]): string | null => 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * Produce a shadow run's comparison report and durably record it as `shadow.compared` — success or
+ * failure alike, so the one raw, per-run result story 3-3's rolling window is computed from is never only
+ * an in-memory return value.
+ *
+ * **Guarded, deliberately.** `compareShadowRun` reaches real `git` one last time after the run has already
+ * durably reached `committed`; a transient failure there (a corrupt object, a momentary IO error) must not
+ * reject this whole call and discard an otherwise-successful `RunFeatureOutcome` — the run *did* complete,
+ * only its grading could not be produced. The failure is recorded, not swallowed, and `null` is returned
+ * so the caller still gets back everything else it is owed.
+ */
+const recordShadowComparison = (options: {
+  readonly recorder: Recorder;
+  readonly run: string;
+  readonly feature: string;
+  readonly realMergeCommit: string;
+  readonly worktreePath: string;
+}): ShadowComparisonReport | null => {
+  const emit = (payload: Record<string, unknown>): void => {
+    options.recorder.record({
+      feature: options.feature,
+      run: options.run,
+      step: null,
+      emitter: ENGINE_EMITTER,
+      type: SHADOW_COMPARED_EVENT_TYPE,
+      payload,
+    });
+  };
+  try {
+    const report = compareShadowRun('HEAD', options.realMergeCommit, options.worktreePath);
+    emit({
+      [SHADOW_COMPARED_PAYLOAD_KEYS.Outcome]: report.outcome,
+      [SHADOW_COMPARED_PAYLOAD_KEYS.ShadowTreeRef]: report.shadowTreeRef,
+      [SHADOW_COMPARED_PAYLOAD_KEYS.RealMergeCommit]: report.realMergeCommit,
+      [SHADOW_COMPARED_PAYLOAD_KEYS.Detail]:
+        report.outcome === 'accepted'
+          ? 'the shadow run’s resulting tree matches the real merge commit’s tree exactly'
+          : 'the shadow run’s resulting tree differs from the real merge commit’s tree',
+    });
+    return report;
+  } catch (thrown: unknown) {
+    emit({
+      [SHADOW_COMPARED_PAYLOAD_KEYS.RealMergeCommit]: options.realMergeCommit,
+      [SHADOW_COMPARED_PAYLOAD_KEYS.Code]: 'shadow.comparison_failed',
+      [SHADOW_COMPARED_PAYLOAD_KEYS.Detail]: thrown instanceof Error ? thrown.message : String(thrown),
+    });
+    return null;
+  }
+};
+
+/**
  * Assemble a real `Reconciler` and drive one feature from an already-confirmed spec through to a
  * terminal state.
  *
@@ -327,22 +444,63 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  * returning as soon as every declared step completes: `awaiting_merge` is this story's whole point, not
  * a state to paper over. If the wait outlasts `maxPasses`, `options.run` (or the CLI's own resume flag)
  * is how to pick the same run back up rather than minting a new one.
+ *
+ * **Story 3-2 (AD-27) — `options.mode: 'shadow'`.** The run drives the exact same pipeline, starting its
+ * worktree at the parent of `options.shadowing.realMergeCommit` rather than current `HEAD`. Every write
+ * intent is probed and recorded but never actually performed (`src/engine/write-executor.ts`), so the run
+ * never opens a real pull request and therefore never enters `awaiting_merge` — it proceeds straight from
+ * its last implementation/verification step to `committed`. Once there, this function itself produces the
+ * one raw comparison result story 3-3's rolling window is computed from (`RunFeatureOutcome.shadowComparison`).
  */
 export const runFeatureToCompletion = async (options: RunFeatureOptions): Promise<RunFeatureOutcome> => {
   const orchHome = options.orchHome ?? resolveOrchHome();
   const resuming = options.run !== undefined;
   const worktreeId = options.run ?? mintRunId();
-  const worktree: Worktree = createWorktree({ run: worktreeId, repository: options.repository, orchHome });
 
-  const plan: FeaturePlan = {
+  // AD-27 — a *fresh* run's mode is exactly what the caller declares here. A *resumed* run's mode is
+  // re-read from its own durable state a few lines below and overrides this, whatever `options.mode` says:
+  // trusting fresh options over what a run already durably is could route the real write executor as if a
+  // shadow run were live (or the reverse). This binding is only what a fresh run uses, and the resumed
+  // run's own provisional value until its persisted state is read.
+  let mode: RunMode = options.mode ?? 'live';
+  if (!resuming && mode === 'shadow' && options.shadowing === undefined) {
+    throw new Error(
+      'mode: "shadow" requires shadowing.realMergeCommit naming the real, already-merged feature’s ' +
+        'merge commit this run shadows.',
+    );
+  }
+
+  // AD-27 — a shadow run's worktree starts at the named merge commit's parent, never current `HEAD`;
+  // `createWorktree`'s existing `ref` option is all this needs (see `resolveShadowStartRef`'s own
+  // docblock). A resumed run's worktree already exists at whatever ref it was originally created with, so
+  // this is only computed for a fresh accept.
+  const shadowStartRef =
+    !resuming && mode === 'shadow' && options.shadowing !== undefined
+      ? resolveShadowStartRef(options.repository, options.shadowing.realMergeCommit)
+      : undefined;
+  const worktree: Worktree = createWorktree({
+    run: worktreeId,
+    repository: options.repository,
+    orchHome,
+    ...(shadowStartRef === undefined ? {} : { ref: shadowStartRef }),
+  });
+
+  const shadowRealMergeCommitFor = (forMode: RunMode): string | null =>
+    forMode === 'shadow' ? (options.shadowing?.realMergeCommit ?? null) : null;
+
+  // `plan` is mutable: the closure below (`plans: () => plan`) reads whatever it currently binds to, so
+  // reassigning it after a resumed run's persisted mode is read (below) is enough to correct what the
+  // reconciler — and therefore the write executor — sees on every subsequent pass.
+  let plan: FeaturePlan = {
     feature: options.spec.feature,
-    mode: 'live',
+    mode,
     territory: [...(options.spec.territory ?? [])],
     steps: STANDARD_PLAN_STEPS,
     request: options.spec.request,
     acceptance_criteria: [...options.spec.acceptance_criteria],
     starting_model_tier: options.spec.starting_model_tier ?? 'claude-haiku-4-5',
     worktree: worktree.path,
+    shadowRealMergeCommit: shadowRealMergeCommitFor(mode),
   };
 
   const { recorderFor, closeAll } = sharedRecorders(orchHome);
@@ -380,10 +538,27 @@ export const runFeatureToCompletion = async (options: RunFeatureOptions): Promis
     // this unconditionally, on both the fresh and the resumed path, safe rather than a mid-run edit.
     takeConfigSnapshot({ repository: options.repository, runId: run, orchHome });
     if (resuming) {
+      // AD-27 — the run's own durable state decides its mode here, never the fresh `options` this call
+      // happened to be given: `RunState.mode` is folded from the log (`rebuildFromLog`), so it is what the
+      // run actually is regardless of what `options.mode`/`options.shadowing` claim on this particular
+      // call. `plan` is reassigned so the `plans: () => plan` closure the reconciler already holds sees
+      // the correction on every pass from here on, including the one this same call makes below.
+      const loaded = reconciler.load(run);
+      const persistedMode = loaded.state.mode;
+      if (persistedMode !== mode) {
+        mode = persistedMode;
+        plan = { ...plan, mode, shadowRealMergeCommit: shadowRealMergeCommitFor(mode) };
+      }
+      if (mode === 'shadow' && options.shadowing === undefined) {
+        throw new Error(
+          'Resuming a run whose own durable state is mode: "shadow" requires shadowing.realMergeCommit ' +
+            'again — it is not itself durably recorded, and the write executor must not guess it.',
+        );
+      }
       // A resumed run may already be past `drafting`; confirming a run that is not still in it is not
       // this call's place to attempt (`Reconciler.confirm`'s own concern), so it is only reached for a
       // run that has not yet been confirmed.
-      if (reconciler.load(run).state.state === 'drafting') reconciler.confirm(run);
+      if (loaded.state.state === 'drafting') reconciler.confirm(run);
     } else {
       reconciler.confirm(run);
     }
@@ -408,7 +583,22 @@ export const runFeatureToCompletion = async (options: RunFeatureOptions): Promis
 
       const state = reconciler.load(run).state.state;
       if (isTerminalFeatureState(state)) {
-        return { run, state, worktree: worktree.path };
+        // AD-27 — the one raw, per-run result story 3-3's rolling window is computed from: a shadow run
+        // that actually reached `committed` compares its resulting worktree tree against the real merge
+        // commit it was shadowing. Never attempted for a live run, and never for a shadow run that landed
+        // somewhere other than `committed` (`blocked`/`handed_off`/etc.) — there is no "resulting tree" to
+        // grade for a run that did not finish composing one.
+        const shadowComparison =
+          mode === 'shadow' && state === 'committed' && options.shadowing !== undefined
+            ? recordShadowComparison({
+                recorder: recorderFor(run, options.spec.feature),
+                run,
+                feature: options.spec.feature,
+                realMergeCommit: options.shadowing.realMergeCommit,
+                worktreePath: worktree.path,
+              })
+            : null;
+        return { run, state, worktree: worktree.path, shadowComparison };
       }
       // A step actively running has already been waited out inside `reconciler.pass()` itself — the
       // spawner does not return until the subprocess terminates — so this delay is only ever spent

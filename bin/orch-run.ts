@@ -8,12 +8,16 @@
  * `src/assembly/`, where the same typecheck, lint and tests as the rest of the package reach it — the
  * same reason `bin/init.ts` and `bin/runner.ts` are this thin.
  *
- * **Usage:** `orch-run [--resume <run-id>] <repository> <spec.json>`, where `spec.json` is
- * `{ "feature": "kebab-slug", "request": "...", "acceptance_criteria": ["..."] }` — CAP-1 through CAP-4's
- * interview is what ordinarily produces this; this entry point takes its output rather than rebuilding
- * the interview. `--resume <run-id>` picks an already-accepted run back up — the timeout error a run
- * parked in `awaiting_merge` past `maxPasses` reports names exactly this flag, because re-running with no
- * `--resume` always mints a *new* run and leaves the parked one behind, still waiting.
+ * **Usage:** `orch-run [--resume <run-id>] [--shadow <merge-commit>] <repository> <spec.json>`, where
+ * `spec.json` is `{ "feature": "kebab-slug", "request": "...", "acceptance_criteria": ["..."] }` — CAP-1
+ * through CAP-4's interview is what ordinarily produces this; this entry point takes its output rather
+ * than rebuilding the interview. `--resume <run-id>` picks an already-accepted run back up — the timeout
+ * error a run parked in `awaiting_merge` past `maxPasses` reports names exactly this flag, because
+ * re-running with no `--resume` always mints a *new* run and leaves the parked one behind, still waiting.
+ * `--shadow <merge-commit>` runs story 3-2's shadow mode instead: `<merge-commit>` names the real,
+ * already-merged feature this run shadows, `mode: 'shadow'` is threaded through `runFeatureToCompletion`,
+ * and no branch is pushed, no pull request is opened and no note is written — every write intent is
+ * probed and recorded, never performed (AD-27, `src/engine/write-executor.ts`).
  *
  * **Preconditions this file asserts rather than performs.** `<repository>` must already be
  * `.orch/`-installed (`npx github:<owner>/<repo> init`, AD-12) — a repository with none refuses here,
@@ -32,17 +36,22 @@ import { resolve } from 'node:path';
 import { parseConfirmedFeatureSpec, runFeatureToCompletion } from 'agent-orcastrator/assembly';
 import type { ConfirmedFeatureSpec } from 'agent-orcastrator/assembly';
 
-const USAGE = 'Usage: orch-run [--resume <run-id>] <repository> <spec.json>\n';
+const USAGE = 'Usage: orch-run [--resume <run-id>] [--shadow <merge-commit>] <repository> <spec.json>\n';
 
 interface ParsedArgv {
   readonly resume: string | null;
+  readonly shadow: string | null;
   readonly positional: readonly string[];
 }
 
-/** Pulls `--resume <run-id>` out of the argument list, wherever it appears; everything else is positional. */
+/**
+ * Pulls `--resume <run-id>` and `--shadow <merge-commit>` out of the argument list, wherever either
+ * appears; everything else is positional.
+ */
 const parseArgv = (argv: readonly string[]): ParsedArgv | null => {
   const positional: string[] = [];
   let resume: string | null = null;
+  let shadow: string | null = null;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--resume') {
@@ -52,9 +61,16 @@ const parseArgv = (argv: readonly string[]): ParsedArgv | null => {
       index += 1;
       continue;
     }
+    if (arg === '--shadow') {
+      const value = argv[index + 1];
+      if (value === undefined) return null;
+      shadow = value;
+      index += 1;
+      continue;
+    }
     positional.push(arg ?? '');
   }
-  return { resume, positional };
+  return { resume, shadow, positional };
 };
 
 const main = async (argv: readonly string[]): Promise<number> => {
@@ -82,6 +98,9 @@ const main = async (argv: readonly string[]): Promise<number> => {
       repository,
       spec,
       ...(parsedArgv.resume === null ? {} : { run: parsedArgv.resume }),
+      ...(parsedArgv.shadow === null
+        ? {}
+        : { mode: 'shadow' as const, shadowing: { realMergeCommit: parsedArgv.shadow } }),
       onProgress: (action): void => {
         process.stderr.write(`[${action.run}] ${action.from} -> ${action.to} (${action.kind})\n`);
       },

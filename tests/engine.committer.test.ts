@@ -683,6 +683,7 @@ describe('a completed committing step composes the commit, and the run keeps it'
       'implement',
       'test',
       'verify',
+      'adversarial',
       'commit',
     ]);
   });

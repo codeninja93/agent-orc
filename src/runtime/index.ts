@@ -28,6 +28,12 @@
  * repository is, which moved down from `src/installer/detect.ts` because resolution has to verify a
  * recorded path by reading the first-commit SHA at it; `detect.ts` re-exports all three, so no installer
  * caller changed. That is the fifth time this relocation has been made, and always for the same rule.
+ *
+ * Story 5-2 made the move a sixth time, in the other direction: `commands.ts` now also carries
+ * `writeFileIfChanged`, the atomic skip-if-unchanged write story 2-1 put in `src/installer/write.ts` when
+ * the installer was its only caller. The engine's knowledge sweep is the second caller, rewriting
+ * `profile.toml` with that same idiom, and the spine forbids the engine from importing `src/installer/`
+ * at all — so the code moved to the layer both may depend on, and `src/installer/write.ts` re-exports it.
  */
 export * from './paths.js';
 export * from './exclusive-create.js';

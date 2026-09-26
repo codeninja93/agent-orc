@@ -598,6 +598,29 @@ describe('an entry nothing can check is refused at parse (matrix 9, 10)', () => 
     ).toBe(false);
   });
 
+  it('refuses a fractional decay_features, the whole-number half of the amended refinement', () => {
+    expect(
+      KnowledgeEntrySchema.safeParse({
+        ...knowledgeEntry(),
+        decay_policy: 'n-features',
+        decay_features: 1.5,
+      }).success,
+    ).toBe(false);
+  });
+
+  it('refuses a decay_features outside the safe integer range, the bound z.int() used to enforce', () => {
+    // Number.isInteger(1e21) is true — 1e21 is a whole number — but it exceeds Number.MAX_SAFE_INTEGER
+    // and cannot round-trip exactly, which is exactly what z.int() refused and a bare Number.isInteger
+    // check would silently admit again.
+    expect(
+      KnowledgeEntrySchema.safeParse({
+        ...knowledgeEntry(),
+        decay_policy: 'n-features',
+        decay_features: 1e21,
+      }).success,
+    ).toBe(false);
+  });
+
   it('refuses a profile whose knowledge section holds an unanchored entry, through the profile itself', () => {
     const repository = workspace();
     const profile = fixtureProfile();

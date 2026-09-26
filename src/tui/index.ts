@@ -26,7 +26,8 @@
  *   persistent question slot story 1-10 filled;
  * - `cards/` — the six surfaces `interface-contract.md` requires, each a pure function from a view to a
  *   plain structure: the one-question card, the spec echo, the morning brief, the kill card, the
- *   completion notice and the handoff note;
+ *   completion notice and the handoff note; plus story 4-4's attention card, a fleet-wide, exceptions-only
+ *   read that is card-shaped but deliberately not one of the six (Boundaries — see `cards/attention.ts`);
  * - `cards.tsx` — one Ink component per card, each laying out its view-model and nothing more;
  * - `fleet` — every run under `runsDir`, folded, so CAP-22's brief is a fold of one log per feature and one
  *   unreadable log costs only its own line;

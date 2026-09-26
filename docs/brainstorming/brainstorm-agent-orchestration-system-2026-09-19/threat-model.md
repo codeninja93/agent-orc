@@ -170,7 +170,12 @@ Nothing runs unattended until **all** of these exist and each has been exercised
 4. **Redaction pass on every path to durable storage** — event log, git notes, dashboard, PR bodies. Fails closed.
 
 **Blast radius**
-5. **Protected `main`** with force-push and deletion disabled, server-side. Set this up first; it is the only control that survives total agent failure.
+5. **Protected `main`** with force-push and deletion disabled, server-side. Set this up first; it is the only control that survives total agent failure. **Stage-4-gate audit note (2026-09-25):** the software-side
+   probe exists and works (`ghDefaultBranchProtectionProbe`, `src/assembly/index.ts`) — but checked directly
+   against this project's own real repository (`gh api repos/codeninja93/agent-orc/branches/main/protection`,
+   2026-09-25), `main` is **not currently protected** ("Branch not protected", HTTP 404). This is a one-time,
+   server-side GitHub setting only a repository admin can set; the harness can check it but should not
+   silently change it. Not yet done.
 6. **Executor has no push credential.** A single gated committer pushes, and a git wrapper rejects every force-push variant.
 7. **Escape hatch command**, written and *tested*: dumps in-flight work to an ordinary branch and detaches.
 
@@ -182,12 +187,50 @@ Nothing runs unattended until **all** of these exist and each has been exercised
 10. **Spec echo before any code** — acceptance criteria restated, one-keystroke confirm.
 11. **Re-grounding rule enforced in every agent prompt**: read the original request verbatim, never a summary.
 12. **Gate 1 verification (typecheck + lint + tests) must pass before anything is proposed for commit.** LLM review is gate 2 and optional in v0.
-13. **Pinned model versions and temperature zero** outside explicitly creative steps.
+13. **Pinned model versions and temperature zero** outside explicitly creative steps. **Stage-4-gate audit
+    note (2026-09-25):** pinning is satisfied — `MODEL_RUNGS` (`src/contracts/state.ts`) names specific
+    model identifiers passed via `--model`, never a floating `-latest`-style alias. Temperature control is
+    not built, and cannot be by the mechanism this item implies: the shipped system invokes the `claude`
+    CLI (`src/engine/spawner.ts`), whose full `--help` output (checked directly) exposes no
+    `--temperature`/seed/sampling flag of any kind — only `--effort` (reasoning depth, a different axis).
+    This is an architectural mismatch between this item's original wording (written before the invocation
+    surface was chosen) and what the chosen surface actually exposes, not a missed wiring. If low-variance
+    behavior on gate-critical steps (verification, committing) still matters, the available lever on this
+    surface is `--effort`, not temperature — worth a deliberate decision by whoever owns this document, not
+    a silent claim that this item is satisfied.
 
 **Operations & trust**
 14. **Append-only event log (SQLite or files) that survives a crash**, and a run is resumable from it.
 15. **Playing dead on repeated failure**: halt and write a handoff document rather than retry-thrash.
-16. **Exceptions-only notifications.** Silence means success.
+16. **Exceptions-only notifications.** Silence means success. **Stage-4-gate audit note (2026-09-25):** not
+    built. `src/tui/fleet.ts`'s `inFlightRuns` and `nextGateFor` show every non-terminal run, not only the
+    ones needing a person's attention — a run proceeding completely normally still surfaces on these
+    surfaces. No dedicated notification-suppression mechanism, and no push/alert channel, exists anywhere
+    in the codebase today. Genuinely unbuilt scope, not merely hard to find — worth a proper spec of its
+    own rather than a quick patch, given "what counts as an exception" and "what channel delivers it" are
+    real design decisions.
+    **Update (2026-09-25, story 4-4):** the classification now exists and is tested —
+    `runsNeedingAttention` and `buildAttentionCard` in `src/tui/fleet.ts` / `src/tui/cards/attention.ts`,
+    covered by `tests/tui.attention.test.ts`. But nothing in production calls it yet: not
+    `src/web/server.ts` (still serves the raw `fleetView` unmodified), not `src/web/static/index.html`
+    (its own hand-rolled `renderFleet`, which never imports `src/tui/cards/`), and no TUI mount point
+    either. So the part of item 16 that means "a person can actually see this" is still open. This is not
+    unique to this story — the same zero-caller status is true of every other card in `src/tui/cards/`
+    today.
 17. **Phase 1 autonomy only**: the system proposes, Deep merges. Autonomy is unlocked per risk tier only after shadow mode shows measured accuracy.
 
 **Before the first unattended night, run the chaos drill once** — kill an agent mid-run and confirm the system halts cleanly, the event log is intact, and the escape hatch works.
+
+**Stage-4-gate audit note (2026-09-25):** items 1–4, 6–12, 14–15, and 17 are built and tested (several —
+redaction, container hardening, the event log — tested against a real container runtime or with heavy
+crash-recovery coverage, well past a "minimum" bar). Items 5, 13, and 16 are not fully satisfied, per the
+notes beside each above.
+
+**Chaos drill note (2026-09-25):** performed as a dedicated, deliberate exercise against real production
+code — see `docs/demos/chaos-drill-2026-09-25.md`. A real subprocess (replaying a genuine captured
+`claude -p` transcript) was spawned through the real `Reconciler`/spawner/stopper chain and held running,
+then stopped mid-step by a real command-intent file, for both `kill` and `take_over`. Result: `kill`
+leaves the run `killed`/`killed` with the event log intact and exactly-once applied; `take_over` leaves
+the run `handed_off`, genuinely commits the work to a real `orch/takeover/<run-id>` branch, and writes a
+real, legible `HANDOFF.md`. This closing line's three claims are now each confirmed once, on purpose,
+against this real system — not only covered by isolated unit/integration tests.
